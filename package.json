@@ -1,0 +1,36 @@
+{
+  "name": "polkaswap-indexer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "packageManager": "yarn@4.10.3",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "worker": "tsx src/worker/index.ts",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@graphql-tools/schema": "^10.0.30",
+    "@polkadot/api": "16.5.4",
+    "graphql": "^16.13.1",
+    "graphql-ws": "6.0.7",
+    "graphql-yoga": "^5.16.2",
+    "pg": "^8.16.3",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.0",
+    "@types/pg": "^8.15.6",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.21.0",
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.0"
+  }
+}

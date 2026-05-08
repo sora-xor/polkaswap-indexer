@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: polkaswap_indexer
+      POSTGRES_USER: polkaswap
+      POSTGRES_PASSWORD: polkaswap
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  api:
+    build: .
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgres://polkaswap:polkaswap@postgres:5432/polkaswap_indexer
+      HOST: 0.0.0.0
+      PORT: 4350
+      GRAPHQL_PATH: /graphql
+    ports:
+      - "4350:4350"
+    command: ["node", "dist/src/index.js"]
+
+  worker:
+    build: .
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgres://polkaswap:polkaswap@postgres:5432/polkaswap_indexer
+      SORA_WS_ENDPOINT: wss://mof2.sora.org
+      CHAIN_BATCH_SIZE: 25
+      CHAIN_STATE_REFRESH_INTERVAL_BLOCKS: 250
+      CHAIN_SNAPSHOT_INTERVAL_BLOCKS: 250
+    command: ["node", "dist/src/worker/index.js"]
+
+volumes:
+  postgres-data:
