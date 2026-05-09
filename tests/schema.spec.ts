@@ -111,4 +111,91 @@ describe('Polkaswap indexer schema', () => {
       xorFees: { amount: '0', amountUSD: '0' },
     });
   });
+
+  it('keeps SubQuery JSON fields selectable as scalar values', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert({
+      collection: 'assetSnapshots',
+      id: 'asset-snapshot-a',
+      data: {
+        id: 'asset-snapshot-a',
+        assetId: 'asset-a',
+        timestamp: 10,
+        type: 'DAY',
+        supply: '100',
+        priceUSD: { open: '1', high: '2', low: '1', close: '2' },
+        volume: { amount: '5', amountUSD: '10' },
+      },
+    });
+    await repository.upsert({
+      collection: 'orderBookSnapshots',
+      id: 'order-book-snapshot-a',
+      data: {
+        id: 'order-book-snapshot-a',
+        orderBookId: '0-base-quote',
+        timestamp: 10,
+        type: 'DAY',
+        price: { open: '1', high: '2', low: '1', close: '2' },
+        volumeUSD: '10',
+      },
+    });
+    await repository.upsert({
+      collection: 'accountMeta',
+      id: 'alice',
+      data: {
+        id: 'alice',
+        accountId: 'alice',
+        createdAtTimestamp: 10,
+        createdAtBlock: 1,
+        xorFees: { amount: '1', amountUSD: '2' },
+        xorBurned: { amount: '0', amountUSD: '0' },
+        xorStakingValRewards: { amount: '0', amountUSD: '0' },
+        orderBook: { created: 1, closed: 0, amountUSD: '2' },
+        vault: { created: 0, closed: 0, amountUSD: '0' },
+        governance: { votes: 1, amount: '3', amountUSD: '4' },
+        deposit: { incomingUSD: '5', outgoingUSD: '6' },
+      },
+    });
+
+    const schema = createSchema();
+    const assetSnapshotType = schema.getType('AssetSnapshot') as { getFields: () => Record<string, { type: unknown }> };
+    const orderBookSnapshotType = schema.getType('OrderBookSnapshot') as { getFields: () => Record<string, { type: unknown }> };
+    const accountMetaType = schema.getType('AccountMeta') as { getFields: () => Record<string, { type: unknown }> };
+    const assetSnapshotsField = schema.getQueryType()?.getFields().assetSnapshots;
+    const orderBookSnapshotsField = schema.getQueryType()?.getFields().orderBookSnapshots;
+    const accountMetaField = schema.getQueryType()?.getFields().accountMeta;
+    const assetSnapshots = await assetSnapshotsField?.resolve?.({}, {}, { repository }, {} as never);
+    const orderBookSnapshots = await orderBookSnapshotsField?.resolve?.({}, {}, { repository }, {} as never);
+    const accountMeta = await accountMetaField?.resolve?.({}, { id: 'alice' }, { repository }, {} as never);
+
+    expect(String(assetSnapshotType.getFields().priceUSD.type)).toBe('JSON');
+    expect(String(assetSnapshotType.getFields().volume.type)).toBe('JSON');
+    expect(String(orderBookSnapshotType.getFields().price.type)).toBe('JSON');
+    expect(String(accountMetaType.getFields().xorFees.type)).toBe('JSON');
+    expect(assetSnapshots).toMatchObject({
+      edges: [{ node: { priceUSD: { close: '2' }, volume: { amountUSD: '10' } } }],
+    });
+    expect(orderBookSnapshots).toMatchObject({
+      edges: [{ node: { price: { close: '2' } } }],
+    });
+    expect(accountMeta).toMatchObject({
+      xorFees: { amount: '1', amountUSD: '2' },
+      orderBook: { created: 1, closed: 0, amountUSD: '2' },
+      governance: { votes: 1, amount: '3', amountUSD: '4' },
+      deposit: { incomingUSD: '5', outgoingUSD: '6' },
+    });
+  });
+
+  it('validates SubQuery-style subscription payload entity scalars', () => {
+    const schema = createSchema();
+    const updatesStreamMutationType = schema.getType('UpdatesStreamMutation') as {
+      getFields: () => Record<string, { type: unknown }>;
+    };
+    const accountMutationType = schema.getType('AccountMutation') as { getFields: () => Record<string, { type: unknown }> };
+    const orderBookMutationType = schema.getType('OrderBookMutation') as { getFields: () => Record<string, { type: unknown }> };
+
+    expect(String(updatesStreamMutationType.getFields()._entity.type)).toBe('JSON!');
+    expect(String(accountMutationType.getFields()._entity.type)).toBe('JSON!');
+    expect(String(orderBookMutationType.getFields()._entity.type)).toBe('JSON!');
+  });
 });

@@ -86,13 +86,13 @@ export const typeDefs = /* GraphQL */ `
     accountId: String
     createdAtTimestamp: Int
     createdAtBlock: Int
-    xorFees: AssetVolume
-    xorBurned: AssetVolume
-    xorStakingValRewards: AssetVolume
-    orderBook: AccountMetaEventCounter
-    vault: AccountMetaEventCounter
-    governance: AccountMetaGovernance
-    deposit: AccountMetaDeposit
+    xorFees: JSON
+    xorBurned: JSON
+    xorStakingValRewards: JSON
+    orderBook: JSON
+    vault: JSON
+    governance: JSON
+    deposit: JSON
   }
 
   type AccountPointSystem {
@@ -100,13 +100,13 @@ export const typeDefs = /* GraphQL */ `
     accountId: String
     version: Int
     startedAtBlock: Int
-    xorFees: AssetVolume
-    xorBurned: AssetVolume
-    xorStakingValRewards: AssetVolume
-    orderBook: AccountMetaEventCounter
-    vault: AccountMetaEventCounter
-    governance: AccountMetaGovernance
-    deposit: AccountMetaDeposit
+    xorFees: JSON
+    xorBurned: JSON
+    xorStakingValRewards: JSON
+    orderBook: JSON
+    vault: JSON
+    governance: JSON
+    deposit: JSON
   }
 
   type AccountPointSystemEdge {
@@ -152,8 +152,8 @@ export const typeDefs = /* GraphQL */ `
     supply: String
     mint: String
     burn: String
-    priceUSD: PriceSnapshot
-    volume: AssetVolume
+    priceUSD: JSON
+    volume: JSON
   }
 
   type AssetSnapshotEdge {
@@ -198,7 +198,7 @@ export const typeDefs = /* GraphQL */ `
     poolId: String
     timestamp: Int
     type: SnapshotType
-    priceUSD: PriceSnapshot
+    priceUSD: JSON
     baseAssetReserves: String
     targetAssetReserves: String
     chameleonAssetReserves: String
@@ -326,7 +326,7 @@ export const typeDefs = /* GraphQL */ `
     orderBookId: String
     timestamp: Int
     type: SnapshotType
-    price: PriceSnapshot
+    price: JSON
     baseAssetVolume: String
     quoteAssetVolume: String
     volumeUSD: String
@@ -475,7 +475,7 @@ export const typeDefs = /* GraphQL */ `
   type UpdatesStreamMutation {
     id: String!
     mutation_type: String!
-    _entity: UpdatesStream!
+    _entity: JSON!
   }
 
   type AccountMutationEntity {
@@ -486,7 +486,7 @@ export const typeDefs = /* GraphQL */ `
   type AccountMutation {
     id: String!
     mutation_type: String!
-    _entity: AccountMutationEntity!
+    _entity: JSON!
   }
 
   type OrderBookMutationEntity {
@@ -500,7 +500,7 @@ export const typeDefs = /* GraphQL */ `
   type OrderBookMutation {
     id: String!
     mutation_type: String!
-    _entity: OrderBookMutationEntity!
+    _entity: JSON!
   }
 
   type Query {

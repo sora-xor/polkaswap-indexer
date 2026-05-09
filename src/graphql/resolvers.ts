@@ -168,9 +168,30 @@ async function* pollSubscription(
   }
 }
 
+async function* watchSubscription(
+  collectionName: IndexerCollection,
+  args: { id?: string | string[] },
+  context: Context
+): AsyncGenerator<MutationPayload, void, unknown> {
+  const ids = getSubscriptionIds(args.id);
+
+  if (!context.repository.watch) {
+    yield* pollSubscription(collectionName, args, context);
+    return;
+  }
+
+  for await (const document of context.repository.watch(collectionName, ids)) {
+    yield {
+      id: document.id,
+      mutation_type: 'UPDATE',
+      _entity: toMutationEntity(collectionName, document.data),
+    };
+  }
+}
+
 const pollingSubscription = (collectionName: IndexerCollection) => ({
   subscribe: (_parent: unknown, args: { id?: string | string[] }, context: Context) =>
-    pollSubscription(collectionName, args, context),
+    watchSubscription(collectionName, args, context),
 });
 
 export function createSchema(): GraphQLSchema {

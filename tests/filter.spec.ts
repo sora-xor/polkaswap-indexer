@@ -34,6 +34,21 @@ describe('GraphQL filter compatibility', () => {
     ).toBe(false);
   });
 
+  it('requires every requested value for array contains filters', () => {
+    expect(
+      matchesFilter(
+        { callNames: ['poolXYK.initializePool', 'poolXYK.depositLiquidity'] },
+        { callNames: { contains: ['poolXYK.initializePool', 'poolXYK.depositLiquidity'] } }
+      )
+    ).toBe(true);
+    expect(
+      matchesFilter(
+        { callNames: ['poolXYK.initializePool'] },
+        { callNames: { contains: ['poolXYK.initializePool', 'poolXYK.depositLiquidity'] } }
+      )
+    ).toBe(false);
+  });
+
   it('sorts SubQuery order tokens by camel-cased document fields', () => {
     const result = sortDocuments(
       [

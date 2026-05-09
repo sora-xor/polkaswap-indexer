@@ -33,11 +33,23 @@ const getOrderField = (orderBy: unknown): { field: string; direction: 'asc' | 'd
 const isSafeJsonField = (field: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(field);
 
 const sqlJsonField = (field: string): string => {
+  if (field === 'id') return 'id';
+  if (field === 'timestamp') return 'timestamp::text';
+  if (field === 'blockHeight') return 'block_height::text';
+
   if (!isSafeJsonField(field)) {
     throw new Error(`Unsupported JSON field in repository query: ${field}`);
   }
 
   return `data->>'${field}'`;
+};
+
+const sqlJsonValue = (field: string): string => {
+  if (!isSafeJsonField(field)) {
+    throw new Error(`Unsupported JSON field in repository query: ${field}`);
+  }
+
+  return `data->'${field}'`;
 };
 
 const NUMERIC_ORDER_FIELDS = new Set([
@@ -95,8 +107,16 @@ const scalarCondition = (
         values.push(`%${String(expected).toLowerCase()}%`);
         return `lower(${expression}) like $${values.length}`;
       case 'contains':
+        if (expected && typeof expected === 'object') {
+          values.push(JSON.stringify(expected));
+          return `${sqlJsonValue(field)} @> $${values.length}::jsonb`;
+        }
+
+        values.push(JSON.stringify([expected]));
+        const arrayIndex = values.length;
         values.push(JSON.stringify({ [field]: expected }));
-        return `data @> $${values.length}::jsonb`;
+        const objectIndex = values.length;
+        return `(${sqlJsonValue(field)} @> $${arrayIndex}::jsonb or data @> $${objectIndex}::jsonb)`;
       default:
         return 'true';
     }
@@ -155,6 +175,10 @@ export class PostgresRepository implements IndexerRepository {
     const orderExpression =
       field === 'id'
         ? 'id'
+        : field === 'timestamp'
+          ? 'timestamp'
+          : field === 'blockHeight'
+            ? 'block_height'
         : NUMERIC_ORDER_FIELDS.has(field)
           ? `coalesce(nullif(${sqlJsonField(field)}, ''), '0')::numeric`
           : sqlJsonField(field);
@@ -215,6 +239,7 @@ export class PostgresRepository implements IndexerRepository {
          updated_at = now()`,
       [document.collection, document.id, document.blockHeight ?? null, document.timestamp ?? null, document.data]
     );
+    await this.notify(document);
   }
 
   async upsertMany(documents: IndexerDocument[]): Promise<void> {
@@ -236,6 +261,7 @@ export class PostgresRepository implements IndexerRepository {
              updated_at = now()`,
           [document.collection, document.id, document.blockHeight ?? null, document.timestamp ?? null, document.data]
         );
+        await client.query('select pg_notify($1, $2)', ['indexer_documents', JSON.stringify({ collection: document.collection, id: document.id })]);
       }
       await client.query('commit');
     } catch (error) {
@@ -248,5 +274,56 @@ export class PostgresRepository implements IndexerRepository {
 
   async close(): Promise<void> {
     await this.pool.end();
+  }
+
+  async *watch(collection: IndexerCollection, ids: string[] = []): AsyncGenerator<IndexerDocument, void, unknown> {
+    const client = await this.pool.connect();
+    const queue: IndexerDocument[] = [];
+    let notify: (() => void) | null = null;
+    const idSet = new Set(ids);
+    const listener = async (message: pg.Notification) => {
+      if (message.channel !== 'indexer_documents' || !message.payload) return;
+
+      try {
+        const payload = JSON.parse(message.payload) as { collection?: IndexerCollection; id?: string };
+        if (payload.collection !== collection || !payload.id || (idSet.size && !idSet.has(payload.id))) return;
+
+        const document = await this.get(collection, payload.id);
+        if (!document) return;
+
+        queue.push(document);
+        notify?.();
+        notify = null;
+      } catch {
+        // Ignore malformed notifications; the backing table remains authoritative.
+      }
+    };
+
+    client.on('notification', listener);
+    await client.query('listen indexer_documents');
+
+    try {
+      while (true) {
+        if (!queue.length) {
+          await new Promise<void>((resolve) => {
+            notify = resolve;
+          });
+        }
+
+        const document = queue.shift();
+        if (document) yield document;
+      }
+    } finally {
+      client.off('notification', listener);
+      await client.query('unlisten indexer_documents').catch(() => undefined);
+      client.release();
+    }
+  }
+
+  private async notify(document: IndexerDocument): Promise<void> {
+    await this.pool.query('select pg_notify($1, $2)', [
+      'indexer_documents',
+      JSON.stringify({ collection: document.collection, id: document.id }),
+    ]);
   }
 }

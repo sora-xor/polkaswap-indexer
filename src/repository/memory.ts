@@ -1,4 +1,5 @@
 import { matchesFilter, sortDocuments } from '../graphql/filter.js';
+import { EventEmitter } from 'node:events';
 
 import type {
   IndexerCollection,
@@ -14,6 +15,7 @@ import type {
  */
 export class MemoryRepository implements IndexerRepository {
   private readonly documents = new Map<IndexerCollection, Map<string, IndexerDocument>>();
+  private readonly events = new EventEmitter();
 
   async list(collection: IndexerCollection): Promise<IndexerDocument[]> {
     return [...(this.documents.get(collection)?.values() ?? [])];
@@ -46,6 +48,7 @@ export class MemoryRepository implements IndexerRepository {
     const collection = this.documents.get(document.collection) ?? new Map<string, IndexerDocument>();
     collection.set(document.id, { ...document, data: { ...document.data } });
     this.documents.set(document.collection, collection);
+    this.events.emit('document', document);
   }
 
   async upsertMany(documents: IndexerDocument[]): Promise<void> {
@@ -56,5 +59,37 @@ export class MemoryRepository implements IndexerRepository {
 
   async close(): Promise<void> {
     this.documents.clear();
+    this.events.removeAllListeners();
+  }
+
+  async *watch(collection: IndexerCollection, ids: string[] = []): AsyncGenerator<IndexerDocument, void, unknown> {
+    const queue: IndexerDocument[] = [];
+    let notify: (() => void) | null = null;
+    const filter = (document: IndexerDocument): boolean =>
+      document.collection === collection && (!ids.length || ids.includes(document.id));
+    const listener = (document: IndexerDocument) => {
+      if (!filter(document)) return;
+
+      queue.push(document);
+      notify?.();
+      notify = null;
+    };
+
+    this.events.on('document', listener);
+
+    try {
+      while (true) {
+        if (!queue.length) {
+          await new Promise<void>((resolve) => {
+            notify = resolve;
+          });
+        }
+
+        const document = queue.shift();
+        if (document) yield document;
+      }
+    } finally {
+      this.events.off('document', listener);
+    }
   }
 }

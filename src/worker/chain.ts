@@ -1,7 +1,7 @@
 import { ApiPromise, WsProvider } from '@polkadot/api';
 
 import type { AppConfig } from '../config.js';
-import type { IndexerDocument, IndexerRepository } from '../repository/types.js';
+import type { IndexerCollection, IndexerDocument, IndexerRepository, RepositoryQueryArgs } from '../repository/types.js';
 
 type CodecLike = {
   toJSON?: () => unknown;
@@ -51,16 +51,83 @@ type PoolState = {
   priceUSD: string;
 };
 
+type SnapshotTypeName = 'DEFAULT' | 'HOUR' | 'DAY' | 'MONTH' | 'BLOCK';
+
+type PriceOhlc = {
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+};
+
+type AssetAggregate = {
+  volumeAmount: bigint;
+  volumeUSD: bigint;
+  mint: bigint;
+  burn: bigint;
+  priceUSD: PriceOhlc;
+};
+
+type PoolAggregate = {
+  baseAssetVolume: bigint;
+  targetAssetVolume: bigint;
+  chameleonAssetVolume: bigint;
+  volumeUSD: bigint;
+  priceUSD: PriceOhlc;
+};
+
+type OrderBookAggregate = {
+  baseAssetVolume: bigint;
+  quoteAssetVolume: bigint;
+  volumeUSD: bigint;
+  liquidityUSD: bigint;
+  price: PriceOhlc;
+  lastDeals: Array<{ orderId: number; timestamp: number; isBuy: boolean; amount: string; price: string }>;
+};
+
+type Analytics = {
+  assets: Map<string, Map<SnapshotTypeName, AssetAggregate>>;
+  pools: Map<string, Map<SnapshotTypeName, PoolAggregate>>;
+  orderBooks: Map<string, Map<SnapshotTypeName, OrderBookAggregate>>;
+  network: Map<SnapshotTypeName, {
+    accounts: number;
+    transactions: number;
+    fees: bigint;
+    liquidityUSD: string;
+    volumeUSD: bigint;
+    bridgeIncomingTransactions: number;
+    bridgeOutgoingTransactions: number;
+  }>;
+  assetDayVolumeUSD: Map<string, bigint>;
+  assetWeekVolumeUSD: Map<string, bigint>;
+  assetDayOpenPrice: Map<string, string>;
+  assetWeekOpenPrice: Map<string, string>;
+  assetOrderBookLiquidity: Map<string, bigint>;
+  poolDayVolumeUSD: Map<string, bigint>;
+  orderBookDayVolumeUSD: Map<string, bigint>;
+  orderBookDayOpenPrice: Map<string, string>;
+  orderBookActiveReserves: Map<string, { baseAssetReserves: bigint; quoteAssetReserves: bigint; liquidityUSD: bigint }>;
+};
+
 const CHAIN_STATE_ID = 'chainState';
 const DECIMALS = 18;
 const SCALE = 10n ** 18n;
-const BLOCKS_PER_YEAR = 5_256_000n;
 const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000';
 const PSWAP = '0x0200050000000000000000000000000000000000000000000000000000000000';
 const DAI = '0x0200060000000000000000000000000000000000000000000000000000000000';
 const XSTUSD = '0x0200080000000000000000000000000000000000000000000000000000000000';
 const KUSD = '0x02000c0000000000000000000000000000000000000000000000000000000000';
 const STABLE_ASSET_IDS = new Set([DAI, XSTUSD, KUSD]);
+const SNAPSHOT_TYPES: SnapshotTypeName[] = ['DEFAULT', 'HOUR', 'DAY', 'MONTH', 'BLOCK'];
+const SNAPSHOT_WINDOW_SECONDS: Record<SnapshotTypeName, number> = {
+  DEFAULT: 86_400,
+  HOUR: 3_600,
+  DAY: 86_400,
+  MONTH: 30 * 86_400,
+  BLOCK: 0,
+};
+const FARMING_PSWAP_PER_DAY = 2_500_000n * SCALE;
+const DAYS_PER_YEAR = 365n;
 
 const collection = <T extends IndexerDocument['collection']>(name: T): T => name;
 
@@ -121,6 +188,10 @@ const codecToBigInt = (value: unknown): bigint => {
   if (typeof json === 'number') return BigInt(Math.trunc(json));
   if (typeof json === 'bigint') return json;
 
+  if (json && typeof json === 'object' && 'inner' in json) {
+    return codecToBigInt((json as { inner?: unknown }).inner);
+  }
+
   if (typeof json === 'string') {
     if (json.startsWith('0x')) return BigInt(json);
     return BigInt(json.replace(/,/g, '') || '0');
@@ -161,6 +232,13 @@ const codecToDecimalString = (value: unknown, decimals = DECIMALS): string =>
 
 const scaledMul = (left: bigint, right: bigint): bigint => (left * right) / SCALE;
 const scaledDiv = (left: bigint, right: bigint): bigint => (right === 0n ? 0n : (left * SCALE) / right);
+const scaledPow = (base: bigint, exponent: number): bigint => {
+  let result = SCALE;
+  for (let index = 0; index < exponent; index += 1) {
+    result = scaledMul(result, base);
+  }
+  return result;
+};
 
 const codecUsd = (assetId: string, amount: bigint, prices: Map<string, bigint>, decimals = DECIMALS): string => {
   const price = prices.get(assetId) ?? 0n;
@@ -170,6 +248,28 @@ const codecUsd = (assetId: string, amount: bigint, prices: Map<string, bigint>, 
 };
 
 const reserveToNaturalScaled = (reserve: bigint, decimals = DECIMALS): bigint => scaledDiv(reserve, 10n ** BigInt(decimals));
+
+const naturalScaledToCodec = (amount: bigint, decimals = DECIMALS): bigint => (amount * 10n ** BigInt(decimals)) / SCALE;
+
+const orderBookAmountUsd = (
+  baseAssetId: string,
+  quoteAssetId: string,
+  amount: bigint,
+  price: bigint,
+  side: string,
+  prices: Map<string, bigint>,
+  assets: Map<string, AssetInfo>
+): string => {
+  const baseDecimals = assets.get(baseAssetId)?.decimals ?? DECIMALS;
+  const baseAmount = reserveToNaturalScaled(amount, baseDecimals);
+
+  if (side === 'Buy') {
+    const quoteAmount = scaledMul(baseAmount, price);
+    return scaledToString(scaledMul(quoteAmount, prices.get(quoteAssetId) ?? 0n), 8);
+  }
+
+  return scaledToString(scaledMul(baseAmount, prices.get(baseAssetId) ?? 0n), 8);
+};
 
 const emptyVolume = () => ({ amount: '0', amountUSD: '0' });
 const emptyCounter = () => ({ created: 0, closed: 0, amountUSD: '0' });
@@ -406,7 +506,8 @@ const createHistoryData = (
     const event = findEvent(events, 'orderBook', 'LimitOrderPlaced') ?? {};
     const orderId = Number(event.orderId ?? args.orderId ?? 0);
     const side = String(args.side ?? event.side ?? 'Buy');
-    const assetId = side === 'Buy' ? orderBookId.quoteAssetId : orderBookId.baseAssetId;
+    const amount = codecToBigInt(args.amount);
+    const price = codecToBigInt(args.price);
 
     return {
       data: {
@@ -416,7 +517,15 @@ const createHistoryData = (
         orderId,
         price: codecToDecimalString(args.price, DECIMALS),
         amount: codecToDecimalString(args.amount, assets.get(orderBookId.baseAssetId)?.decimals ?? DECIMALS),
-        amountUSD: codecUsd(assetId, codecToBigInt(args.amount), prices, assets.get(assetId)?.decimals ?? DECIMALS),
+        amountUSD: orderBookAmountUsd(
+          orderBookId.baseAssetId,
+          orderBookId.quoteAssetId,
+          amount,
+          price,
+          side,
+          prices,
+          assets
+        ),
         side,
         lifetime: Number(args.lifetime ?? 0),
       },
@@ -527,7 +636,111 @@ const parseOrderBookId = (value: unknown): { dexId: number; baseAssetId: string;
 const orderBookIdString = ({ dexId, baseAssetId, quoteAssetId }: { dexId: number; baseAssetId: string; quoteAssetId: string }) =>
   `${dexId}-${baseAssetId}-${quoteAssetId}`;
 
-const snapshotId = (prefix: string, id: string, type: string, timestamp: number): string => `${prefix}-${id}-${type}-${timestamp}`;
+const snapshotBucket = (type: string, timestamp: number, blockHeight = 0): number => {
+  if (type === 'BLOCK') return blockHeight || timestamp;
+
+  const seconds = SNAPSHOT_WINDOW_SECONDS[type as SnapshotTypeName] ?? SNAPSHOT_WINDOW_SECONDS.DEFAULT;
+  return Math.floor(timestamp / seconds) * seconds;
+};
+
+const snapshotId = (prefix: string, id: string, type: string, timestamp: number, blockHeight = 0): string =>
+  `${prefix}-${id}-${type}-${snapshotBucket(type, timestamp, blockHeight)}`;
+
+const emptyPriceOhlc = (price: string): PriceOhlc => ({ open: price, high: price, low: price, close: price });
+
+const minDecimalString = (left: string, right: string): string => (decimalStringToScaled(left) <= decimalStringToScaled(right) ? left : right);
+
+const maxDecimalString = (left: string, right: string): string => (decimalStringToScaled(left) >= decimalStringToScaled(right) ? left : right);
+
+const mergePriceOhlc = (previous: unknown, currentPrice: string): PriceOhlc => {
+  if (!previous || typeof previous !== 'object') return emptyPriceOhlc(currentPrice);
+
+  const record = previous as Record<string, unknown>;
+  const open = String(record.open ?? currentPrice);
+  const high = maxDecimalString(String(record.high ?? open), currentPrice);
+  const low = minDecimalString(String(record.low ?? open), currentPrice);
+
+  return { open, high, low, close: currentPrice };
+};
+
+const percentChange = (openPrice: string, closePrice: string): number => {
+  const open = decimalStringToScaled(openPrice);
+  if (open === 0n) return 0;
+
+  const close = decimalStringToScaled(closePrice);
+  return Number(scaledDiv(close - open, open)) / 10 ** 16;
+};
+
+const addDecimalStrings = (left: unknown, right: unknown, precision = 18): string =>
+  scaledToString(decimalStringToScaled(left) + decimalStringToScaled(right), precision);
+
+const poolIdForAssets = (baseAssetId: string, targetAssetId: string): string =>
+  baseAssetId && targetAssetId ? `${baseAssetId}-${targetAssetId}` : '';
+
+const getTypeMap = <T>(map: Map<string, Map<SnapshotTypeName, T>>, id: string): Map<SnapshotTypeName, T> => {
+  const current = map.get(id);
+  if (current) return current;
+
+  const created = new Map<SnapshotTypeName, T>();
+  map.set(id, created);
+  return created;
+};
+
+const getAggregate = <T>(
+  map: Map<string, Map<SnapshotTypeName, T>>,
+  id: string,
+  type: SnapshotTypeName,
+  create: () => T
+): T => {
+  const byType = getTypeMap(map, id);
+  const current = byType.get(type);
+  if (current) return current;
+
+  const created = create();
+  byType.set(type, created);
+  return created;
+};
+
+const newAssetAggregate = (priceUSD: string): AssetAggregate => ({
+  volumeAmount: 0n,
+  volumeUSD: 0n,
+  mint: 0n,
+  burn: 0n,
+  priceUSD: emptyPriceOhlc(priceUSD),
+});
+
+const newPoolAggregate = (priceUSD: string): PoolAggregate => ({
+  baseAssetVolume: 0n,
+  targetAssetVolume: 0n,
+  chameleonAssetVolume: 0n,
+  volumeUSD: 0n,
+  priceUSD: emptyPriceOhlc(priceUSD),
+});
+
+const newOrderBookAggregate = (price: string): OrderBookAggregate => ({
+  baseAssetVolume: 0n,
+  quoteAssetVolume: 0n,
+  volumeUSD: 0n,
+  liquidityUSD: 0n,
+  price: emptyPriceOhlc(price),
+  lastDeals: [],
+});
+
+const emptyAnalytics = (): Analytics => ({
+  assets: new Map(),
+  pools: new Map(),
+  orderBooks: new Map(),
+  network: new Map(),
+  assetDayVolumeUSD: new Map(),
+  assetWeekVolumeUSD: new Map(),
+  assetDayOpenPrice: new Map(),
+  assetWeekOpenPrice: new Map(),
+  assetOrderBookLiquidity: new Map(),
+  poolDayVolumeUSD: new Map(),
+  orderBookDayVolumeUSD: new Map(),
+  orderBookDayOpenPrice: new Map(),
+  orderBookActiveReserves: new Map(),
+});
 
 export class ChainIndexer {
   private api: ApiPromise | null = null;
@@ -629,6 +842,7 @@ export class ChainIndexer {
     let volumeUSD = 0n;
     let bridgeIncomingTransactions = 0;
     let bridgeOutgoingTransactions = 0;
+    const accountPointData = new Map<string, Record<string, unknown>>();
 
     for (const [index, extrinsic] of signedBlock.block.extrinsics.entries()) {
       const eventsForExtrinsic = events.filter(
@@ -682,8 +896,16 @@ export class ChainIndexer {
         },
       });
 
-      [address, history.from, history.to].filter(Boolean).forEach((account) => touchedAccounts.add(account));
-      documents.push(...(await this.createAccountDocuments([...touchedAccounts], id, blockHeight, timestamp)));
+      const currentAccounts = [...new Set([address, history.from, history.to].filter(Boolean))];
+      currentAccounts.forEach((account) => touchedAccounts.add(account));
+      documents.push(
+        ...(await this.createAccountDocuments(currentAccounts, id, blockHeight, timestamp, accountPointData, {
+          module: extrinsic.method.section,
+          method: extrinsic.method.method,
+          data: history.data,
+          fee,
+        }))
+      );
       documents.push(...this.createEventDocuments(eventsForExtrinsic, blockHeight, timestamp, address));
     }
 
@@ -729,14 +951,19 @@ export class ChainIndexer {
 
     return Object.entries(data as Record<string, unknown>)
       .filter(([key]) => key.endsWith('AmountUSD') || key === 'amountUSD' || key === 'volumeUSD')
-      .reduce((sum, [, value]) => sum + decimalStringToScaled(value), 0n);
+      .reduce((max, [, value]) => {
+        const amount = decimalStringToScaled(value);
+        return amount > max ? amount : max;
+      }, 0n);
   }
 
   private async createAccountDocuments(
     accounts: string[],
     latestHistoryElementId: string,
     blockHeight: number,
-    timestamp: number
+    timestamp: number,
+    pendingPointData: Map<string, Record<string, unknown>>,
+    update?: { module: string; method: string; data: unknown; fee: bigint }
   ): Promise<IndexerDocument[]> {
     const documents: IndexerDocument[] = [];
 
@@ -753,26 +980,117 @@ export class ChainIndexer {
         },
       });
 
-      if (!(await this.repository.get(collection('accountMeta'), account))) {
-        const data = emptyPointData(account, blockHeight, timestamp);
-        documents.push({ collection: collection('accountMeta'), id: account, blockHeight, timestamp, data });
-        documents.push({
-          collection: collection('accountPointSystems'),
+      const existing = pendingPointData.get(account) ?? (await this.repository.get(collection('accountMeta'), account))?.data;
+      const data = this.applyAccountPointUpdate(existing ?? emptyPointData(account, blockHeight, timestamp), update);
+      pendingPointData.set(account, data);
+
+      documents.push({ collection: collection('accountMeta'), id: account, blockHeight, timestamp, data });
+      documents.push({
+        collection: collection('accountPointSystems'),
+        id: `${account}-1`,
+        blockHeight,
+        timestamp,
+        data: {
+          ...data,
           id: `${account}-1`,
-          blockHeight,
-          timestamp,
-          data: {
-            ...data,
-            id: `${account}-1`,
-            accountId: account,
-            version: 1,
-            startedAtBlock: blockHeight,
-          },
-        });
-      }
+          accountId: account,
+          version: 1,
+          startedAtBlock: Number(data.createdAtBlock ?? blockHeight),
+        },
+      });
     }
 
     return documents;
+  }
+
+  private applyAccountPointUpdate(
+    current: Record<string, unknown>,
+    update?: { module: string; method: string; data: unknown; fee: bigint }
+  ): Record<string, unknown> {
+    const data = this.clonePointData(current);
+    if (!update) return data;
+
+    if (update.fee > 0n) {
+      this.addPointVolume(data, 'xorFees', codecToDecimalString(update.fee), codecUsd(XOR, update.fee, this.prices));
+    }
+
+    const payload = Array.isArray(update.data) ? {} : ((update.data ?? {}) as Record<string, unknown>);
+    const amountUSD = String(payload.amountUSD ?? payload.collateralAmountUSD ?? payload.debtAmountUSD ?? '0');
+
+    if (update.module === 'assets' && update.method === 'burn' && String(payload.assetId ?? '') === XOR) {
+      this.addPointVolume(data, 'xorBurned', String(payload.amount ?? '0'), amountUSD);
+    }
+
+    if (update.module === 'orderBook') {
+      if (update.method === 'placeLimitOrder') {
+        this.addPointCounter(data, 'orderBook', 'created', 1, amountUSD);
+      } else if (update.method === 'cancelLimitOrder' || update.method === 'cancelLimitOrdersBatch') {
+        const closed = Array.isArray(update.data) ? update.data.length : 1;
+        this.addPointCounter(data, 'orderBook', 'closed', closed, '0');
+      }
+    }
+
+    if (update.module === 'kensetsu') {
+      const method = update.method.toLowerCase();
+      if (method.includes('create')) {
+        this.addPointCounter(data, 'vault', 'created', 1, amountUSD);
+      } else if (method.includes('close') || method.includes('liquidat')) {
+        this.addPointCounter(data, 'vault', 'closed', 1, amountUSD);
+      }
+    }
+
+    if (update.module === 'ethBridge') {
+      this.addPointDeposit(data, 'outgoingUSD', amountUSD);
+    }
+
+    if (update.module === 'bridgeMultisig') {
+      this.addPointDeposit(data, 'incomingUSD', amountUSD);
+    }
+
+    if (update.module.includes('democracy') || update.module.includes('referenda') || update.method.toLowerCase().includes('vote')) {
+      const governance = data.governance as Record<string, unknown>;
+      governance.votes = Number(governance.votes ?? 0) + 1;
+      governance.amount = addDecimalStrings(governance.amount ?? '0', payload.amount ?? payload.balance ?? '0');
+      governance.amountUSD = addDecimalStrings(governance.amountUSD ?? '0', amountUSD, 8);
+    }
+
+    return data;
+  }
+
+  private clonePointData(current: Record<string, unknown>): Record<string, unknown> {
+    return {
+      ...current,
+      xorFees: { ...emptyVolume(), ...((current.xorFees as Record<string, unknown> | undefined) ?? {}) },
+      xorBurned: { ...emptyVolume(), ...((current.xorBurned as Record<string, unknown> | undefined) ?? {}) },
+      xorStakingValRewards: { ...emptyVolume(), ...((current.xorStakingValRewards as Record<string, unknown> | undefined) ?? {}) },
+      orderBook: { ...emptyCounter(), ...((current.orderBook as Record<string, unknown> | undefined) ?? {}) },
+      vault: { ...emptyCounter(), ...((current.vault as Record<string, unknown> | undefined) ?? {}) },
+      governance: { ...emptyGovernance(), ...((current.governance as Record<string, unknown> | undefined) ?? {}) },
+      deposit: { ...emptyDeposit(), ...((current.deposit as Record<string, unknown> | undefined) ?? {}) },
+    };
+  }
+
+  private addPointVolume(data: Record<string, unknown>, field: string, amount: unknown, amountUSD: unknown): void {
+    const volume = data[field] as Record<string, unknown>;
+    volume.amount = addDecimalStrings(volume.amount ?? '0', amount);
+    volume.amountUSD = addDecimalStrings(volume.amountUSD ?? '0', amountUSD, 8);
+  }
+
+  private addPointCounter(
+    data: Record<string, unknown>,
+    field: string,
+    counter: 'created' | 'closed',
+    count: number,
+    amountUSD: unknown
+  ): void {
+    const value = data[field] as Record<string, unknown>;
+    value[counter] = Number(value[counter] ?? 0) + count;
+    value.amountUSD = addDecimalStrings(value.amountUSD ?? '0', amountUSD, 8);
+  }
+
+  private addPointDeposit(data: Record<string, unknown>, field: 'incomingUSD' | 'outgoingUSD', amountUSD: unknown): void {
+    const deposit = data.deposit as Record<string, unknown>;
+    deposit[field] = addDecimalStrings(deposit[field] ?? '0', amountUSD, 8);
   }
 
   private createEventDocuments(events: EventRecord[], blockHeight: number, timestamp: number, signer: string): IndexerDocument[] {
@@ -833,6 +1151,15 @@ export class ChainIndexer {
       const amount = codecToBigInt(data.amount ?? data.arg3 ?? 0);
       const price = codecToBigInt(data.price ?? data.arg4 ?? 0);
       const status = method === 'LimitOrderPlaced' || method === 'LimitOrderUpdated' ? 'Active' : method === 'LimitOrderFilled' ? 'Filled' : 'Canceled';
+      const amountUSD = orderBookAmountUsd(
+        orderBookId.baseAssetId,
+        orderBookId.quoteAssetId,
+        amount,
+        price,
+        isBuy ? 'Buy' : 'Sell',
+        this.prices,
+        this.assetInfos
+      );
 
       documents.push({
         collection: collection('orderBookOrders'),
@@ -850,6 +1177,7 @@ export class ChainIndexer {
           isBuy,
           amount: decimalToString(amount),
           price: decimalToString(price),
+          amountUSD,
           lifetime: Number(data.lifetime ?? 0),
           expiresAt: Number(data.expiresAt ?? 0),
           amountFilled: decimalToString(codecToBigInt(data.amountFilled ?? 0)),
@@ -921,19 +1249,44 @@ export class ChainIndexer {
   private async refreshDerivedState(blockHeight: number, timestamp: number, includeSnapshots: boolean): Promise<void> {
     if (!this.api) return;
 
-    const [assetInfos, tokenIssuances, poolProperties, poolReserves, poolIssuances, poolProviders, orderBooks, nominators, referrers, cdpEntries] =
-      await Promise.all([
-        (this.api.query as any).assets.assetInfosV2.entries(),
-        (this.api.query as any).tokens.totalIssuance.entries(),
-        (this.api.query as any).poolXYK.properties.entries(),
-        (this.api.query as any).poolXYK.reserves.entries(),
-        (this.api.query as any).poolXYK.totalIssuances.entries(),
-        (this.api.query as any).poolXYK.poolProviders.entries(),
-        (this.api.query as any).orderBook.orderBooks.entries(),
-        (this.api.query as any).staking.nominators.entries(),
-        (this.api.query as any).referrals.referrers.entries(),
-        (this.api.query as any).kensetsu.cdpDepository.entries(),
-      ]);
+    const [
+      assetInfos,
+      tokenIssuances,
+      poolProperties,
+      poolReserves,
+      poolIssuances,
+      poolProviders,
+      orderBooks,
+      orderBookBids,
+      orderBookAsks,
+      orderBookLimitOrders,
+      farmingPoolFarmers,
+      nominators,
+      referrers,
+      cdpEntries,
+      systemAccountKeys,
+      latestHeader,
+    ] = await Promise.all([
+      (this.api.query as any).assets.assetInfosV2.entries(),
+      (this.api.query as any).tokens.totalIssuance.entries(),
+      (this.api.query as any).poolXYK.properties.entries(),
+      (this.api.query as any).poolXYK.reserves.entries(),
+      (this.api.query as any).poolXYK.totalIssuances.entries(),
+      (this.api.query as any).poolXYK.poolProviders.entries(),
+      (this.api.query as any).orderBook.orderBooks.entries(),
+      (this.api.query as any).orderBook.bids.entries().catch(() => []),
+      (this.api.query as any).orderBook.asks.entries().catch(() => []),
+      (this.api.query as any).orderBook.limitOrders.entries().catch(() => []),
+      (this.api.query as any).farming?.poolFarmers?.entries
+        ? (this.api.query as any).farming.poolFarmers.entries().catch(() => [])
+        : [],
+      (this.api.query as any).staking.nominators.entries(),
+      (this.api.query as any).referrals.referrers.entries(),
+      (this.api.query as any).kensetsu.cdpDepository.entries(),
+      (this.api.query as any).system.account.keys().catch(() => []),
+      this.api.rpc.chain.getHeader().catch(() => null),
+    ]);
+    const effectiveBlockHeight = blockHeight || Number(latestHeader?.number?.toString?.() ?? 0);
 
     const supplyByAsset = new Map<string, bigint>();
     for (const [key, value] of tokenIssuances) {
@@ -1012,15 +1365,36 @@ export class ChainIndexer {
       assetPoolLiquidity.set(pool.targetAssetId, (assetPoolLiquidity.get(pool.targetAssetId) ?? 0n) + pool.targetAssetReserves);
     }
 
+    const networkLiquidityUSD = scaledToString(
+      poolStates.reduce((sum, pool) => sum + decimalStringToScaled(pool.liquidityUSD), 0n),
+      8
+    );
+    const analytics = await this.buildAnalytics(timestamp, assets, prices, poolStates, networkLiquidityUSD, systemAccountKeys.length);
+    this.mergeLimitOrderStorage(orderBookLimitOrders, assets, prices, analytics);
+    const apyByPool = this.derivePoolApy(poolStates, farmingPoolFarmers, effectiveBlockHeight, prices);
     const documents: IndexerDocument[] = [];
-    documents.push(...this.createAssetDocuments(assets, prices, assetPoolLiquidity, blockHeight, timestamp, includeSnapshots));
-    documents.push(...this.createPoolDocuments(poolStates, prices, assets, blockHeight, timestamp, includeSnapshots));
-    documents.push(...this.createOrderBookDocuments(orderBooks, blockHeight, timestamp, includeSnapshots));
+    documents.push(...(await this.createAssetDocuments(assets, prices, assetPoolLiquidity, analytics, blockHeight, timestamp, includeSnapshots)));
+    documents.push(...(await this.createPoolDocuments(poolStates, analytics, apyByPool, blockHeight, timestamp, includeSnapshots)));
+    documents.push(
+      ...(await this.createOrderBookDocuments(
+        orderBooks,
+        orderBookBids,
+        orderBookAsks,
+        orderBookLimitOrders,
+        assets,
+        prices,
+        analytics,
+        blockHeight,
+        timestamp,
+        includeSnapshots
+      ))
+    );
+    documents.push(...this.createNetworkSnapshotDocuments(analytics, blockHeight, timestamp, includeSnapshots));
     documents.push(...this.createStakingDocuments(nominators, blockHeight, timestamp));
     documents.push(...this.createReferralDocuments(referrers, blockHeight, timestamp));
-    documents.push(...this.createVaultDocuments(cdpEntries, blockHeight, timestamp));
+    documents.push(...(await this.createVaultDocuments(cdpEntries, blockHeight, timestamp)));
     documents.push(...this.createAccountLiquidityDocuments(poolProviders, poolStates, assets, prices, blockHeight, timestamp));
-    documents.push(...this.createUpdateStreams(poolStates, assets, prices, blockHeight, timestamp));
+    documents.push(...this.createUpdateStreams(poolStates, assets, prices, apyByPool, blockHeight, timestamp));
 
     await this.repository.upsertMany(documents);
   }
@@ -1096,19 +1470,304 @@ export class ChainIndexer {
     return prices;
   }
 
-  private createAssetDocuments(
+  private async queryAll(collectionName: IndexerCollection, args: RepositoryQueryArgs = {}): Promise<IndexerDocument[]> {
+    if (!this.repository.query) {
+      return this.repository.list(collectionName);
+    }
+
+    const pageSize = 1_000;
+    const documents: IndexerDocument[] = [];
+
+    for (let offset = 0; ; offset += pageSize) {
+      const page = await this.repository.query(collectionName, { ...args, first: pageSize, offset });
+      documents.push(...page.items);
+
+      if (documents.length >= page.totalCount || page.items.length === 0) break;
+    }
+
+    return documents;
+  }
+
+  private async buildAnalytics(
+    timestamp: number,
+    assets: Map<string, AssetInfo>,
+    prices: Map<string, bigint>,
+    pools: PoolState[],
+    networkLiquidityUSD: string,
+    chainAccountCount: number
+  ): Promise<Analytics> {
+    const analytics = emptyAnalytics();
+    const since = timestamp - SNAPSHOT_WINDOW_SECONDS.MONTH;
+    const [history, blockSnapshots, orderBookOrders, assetDaySnapshots, orderBookDaySnapshots] = await Promise.all([
+      this.queryAll(collection('historyElements'), {
+        filter: { timestamp: { greaterThanOrEqualTo: since } },
+        orderBy: ['TIMESTAMP_ASC'],
+      }),
+      this.queryAll(collection('networkSnapshots'), {
+        filter: { and: [{ type: { equalTo: 'BLOCK' } }, { timestamp: { greaterThanOrEqualTo: since } }] },
+        orderBy: ['TIMESTAMP_ASC'],
+      }),
+      this.queryAll(collection('orderBookOrders'), {
+        filter: { timestamp: { greaterThanOrEqualTo: since } },
+        orderBy: ['TIMESTAMP_ASC'],
+      }),
+      this.queryAll(collection('assetSnapshots'), {
+        filter: { and: [{ type: { equalTo: 'DAY' } }, { timestamp: { greaterThanOrEqualTo: timestamp - 7 * 86_400 } }] },
+        orderBy: ['TIMESTAMP_ASC'],
+      }),
+      this.queryAll(collection('orderBookSnapshots'), {
+        filter: { and: [{ type: { equalTo: 'DAY' } }, { timestamp: { greaterThanOrEqualTo: timestamp - 86_400 } }] },
+        orderBy: ['TIMESTAMP_ASC'],
+      }),
+    ]);
+    const poolById = new Map(pools.map((pool) => [pool.id, pool]));
+
+    for (const asset of assets.values()) {
+      const currentPrice = scaledToString(prices.get(asset.id) ?? 0n, 8);
+      analytics.assetDayOpenPrice.set(asset.id, currentPrice);
+      analytics.assetWeekOpenPrice.set(asset.id, currentPrice);
+    }
+
+    for (const snapshot of assetDaySnapshots) {
+      const assetId = String(snapshot.data.assetId ?? '');
+      const price = snapshot.data.priceUSD as Record<string, unknown> | undefined;
+      const open = String(price?.open ?? price?.close ?? '');
+      if (!assetId || !open) continue;
+
+      if (Number(snapshot.data.timestamp ?? 0) >= snapshotBucket('DAY', timestamp)) {
+        analytics.assetDayOpenPrice.set(assetId, open);
+      }
+      if (!analytics.assetWeekOpenPrice.has(assetId) || analytics.assetWeekOpenPrice.get(assetId) === analytics.assetDayOpenPrice.get(assetId)) {
+        analytics.assetWeekOpenPrice.set(assetId, open);
+      }
+    }
+
+    for (const snapshot of orderBookDaySnapshots) {
+      const orderBookId = String(snapshot.data.orderBookId ?? '');
+      const price = snapshot.data.price as Record<string, unknown> | undefined;
+      const open = String(price?.open ?? price?.close ?? '');
+      if (orderBookId && open) analytics.orderBookDayOpenPrice.set(orderBookId, open);
+    }
+
+    for (const document of history) {
+      const eventTimestamp = Number(document.data.timestamp ?? document.timestamp ?? 0);
+      const eventData = (document.data.data ?? {}) as Record<string, unknown>;
+      const module = String(document.data.module ?? '');
+      const method = String(document.data.method ?? '');
+      const activeTypes = SNAPSHOT_TYPES.filter((type) => type !== 'BLOCK' && eventTimestamp >= timestamp - SNAPSHOT_WINDOW_SECONDS[type]);
+      const updateAsset = (assetId: string, amount: unknown, amountUSD: unknown): void => {
+        if (!assetId) return;
+        const currentPrice = scaledToString(prices.get(assetId) ?? 0n, 8);
+        for (const type of activeTypes) {
+          const aggregate = getAggregate(analytics.assets, assetId, type, () => newAssetAggregate(currentPrice));
+          aggregate.volumeAmount += decimalStringToScaled(amount);
+          aggregate.volumeUSD += decimalStringToScaled(amountUSD);
+          aggregate.priceUSD.close = currentPrice;
+        }
+      };
+      const updatePool = (
+        baseAssetId: string,
+        targetAssetId: string,
+        baseAmount: unknown,
+        targetAmount: unknown,
+        amountUSD: unknown
+      ): void => {
+        const poolId = poolIdForAssets(baseAssetId, targetAssetId);
+        const pool = poolById.get(poolId);
+        if (!pool) return;
+
+        for (const type of activeTypes) {
+          const aggregate = getAggregate(analytics.pools, poolId, type, () => newPoolAggregate(pool.priceUSD));
+          aggregate.baseAssetVolume += decimalStringToScaled(baseAmount);
+          aggregate.targetAssetVolume += decimalStringToScaled(targetAmount);
+          aggregate.volumeUSD += decimalStringToScaled(amountUSD);
+          aggregate.priceUSD.close = pool.priceUSD;
+        }
+
+        if (eventTimestamp >= timestamp - 86_400) {
+          analytics.poolDayVolumeUSD.set(poolId, (analytics.poolDayVolumeUSD.get(poolId) ?? 0n) + decimalStringToScaled(amountUSD));
+        }
+      };
+      const volumeUSD = this.extractVolumeUSD(eventData);
+
+      if (eventTimestamp >= timestamp - 86_400) {
+        for (const assetId of collectAssets(eventData)) {
+          analytics.assetDayVolumeUSD.set(assetId, (analytics.assetDayVolumeUSD.get(assetId) ?? 0n) + volumeUSD);
+        }
+      }
+      if (eventTimestamp >= timestamp - 7 * 86_400) {
+        for (const assetId of collectAssets(eventData)) {
+          analytics.assetWeekVolumeUSD.set(assetId, (analytics.assetWeekVolumeUSD.get(assetId) ?? 0n) + volumeUSD);
+        }
+      }
+
+      if (module === 'assets' && method === 'mint') {
+        const assetId = String(eventData.assetId ?? '');
+        const amount = decimalStringToScaled(eventData.amount ?? '0');
+        for (const type of activeTypes) {
+          const aggregate = getAggregate(analytics.assets, assetId, type, () =>
+            newAssetAggregate(scaledToString(prices.get(assetId) ?? 0n, 8))
+          );
+          aggregate.mint += amount;
+        }
+      }
+
+      if (module === 'assets' && method === 'burn') {
+        const assetId = String(eventData.assetId ?? '');
+        const amount = decimalStringToScaled(eventData.amount ?? '0');
+        for (const type of activeTypes) {
+          const aggregate = getAggregate(analytics.assets, assetId, type, () =>
+            newAssetAggregate(scaledToString(prices.get(assetId) ?? 0n, 8))
+          );
+          aggregate.burn += amount;
+        }
+      }
+
+      const baseAssetId = String(eventData.baseAssetId ?? '');
+      const targetAssetId = String(eventData.targetAssetId ?? '');
+      const baseAssetAmount = eventData.baseAssetAmount ?? eventData.amount ?? '0';
+      const targetAssetAmount = eventData.targetAssetAmount ?? '0';
+      const baseAssetAmountUSD = eventData.baseAssetAmountUSD ?? eventData.amountUSD ?? '0';
+      const targetAssetAmountUSD = eventData.targetAssetAmountUSD ?? eventData.amountUSD ?? '0';
+
+      if (baseAssetId) updateAsset(baseAssetId, baseAssetAmount, baseAssetAmountUSD);
+      if (targetAssetId) updateAsset(targetAssetId, targetAssetAmount, targetAssetAmountUSD);
+      if (baseAssetId && targetAssetId) {
+        updatePool(baseAssetId, targetAssetId, baseAssetAmount, targetAssetAmount, scaledToString(volumeUSD, 8));
+      }
+    }
+
+    for (const document of blockSnapshots) {
+      const eventTimestamp = Number(document.data.timestamp ?? document.timestamp ?? 0);
+      for (const type of SNAPSHOT_TYPES.filter((item) => item !== 'BLOCK')) {
+        if (eventTimestamp < timestamp - SNAPSHOT_WINDOW_SECONDS[type]) continue;
+
+        const current =
+          analytics.network.get(type) ?? {
+            accounts: chainAccountCount,
+            transactions: 0,
+            fees: 0n,
+            liquidityUSD: networkLiquidityUSD,
+            volumeUSD: 0n,
+            bridgeIncomingTransactions: 0,
+            bridgeOutgoingTransactions: 0,
+          };
+        current.transactions += Number(document.data.transactions ?? 0);
+        current.fees += codecToBigInt(document.data.fees ?? 0);
+        current.volumeUSD += decimalStringToScaled(document.data.volumeUSD ?? '0');
+        current.bridgeIncomingTransactions += Number(document.data.bridgeIncomingTransactions ?? 0);
+        current.bridgeOutgoingTransactions += Number(document.data.bridgeOutgoingTransactions ?? 0);
+        current.accounts = Math.max(current.accounts, chainAccountCount);
+        current.liquidityUSD = networkLiquidityUSD;
+        analytics.network.set(type, current);
+      }
+    }
+
+    for (const document of orderBookOrders) {
+      const eventTimestamp = Number(document.data.timestamp ?? document.timestamp ?? 0);
+      const orderBookId = String(document.data.orderBookId ?? '');
+      const [dexId, baseAssetId, quoteAssetId] = orderBookId.split('-');
+      if (!dexId || !baseAssetId || !quoteAssetId) continue;
+
+      const amount = decimalStringToScaled(document.data.amount ?? '0');
+      const price = decimalStringToScaled(document.data.price ?? '0');
+      const quoteAmount = scaledMul(amount, price);
+      const isBuy = Boolean(document.data.isBuy);
+      const storedAmountUSD = decimalStringToScaled(document.data.amountUSD ?? '0');
+      const amountUSD =
+        storedAmountUSD > 0n
+          ? storedAmountUSD
+          : isBuy
+            ? scaledMul(quoteAmount, prices.get(quoteAssetId) ?? 0n)
+            : scaledMul(amount, prices.get(baseAssetId) ?? 0n);
+      const activeTypes = SNAPSHOT_TYPES.filter((type) => type !== 'BLOCK' && eventTimestamp >= timestamp - SNAPSHOT_WINDOW_SECONDS[type]);
+      const priceText = String(document.data.price ?? '0');
+
+      if (String(document.data.status ?? '') === 'Active') {
+        const reserves =
+          analytics.orderBookActiveReserves.get(orderBookId) ?? { baseAssetReserves: 0n, quoteAssetReserves: 0n, liquidityUSD: 0n };
+        if (isBuy) {
+          const quoteReserve = naturalScaledToCodec(quoteAmount, assets.get(quoteAssetId)?.decimals ?? DECIMALS);
+          reserves.quoteAssetReserves += quoteReserve;
+          analytics.assetOrderBookLiquidity.set(
+            quoteAssetId,
+            (analytics.assetOrderBookLiquidity.get(quoteAssetId) ?? 0n) + quoteReserve
+          );
+        } else {
+          const baseReserve = naturalScaledToCodec(amount, assets.get(baseAssetId)?.decimals ?? DECIMALS);
+          reserves.baseAssetReserves += baseReserve;
+          analytics.assetOrderBookLiquidity.set(
+            baseAssetId,
+            (analytics.assetOrderBookLiquidity.get(baseAssetId) ?? 0n) + baseReserve
+          );
+        }
+        reserves.liquidityUSD += amountUSD;
+        analytics.orderBookActiveReserves.set(orderBookId, reserves);
+      }
+
+      if (eventTimestamp >= timestamp - 86_400) {
+        analytics.orderBookDayVolumeUSD.set(orderBookId, (analytics.orderBookDayVolumeUSD.get(orderBookId) ?? 0n) + amountUSD);
+      }
+
+      for (const type of activeTypes) {
+        const aggregate = getAggregate(analytics.orderBooks, orderBookId, type, () => newOrderBookAggregate(priceText));
+        aggregate.baseAssetVolume += amount;
+        aggregate.quoteAssetVolume += quoteAmount;
+        aggregate.volumeUSD += amountUSD;
+        aggregate.price.close = priceText;
+        aggregate.price.high = maxDecimalString(aggregate.price.high, priceText);
+        aggregate.price.low = minDecimalString(aggregate.price.low, priceText);
+
+        if (String(document.data.status ?? '') === 'Filled') {
+          aggregate.lastDeals.unshift({
+            orderId: Number(document.data.orderId ?? 0),
+            timestamp: eventTimestamp,
+            isBuy,
+            amount: String(document.data.amount ?? '0'),
+            price: priceText,
+          });
+          aggregate.lastDeals = aggregate.lastDeals.slice(0, 25);
+        }
+      }
+    }
+
+    for (const type of SNAPSHOT_TYPES.filter((item) => item !== 'BLOCK')) {
+      if (!analytics.network.has(type)) {
+        analytics.network.set(type, {
+          accounts: chainAccountCount,
+          transactions: 0,
+          fees: 0n,
+          liquidityUSD: networkLiquidityUSD,
+          volumeUSD: 0n,
+          bridgeIncomingTransactions: 0,
+          bridgeOutgoingTransactions: 0,
+        });
+      }
+    }
+
+    return analytics;
+  }
+
+  private async createAssetDocuments(
     assets: Map<string, AssetInfo>,
     prices: Map<string, bigint>,
     liquidity: Map<string, bigint>,
+    analytics: Analytics,
     blockHeight: number,
     timestamp: number,
     includeSnapshots: boolean
-  ): IndexerDocument[] {
+  ): Promise<IndexerDocument[]> {
     const documents: IndexerDocument[] = [];
 
     for (const asset of assets.values()) {
       const priceUSD = scaledToString(prices.get(asset.id) ?? 0n, 8);
       const assetLiquidity = liquidity.get(asset.id) ?? 0n;
+      const assetLiquidityUSD = scaledMul(reserveToNaturalScaled(assetLiquidity, asset.decimals), prices.get(asset.id) ?? 0n);
+      const dayVolumeUSD = analytics.assetDayVolumeUSD.get(asset.id) ?? 0n;
+      const weekVolumeUSD = analytics.assetWeekVolumeUSD.get(asset.id) ?? 0n;
+      const priceChangeDay = percentChange(analytics.assetDayOpenPrice.get(asset.id) ?? priceUSD, priceUSD);
+      const priceChangeWeek = percentChange(analytics.assetWeekOpenPrice.get(asset.id) ?? priceUSD, priceUSD);
+      const velocity = assetLiquidityUSD === 0n ? 0 : Number(scaledDiv(dayVolumeUSD, assetLiquidityUSD)) / 10 ** 18;
 
       documents.push({
         collection: collection('assets'),
@@ -1120,32 +1779,44 @@ export class ChainIndexer {
           priceUSD,
           supply: asset.supply.toString(),
           liquidity: assetLiquidity.toString(),
-          liquidityBooks: '0',
-          priceChangeDay: 0,
-          priceChangeWeek: 0,
-          volumeDayUSD: 0,
-          volumeWeekUSD: 0,
-          velocity: 0,
+          liquidityBooks: (analytics.assetOrderBookLiquidity.get(asset.id) ?? 0n).toString(),
+          priceChangeDay,
+          priceChangeWeek,
+          volumeDayUSD: Number(scaledToString(dayVolumeUSD, 8)),
+          volumeWeekUSD: Number(scaledToString(weekVolumeUSD, 8)),
+          velocity,
         },
       });
 
       if (includeSnapshots) {
-        for (const type of ['DEFAULT', 'HOUR', 'DAY', 'MONTH', 'BLOCK']) {
+        for (const type of SNAPSHOT_TYPES) {
+          const id = snapshotId('asset', asset.id, type, timestamp, blockHeight);
+          const aggregate = analytics.assets.get(asset.id)?.get(type) ?? newAssetAggregate(priceUSD);
+          const previous = await this.repository.get(collection('assetSnapshots'), id);
+          const priceSnapshot = mergePriceOhlc(previous?.data.priceUSD, priceUSD);
           documents.push({
             collection: collection('assetSnapshots'),
-            id: snapshotId('asset', asset.id, type, timestamp),
+            id,
             blockHeight,
             timestamp,
             data: {
-              id: snapshotId('asset', asset.id, type, timestamp),
+              id,
               assetId: asset.id,
               timestamp,
               type,
               supply: asset.supply.toString(),
-              mint: '0',
-              burn: '0',
-              priceUSD: { open: priceUSD, high: priceUSD, low: priceUSD, close: priceUSD },
-              volume: emptyVolume(),
+              mint: scaledToString(aggregate.mint),
+              burn: scaledToString(aggregate.burn),
+              priceUSD: {
+                open: priceSnapshot.open,
+                high: maxDecimalString(priceSnapshot.high, aggregate.priceUSD.high),
+                low: minDecimalString(priceSnapshot.low, aggregate.priceUSD.low),
+                close: priceUSD,
+              },
+              volume: {
+                amount: scaledToString(aggregate.volumeAmount),
+                amountUSD: scaledToString(aggregate.volumeUSD, 8),
+              },
             },
           });
         }
@@ -1155,16 +1826,15 @@ export class ChainIndexer {
     return documents;
   }
 
-  private createPoolDocuments(
+  private async createPoolDocuments(
     pools: PoolState[],
-    prices: Map<string, bigint>,
-    assets: Map<string, AssetInfo>,
+    analytics: Analytics,
+    apyByPool: Map<string, string>,
     blockHeight: number,
     timestamp: number,
     includeSnapshots: boolean
-  ): IndexerDocument[] {
+  ): Promise<IndexerDocument[]> {
     const documents: IndexerDocument[] = [];
-    const apyByPool = this.derivePoolApy(pools, prices);
 
     for (const pool of pools) {
       const poolTokenPrice =
@@ -1193,8 +1863,11 @@ export class ChainIndexer {
       });
 
       if (includeSnapshots) {
-        for (const type of ['DEFAULT', 'HOUR', 'DAY', 'MONTH', 'BLOCK']) {
-          const id = snapshotId('pool', pool.id, type, timestamp);
+        for (const type of SNAPSHOT_TYPES) {
+          const id = snapshotId('pool', pool.id, type, timestamp, blockHeight);
+          const aggregate = analytics.pools.get(pool.id)?.get(type) ?? newPoolAggregate(pool.priceUSD);
+          const previous = await this.repository.get(collection('poolSnapshots'), id);
+          const priceSnapshot = mergePriceOhlc(previous?.data.priceUSD, pool.priceUSD);
           documents.push({
             collection: collection('poolSnapshots'),
             id,
@@ -1205,17 +1878,22 @@ export class ChainIndexer {
               poolId: pool.id,
               timestamp,
               type,
-              priceUSD: { open: pool.priceUSD, high: pool.priceUSD, low: pool.priceUSD, close: pool.priceUSD },
+              priceUSD: {
+                open: priceSnapshot.open,
+                high: maxDecimalString(priceSnapshot.high, aggregate.priceUSD.high),
+                low: minDecimalString(priceSnapshot.low, aggregate.priceUSD.low),
+                close: pool.priceUSD,
+              },
               baseAssetReserves: pool.baseAssetReserves.toString(),
               targetAssetReserves: pool.targetAssetReserves.toString(),
               chameleonAssetReserves: '0',
-              baseAssetVolume: '0',
-              targetAssetVolume: '0',
-              chameleonAssetVolume: '0',
+              baseAssetVolume: scaledToString(aggregate.baseAssetVolume),
+              targetAssetVolume: scaledToString(aggregate.targetAssetVolume),
+              chameleonAssetVolume: scaledToString(aggregate.chameleonAssetVolume),
               poolTokenSupply: pool.poolTokenSupply.toString(),
               poolTokenPriceUSD: poolTokenPrice,
               liquidityUSD: pool.liquidityUSD,
-              volumeUSD: '0',
+              volumeUSD: scaledToString(aggregate.volumeUSD, 8),
             },
           });
         }
@@ -1225,30 +1903,102 @@ export class ChainIndexer {
     return documents;
   }
 
-  private derivePoolApy(pools: PoolState[], prices: Map<string, bigint>): Map<string, string> {
+  /**
+   * Mirrors farming pallet time amplification: weight * (1 + farming_time / current_block)^3.
+   */
+  private farmingWeight(weight: bigint, farmerBlock: number, currentBlock: number): bigint {
+    if (weight <= 0n) return 0n;
+    if (!currentBlock || farmerBlock >= currentBlock) return weight;
+
+    const farmingTime = BigInt(Math.max(currentBlock - farmerBlock, 0));
+    const coefficient = scaledPow(SCALE + scaledDiv(farmingTime * SCALE, BigInt(currentBlock) * SCALE), 3);
+
+    return scaledMul(weight, coefficient);
+  }
+
+  /**
+   * Computes strategic bonus APY from on-chain farming weights and the runtime PSWAP/day emission.
+   */
+  private derivePoolApy(pools: PoolState[], farmingPoolFarmers: any[], currentBlock: number, prices: Map<string, bigint>): Map<string, string> {
     const result = new Map<string, string>();
-    const pswapPrice = prices.get(PSWAP) ?? 0n;
+    const poolByAccount = new Map(pools.map((pool) => [pool.poolAccount, pool]));
+    const weightByPool = new Map<string, bigint>();
+    let totalWeight = 0n;
+
+    for (const [key, value] of farmingPoolFarmers) {
+      const poolAccount = String(key.args?.[0] ?? '');
+      const pool = poolByAccount.get(poolAccount);
+      if (!pool) continue;
+
+      const farmers = normalizeValue(value);
+      if (!Array.isArray(farmers)) continue;
+
+      for (const farmer of farmers) {
+        if (!farmer || typeof farmer !== 'object') continue;
+
+        const data = farmer as Record<string, unknown>;
+        const weight = codecToBigInt(data.weight ?? 0);
+        const farmerBlock = Number(data.block ?? 0);
+        const amplifiedWeight = this.farmingWeight(weight, farmerBlock, currentBlock);
+
+        weightByPool.set(pool.id, (weightByPool.get(pool.id) ?? 0n) + amplifiedWeight);
+        totalWeight += amplifiedWeight;
+      }
+    }
+
+    const pswapPriceUSD = prices.get(PSWAP) ?? 0n;
+    const annualRewardUSD = scaledMul(reserveToNaturalScaled(FARMING_PSWAP_PER_DAY * DAYS_PER_YEAR), pswapPriceUSD);
 
     for (const pool of pools) {
-      if (pool.liquidityUSD === '0' || pswapPrice === 0n) {
+      const liquidityUSD = decimalStringToScaled(pool.liquidityUSD);
+      const weight = weightByPool.get(pool.id) ?? 0n;
+
+      if (liquidityUSD === 0n || weight === 0n || totalWeight === 0n || annualRewardUSD === 0n) {
         result.set(pool.id, '0');
         continue;
       }
 
-      result.set(pool.id, '0');
+      const poolAnnualRewardUSD = (annualRewardUSD * weight) / totalWeight;
+      result.set(pool.id, scaledToString(scaledDiv(poolAnnualRewardUSD, liquidityUSD), 8));
     }
 
     return result;
   }
 
-  private createOrderBookDocuments(orderBooks: any[], blockHeight: number, timestamp: number, includeSnapshots: boolean): IndexerDocument[] {
+  private async createOrderBookDocuments(
+    orderBooks: any[],
+    bids: any[],
+    asks: any[],
+    limitOrders: any[],
+    assets: Map<string, AssetInfo>,
+    prices: Map<string, bigint>,
+    analytics: Analytics,
+    blockHeight: number,
+    timestamp: number,
+    includeSnapshots: boolean
+  ): Promise<IndexerDocument[]> {
     const documents: IndexerDocument[] = [];
+    const priceLevels = this.extractOrderBookPriceLevels(bids, asks);
 
     for (const [key, value] of orderBooks) {
       const id = parseOrderBookId(key.args[0]);
       const data = toJson(value) as Record<string, unknown>;
       const idString = orderBookIdString(id);
       const status = String(data.status ?? 'Stop');
+      const levels = priceLevels.get(idString);
+      const reserves =
+        analytics.orderBookActiveReserves.get(idString) ?? { baseAssetReserves: 0n, quoteAssetReserves: 0n, liquidityUSD: 0n };
+      const aggregate = analytics.orderBooks.get(idString)?.get('DAY') ?? newOrderBookAggregate('0');
+      const price =
+        levels?.bestAsk && levels.bestBid
+          ? scaledToString((levels.bestAsk + levels.bestBid) / 2n, 8)
+          : levels?.bestAsk
+            ? scaledToString(levels.bestAsk, 8)
+            : levels?.bestBid
+              ? scaledToString(levels.bestBid, 8)
+              : aggregate.price.close;
+      const priceChangeDay = percentChange(analytics.orderBookDayOpenPrice.get(idString) ?? price, price);
+      const volumeDayUSD = analytics.orderBookDayVolumeUSD.get(idString) ?? aggregate.volumeUSD;
 
       documents.push({
         collection: collection('orderBooks'),
@@ -1260,20 +2010,23 @@ export class ChainIndexer {
           dexId: id.dexId,
           baseAssetId: id.baseAssetId,
           quoteAssetId: id.quoteAssetId,
-          baseAssetReserves: '0',
-          quoteAssetReserves: '0',
+          baseAssetReserves: reserves.baseAssetReserves.toString(),
+          quoteAssetReserves: reserves.quoteAssetReserves.toString(),
           status,
-          price: '0',
-          priceChangeDay: 0,
-          volumeDayUSD: '0',
-          lastDeals: '[]',
+          price,
+          priceChangeDay,
+          volumeDayUSD: scaledToString(volumeDayUSD, 8),
+          lastDeals: JSON.stringify(aggregate.lastDeals),
           updatedAtBlock: blockHeight,
         },
       });
 
       if (includeSnapshots) {
-        for (const type of ['DEFAULT', 'HOUR', 'DAY', 'MONTH', 'BLOCK']) {
-          const snapshot = snapshotId('orderBook', idString, type, timestamp);
+        for (const type of SNAPSHOT_TYPES) {
+          const snapshot = snapshotId('orderBook', idString, type, timestamp, blockHeight);
+          const typeAggregate = analytics.orderBooks.get(idString)?.get(type) ?? newOrderBookAggregate(price);
+          const previous = await this.repository.get(collection('orderBookSnapshots'), snapshot);
+          const priceSnapshot = mergePriceOhlc(previous?.data.price, price);
           documents.push({
             collection: collection('orderBookSnapshots'),
             id: snapshot,
@@ -1284,11 +2037,16 @@ export class ChainIndexer {
               orderBookId: idString,
               timestamp,
               type,
-              price: { open: '0', high: '0', low: '0', close: '0' },
-              baseAssetVolume: '0',
-              quoteAssetVolume: '0',
-              volumeUSD: '0',
-              liquidityUSD: '0',
+              price: {
+                open: priceSnapshot.open,
+                high: maxDecimalString(priceSnapshot.high, typeAggregate.price.high),
+                low: minDecimalString(priceSnapshot.low, typeAggregate.price.low),
+                close: price,
+              },
+              baseAssetVolume: scaledToString(typeAggregate.baseAssetVolume),
+              quoteAssetVolume: scaledToString(typeAggregate.quoteAssetVolume),
+              volumeUSD: scaledToString(typeAggregate.volumeUSD, 8),
+              liquidityUSD: scaledToString(reserves.liquidityUSD, 8),
             },
           });
         }
@@ -1296,6 +2054,103 @@ export class ChainIndexer {
     }
 
     return documents;
+  }
+
+  private extractOrderBookPriceLevels(
+    bids: any[],
+    asks: any[]
+  ): Map<string, { bestBid?: bigint; bestAsk?: bigint }> {
+    const result = new Map<string, { bestBid?: bigint; bestAsk?: bigint }>();
+
+    for (const [key] of bids) {
+      const id = orderBookIdString(parseOrderBookId(key.args[0]));
+      const price = codecToBigInt(key.args[1]);
+      const current = result.get(id) ?? {};
+      current.bestBid = current.bestBid === undefined || price > current.bestBid ? price : current.bestBid;
+      result.set(id, current);
+    }
+
+    for (const [key] of asks) {
+      const id = orderBookIdString(parseOrderBookId(key.args[0]));
+      const price = codecToBigInt(key.args[1]);
+      const current = result.get(id) ?? {};
+      current.bestAsk = current.bestAsk === undefined || price < current.bestAsk ? price : current.bestAsk;
+      result.set(id, current);
+    }
+
+    return result;
+  }
+
+  private mergeLimitOrderStorage(limitOrders: any[], assets: Map<string, AssetInfo>, prices: Map<string, bigint>, analytics: Analytics): void {
+    for (const [key, value] of limitOrders) {
+      const orderBookId = orderBookIdString(parseOrderBookId(key.args[0]));
+      const [dexId, baseAssetId, quoteAssetId] = orderBookId.split('-');
+      if (!dexId || !baseAssetId || !quoteAssetId) continue;
+
+      const data = normalizeValue(value) as Record<string, unknown>;
+      const side = String(data.side ?? 'Sell');
+      const amount = decimalStringToScaled(codecToDecimalString(data.amount ?? 0, assets.get(baseAssetId)?.decimals ?? DECIMALS));
+      const price = decimalStringToScaled(codecToDecimalString(data.price ?? 0, DECIMALS));
+      const quoteAmount = scaledMul(amount, price);
+      const reserves =
+        analytics.orderBookActiveReserves.get(orderBookId) ?? { baseAssetReserves: 0n, quoteAssetReserves: 0n, liquidityUSD: 0n };
+
+      if (side === 'Buy') {
+        const quoteReserve = naturalScaledToCodec(quoteAmount, assets.get(quoteAssetId)?.decimals ?? DECIMALS);
+        reserves.quoteAssetReserves += quoteReserve;
+        reserves.liquidityUSD += scaledMul(quoteAmount, prices.get(quoteAssetId) ?? 0n);
+        analytics.assetOrderBookLiquidity.set(quoteAssetId, (analytics.assetOrderBookLiquidity.get(quoteAssetId) ?? 0n) + quoteReserve);
+      } else {
+        const baseReserve = naturalScaledToCodec(amount, assets.get(baseAssetId)?.decimals ?? DECIMALS);
+        reserves.baseAssetReserves += baseReserve;
+        reserves.liquidityUSD += scaledMul(amount, prices.get(baseAssetId) ?? 0n);
+        analytics.assetOrderBookLiquidity.set(baseAssetId, (analytics.assetOrderBookLiquidity.get(baseAssetId) ?? 0n) + baseReserve);
+      }
+
+      analytics.orderBookActiveReserves.set(orderBookId, reserves);
+    }
+  }
+
+  private createNetworkSnapshotDocuments(
+    analytics: Analytics,
+    blockHeight: number,
+    timestamp: number,
+    includeSnapshots: boolean
+  ): IndexerDocument[] {
+    if (!includeSnapshots) return [];
+
+    return SNAPSHOT_TYPES.filter((type) => type !== 'BLOCK').map((type) => {
+      const aggregate =
+        analytics.network.get(type) ?? {
+          accounts: 0,
+          transactions: 0,
+          fees: 0n,
+          liquidityUSD: '0',
+          volumeUSD: 0n,
+          bridgeIncomingTransactions: 0,
+          bridgeOutgoingTransactions: 0,
+        };
+      const id = snapshotId('network', 'all', type, timestamp, blockHeight);
+
+      return {
+        collection: collection('networkSnapshots'),
+        id,
+        blockHeight,
+        timestamp,
+        data: {
+          id,
+          type,
+          timestamp,
+          accounts: aggregate.accounts,
+          transactions: aggregate.transactions,
+          fees: aggregate.fees.toString(),
+          liquidityUSD: aggregate.liquidityUSD,
+          volumeUSD: scaledToString(aggregate.volumeUSD, 8),
+          bridgeIncomingTransactions: aggregate.bridgeIncomingTransactions,
+          bridgeOutgoingTransactions: aggregate.bridgeOutgoingTransactions,
+        },
+      };
+    });
   }
 
   private createStakingDocuments(nominators: any[], blockHeight: number, timestamp: number): IndexerDocument[] {
@@ -1331,11 +2186,14 @@ export class ChainIndexer {
     });
   }
 
-  private createVaultDocuments(cdpEntries: any[], blockHeight: number, timestamp: number): IndexerDocument[] {
-    return cdpEntries.map(([key, value]) => {
+  private async createVaultDocuments(cdpEntries: any[], blockHeight: number, timestamp: number): Promise<IndexerDocument[]> {
+    const documents: IndexerDocument[] = [];
+
+    for (const [key, value] of cdpEntries) {
       const id = String(key.args[0]);
       const data = normalizeValue(value) as Record<string, unknown>;
-      return {
+      const existing = await this.repository.get(collection('vaults'), id);
+      documents.push({
         collection: collection('vaults'),
         id,
         blockHeight,
@@ -1348,11 +2206,13 @@ export class ChainIndexer {
           collateralAssetId: firstString(data, ['collateralAssetId']),
           debtAssetId: firstString(data, ['stablecoinAssetId']),
           collateralAmountReturned: '0',
-          createdAtBlock: blockHeight,
+          createdAtBlock: Number(existing?.data.createdAtBlock ?? blockHeight),
           updatedAtBlock: blockHeight,
         },
-      };
-    });
+      });
+    }
+
+    return documents;
   }
 
   private createAccountLiquidityDocuments(
@@ -1400,11 +2260,12 @@ export class ChainIndexer {
     pools: PoolState[],
     assets: Map<string, AssetInfo>,
     prices: Map<string, bigint>,
+    apyByPool: Map<string, string>,
     blockHeight: number,
     timestamp: number
   ): IndexerDocument[] {
     const priceData = Object.fromEntries([...assets.values()].map((asset) => [asset.id, scaledToString(prices.get(asset.id) ?? 0n, 8)]));
-    const apyData = Object.fromEntries(pools.map((pool) => [pool.id, '0']));
+    const apyData = Object.fromEntries(pools.map((pool) => [pool.id, apyByPool.get(pool.id) ?? '0']));
     const assetRegistrationData = Object.fromEntries(
       [...assets.values()].map((asset) => [
         asset.id,

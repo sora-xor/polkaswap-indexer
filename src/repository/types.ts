@@ -45,6 +45,7 @@ export type RepositoryQueryResult = {
 export interface IndexerRepository {
   list(collection: IndexerCollection): Promise<IndexerDocument[]>;
   query?(collection: IndexerCollection, args: RepositoryQueryArgs): Promise<RepositoryQueryResult>;
+  watch?(collection: IndexerCollection, ids?: string[]): AsyncGenerator<IndexerDocument, void, unknown>;
   get(collection: IndexerCollection, id: string): Promise<IndexerDocument | null>;
   upsert(document: IndexerDocument): Promise<void>;
   upsertMany(documents: IndexerDocument[]): Promise<void>;
