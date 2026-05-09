@@ -120,10 +120,13 @@ export function sortDocuments<T extends Record<string, unknown>>(items: T[], ord
   return [...items].sort((a, b) => {
     const left = getPath(a, field);
     const right = getPath(b, field);
+    const leftNullishRank = left === undefined ? 0 : left === null ? 1 : -1;
+    const rightNullishRank = right === undefined ? 0 : right === null ? 1 : -1;
 
     if (left === right) return 0;
-    if (left === undefined || left === null) return factor;
-    if (right === undefined || right === null) return -factor;
+    if (leftNullishRank >= 0 && rightNullishRank >= 0) return leftNullishRank - rightNullishRank;
+    if (leftNullishRank >= 0) return factor;
+    if (rightNullishRank >= 0) return -factor;
 
     if (typeof left === 'number' && typeof right === 'number') {
       return left > right ? factor : -factor;

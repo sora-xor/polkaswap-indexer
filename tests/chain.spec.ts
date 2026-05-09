@@ -9,6 +9,32 @@ const PSWAP = '0x020005000000000000000000000000000000000000000000000000000000000
 const DUST_DAI = '0x00a0e746a66b290bd29cbffecc710aefacb98840937229e1e847590006fa0696';
 const KUSD = '0x02000c0000000000000000000000000000000000000000000000000000000000';
 
+const eventRecord = (section: string, method: string, data: Record<string, unknown>) => ({
+  phase: {
+    isApplyExtrinsic: true,
+    asApplyExtrinsic: { toNumber: () => 0 },
+  },
+  event: {
+    section,
+    method,
+    data: {
+      toArray: () =>
+        Object.values(data).map((value) => ({
+          toJSON: () => value,
+          toString: () => String(value ?? ''),
+        })),
+    },
+    meta: {
+      fields: Object.keys(data).map((name) => ({
+        name: {
+          isSome: true,
+          unwrap: () => ({ toString: () => name }),
+        },
+      })),
+    },
+  },
+});
+
 const config = {
   host: '0.0.0.0',
   port: 4350,
@@ -164,6 +190,209 @@ describe('ChainIndexer price derivation', () => {
 
     expect(meta?.xorFees).toEqual({ amount: '1', amountUSD: '5' });
     expect(meta?.xorBurned).toEqual({ amount: '2', amountUSD: '10' });
+  });
+
+  it('continues existing account point metadata from the repository', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert({
+      collection: 'accountMeta',
+      id: 'alice',
+      blockHeight: 1,
+      timestamp: 100,
+      data: {
+        id: 'alice',
+        accountId: 'alice',
+        createdAtTimestamp: 100,
+        createdAtBlock: 1,
+        orderBook: { created: 1, closed: 0, amountUSD: '10' },
+      },
+    });
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      createAccountDocuments: (
+        accounts: string[],
+        latestHistoryElementId: string,
+        blockHeight: number,
+        timestamp: number,
+        pendingPointData: Map<string, Record<string, unknown>>,
+        update: { module: string; method: string; data: unknown; fee: bigint }
+      ) => Promise<Array<{ collection: string; id: string; data: Record<string, unknown> }>>;
+    };
+
+    const documents = await indexer.createAccountDocuments(['alice'], 'history-2', 20, 2000, new Map(), {
+      module: 'orderBook',
+      method: 'placeLimitOrder',
+      data: { amountUSD: '12.5' },
+      fee: 0n,
+    });
+    const meta = documents.find((document) => document.collection === 'accountMeta')?.data;
+    const pointSystem = documents.find((document) => document.collection === 'accountPointSystems')?.data;
+
+    expect(meta).toMatchObject({
+      createdAtBlock: 1,
+      createdAtTimestamp: 100,
+      orderBook: { created: 2, closed: 0, amountUSD: '22.5' },
+      xorFees: { amount: '0', amountUSD: '0' },
+    });
+    expect(pointSystem).toMatchObject({
+      accountId: 'alice',
+      startedAtBlock: 1,
+      orderBook: { created: 2, closed: 0, amountUSD: '22.5' },
+    });
+  });
+
+  it('keeps pending account point updates across multiple same-block activities', async () => {
+    const repository = new MemoryRepository();
+    const pendingPointData = new Map<string, Record<string, unknown>>();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      createAccountDocuments: (
+        accounts: string[],
+        latestHistoryElementId: string,
+        blockHeight: number,
+        timestamp: number,
+        pendingPointData: Map<string, Record<string, unknown>>,
+        update: { module: string; method: string; data: unknown; fee: bigint }
+      ) => Promise<Array<{ collection: string; id: string; data: Record<string, unknown> }>>;
+    };
+
+    await indexer.createAccountDocuments(['alice'], 'history-1', 10, 1000, pendingPointData, {
+      module: 'ethBridge',
+      method: 'transferToSidechain',
+      data: { amountUSD: '3.25' },
+      fee: 0n,
+    });
+    const documents = await indexer.createAccountDocuments(['alice'], 'history-2', 10, 1000, pendingPointData, {
+      module: 'bridgeMultisig',
+      method: 'approveRequest',
+      data: { amountUSD: '4.75' },
+      fee: 0n,
+    });
+    const meta = documents.find((document) => document.collection === 'accountMeta')?.data;
+
+    expect(meta?.deposit).toEqual({ incomingUSD: '4.75', outgoingUSD: '3.25' });
+  });
+
+  it('tracks order book cancels, vault closes, and governance votes in account points', async () => {
+    const repository = new MemoryRepository();
+    const pendingPointData = new Map<string, Record<string, unknown>>();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      createAccountDocuments: (
+        accounts: string[],
+        latestHistoryElementId: string,
+        blockHeight: number,
+        timestamp: number,
+        pendingPointData: Map<string, Record<string, unknown>>,
+        update: { module: string; method: string; data: unknown; fee: bigint }
+      ) => Promise<Array<{ collection: string; id: string; data: Record<string, unknown> }>>;
+    };
+
+    await indexer.createAccountDocuments(['alice'], 'history-1', 10, 1000, pendingPointData, {
+      module: 'orderBook',
+      method: 'cancelLimitOrdersBatch',
+      data: [{ orderId: 1 }, { orderId: 2 }, { orderId: 3 }],
+      fee: 0n,
+    });
+    await indexer.createAccountDocuments(['alice'], 'history-2', 10, 1000, pendingPointData, {
+      module: 'kensetsu',
+      method: 'closeCdp',
+      data: { debtAmountUSD: '8.5' },
+      fee: 0n,
+    });
+    const documents = await indexer.createAccountDocuments(['alice'], 'history-3', 10, 1000, pendingPointData, {
+      module: 'referenda',
+      method: 'vote',
+      data: { amount: '7', amountUSD: '14' },
+      fee: 0n,
+    });
+    const meta = documents.find((document) => document.collection === 'accountMeta')?.data;
+
+    expect(meta).toMatchObject({
+      orderBook: { created: 0, closed: 3, amountUSD: '0' },
+      vault: { created: 0, closed: 1, amountUSD: '8.5' },
+      governance: { votes: 1, amount: '7', amountUSD: '14' },
+    });
+  });
+
+  it('creates indexed documents from order book, vault, and referrer events', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createEventDocuments: (
+        events: unknown[],
+        blockHeight: number,
+        timestamp: number,
+        signer: string
+      ) => Array<{ collection: string; id: string; data: Record<string, unknown> }>;
+    };
+
+    const documents = indexer.createEventDocuments(
+      [
+        eventRecord('orderBook', 'LimitOrderPlaced', {
+          orderBookId: `0-${XOR}-${KUSD}`,
+          orderId: 42,
+          side: 'Sell',
+          amount: (3n * SCALE).toString(),
+          price: (2n * SCALE).toString(),
+          owner: 'alice',
+        }),
+        eventRecord('kensetsu', 'CDPClosed', {
+          cdpId: 'vault-1',
+          collateralAssetId: XOR,
+          stablecoinAssetId: KUSD,
+          amount: (5n * SCALE).toString(),
+          owner: 'bob',
+        }),
+        eventRecord('xorFee', 'ReferrerRewarded', {
+          referral: 'charlie',
+          referrer: 'dave',
+          amount: '123',
+        }),
+      ],
+      99,
+      1_700_000_000,
+      'fallback-signer'
+    );
+
+    expect(documents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          collection: 'orderBookOrders',
+          id: `0-${XOR}-${KUSD}-42`,
+          data: expect.objectContaining({
+            accountId: 'alice',
+            amount: '3',
+            isBuy: false,
+            orderBookId: `0-${XOR}-${KUSD}`,
+            price: '2',
+            status: 'Active',
+          }),
+        }),
+        expect.objectContaining({
+          collection: 'vaultEvents',
+          id: 'vault-1-99-CDPClosed',
+          data: expect.objectContaining({
+            amount: '5',
+            type: 'Closed',
+            vaultId: 'vault-1',
+          }),
+        }),
+        expect.objectContaining({
+          collection: 'vaults',
+          id: 'vault-1',
+          data: expect.objectContaining({
+            collateralAmountReturned: '5',
+            ownerId: 'bob',
+            status: 'Closed',
+          }),
+        }),
+        expect.objectContaining({
+          collection: 'referrerRewards',
+          id: 'dave-charlie',
+          data: expect.objectContaining({
+            amount: '123',
+            referral: 'charlie',
+            referrer: 'dave',
+          }),
+        }),
+      ])
+    );
   });
 });
 

@@ -9,6 +9,25 @@ import type {
   RepositoryQueryResult,
 } from './types.js';
 
+const documentFieldValue = (document: IndexerDocument, field: NonNullable<RepositoryQueryArgs['seek']>['field']): number => {
+  const value = field === 'timestamp' ? document.timestamp : document.blockHeight;
+  const fallback = field === 'timestamp' ? document.data.timestamp : document.data.blockHeight;
+  const parsed = Number(value ?? fallback ?? 0);
+
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const isAfterSeek = (document: IndexerDocument, seek: NonNullable<RepositoryQueryArgs['seek']>): boolean => {
+  const value = documentFieldValue(document, seek.field);
+  const direction = seek.direction ?? 'asc';
+
+  if (value === seek.value) {
+    return direction === 'desc' ? document.id < seek.id : document.id > seek.id;
+  }
+
+  return direction === 'desc' ? value < seek.value : value > seek.value;
+};
+
 /**
  * In-memory repository used by tests and by local experiments that do not need
  * persistence.
@@ -23,10 +42,12 @@ export class MemoryRepository implements IndexerRepository {
 
   async query(collection: IndexerCollection, args: RepositoryQueryArgs): Promise<RepositoryQueryResult> {
     const documents = await this.list(collection);
-    const filtered = sortDocuments(
+    const sorted = sortDocuments(
       documents.filter((document) => matchesFilter(document.data, args.filter)),
       args.orderBy
     );
+    const seek = args.seek;
+    const filtered = seek ? sorted.filter((document) => isAfterSeek(document, seek)) : sorted;
     const totalCount = filtered.length;
     const after = args.after === null || args.after === undefined || args.after === '' ? 0 : Number(args.after) + 1;
     const offset = Number(args.offset ?? after);
@@ -35,13 +56,32 @@ export class MemoryRepository implements IndexerRepository {
     const last = args.last ?? null;
     const end =
       first === null || first === undefined ? filtered.length : Math.min(start + Math.max(first, 0), filtered.length);
-    const items = last === null || last === undefined ? filtered.slice(start, end) : filtered.slice(Math.max(end - last, start), end);
+    const pageStart = last === null || last === undefined ? start : Math.max(end - Math.max(last, 0), start);
+    const items = filtered.slice(pageStart, end);
 
-    return { items, totalCount };
+    return {
+      items,
+      totalCount: args.includeTotalCount === false ? null : totalCount,
+      pageStart,
+      hasNextPage: end < totalCount,
+      hasPreviousPage: pageStart > 0,
+    };
   }
 
   async get(collection: IndexerCollection, id: string): Promise<IndexerDocument | null> {
     return this.documents.get(collection)?.get(id) ?? null;
+  }
+
+  async getMany(collection: IndexerCollection, ids: string[]): Promise<Map<string, IndexerDocument>> {
+    const documents = this.documents.get(collection);
+    const result = new Map<string, IndexerDocument>();
+
+    for (const id of ids) {
+      const document = documents?.get(id);
+      if (document) result.set(id, document);
+    }
+
+    return result;
   }
 
   async upsert(document: IndexerDocument): Promise<void> {

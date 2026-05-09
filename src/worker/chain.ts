@@ -31,6 +31,20 @@ type IndexedCall = {
   hash?: string;
 };
 
+type BlockExtrinsicContext = {
+  id: string;
+  module: string;
+  method: string;
+  address: string;
+  failed: boolean;
+  history: { data: unknown; from: string; to: string; assets: string[] };
+  calls: IndexedCall[];
+  callNames: string[];
+  events: EventRecord[];
+  accounts: string[];
+  fee: bigint;
+};
+
 type AssetInfo = {
   id: string;
   symbol: string;
@@ -119,6 +133,7 @@ const XSTUSD = '0x02000800000000000000000000000000000000000000000000000000000000
 const KUSD = '0x02000c0000000000000000000000000000000000000000000000000000000000';
 const STABLE_ASSET_IDS = new Set([DAI, XSTUSD, KUSD]);
 const SNAPSHOT_TYPES: SnapshotTypeName[] = ['DEFAULT', 'HOUR', 'DAY', 'MONTH', 'BLOCK'];
+const AGGREGATE_SNAPSHOT_TYPES: SnapshotTypeName[] = SNAPSHOT_TYPES.filter((type) => type !== 'BLOCK');
 const SNAPSHOT_WINDOW_SECONDS: Record<SnapshotTypeName, number> = {
   DEFAULT: 86_400,
   HOUR: 3_600,
@@ -128,6 +143,17 @@ const SNAPSHOT_WINDOW_SECONDS: Record<SnapshotTypeName, number> = {
 };
 const FARMING_PSWAP_PER_DAY = 2_500_000n * SCALE;
 const DAYS_PER_YEAR = 365n;
+const EVENT_DATA_CACHE = new WeakMap<EventRecord['event'], Record<string, unknown>>();
+
+const activeAggregateSnapshotTypes = (eventTimestamp: number, timestamp: number): SnapshotTypeName[] => {
+  const active: SnapshotTypeName[] = [];
+
+  for (const type of AGGREGATE_SNAPSHOT_TYPES) {
+    if (eventTimestamp >= timestamp - SNAPSHOT_WINDOW_SECONDS[type]) active.push(type);
+  }
+
+  return active;
+};
 
 const collection = <T extends IndexerDocument['collection']>(name: T): T => name;
 
@@ -326,16 +352,21 @@ const normalizeValue = (value: unknown): unknown => {
 };
 
 const eventData = (event: EventRecord['event']): Record<string, unknown> => {
+  const cached = EVENT_DATA_CACHE.get(event);
+  if (cached) return cached;
+
   const values = event.data.toArray?.() ?? [];
   const fields = event.meta?.fields ?? [];
-
-  return Object.fromEntries(
+  const data = Object.fromEntries(
     values.map((value, index) => {
       const nameValue = fields[index]?.name;
       const name = nameValue?.isSome ? nameValue.unwrap?.().toString() : undefined;
       return [normalizeKey(name ?? `arg${index}`), normalizeValue(value)];
     })
   );
+  EVENT_DATA_CACHE.set(event, data);
+
+  return data;
 };
 
 const getSigner = (extrinsic: { isSigned?: boolean; signer?: { toString: () => string } }): string => {
@@ -358,18 +389,23 @@ const getUtilityCalls = (extrinsic: { method: { section: string; method: string;
   });
 };
 
-const collectAssets = (value: unknown, assets = new Set<string>()): string[] => {
-  if (!value) return [...assets];
+const collectAssetsInto = (value: unknown, assets: Set<string>): void => {
+  if (!value) return;
 
   if (typeof value === 'string' && value.startsWith('0x') && value.length >= 66) {
     assets.add(value);
   }
 
   if (Array.isArray(value)) {
-    value.forEach((item) => collectAssets(item, assets));
+    value.forEach((item) => collectAssetsInto(item, assets));
   } else if (typeof value === 'object') {
-    Object.values(value as Record<string, unknown>).forEach((item) => collectAssets(item, assets));
+    Object.values(value as Record<string, unknown>).forEach((item) => collectAssetsInto(item, assets));
   }
+};
+
+const collectAssets = (value: unknown): string[] => {
+  const assets = new Set<string>();
+  collectAssetsInto(value, assets);
 
   return [...assets];
 };
@@ -387,6 +423,24 @@ const firstString = (record: Record<string, unknown>, keys: string[]): string =>
 const findEvent = (events: EventRecord[], section: string, method: string): Record<string, unknown> | null => {
   const match = events.find((item) => item.event.section === section && item.event.method === method);
   return match ? eventData(match.event) : null;
+};
+
+const groupEventsByExtrinsic = (events: EventRecord[]): Map<number, EventRecord[]> => {
+  const grouped = new Map<number, EventRecord[]>();
+
+  for (const event of events) {
+    if (!event.phase.isApplyExtrinsic) continue;
+
+    const extrinsicIndex = event.phase.asApplyExtrinsic.toNumber();
+    const group = grouped.get(extrinsicIndex);
+    if (group) {
+      group.push(event);
+    } else {
+      grouped.set(extrinsicIndex, [event]);
+    }
+  }
+
+  return grouped;
 };
 
 const createHistoryData = (
@@ -746,6 +800,7 @@ export class ChainIndexer {
   private api: ApiPromise | null = null;
   private assetInfos = new Map<string, AssetInfo>();
   private prices = new Map<string, bigint>();
+  private networkLiquidityUSD = '0';
 
   constructor(
     private readonly config: AppConfig,
@@ -755,8 +810,11 @@ export class ChainIndexer {
   async start(): Promise<void> {
     const provider = new WsProvider(this.config.soraWsEndpoint);
     this.api = await ApiPromise.create({ provider });
+    const finalizedHash = await this.api.rpc.chain.getFinalizedHead();
+    const finalizedHeader = await this.api.rpc.chain.getHeader(finalizedHash);
+    const finalizedBlock = finalizedHeader.number.toNumber();
 
-    await this.refreshDerivedState(0, Math.floor(Date.now() / 1000), true);
+    await this.refreshDerivedState(finalizedBlock, Math.floor(Date.now() / 1000), true);
     await this.backfill();
     await this.subscribeFinalizedHeads();
   }
@@ -833,6 +891,7 @@ export class ChainIndexer {
       (this.api.query as any).timestamp?.now.at(hash).catch(() => null),
     ]);
     const events = eventsCodec as unknown as EventRecord[];
+    const eventsByExtrinsic = groupEventsByExtrinsic(events);
     const blockHeight = signedBlock.block.header.number.toNumber();
     const blockHash = signedBlock.block.header.hash.toString();
     const timestamp = timestampNow ? Math.floor(Number(timestampNow.toString()) / 1000) : Math.floor(Date.now() / 1000);
@@ -843,11 +902,11 @@ export class ChainIndexer {
     let bridgeIncomingTransactions = 0;
     let bridgeOutgoingTransactions = 0;
     const accountPointData = new Map<string, Record<string, unknown>>();
+    const extrinsicContexts: BlockExtrinsicContext[] = [];
+    const latestHistoryByAccount = new Map<string, string>();
 
     for (const [index, extrinsic] of signedBlock.block.extrinsics.entries()) {
-      const eventsForExtrinsic = events.filter(
-        ({ phase }) => phase.isApplyExtrinsic && phase.asApplyExtrinsic.toNumber() === index
-      );
+      const eventsForExtrinsic = eventsByExtrinsic.get(index) ?? [];
       const failed = eventsForExtrinsic.find(({ event }) => event.section === 'system' && event.method === 'ExtrinsicFailed');
       const args = codecArgs(extrinsic.method as any);
       const calls = getUtilityCalls(extrinsic as any);
@@ -864,50 +923,77 @@ export class ChainIndexer {
       );
       const id = extrinsic.hash?.toString?.() || `${blockHeight}-${index}`;
       const fee = this.extractNetworkFee(eventsForExtrinsic);
+      const currentAccounts = [...new Set([address, history.from, history.to].filter(Boolean))];
       totalFees += fee;
       volumeUSD += this.extractVolumeUSD(history.data);
       if (extrinsic.method.section === 'bridgeMultisig') bridgeIncomingTransactions += 1;
       if (extrinsic.method.section === 'ethBridge') bridgeOutgoingTransactions += 1;
+      currentAccounts.forEach((account) => touchedAccounts.add(account));
+      extrinsicContexts.push({
+        id,
+        module: extrinsic.method.section,
+        method: extrinsic.method.method,
+        address,
+        failed: Boolean(failed),
+        history,
+        calls,
+        callNames,
+        events: eventsForExtrinsic,
+        accounts: currentAccounts,
+        fee,
+      });
+    }
 
+    const existingAccountMeta = await this.repository.getMany(collection('accountMeta'), [...touchedAccounts]);
+
+    for (const context of extrinsicContexts) {
       documents.push({
         collection: collection('historyElements'),
-        id,
+        id: context.id,
         blockHeight,
         timestamp,
         data: {
-          id,
+          id: context.id,
           type: 'CALL',
           timestamp,
           blockHash,
           blockHeight,
-          module: extrinsic.method.section,
-          method: extrinsic.method.method,
-          address,
-          networkFee: fee.toString(),
-          execution: failed
+          module: context.module,
+          method: context.method,
+          address: context.address,
+          networkFee: context.fee.toString(),
+          execution: context.failed
             ? { success: false, error: { moduleErrorId: 0, moduleErrorIndex: 0 } }
             : { success: true },
-          data: history.data,
-          dataFrom: history.from || address,
-          dataTo: history.to,
-          dataAssets: history.assets,
-          callNames,
-          calls,
+          data: context.history.data,
+          dataFrom: context.history.from || context.address,
+          dataTo: context.history.to,
+          dataAssets: context.history.assets,
+          callNames: context.callNames,
+          calls: context.calls,
         },
       });
 
-      const currentAccounts = [...new Set([address, history.from, history.to].filter(Boolean))];
-      currentAccounts.forEach((account) => touchedAccounts.add(account));
-      documents.push(
-        ...(await this.createAccountDocuments(currentAccounts, id, blockHeight, timestamp, accountPointData, {
-          module: extrinsic.method.section,
-          method: extrinsic.method.method,
-          data: history.data,
-          fee,
-        }))
+      context.accounts.forEach((account) => latestHistoryByAccount.set(account, context.id));
+      this.applyAccountPointUpdates(
+        context.accounts,
+        blockHeight,
+        timestamp,
+        accountPointData,
+        {
+          module: context.module,
+          method: context.method,
+          data: context.history.data,
+          fee: context.fee,
+        },
+        existingAccountMeta
       );
-      documents.push(...this.createEventDocuments(eventsForExtrinsic, blockHeight, timestamp, address));
+      documents.push(...this.createEventDocuments(context.events, blockHeight, timestamp, context.address));
     }
+
+    documents.push(
+      ...this.createFinalAccountDocuments([...touchedAccounts], latestHistoryByAccount, blockHeight, timestamp, accountPointData)
+    );
 
     documents.push({
       collection: collection('networkSnapshots'),
@@ -921,7 +1007,7 @@ export class ChainIndexer {
         accounts: touchedAccounts.size,
         transactions: signedBlock.block.extrinsics.length,
         fees: totalFees.toString(),
-        liquidityUSD: await this.getCurrentNetworkLiquidity(),
+        liquidityUSD: this.networkLiquidityUSD,
         volumeUSD: scaledToString(volumeUSD, 8),
         bridgeIncomingTransactions,
         bridgeOutgoingTransactions,
@@ -938,23 +1024,31 @@ export class ChainIndexer {
   }
 
   private extractNetworkFee(events: EventRecord[]): bigint {
-    return events
-      .filter(({ event }) => event.section === 'xorFee' && event.method === 'FeeWithdrawn')
-      .reduce((sum, { event }) => {
+    let total = 0n;
+
+    for (const { event } of events) {
+      if (event.section === 'xorFee' && event.method === 'FeeWithdrawn') {
         const data = eventData(event);
-        return sum + codecToBigInt(data.amount ?? data.fee ?? data.arg1 ?? data.arg0 ?? 0);
-      }, 0n);
+        total += codecToBigInt(data.amount ?? data.fee ?? data.arg1 ?? data.arg0 ?? 0);
+      }
+    }
+
+    return total;
   }
 
   private extractVolumeUSD(data: unknown): bigint {
     if (!data || typeof data !== 'object') return 0n;
 
-    return Object.entries(data as Record<string, unknown>)
-      .filter(([key]) => key.endsWith('AmountUSD') || key === 'amountUSD' || key === 'volumeUSD')
-      .reduce((max, [, value]) => {
+    let max = 0n;
+
+    for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+      if (key.endsWith('AmountUSD') || key === 'amountUSD' || key === 'volumeUSD') {
         const amount = decimalStringToScaled(value);
-        return amount > max ? amount : max;
-      }, 0n);
+        if (amount > max) max = amount;
+      }
+    }
+
+    return max;
   }
 
   private async createAccountDocuments(
@@ -963,11 +1057,50 @@ export class ChainIndexer {
     blockHeight: number,
     timestamp: number,
     pendingPointData: Map<string, Record<string, unknown>>,
-    update?: { module: string; method: string; data: unknown; fee: bigint }
+    update?: { module: string; method: string; data: unknown; fee: bigint },
+    existingAccountMeta?: Map<string, IndexerDocument>
   ): Promise<IndexerDocument[]> {
+    const accountMeta =
+      existingAccountMeta ??
+      (await this.repository.getMany(
+        collection('accountMeta'),
+        accounts.filter((account) => !pendingPointData.has(account))
+      ));
+    const latestHistoryByAccount = new Map(accounts.map((account) => [account, latestHistoryElementId]));
+
+    this.applyAccountPointUpdates(accounts, blockHeight, timestamp, pendingPointData, update, accountMeta);
+
+    return this.createFinalAccountDocuments(accounts, latestHistoryByAccount, blockHeight, timestamp, pendingPointData);
+  }
+
+  private applyAccountPointUpdates(
+    accounts: string[],
+    blockHeight: number,
+    timestamp: number,
+    pendingPointData: Map<string, Record<string, unknown>>,
+    update: { module: string; method: string; data: unknown; fee: bigint } | undefined,
+    existingAccountMeta: Map<string, IndexerDocument>
+  ): void {
+    for (const account of accounts) {
+      const existing = pendingPointData.get(account) ?? existingAccountMeta.get(account)?.data;
+      const data = this.applyAccountPointUpdate(existing ?? emptyPointData(account, blockHeight, timestamp), update);
+      pendingPointData.set(account, data);
+    }
+  }
+
+  private createFinalAccountDocuments(
+    accounts: string[],
+    latestHistoryByAccount: Map<string, string>,
+    blockHeight: number,
+    timestamp: number,
+    pointData: Map<string, Record<string, unknown>>
+  ): IndexerDocument[] {
     const documents: IndexerDocument[] = [];
 
     for (const account of accounts) {
+      const latestHistoryElementId = latestHistoryByAccount.get(account) ?? '';
+      const data = pointData.get(account) ?? emptyPointData(account, blockHeight, timestamp);
+
       documents.push({
         collection: collection('accounts'),
         id: account,
@@ -979,10 +1112,6 @@ export class ChainIndexer {
           latestHistoryElementId,
         },
       });
-
-      const existing = pendingPointData.get(account) ?? (await this.repository.get(collection('accountMeta'), account))?.data;
-      const data = this.applyAccountPointUpdate(existing ?? emptyPointData(account, blockHeight, timestamp), update);
-      pendingPointData.set(account, data);
 
       documents.push({ collection: collection('accountMeta'), id: account, blockHeight, timestamp, data });
       documents.push({
@@ -1097,17 +1226,20 @@ export class ChainIndexer {
     const documents: IndexerDocument[] = [];
 
     for (const { event } of events) {
-      const data = eventData(event);
-
-      if (event.section === 'orderBook') {
+      if (event.section === 'orderBook' && event.method.includes('LimitOrder')) {
+        const data = eventData(event);
         documents.push(...this.createOrderBookEventDocuments(event.method, data, blockHeight, timestamp, signer));
+        continue;
       }
 
       if (event.section === 'kensetsu') {
+        const data = eventData(event);
         documents.push(...this.createVaultEventDocuments(event.method, data, blockHeight, timestamp, signer));
+        continue;
       }
 
       if (event.section === 'xorFee' && event.method === 'ReferrerRewarded') {
+        const data = eventData(event);
         const referral = firstString(data, ['referral', 'who', 'arg0']);
         const referrer = firstString(data, ['referrer', 'arg1']);
         const amount = codecToBigInt(data.amount ?? data.arg2 ?? 0);
@@ -1369,12 +1501,15 @@ export class ChainIndexer {
       poolStates.reduce((sum, pool) => sum + decimalStringToScaled(pool.liquidityUSD), 0n),
       8
     );
+    this.networkLiquidityUSD = networkLiquidityUSD;
     const analytics = await this.buildAnalytics(timestamp, assets, prices, poolStates, networkLiquidityUSD, systemAccountKeys.length);
     this.mergeLimitOrderStorage(orderBookLimitOrders, assets, prices, analytics);
     const apyByPool = this.derivePoolApy(poolStates, farmingPoolFarmers, effectiveBlockHeight, prices);
     const documents: IndexerDocument[] = [];
-    documents.push(...(await this.createAssetDocuments(assets, prices, assetPoolLiquidity, analytics, blockHeight, timestamp, includeSnapshots)));
-    documents.push(...(await this.createPoolDocuments(poolStates, analytics, apyByPool, blockHeight, timestamp, includeSnapshots)));
+    documents.push(
+      ...(await this.createAssetDocuments(assets, prices, assetPoolLiquidity, analytics, effectiveBlockHeight, timestamp, includeSnapshots))
+    );
+    documents.push(...(await this.createPoolDocuments(poolStates, analytics, apyByPool, effectiveBlockHeight, timestamp, includeSnapshots)));
     documents.push(
       ...(await this.createOrderBookDocuments(
         orderBooks,
@@ -1384,17 +1519,17 @@ export class ChainIndexer {
         assets,
         prices,
         analytics,
-        blockHeight,
+        effectiveBlockHeight,
         timestamp,
         includeSnapshots
       ))
     );
-    documents.push(...this.createNetworkSnapshotDocuments(analytics, blockHeight, timestamp, includeSnapshots));
-    documents.push(...this.createStakingDocuments(nominators, blockHeight, timestamp));
-    documents.push(...this.createReferralDocuments(referrers, blockHeight, timestamp));
-    documents.push(...(await this.createVaultDocuments(cdpEntries, blockHeight, timestamp)));
-    documents.push(...this.createAccountLiquidityDocuments(poolProviders, poolStates, assets, prices, blockHeight, timestamp));
-    documents.push(...this.createUpdateStreams(poolStates, assets, prices, apyByPool, blockHeight, timestamp));
+    documents.push(...this.createNetworkSnapshotDocuments(analytics, effectiveBlockHeight, timestamp, includeSnapshots));
+    documents.push(...this.createStakingDocuments(nominators, effectiveBlockHeight, timestamp));
+    documents.push(...this.createReferralDocuments(referrers, effectiveBlockHeight, timestamp));
+    documents.push(...(await this.createVaultDocuments(cdpEntries, effectiveBlockHeight, timestamp)));
+    documents.push(...this.createAccountLiquidityDocuments(poolProviders, poolStates, assets, prices, effectiveBlockHeight, timestamp));
+    documents.push(...this.createUpdateStreams(poolStates, assets, prices, apyByPool, effectiveBlockHeight, timestamp));
 
     await this.repository.upsertMany(documents);
   }
@@ -1477,12 +1612,36 @@ export class ChainIndexer {
 
     const pageSize = 1_000;
     const documents: IndexerDocument[] = [];
+    const firstOrder = Array.isArray(args.orderBy) ? args.orderBy[0] : args.orderBy;
+    const useTimestampSeek =
+      String(firstOrder ?? '').toUpperCase() === 'TIMESTAMP_ASC' &&
+      args.offset === undefined &&
+      args.after === undefined &&
+      args.last === undefined;
+    let offset = 0;
+    let seek: RepositoryQueryArgs['seek'];
 
-    for (let offset = 0; ; offset += pageSize) {
-      const page = await this.repository.query(collectionName, { ...args, first: pageSize, offset });
+    while (true) {
+      const page = await this.repository.query(collectionName, {
+        ...args,
+        first: pageSize,
+        offset: useTimestampSeek ? null : offset,
+        includeTotalCount: false,
+        seek,
+      });
       documents.push(...page.items);
 
-      if (documents.length >= page.totalCount || page.items.length === 0) break;
+      if (page.items.length < pageSize) break;
+
+      if (useTimestampSeek) {
+        const last = page.items[page.items.length - 1];
+        const timestampValue = Number(last?.timestamp ?? last?.data.timestamp);
+        if (!last || !Number.isFinite(timestampValue)) break;
+
+        seek = { field: 'timestamp', value: timestampValue, id: last.id, direction: 'asc' };
+      } else {
+        offset += pageSize;
+      }
     }
 
     return documents;
@@ -1554,14 +1713,16 @@ export class ChainIndexer {
       const eventData = (document.data.data ?? {}) as Record<string, unknown>;
       const module = String(document.data.module ?? '');
       const method = String(document.data.method ?? '');
-      const activeTypes = SNAPSHOT_TYPES.filter((type) => type !== 'BLOCK' && eventTimestamp >= timestamp - SNAPSHOT_WINDOW_SECONDS[type]);
+      const activeTypes = activeAggregateSnapshotTypes(eventTimestamp, timestamp);
       const updateAsset = (assetId: string, amount: unknown, amountUSD: unknown): void => {
         if (!assetId) return;
         const currentPrice = scaledToString(prices.get(assetId) ?? 0n, 8);
+        const amountScaled = decimalStringToScaled(amount);
+        const amountUSDScaled = decimalStringToScaled(amountUSD);
         for (const type of activeTypes) {
           const aggregate = getAggregate(analytics.assets, assetId, type, () => newAssetAggregate(currentPrice));
-          aggregate.volumeAmount += decimalStringToScaled(amount);
-          aggregate.volumeUSD += decimalStringToScaled(amountUSD);
+          aggregate.volumeAmount += amountScaled;
+          aggregate.volumeUSD += amountUSDScaled;
           aggregate.priceUSD.close = currentPrice;
         }
       };
@@ -1570,33 +1731,36 @@ export class ChainIndexer {
         targetAssetId: string,
         baseAmount: unknown,
         targetAmount: unknown,
-        amountUSD: unknown
+        amountUSD: bigint
       ): void => {
         const poolId = poolIdForAssets(baseAssetId, targetAssetId);
         const pool = poolById.get(poolId);
         if (!pool) return;
+        const baseAmountScaled = decimalStringToScaled(baseAmount);
+        const targetAmountScaled = decimalStringToScaled(targetAmount);
 
         for (const type of activeTypes) {
           const aggregate = getAggregate(analytics.pools, poolId, type, () => newPoolAggregate(pool.priceUSD));
-          aggregate.baseAssetVolume += decimalStringToScaled(baseAmount);
-          aggregate.targetAssetVolume += decimalStringToScaled(targetAmount);
-          aggregate.volumeUSD += decimalStringToScaled(amountUSD);
+          aggregate.baseAssetVolume += baseAmountScaled;
+          aggregate.targetAssetVolume += targetAmountScaled;
+          aggregate.volumeUSD += amountUSD;
           aggregate.priceUSD.close = pool.priceUSD;
         }
 
         if (eventTimestamp >= timestamp - 86_400) {
-          analytics.poolDayVolumeUSD.set(poolId, (analytics.poolDayVolumeUSD.get(poolId) ?? 0n) + decimalStringToScaled(amountUSD));
+          analytics.poolDayVolumeUSD.set(poolId, (analytics.poolDayVolumeUSD.get(poolId) ?? 0n) + amountUSD);
         }
       };
       const volumeUSD = this.extractVolumeUSD(eventData);
+      const eventAssets = collectAssets(eventData);
 
       if (eventTimestamp >= timestamp - 86_400) {
-        for (const assetId of collectAssets(eventData)) {
+        for (const assetId of eventAssets) {
           analytics.assetDayVolumeUSD.set(assetId, (analytics.assetDayVolumeUSD.get(assetId) ?? 0n) + volumeUSD);
         }
       }
       if (eventTimestamp >= timestamp - 7 * 86_400) {
-        for (const assetId of collectAssets(eventData)) {
+        for (const assetId of eventAssets) {
           analytics.assetWeekVolumeUSD.set(assetId, (analytics.assetWeekVolumeUSD.get(assetId) ?? 0n) + volumeUSD);
         }
       }
@@ -1633,13 +1797,13 @@ export class ChainIndexer {
       if (baseAssetId) updateAsset(baseAssetId, baseAssetAmount, baseAssetAmountUSD);
       if (targetAssetId) updateAsset(targetAssetId, targetAssetAmount, targetAssetAmountUSD);
       if (baseAssetId && targetAssetId) {
-        updatePool(baseAssetId, targetAssetId, baseAssetAmount, targetAssetAmount, scaledToString(volumeUSD, 8));
+        updatePool(baseAssetId, targetAssetId, baseAssetAmount, targetAssetAmount, volumeUSD);
       }
     }
 
     for (const document of blockSnapshots) {
       const eventTimestamp = Number(document.data.timestamp ?? document.timestamp ?? 0);
-      for (const type of SNAPSHOT_TYPES.filter((item) => item !== 'BLOCK')) {
+      for (const type of AGGREGATE_SNAPSHOT_TYPES) {
         if (eventTimestamp < timestamp - SNAPSHOT_WINDOW_SECONDS[type]) continue;
 
         const current =
@@ -1680,10 +1844,11 @@ export class ChainIndexer {
           : isBuy
             ? scaledMul(quoteAmount, prices.get(quoteAssetId) ?? 0n)
             : scaledMul(amount, prices.get(baseAssetId) ?? 0n);
-      const activeTypes = SNAPSHOT_TYPES.filter((type) => type !== 'BLOCK' && eventTimestamp >= timestamp - SNAPSHOT_WINDOW_SECONDS[type]);
+      const activeTypes = activeAggregateSnapshotTypes(eventTimestamp, timestamp);
       const priceText = String(document.data.price ?? '0');
+      const status = String(document.data.status ?? '');
 
-      if (String(document.data.status ?? '') === 'Active') {
+      if (status === 'Active') {
         const reserves =
           analytics.orderBookActiveReserves.get(orderBookId) ?? { baseAssetReserves: 0n, quoteAssetReserves: 0n, liquidityUSD: 0n };
         if (isBuy) {
@@ -1718,7 +1883,7 @@ export class ChainIndexer {
         aggregate.price.high = maxDecimalString(aggregate.price.high, priceText);
         aggregate.price.low = minDecimalString(aggregate.price.low, priceText);
 
-        if (String(document.data.status ?? '') === 'Filled') {
+        if (status === 'Filled') {
           aggregate.lastDeals.unshift({
             orderId: Number(document.data.orderId ?? 0),
             timestamp: eventTimestamp,
@@ -1731,7 +1896,7 @@ export class ChainIndexer {
       }
     }
 
-    for (const type of SNAPSHOT_TYPES.filter((item) => item !== 'BLOCK')) {
+    for (const type of AGGREGATE_SNAPSHOT_TYPES) {
       if (!analytics.network.has(type)) {
         analytics.network.set(type, {
           accounts: chainAccountCount,
@@ -1758,6 +1923,12 @@ export class ChainIndexer {
     includeSnapshots: boolean
   ): Promise<IndexerDocument[]> {
     const documents: IndexerDocument[] = [];
+    const previousSnapshots = includeSnapshots
+      ? await this.repository.getMany(
+          collection('assetSnapshots'),
+          [...assets.values()].flatMap((asset) => SNAPSHOT_TYPES.map((type) => snapshotId('asset', asset.id, type, timestamp, blockHeight)))
+        )
+      : new Map<string, IndexerDocument>();
 
     for (const asset of assets.values()) {
       const priceUSD = scaledToString(prices.get(asset.id) ?? 0n, 8);
@@ -1792,7 +1963,7 @@ export class ChainIndexer {
         for (const type of SNAPSHOT_TYPES) {
           const id = snapshotId('asset', asset.id, type, timestamp, blockHeight);
           const aggregate = analytics.assets.get(asset.id)?.get(type) ?? newAssetAggregate(priceUSD);
-          const previous = await this.repository.get(collection('assetSnapshots'), id);
+          const previous = previousSnapshots.get(id);
           const priceSnapshot = mergePriceOhlc(previous?.data.priceUSD, priceUSD);
           documents.push({
             collection: collection('assetSnapshots'),
@@ -1835,6 +2006,12 @@ export class ChainIndexer {
     includeSnapshots: boolean
   ): Promise<IndexerDocument[]> {
     const documents: IndexerDocument[] = [];
+    const previousSnapshots = includeSnapshots
+      ? await this.repository.getMany(
+          collection('poolSnapshots'),
+          pools.flatMap((pool) => SNAPSHOT_TYPES.map((type) => snapshotId('pool', pool.id, type, timestamp, blockHeight)))
+        )
+      : new Map<string, IndexerDocument>();
 
     for (const pool of pools) {
       const poolTokenPrice =
@@ -1866,7 +2043,7 @@ export class ChainIndexer {
         for (const type of SNAPSHOT_TYPES) {
           const id = snapshotId('pool', pool.id, type, timestamp, blockHeight);
           const aggregate = analytics.pools.get(pool.id)?.get(type) ?? newPoolAggregate(pool.priceUSD);
-          const previous = await this.repository.get(collection('poolSnapshots'), id);
+          const previous = previousSnapshots.get(id);
           const priceSnapshot = mergePriceOhlc(previous?.data.priceUSD, pool.priceUSD);
           documents.push({
             collection: collection('poolSnapshots'),
@@ -1979,6 +2156,15 @@ export class ChainIndexer {
   ): Promise<IndexerDocument[]> {
     const documents: IndexerDocument[] = [];
     const priceLevels = this.extractOrderBookPriceLevels(bids, asks);
+    const orderBookSnapshotIds = includeSnapshots
+      ? orderBooks.flatMap(([key]) => {
+          const idString = orderBookIdString(parseOrderBookId(key.args[0]));
+          return SNAPSHOT_TYPES.map((type) => snapshotId('orderBook', idString, type, timestamp, blockHeight));
+        })
+      : [];
+    const previousSnapshots = includeSnapshots
+      ? await this.repository.getMany(collection('orderBookSnapshots'), orderBookSnapshotIds)
+      : new Map<string, IndexerDocument>();
 
     for (const [key, value] of orderBooks) {
       const id = parseOrderBookId(key.args[0]);
@@ -2025,7 +2211,7 @@ export class ChainIndexer {
         for (const type of SNAPSHOT_TYPES) {
           const snapshot = snapshotId('orderBook', idString, type, timestamp, blockHeight);
           const typeAggregate = analytics.orderBooks.get(idString)?.get(type) ?? newOrderBookAggregate(price);
-          const previous = await this.repository.get(collection('orderBookSnapshots'), snapshot);
+          const previous = previousSnapshots.get(snapshot);
           const priceSnapshot = mergePriceOhlc(previous?.data.price, price);
           documents.push({
             collection: collection('orderBookSnapshots'),
@@ -2119,7 +2305,7 @@ export class ChainIndexer {
   ): IndexerDocument[] {
     if (!includeSnapshots) return [];
 
-    return SNAPSHOT_TYPES.filter((type) => type !== 'BLOCK').map((type) => {
+    return AGGREGATE_SNAPSHOT_TYPES.map((type) => {
       const aggregate =
         analytics.network.get(type) ?? {
           accounts: 0,
@@ -2188,11 +2374,15 @@ export class ChainIndexer {
 
   private async createVaultDocuments(cdpEntries: any[], blockHeight: number, timestamp: number): Promise<IndexerDocument[]> {
     const documents: IndexerDocument[] = [];
+    const existingVaults = await this.repository.getMany(
+      collection('vaults'),
+      cdpEntries.map(([key]) => String(key.args[0]))
+    );
 
     for (const [key, value] of cdpEntries) {
       const id = String(key.args[0]);
       const data = normalizeValue(value) as Record<string, unknown>;
-      const existing = await this.repository.get(collection('vaults'), id);
+      const existing = existingVaults.get(id);
       documents.push({
         collection: collection('vaults'),
         id,
@@ -2301,20 +2491,5 @@ export class ChainIndexer {
         data: { id: 'assetRegistration', block: blockHeight, data: JSON.stringify(assetRegistrationData) },
       },
     ];
-  }
-
-  private async getCurrentNetworkLiquidity(): Promise<string> {
-    const assets = await this.repository.list(collection('assets'));
-
-    return scaledToString(
-      assets.reduce((sum, document) => {
-        const liquidity = codecToBigInt(document.data.liquidity ?? 0);
-        const assetId = String(document.data.id ?? '');
-        const decimals = this.assetInfos.get(assetId)?.decimals ?? DECIMALS;
-        const amount = scaledDiv(liquidity, 10n ** BigInt(decimals));
-        return sum + scaledMul(amount, this.prices.get(assetId) ?? 0n);
-      }, 0n),
-      8
-    );
   }
 }

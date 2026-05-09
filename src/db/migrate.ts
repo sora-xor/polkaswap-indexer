@@ -28,6 +28,45 @@ export async function migrate(databaseUrl = readConfig().databaseUrl): Promise<v
     await pool.query(
       'create index if not exists indexer_documents_data_gin_idx on indexer_documents using gin(data jsonb_path_ops);'
     );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_timestamp_id_idx on indexer_documents(collection, timestamp, id);'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_type_timestamp_id_idx on indexer_documents(collection, (data->>\'type\'), timestamp, id);'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_asset_id_idx on indexer_documents(collection, (data->>\'assetId\'));'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_account_id_idx on indexer_documents(collection, (data->>\'accountId\'));'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_order_book_id_idx on indexer_documents(collection, (data->>\'orderBookId\'));'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_status_idx on indexer_documents(collection, (data->>\'status\'));'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_updated_at_block_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'updatedAtBlock\', \'\'), \'0\'))::numeric), id);'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_created_at_block_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'createdAtBlock\', \'\'), \'0\'))::numeric), id);'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_price_change_day_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'priceChangeDay\', \'\'), \'0\'))::numeric), id);'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_liquidity_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'liquidity\', \'\'), \'0\'))::numeric), id);'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_liquidity_books_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'liquidityBooks\', \'\'), \'0\'))::numeric), id);'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_volume_day_usd_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'volumeDayUSD\', \'\'), \'0\'))::numeric), id);'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_volume_week_usd_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'volumeWeekUSD\', \'\'), \'0\'))::numeric), id);'
+    );
   } finally {
     await pool.end();
   }

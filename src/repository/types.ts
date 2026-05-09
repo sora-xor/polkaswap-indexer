@@ -35,11 +35,21 @@ export type RepositoryQueryArgs = {
   before?: string | number | null;
   orderBy?: unknown;
   filter?: Record<string, unknown> | null;
+  includeTotalCount?: boolean;
+  seek?: {
+    field: 'timestamp' | 'blockHeight';
+    value: number;
+    id: string;
+    direction?: 'asc' | 'desc';
+  };
 };
 
 export type RepositoryQueryResult = {
   items: IndexerDocument[];
-  totalCount: number;
+  totalCount: number | null;
+  pageStart?: number;
+  hasNextPage?: boolean;
+  hasPreviousPage?: boolean;
 };
 
 export interface IndexerRepository {
@@ -47,6 +57,7 @@ export interface IndexerRepository {
   query?(collection: IndexerCollection, args: RepositoryQueryArgs): Promise<RepositoryQueryResult>;
   watch?(collection: IndexerCollection, ids?: string[]): AsyncGenerator<IndexerDocument, void, unknown>;
   get(collection: IndexerCollection, id: string): Promise<IndexerDocument | null>;
+  getMany(collection: IndexerCollection, ids: string[]): Promise<Map<string, IndexerDocument>>;
   upsert(document: IndexerDocument): Promise<void>;
   upsertMany(documents: IndexerDocument[]): Promise<void>;
   close(): Promise<void>;

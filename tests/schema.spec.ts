@@ -3,6 +3,21 @@ import { describe, expect, it } from 'vitest';
 import { createSchema } from '../src/graphql/resolvers.js';
 import { MemoryRepository } from '../src/repository/memory.js';
 
+import type { IndexerRepository, RepositoryQueryArgs } from '../src/repository/types.js';
+import type { GraphQLResolveInfo } from 'graphql';
+
+type QueryFunction = NonNullable<IndexerRepository['query']>;
+
+const repositoryWithQuery = (query: QueryFunction): IndexerRepository => ({
+  list: async () => [],
+  query,
+  get: async () => null,
+  getMany: async () => new Map(),
+  upsert: async () => undefined,
+  upsertMany: async () => undefined,
+  close: async () => undefined,
+});
+
 describe('Polkaswap indexer schema', () => {
   it('serves SubQuery-compatible asset connections', async () => {
     const repository = new MemoryRepository();
@@ -48,6 +63,197 @@ describe('Polkaswap indexer schema', () => {
         hasPreviousPage: false,
         startCursor: '0',
       },
+    });
+  });
+
+  it('reports stable cursors for last windows within a first page', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany(
+      ['asset-a', 'asset-b', 'asset-c', 'asset-d'].map((id) => ({
+        collection: 'assets',
+        id,
+        data: {
+          id,
+          priceUSD: '1',
+          liquidity: '1',
+          liquidityBooks: '0',
+        },
+      }))
+    );
+
+    const schema = createSchema();
+    const assetsField = schema.getQueryType()?.getFields().assets;
+    const result = await assetsField?.resolve?.(
+      {},
+      {
+        first: 3,
+        last: 2,
+        orderBy: ['ID_ASC'],
+      },
+      { repository },
+      {} as never
+    );
+
+    expect(result).toEqual({
+      totalCount: 4,
+      edges: [
+        {
+          cursor: '1',
+          node: {
+            id: 'asset-b',
+            priceUSD: '1',
+            liquidity: '1',
+            liquidityBooks: '0',
+          },
+        },
+        {
+          cursor: '2',
+          node: {
+            id: 'asset-c',
+            priceUSD: '1',
+            liquidity: '1',
+            liquidityBooks: '0',
+          },
+        },
+      ],
+      pageInfo: {
+        endCursor: '2',
+        hasNextPage: true,
+        hasPreviousPage: true,
+        startCursor: '1',
+      },
+    });
+  });
+
+  it('returns empty page info for filtered-out connection results', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert({
+      collection: 'assets',
+      id: 'asset-a',
+      data: {
+        id: 'asset-a',
+        priceUSD: '1',
+        liquidity: '0',
+        liquidityBooks: '0',
+      },
+    });
+
+    const schema = createSchema();
+    const assetsField = schema.getQueryType()?.getFields().assets;
+    const result = await assetsField?.resolve?.(
+      {},
+      { filter: { liquidity: { greaterThan: '0' } } },
+      { repository },
+      {} as never
+    );
+
+    expect(result).toEqual({
+      edges: [],
+      totalCount: 0,
+      pageInfo: {
+        endCursor: null,
+        hasNextPage: false,
+        hasPreviousPage: false,
+        startCursor: null,
+      },
+    });
+  });
+
+  it('skips repository total counts when connection selections omit totalCount', async () => {
+    const queryArgs: RepositoryQueryArgs[] = [];
+    const repository = repositoryWithQuery(async (_collection, args) => {
+      queryArgs.push(args);
+
+      return {
+        items: [
+          {
+            collection: 'assets',
+            id: 'asset-c',
+            data: { id: 'asset-c', priceUSD: '1', liquidity: '1', liquidityBooks: '0' },
+          },
+        ],
+        totalCount: null,
+        pageStart: 2,
+        hasNextPage: true,
+        hasPreviousPage: true,
+      };
+    });
+    const info = {
+      fieldNodes: [
+        {
+          selectionSet: {
+            selections: [
+              { kind: 'Field', name: { value: 'edges' } },
+              { kind: 'Field', name: { value: 'pageInfo' } },
+            ],
+          },
+        },
+      ],
+      fragments: {},
+    } as unknown as GraphQLResolveInfo;
+    const schema = createSchema();
+    const assetsField = schema.getQueryType()?.getFields().assets;
+
+    const result = await assetsField?.resolve?.({}, { first: 1, after: '1' }, { repository }, info);
+
+    expect(queryArgs).toHaveLength(1);
+    expect(queryArgs[0]?.includeTotalCount).toBe(false);
+    expect(result).toMatchObject({
+      edges: [{ cursor: '2', node: { id: 'asset-c' } }],
+      pageInfo: {
+        endCursor: '2',
+        hasNextPage: true,
+        hasPreviousPage: true,
+        startCursor: '2',
+      },
+    });
+  });
+
+  it('requests repository total counts when selected through fragments', async () => {
+    const queryArgs: RepositoryQueryArgs[] = [];
+    const repository = repositoryWithQuery(async (_collection, args) => {
+      queryArgs.push(args);
+
+      return {
+        items: [
+          {
+            collection: 'assets',
+            id: 'asset-a',
+            data: { id: 'asset-a', priceUSD: '1', liquidity: '1', liquidityBooks: '0' },
+          },
+        ],
+        totalCount: 1,
+      };
+    });
+    const info = {
+      fieldNodes: [
+        {
+          selectionSet: {
+            selections: [{ kind: 'FragmentSpread', name: { value: 'AssetConnectionFields' } }],
+          },
+        },
+      ],
+      fragments: {
+        AssetConnectionFields: {
+          selectionSet: {
+            selections: [
+              { kind: 'Field', name: { value: 'totalCount' } },
+              { kind: 'Field', name: { value: 'edges' } },
+            ],
+          },
+        },
+      },
+    } as unknown as GraphQLResolveInfo;
+    const schema = createSchema();
+    const assetsField = schema.getQueryType()?.getFields().assets;
+
+    const result = await assetsField?.resolve?.({}, {}, { repository }, info);
+
+    expect(queryArgs).toHaveLength(1);
+    expect(queryArgs[0]?.includeTotalCount).toBe(true);
+    expect(result).toMatchObject({
+      edges: [{ node: { id: 'asset-a' } }],
+      totalCount: 1,
     });
   });
 
@@ -110,6 +316,47 @@ describe('Polkaswap indexer schema', () => {
       createdAtBlock: 1,
       xorFees: { amount: '0', amountUSD: '0' },
     });
+  });
+
+  it('serves singleton query fields and normalizes history call nodes', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert({
+      collection: 'accounts',
+      id: 'alice',
+      data: { id: 'alice', latestHistoryElementId: 'history-a' },
+    });
+    await repository.upsert({
+      collection: 'orderBooks',
+      id: '0-xor-kusd',
+      data: { id: '0-xor-kusd', status: 'Trading', price: '2' },
+    });
+    await repository.upsert({
+      collection: 'updatesStreams',
+      id: 'chainState',
+      data: { id: 'chainState', block: 123, data: 'synced' },
+    });
+
+    const schema = createSchema();
+    const queryFields = schema.getQueryType()?.getFields();
+    const historyElementType = schema.getType('HistoryElement') as { getFields: () => Record<string, { resolve?: (...args: unknown[]) => unknown }> };
+    const account = await queryFields?.account.resolve?.({}, { id: 'alice' }, { repository }, {} as never);
+    const missingAccount = await queryFields?.account.resolve?.({}, { id: 'missing' }, { repository }, {} as never);
+    const orderBook = await queryFields?.orderBook.resolve?.({}, { id: '0-xor-kusd' }, { repository }, {} as never);
+    const updatesStream = await queryFields?.updatesStream.resolve?.({}, { id: 'chainState' }, { repository }, {} as never);
+    const calls = historyElementType.getFields().calls.resolve?.(
+      { calls: [{ module: 'assets', method: 'transfer', data: { amount: '1' } }] },
+      {},
+      {},
+      {} as never
+    );
+    const missingCalls = historyElementType.getFields().calls.resolve?.({ calls: null }, {}, {}, {} as never);
+
+    expect(account).toEqual({ id: 'alice', latestHistoryElementId: 'history-a' });
+    expect(missingAccount).toBeNull();
+    expect(orderBook).toEqual({ id: '0-xor-kusd', status: 'Trading', price: '2' });
+    expect(updatesStream).toEqual({ id: 'chainState', block: 123, data: 'synced' });
+    expect(calls).toEqual({ nodes: [{ module: 'assets', method: 'transfer', data: { amount: '1' } }] });
+    expect(missingCalls).toEqual({ nodes: [] });
   });
 
   it('keeps SubQuery JSON fields selectable as scalar values', async () => {
@@ -197,5 +444,83 @@ describe('Polkaswap indexer schema', () => {
     expect(String(updatesStreamMutationType.getFields()._entity.type)).toBe('JSON!');
     expect(String(accountMutationType.getFields()._entity.type)).toBe('JSON!');
     expect(String(orderBookMutationType.getFields()._entity.type)).toBe('JSON!');
+  });
+
+  it('emits account subscription payloads with SubQuery entity field names', async () => {
+    const repository = new MemoryRepository();
+    const schema = createSchema();
+    const accountsField = schema.getSubscriptionType()?.getFields().accounts;
+    const iterator = accountsField?.subscribe?.({}, { id: ['alice'] }, { repository }, {} as never) as AsyncGenerator<
+      unknown,
+      void,
+      unknown
+    >;
+    const next = iterator.next();
+
+    await repository.upsert({
+      collection: 'accounts',
+      id: 'bob',
+      data: { id: 'bob', latestHistoryElementId: 'history-b' },
+    });
+    await repository.upsert({
+      collection: 'accounts',
+      id: 'alice',
+      data: { id: 'alice', latestHistoryElementId: 'history-a' },
+    });
+
+    await expect(next).resolves.toEqual({
+      done: false,
+      value: {
+        id: 'alice',
+        mutation_type: 'UPDATE',
+        _entity: {
+          id: 'alice',
+          latest_history_element_id: 'history-a',
+        },
+      },
+    });
+    await iterator.return(undefined);
+  });
+
+  it('emits order book subscription payloads with UI-compatible entity keys', async () => {
+    const repository = new MemoryRepository();
+    const schema = createSchema();
+    const orderBooksField = schema.getSubscriptionType()?.getFields().orderBooks;
+    const iterator = orderBooksField?.subscribe?.({}, { id: ['0-xor-kusd'] }, { repository }, {} as never) as AsyncGenerator<
+      unknown,
+      void,
+      unknown
+    >;
+    const next = iterator.next();
+
+    await repository.upsert({
+      collection: 'orderBooks',
+      id: '0-xor-kusd',
+      data: {
+        id: '0-xor-kusd',
+        price: '2',
+        priceChangeDay: 0.5,
+        volumeDayUSD: '100',
+        status: 'Trading',
+        lastDeals: '[]',
+        updatedAtBlock: 20,
+      },
+    });
+
+    await expect(next).resolves.toEqual({
+      done: false,
+      value: {
+        id: '0-xor-kusd',
+        mutation_type: 'UPDATE',
+        _entity: {
+          price: '2',
+          price_change_day: 0.5,
+          volume_day_u_s_d: '100',
+          status: 'Trading',
+          last_deals: '[]',
+        },
+      },
+    });
+    await iterator.return(undefined);
   });
 });

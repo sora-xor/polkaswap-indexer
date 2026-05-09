@@ -11,9 +11,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/index.ts",
-    "start": "node dist/index.js",
+    "start": "node dist/src/index.js",
+    "start:worker": "node dist/src/worker/index.js",
     "worker": "tsx src/worker/index.ts",
     "db:migrate": "tsx src/db/migrate.ts",
+    "db:migrate:dist": "node dist/src/db/migrate.js",
     "test": "vitest run"
   },
   "dependencies": {

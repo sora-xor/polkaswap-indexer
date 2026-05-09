@@ -44,6 +44,13 @@ const sqlJsonField = (field: string): string => {
   return `data->>'${field}'`;
 };
 
+const sqlNativeNumericField = (field: string): string | null => {
+  if (field === 'timestamp') return 'timestamp';
+  if (field === 'blockHeight') return 'block_height';
+
+  return null;
+};
+
 const sqlJsonValue = (field: string): string => {
   if (!isSafeJsonField(field)) {
     throw new Error(`Unsupported JSON field in repository query: ${field}`);
@@ -59,9 +66,42 @@ const NUMERIC_ORDER_FIELDS = new Set([
   'createdAtBlock',
   'dexId',
   'orderId',
+  'liquidity',
+  'liquidityBooks',
   'priceChangeDay',
   'volumeDayUSD',
+  'volumeWeekUSD',
 ]);
+const UPSERT_BATCH_SIZE = 1_000;
+
+const sqlNumericField = (field: string): string | null => {
+  const nativeExpression = sqlNativeNumericField(field);
+  if (nativeExpression) return nativeExpression;
+  if (!NUMERIC_ORDER_FIELDS.has(field)) return null;
+
+  return `coalesce(nullif(${sqlJsonField(field)}, ''), '0')::numeric`;
+};
+
+const dedupeDocuments = (documents: IndexerDocument[]): IndexerDocument[] => {
+  const byPrimaryKey = new Map<string, IndexerDocument>();
+
+  for (const document of documents) {
+    byPrimaryKey.set(`${document.collection}\0${document.id}`, document);
+  }
+
+  return [...byPrimaryKey.values()];
+};
+
+const toDatabasePayload = (documents: IndexerDocument[]): string =>
+  JSON.stringify(
+    documents.map((document) => ({
+      collection: document.collection,
+      id: document.id,
+      blockHeight: document.blockHeight ?? null,
+      timestamp: document.timestamp ?? null,
+      data: document.data,
+    }))
+  );
 
 const scalarCondition = (
   field: string,
@@ -71,11 +111,14 @@ const scalarCondition = (
 ): string => {
   const clauses = Object.entries(comparison).map(([operator, expected]) => {
     const expression = sqlJsonField(field);
+    const nativeNumericExpression = sqlNativeNumericField(field);
+    const numericExpression = sqlNumericField(field);
 
     switch (operator) {
       case 'equalTo':
       case 'eq':
         values.push(String(expected));
+        if (nativeNumericExpression) return `${nativeNumericExpression} = $${values.length}::bigint`;
         return `${expression} = $${values.length}`;
       case 'equalToInsensitive':
         values.push(String(expected).toLowerCase());
@@ -83,25 +126,35 @@ const scalarCondition = (
       case 'notEqualTo':
       case 'not_eq':
         values.push(String(expected));
+        if (nativeNumericExpression) return `${nativeNumericExpression} <> $${values.length}::bigint`;
         return `${expression} <> $${values.length}`;
       case 'in':
         values.push((Array.isArray(expected) ? expected : []).map(String));
+        if (nativeNumericExpression) return `${nativeNumericExpression} = any($${values.length}::bigint[])`;
         return `${expression} = any($${values.length}::text[])`;
       case 'greaterThan':
       case 'gt':
         values.push(String(expected));
+        if (nativeNumericExpression) return `${nativeNumericExpression} > $${values.length}::bigint`;
+        if (numericExpression) return `${numericExpression} > ($${values.length})::numeric`;
         return `(${expression})::numeric > ($${values.length})::numeric`;
       case 'greaterThanOrEqualTo':
       case 'gte':
         values.push(String(expected));
+        if (nativeNumericExpression) return `${nativeNumericExpression} >= $${values.length}::bigint`;
+        if (numericExpression) return `${numericExpression} >= ($${values.length})::numeric`;
         return `(${expression})::numeric >= ($${values.length})::numeric`;
       case 'lessThan':
       case 'lt':
         values.push(String(expected));
+        if (nativeNumericExpression) return `${nativeNumericExpression} < $${values.length}::bigint`;
+        if (numericExpression) return `${numericExpression} < ($${values.length})::numeric`;
         return `(${expression})::numeric < ($${values.length})::numeric`;
       case 'lessThanOrEqualTo':
       case 'lte':
         values.push(String(expected));
+        if (nativeNumericExpression) return `${nativeNumericExpression} <= $${values.length}::bigint`;
+        if (numericExpression) return `${numericExpression} <= ($${values.length})::numeric`;
         return `(${expression})::numeric <= ($${values.length})::numeric`;
       case 'includesInsensitive':
         values.push(`%${String(expected).toLowerCase()}%`);
@@ -144,10 +197,29 @@ const filterCondition = (filter: Record<string, unknown> | null | undefined, val
     }
 
     values.push(String(condition));
+    const nativeNumericExpression = sqlNativeNumericField(field);
+    if (nativeNumericExpression) return `${nativeNumericExpression} = $${values.length}::bigint`;
+
     return `${sqlJsonField(field)} = $${values.length}`;
   });
 
   return clauses.join(' and ');
+};
+
+const seekCondition = (seek: RepositoryQueryArgs['seek'], values: unknown[]): string => {
+  if (!seek) return 'true';
+
+  const expression = sqlNativeNumericField(seek.field);
+  if (!expression) throw new Error(`Unsupported seek field in repository query: ${seek.field}`);
+
+  const direction = seek.direction ?? 'asc';
+  const comparison = direction === 'desc' ? '<' : '>';
+  values.push(String(seek.value));
+  const valueIndex = values.length;
+  values.push(seek.id);
+  const idIndex = values.length;
+
+  return `(${expression} ${comparison} $${valueIndex}::bigint or (${expression} = $${valueIndex}::bigint and id ${comparison} $${idIndex}))`;
 };
 
 export class PostgresRepository implements IndexerRepository {
@@ -170,30 +242,35 @@ export class PostgresRepository implements IndexerRepository {
 
   async query(collection: IndexerCollection, args: RepositoryQueryArgs): Promise<RepositoryQueryResult> {
     const values: unknown[] = [collection];
-    const where = filterCondition(args.filter, values);
+    const where = `(${filterCondition(args.filter, values)}) and (${seekCondition(args.seek, values)})`;
     const { field, direction } = getOrderField(args.orderBy);
     const orderExpression =
       field === 'id'
         ? 'id'
         : field === 'timestamp'
           ? 'timestamp'
-          : field === 'blockHeight'
+        : field === 'blockHeight'
             ? 'block_height'
         : NUMERIC_ORDER_FIELDS.has(field)
-          ? `coalesce(nullif(${sqlJsonField(field)}, ''), '0')::numeric`
+          ? sqlNumericField(field) ?? sqlJsonField(field)
           : sqlJsonField(field);
-    const offset = Math.max(Number(args.offset ?? afterToOffset(args.after)), 0);
+    const offset = args.seek ? 0 : Math.max(Number(args.offset ?? afterToOffset(args.after)), 0);
     const first = args.first ?? null;
     const last = args.last ?? null;
     const limit = first === null || first === undefined ? null : Math.max(first, 0);
-    const countResult = await this.pool.query(
-      `select count(*)::int as count
-       from indexer_documents
-       where collection = $1 and ${where}`,
-      values
-    );
+    const shouldOverfetch = args.includeTotalCount === false && limit !== null;
+    const queryLimit = shouldOverfetch ? limit + 1 : limit;
+    const countResult =
+      args.includeTotalCount === false
+        ? null
+        : await this.pool.query(
+            `select count(*)::int as count
+             from indexer_documents
+             where collection = $1 and ${where}`,
+            values
+          );
     const queryValues = [...values];
-    queryValues.push(limit);
+    queryValues.push(queryLimit);
     const limitIndex = queryValues.length;
     queryValues.push(offset);
     const offsetIndex = queryValues.length;
@@ -207,11 +284,24 @@ export class PostgresRepository implements IndexerRepository {
       queryValues
     );
     const rows = result.rows as IndexerDocument[];
-    const items = last === null || last === undefined ? rows : rows.slice(Math.max(rows.length - last, 0));
+    const requestedLimit = limit ?? rows.length;
+    const hasOverfetched = shouldOverfetch && rows.length > requestedLimit;
+    const windowRows = hasOverfetched ? rows.slice(0, requestedLimit) : rows;
+    const pageStartOffset =
+      last === null || last === undefined ? 0 : Math.max(windowRows.length - Math.max(last, 0), 0);
+    const items =
+      last === null || last === undefined
+        ? windowRows
+        : windowRows.slice(pageStartOffset);
+    const totalCount = countResult?.rows[0]?.count ?? null;
+    const pageStart = offset + pageStartOffset;
 
     return {
       items,
-      totalCount: countResult.rows[0]?.count ?? 0,
+      totalCount,
+      pageStart,
+      hasNextPage: totalCount === null ? hasOverfetched : offset + windowRows.length < totalCount,
+      hasPreviousPage: pageStart > 0,
     };
   }
 
@@ -227,41 +317,82 @@ export class PostgresRepository implements IndexerRepository {
     return result.rows[0] ?? null;
   }
 
+  async getMany(collection: IndexerCollection, ids: string[]): Promise<Map<string, IndexerDocument>> {
+    if (!ids.length) return new Map();
+
+    const result = await this.pool.query(
+      `select collection, id, block_height as "blockHeight", timestamp, data
+       from indexer_documents
+       where collection = $1 and id = any($2::text[])`,
+      [collection, [...new Set(ids)]]
+    );
+
+    return new Map((result.rows as IndexerDocument[]).map((document) => [document.id, document]));
+  }
+
   async upsert(document: IndexerDocument): Promise<void> {
     await this.pool.query(
-      `insert into indexer_documents(collection, id, block_height, timestamp, data)
-       values ($1, $2, $3, $4, $5)
-       on conflict (collection, id)
-       do update set
-         block_height = excluded.block_height,
-         timestamp = excluded.timestamp,
-         data = excluded.data,
-         updated_at = now()`,
+      `with upserted as (
+         insert into indexer_documents(collection, id, block_height, timestamp, data)
+         values ($1, $2, $3, $4, $5)
+         on conflict (collection, id)
+         do update set
+           block_height = excluded.block_height,
+           timestamp = excluded.timestamp,
+           data = excluded.data,
+           updated_at = now()
+         where indexer_documents.block_height is distinct from excluded.block_height
+            or indexer_documents.timestamp is distinct from excluded.timestamp
+            or indexer_documents.data is distinct from excluded.data
+         returning collection, id
+       )
+       select pg_notify('indexer_documents', json_build_object('collection', collection, 'id', id)::text)
+       from upserted`,
       [document.collection, document.id, document.blockHeight ?? null, document.timestamp ?? null, document.data]
     );
-    await this.notify(document);
   }
 
   async upsertMany(documents: IndexerDocument[]): Promise<void> {
     if (!documents.length) return;
 
+    const uniqueDocuments = dedupeDocuments(documents);
     const client = await this.pool.connect();
 
     try {
       await client.query('begin');
-      for (const document of documents) {
+      for (let start = 0; start < uniqueDocuments.length; start += UPSERT_BATCH_SIZE) {
+        const batch = uniqueDocuments.slice(start, start + UPSERT_BATCH_SIZE);
+
         await client.query(
-          `insert into indexer_documents(collection, id, block_height, timestamp, data)
-           values ($1, $2, $3, $4, $5)
-           on conflict (collection, id)
-           do update set
-             block_height = excluded.block_height,
-             timestamp = excluded.timestamp,
-             data = excluded.data,
-             updated_at = now()`,
-          [document.collection, document.id, document.blockHeight ?? null, document.timestamp ?? null, document.data]
+          `with input as (
+             select collection, id, "blockHeight" as block_height, timestamp, data
+             from jsonb_to_recordset($1::jsonb) as documents(
+               collection text,
+               id text,
+               "blockHeight" bigint,
+               timestamp bigint,
+               data jsonb
+             )
+           ),
+           upserted as (
+             insert into indexer_documents(collection, id, block_height, timestamp, data)
+             select collection, id, block_height, timestamp, data
+             from input
+             on conflict (collection, id)
+             do update set
+               block_height = excluded.block_height,
+               timestamp = excluded.timestamp,
+               data = excluded.data,
+               updated_at = now()
+             where indexer_documents.block_height is distinct from excluded.block_height
+                or indexer_documents.timestamp is distinct from excluded.timestamp
+                or indexer_documents.data is distinct from excluded.data
+             returning collection, id
+           )
+           select pg_notify('indexer_documents', json_build_object('collection', collection, 'id', id)::text)
+           from upserted`,
+          [toDatabasePayload(batch)]
         );
-        await client.query('select pg_notify($1, $2)', ['indexer_documents', JSON.stringify({ collection: document.collection, id: document.id })]);
       }
       await client.query('commit');
     } catch (error) {
@@ -279,21 +410,57 @@ export class PostgresRepository implements IndexerRepository {
   async *watch(collection: IndexerCollection, ids: string[] = []): AsyncGenerator<IndexerDocument, void, unknown> {
     const client = await this.pool.connect();
     const queue: IndexerDocument[] = [];
+    const pendingIds = new Set<string>();
     let notify: (() => void) | null = null;
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    let flushing = false;
     const idSet = new Set(ids);
-    const listener = async (message: pg.Notification) => {
+
+    const wake = () => {
+      notify?.();
+      notify = null;
+    };
+    const flush = async () => {
+      if (flushing) return;
+
+      flushing = true;
+      try {
+        while (pendingIds.size) {
+          const idsToLoad = [...pendingIds];
+          pendingIds.clear();
+          const documents = await this.getMany(collection, idsToLoad);
+
+          for (const id of idsToLoad) {
+            const document = documents.get(id);
+            if (document) queue.push(document);
+          }
+
+          wake();
+        }
+      } catch {
+        // Notifications are best-effort; the backing table remains authoritative.
+      } finally {
+        flushing = false;
+        if (pendingIds.size) scheduleFlush();
+      }
+    };
+    const scheduleFlush = () => {
+      if (flushTimer || flushing) return;
+
+      flushTimer = setTimeout(() => {
+        flushTimer = null;
+        void flush();
+      }, 25);
+    };
+    const listener = (message: pg.Notification) => {
       if (message.channel !== 'indexer_documents' || !message.payload) return;
 
       try {
         const payload = JSON.parse(message.payload) as { collection?: IndexerCollection; id?: string };
         if (payload.collection !== collection || !payload.id || (idSet.size && !idSet.has(payload.id))) return;
 
-        const document = await this.get(collection, payload.id);
-        if (!document) return;
-
-        queue.push(document);
-        notify?.();
-        notify = null;
+        pendingIds.add(payload.id);
+        scheduleFlush();
       } catch {
         // Ignore malformed notifications; the backing table remains authoritative.
       }
@@ -314,16 +481,11 @@ export class PostgresRepository implements IndexerRepository {
         if (document) yield document;
       }
     } finally {
+      if (flushTimer) clearTimeout(flushTimer);
+      pendingIds.clear();
       client.off('notification', listener);
       await client.query('unlisten indexer_documents').catch(() => undefined);
       client.release();
     }
-  }
-
-  private async notify(document: IndexerDocument): Promise<void> {
-    await this.pool.query('select pg_notify($1, $2)', [
-      'indexer_documents',
-      JSON.stringify({ collection: document.collection, id: document.id }),
-    ]);
   }
 }

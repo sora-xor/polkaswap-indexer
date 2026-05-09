@@ -49,6 +49,47 @@ describe('GraphQL filter compatibility', () => {
     ).toBe(false);
   });
 
+  it('matches case-insensitive, membership, and object containment filters', () => {
+    expect(
+      matchesFilter(
+        {
+          symbol: 'xor',
+          status: 'Trading',
+          metadata: { source: 'chain', verified: true },
+        },
+        {
+          symbol: { equalToInsensitive: 'XOR' },
+          status: { in: ['Trading', 'Stopped'] },
+          metadata: { contains: { verified: true } },
+        }
+      )
+    ).toBe(true);
+  });
+
+  it('matches nested path and substring filters', () => {
+    expect(
+      matchesFilter(
+        {
+          execution: { success: true },
+          data: { sidechainAddress: '0xABCDEF' },
+        },
+        {
+          'execution.success': { equalTo: true },
+          'data.sidechainAddress': { includesInsensitive: 'bcde' },
+        }
+      )
+    ).toBe(true);
+  });
+
+  it('treats non-numeric comparison values as zero', () => {
+    expect(matchesFilter({ liquidity: 'not-a-number' }, { liquidity: { greaterThanOrEqualTo: 0 } })).toBe(true);
+    expect(matchesFilter({ liquidity: 'not-a-number' }, { liquidity: { greaterThan: 0 } })).toBe(false);
+  });
+
+  it('rejects unsupported comparison operators', () => {
+    expect(matchesFilter({ id: 'asset-a' }, { id: { startsWith: 'asset' } })).toBe(false);
+  });
+
   it('sorts SubQuery order tokens by camel-cased document fields', () => {
     const result = sortDocuments(
       [
@@ -60,5 +101,17 @@ describe('GraphQL filter compatibility', () => {
     );
 
     expect(result.map((item) => item.id)).toEqual(['b', 'c', 'a']);
+  });
+
+  it('sorts nullish values last for ascending order and first for descending order', () => {
+    const items = [
+      { id: 'missing' },
+      { id: 'one', timestamp: 1 },
+      { id: 'two', timestamp: 2 },
+      { id: 'null', timestamp: null },
+    ];
+
+    expect(sortDocuments(items, ['TIMESTAMP_ASC']).map((item) => item.id)).toEqual(['one', 'two', 'missing', 'null']);
+    expect(sortDocuments(items, ['TIMESTAMP_DESC']).map((item) => item.id)).toEqual(['missing', 'null', 'two', 'one']);
   });
 });

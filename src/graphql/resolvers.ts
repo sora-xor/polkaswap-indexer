@@ -4,8 +4,8 @@ import { matchesFilter, sortDocuments } from './filter.js';
 import { CursorScalar, FilterScalars, JSONScalar, OrderByScalar } from './scalars.js';
 import { typeDefs } from './schema.js';
 
-import type { IndexerCollection, IndexerRepository } from '../repository/types.js';
-import type { GraphQLSchema } from 'graphql';
+import type { IndexerCollection, IndexerDocument, IndexerRepository } from '../repository/types.js';
+import type { GraphQLResolveInfo, GraphQLSchema, SelectionNode } from 'graphql';
 
 type Context = {
   repository: IndexerRepository;
@@ -41,20 +41,49 @@ const afterToOffset = (after: ConnectionArgs['after']): number => {
   return Number.isFinite(parsed) ? parsed + 1 : 0;
 };
 
+const paginationWindow = (args: ConnectionArgs, totalCount: number) => {
+  const baseOffset = args.offset ?? afterToOffset(args.after);
+  const start = Math.max(baseOffset, 0);
+  const first = args.first ?? null;
+  const last = args.last ?? null;
+  const end =
+    first === null || first === undefined ? totalCount : Math.min(start + Math.max(first, 0), totalCount);
+  const pageStart =
+    last === null || last === undefined ? start : Math.max(end - Math.max(last, 0), start);
+
+  return { end, pageStart };
+};
+
+const selectionIncludesField = (info: GraphQLResolveInfo | undefined, fieldName: string): boolean => {
+  if (!info?.fieldNodes) return true;
+
+  const visitSelections = (selections: readonly SelectionNode[] | undefined): boolean => {
+    if (!selections) return false;
+
+    return selections.some((selection) => {
+      if (selection.kind === 'Field') return selection.name.value === fieldName;
+      if (selection.kind === 'InlineFragment') return visitSelections(selection.selectionSet.selections);
+      if (selection.kind === 'FragmentSpread') {
+        return visitSelections(info.fragments[selection.name.value]?.selectionSet.selections);
+      }
+
+      return false;
+    });
+  };
+
+  return info.fieldNodes.some((fieldNode) => visitSelections(fieldNode.selectionSet?.selections));
+};
+
 const buildConnection = (items: Record<string, unknown>[], args: ConnectionArgs) => {
   const filtered = sortDocuments(
     items.filter((item) => matchesFilter(item, args.filter)),
     args.orderBy
   );
   const totalCount = filtered.length;
-  const baseOffset = args.offset ?? afterToOffset(args.after);
-  const first = args.first ?? null;
-  const last = args.last ?? null;
-  const start = Math.max(baseOffset, 0);
-  const end = first === null || first === undefined ? filtered.length : Math.min(start + Math.max(first, 0), filtered.length);
-  const pageItems = last === null || last === undefined ? filtered.slice(start, end) : filtered.slice(Math.max(end - last, start), end);
+  const { end, pageStart } = paginationWindow(args, totalCount);
+  const pageItems = filtered.slice(pageStart, end);
   const edges: Edge[] = pageItems.map((node, index) => ({
-    cursor: String(start + index),
+    cursor: String(pageStart + index),
     node,
   }));
 
@@ -64,7 +93,7 @@ const buildConnection = (items: Record<string, unknown>[], args: ConnectionArgs)
     pageInfo: edges.length
       ? {
           hasNextPage: end < filtered.length,
-          hasPreviousPage: start > 0,
+          hasPreviousPage: pageStart > 0,
           startCursor: edges[0]?.cursor ?? null,
           endCursor: edges[edges.length - 1]?.cursor ?? null,
         }
@@ -74,22 +103,26 @@ const buildConnection = (items: Record<string, unknown>[], args: ConnectionArgs)
 
 const connectionResolver =
   (collectionName: IndexerCollection) =>
-  async (_parent: unknown, args: ConnectionArgs, context: Context) => {
+  async (_parent: unknown, args: ConnectionArgs, context: Context, info?: GraphQLResolveInfo) => {
     if (context.repository.query) {
-      const result = await context.repository.query(collectionName, args);
-      const baseOffset = args.offset ?? afterToOffset(args.after);
+      const includeTotalCount = selectionIncludesField(info, 'totalCount');
+      const result = await context.repository.query(collectionName, { ...args, includeTotalCount });
+      const fallbackTotalCount =
+        result.totalCount ?? (result.pageStart ?? 0) + result.items.length + (result.hasNextPage ? 1 : 0);
+      const { end, pageStart: fallbackPageStart } = paginationWindow(args, fallbackTotalCount);
+      const pageStart = result.pageStart ?? fallbackPageStart;
       const edges: Edge[] = result.items.map((document, index) => ({
-        cursor: String(baseOffset + index),
+        cursor: String(pageStart + index),
         node: document.data,
       }));
 
       return {
         edges,
-        totalCount: result.totalCount,
+        totalCount: result.totalCount ?? fallbackTotalCount,
         pageInfo: edges.length
           ? {
-              hasNextPage: baseOffset + edges.length < result.totalCount,
-              hasPreviousPage: baseOffset > 0,
+              hasNextPage: result.hasNextPage ?? end < fallbackTotalCount,
+              hasPreviousPage: result.hasPreviousPage ?? pageStart > 0,
               startCursor: edges[0]?.cursor ?? null,
               endCursor: edges[edges.length - 1]?.cursor ?? null,
             }
@@ -145,9 +178,13 @@ async function* pollSubscription(
   const snapshots = new Map<string, string>();
 
   while (true) {
-    const candidates = ids.length
-      ? await Promise.all(ids.map((id) => context.repository.get(collectionName, id)))
-      : await context.repository.list(collectionName);
+    let candidates: Array<IndexerDocument | null>;
+    if (ids.length) {
+      const documents = await context.repository.getMany(collectionName, ids);
+      candidates = ids.map((id) => documents.get(id) ?? null);
+    } else {
+      candidates = await context.repository.list(collectionName);
+    }
 
     for (const document of candidates) {
       if (!document) continue;
