@@ -16,6 +16,7 @@ export const typeDefs = /* GraphQL */ `
   scalar ReferrerRewardFilter
   scalar VaultEventFilter
   scalar VaultFilter
+  scalar XorBurnFilter
 
   enum HistoryElementsOrderBy {
     ID_ASC
@@ -250,7 +251,13 @@ export const typeDefs = /* GraphQL */ `
     transactions: Int
     fees: String
     liquidityUSD: String
+    poolLiquidityUSD: String
+    orderBookLiquidityUSD: String
     volumeUSD: String
+    swaps: Int
+    activePools: Int
+    activeOrderBooks: Int
+    listedAssets: Int
     bridgeIncomingTransactions: Int
     bridgeOutgoingTransactions: Int
   }
@@ -264,6 +271,16 @@ export const typeDefs = /* GraphQL */ `
     edges: [NetworkSnapshotEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
+  }
+
+  type ExploreStats {
+    id: String!
+    tokenCount: Int!
+    poolCount: Int!
+    orderBookCount: Int!
+    liquidityUSD: String!
+    volumeDayUSD: String!
+    updatedAtTimestamp: Int
   }
 
   type OrderBook {
@@ -385,6 +402,28 @@ export const typeDefs = /* GraphQL */ `
 
   type HistoryElementConnection {
     edges: [HistoryElementEdge!]!
+    pageInfo: PageInfo!
+    totalCount: Int!
+  }
+
+  type XorBurn {
+    id: String!
+    address: String
+    amount: String
+    assetId: String
+    blockHeight: Int
+    timestamp: Int
+    txHash: String
+    nexusRecipient: String
+  }
+
+  type XorBurnEdge {
+    cursor: Cursor
+    node: XorBurn!
+  }
+
+  type XorBurnConnection {
+    edges: [XorBurnEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
   }
@@ -517,6 +556,7 @@ export const typeDefs = /* GraphQL */ `
     orderBookOrders(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: OrderBookOrderFilter): OrderBookOrderConnection!
     orderBookSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: OrderBookSnapshotFilter): OrderBookSnapshotConnection!
     historyElements(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [HistoryElementsOrderBy!], filter: HistoryElementFilter): HistoryElementConnection!
+    xorBurns(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [HistoryElementsOrderBy!], filter: XorBurnFilter): XorBurnConnection!
     referrerRewards(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: ReferrerRewardFilter): ReferrerRewardConnection!
     stakingStakers(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountFilter): StakingStakerConnection!
     vaults(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: VaultFilter): VaultConnection!
@@ -524,6 +564,7 @@ export const typeDefs = /* GraphQL */ `
     updatesStream(id: String!): UpdatesStream
     accountMeta(id: String!): AccountMeta
     accountPointSystems(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountFilter): AccountPointSystemConnection!
+    exploreStats: ExploreStats!
   }
 
   type Subscription {

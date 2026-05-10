@@ -96,6 +96,20 @@ describe('ChainIndexer price derivation', () => {
     expect(volume).toBe(10n * SCALE);
   });
 
+  it('sums xor fee withdrawal events as network fees', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      extractNetworkFee: (events: unknown[]) => bigint;
+    };
+
+    const fee = indexer.extractNetworkFee([
+      eventRecord('xorFee', 'FeeWithdrawn', { amount: '100' }),
+      eventRecord('xorFee', 'FeeWithdrawn', { fee: '23' }),
+      eventRecord('balances', 'Transfer', { amount: '999' }),
+    ]);
+
+    expect(fee).toBe(123n);
+  });
+
   it('derives pool APY from farming reward weights and liquidity', () => {
     const poolId = `${XOR}-${KUSD}`;
     const otherPoolId = `${KUSD}-${PSWAP}`;
@@ -190,6 +204,147 @@ describe('ChainIndexer price derivation', () => {
 
     expect(meta?.xorFees).toEqual({ amount: '1', amountUSD: '5' });
     expect(meta?.xorBurned).toEqual({ amount: '2', amountUSD: '10' });
+  });
+
+  it('indexes utility batch burn calls for burn page stats', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+    const blockTimestampMs = 1_700_000_000_000;
+    const burnCall = {
+      section: 'assets',
+      method: 'burn',
+      args: [XOR, '10000000000000000000'],
+      meta: { args: [{ name: 'assetId' }, { name: 'amount' }] },
+    };
+    const remarkCall = {
+      section: 'system',
+      method: 'remark',
+      args: ['0x7b7d'],
+      meta: { args: [{ name: 'remark' }] },
+    };
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 25_900_001 },
+                hash: { toString: () => '0xblock' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xbatchburn' },
+                  method: {
+                    section: 'utility',
+                    method: 'batchAll',
+                    args: [[burnCall, remarkCall]],
+                    meta: { args: [{ name: 'calls' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => String(blockTimestampMs) }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xblock');
+
+    const history = await repository.get('historyElements', '0xbatchburn');
+    const xorBurn = await repository.get('xorBurns', '0xbatchburn');
+    const chainState = await repository.get('updatesStreams', 'chainState');
+
+    expect(history?.data).toMatchObject({
+      module: 'utility',
+      method: 'batchAll',
+      address: 'alice',
+      blockHeight: 25_900_001,
+      timestamp: 1_700_000_000,
+      callNames: ['assets.burn', 'system.remark'],
+      calls: [
+        {
+          module: 'assets',
+          method: 'burn',
+          data: { args: { assetId: XOR, amount: '10000000000000000000' } },
+        },
+        {
+          module: 'system',
+          method: 'remark',
+          data: { args: { remark: '0x7b7d' } },
+        },
+      ],
+    });
+    expect(xorBurn?.data).toMatchObject({
+      id: '0xbatchburn',
+      address: 'alice',
+      amount: '10',
+      assetId: XOR,
+      blockHeight: 25_900_001,
+      timestamp: 1_700_000_000,
+      txHash: '0xbatchburn',
+    });
+    expect(chainState?.data).toMatchObject({
+      id: 'chainState',
+      block: 25_900_001,
+      data: JSON.stringify({ lastIndexedBlock: 25_900_001 }),
+    });
+  });
+
+  it('skips expensive derived-state refreshes while backfilling historical blocks', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(
+      { ...config, stateRefreshIntervalBlocks: 1, snapshotIntervalBlocks: 1 },
+      repository
+    ) as unknown as {
+      api: unknown;
+      backfill: () => Promise<void>;
+      indexBlockByNumber: (block: number, options?: { refreshDerivedState?: boolean }) => Promise<void>;
+      refreshDerivedState: (blockHeight: number, timestamp: number, includeSnapshots: boolean) => Promise<void>;
+    };
+    const indexedBlocks: Array<{ block: number; refreshDerivedState?: boolean }> = [];
+    const refreshes: Array<{ blockHeight: number; includeSnapshots: boolean }> = [];
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getFinalizedHead: async () => '0xfinal',
+          getHeader: async () => ({ number: { toNumber: () => 3 } }),
+        },
+      },
+    };
+    indexer.indexBlockByNumber = async (block, options) => {
+      indexedBlocks.push({ block, refreshDerivedState: options?.refreshDerivedState });
+    };
+    indexer.refreshDerivedState = async (blockHeight, _timestamp, includeSnapshots) => {
+      refreshes.push({ blockHeight, includeSnapshots });
+    };
+
+    await indexer.backfill();
+
+    expect(indexedBlocks).toEqual([
+      { block: 1, refreshDerivedState: false },
+      { block: 2, refreshDerivedState: false },
+      { block: 3, refreshDerivedState: false },
+    ]);
+    expect(refreshes).toEqual([{ blockHeight: 3, includeSnapshots: true }]);
   });
 
   it('continues existing account point metadata from the repository', async () => {
@@ -393,6 +548,246 @@ describe('ChainIndexer price derivation', () => {
         }),
       ])
     );
+  });
+
+  it('creates storage-derived staking and referral documents', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createStakingDocuments: (nominators: unknown[], blockHeight: number, timestamp: number) => unknown[];
+      createReferralDocuments: (referrers: unknown[], blockHeight: number, timestamp: number) => unknown[];
+    };
+
+    const staking = indexer.createStakingDocuments([[{ args: ['alice'] }]], 12, 1_700_000_000);
+    const referrals = indexer.createReferralDocuments(
+      [[{ args: ['charlie'] }, { toJSON: () => 'dave' }]],
+      12,
+      1_700_000_000
+    );
+
+    expect(staking).toEqual([
+      {
+        collection: 'stakingStakers',
+        id: 'alice',
+        blockHeight: 12,
+        timestamp: 1_700_000_000,
+        data: { id: 'alice' },
+      },
+    ]);
+    expect(referrals).toEqual([
+      {
+        collection: 'referrerRewards',
+        id: 'dave-charlie',
+        blockHeight: 12,
+        timestamp: 1_700_000_000,
+        data: {
+          id: 'dave-charlie',
+          referral: 'charlie',
+          referrer: 'dave',
+          updated: 1_700_000_000,
+          amount: '0',
+        },
+      },
+    ]);
+  });
+
+  it('preserves vault creation blocks while refreshing storage-derived vaults', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert({
+      collection: 'vaults',
+      id: 'vault-1',
+      blockHeight: 50,
+      timestamp: 1_600_000_000,
+      data: {
+        id: 'vault-1',
+        createdAtBlock: 50,
+      },
+    });
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      createVaultDocuments: (cdpEntries: unknown[], blockHeight: number, timestamp: number) => Promise<unknown[]>;
+    };
+
+    const documents = await indexer.createVaultDocuments(
+      [
+        [
+          { args: ['vault-1'] },
+          {
+            toJSON: () => ({
+              owner: 'alice',
+              collateral_asset_id: XOR,
+              stablecoin_asset_id: KUSD,
+            }),
+          },
+        ],
+      ],
+      99,
+      1_700_000_000
+    );
+
+    expect(documents).toEqual([
+      {
+        collection: 'vaults',
+        id: 'vault-1',
+        blockHeight: 99,
+        timestamp: 1_700_000_000,
+        data: {
+          id: 'vault-1',
+          type: 'Type2',
+          status: 'Opened',
+          ownerId: 'alice',
+          collateralAssetId: XOR,
+          debtAssetId: KUSD,
+          collateralAmountReturned: '0',
+          createdAtBlock: 50,
+          updatedAtBlock: 99,
+        },
+      },
+    ]);
+  });
+
+  it('creates account liquidity snapshots from pool provider shares', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createAccountLiquidityDocuments: (
+        poolProviders: unknown[],
+        pools: unknown[],
+        assets: Map<string, unknown>,
+        prices: Map<string, bigint>,
+        blockHeight: number,
+        timestamp: number
+      ) => unknown[];
+    };
+
+    const documents = indexer.createAccountLiquidityDocuments(
+      [[{ args: ['pool-account', 'alice'] }, (250n * SCALE).toString()]],
+      [
+        {
+          id: `${XOR}-${KUSD}`,
+          poolAccount: 'pool-account',
+          poolTokenSupply: 1_000n * SCALE,
+          liquidityUSD: '1000',
+        },
+      ],
+      new Map(),
+      new Map(),
+      77,
+      1_700_000_000
+    );
+
+    expect(documents).toEqual([
+      expect.objectContaining({
+        collection: 'accountLiquiditySnapshots',
+        blockHeight: 77,
+        timestamp: 1_700_000_000,
+        data: expect.objectContaining({
+          accountLiquidityId: `alice-${XOR}-${KUSD}`,
+          poolTokens: (250n * SCALE).toString(),
+          liquidityUSD: '250',
+          type: 'DEFAULT',
+        }),
+      }),
+    ]);
+  });
+
+  it('creates network snapshots only for aggregate windows', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createNetworkSnapshotDocuments: (
+        analytics: unknown,
+        blockHeight: number,
+        timestamp: number,
+        includeSnapshots: boolean
+      ) => Array<{ collection: string; data: Record<string, unknown> }>;
+    };
+    const analytics = {
+      network: new Map([
+        [
+          'DEFAULT',
+          {
+            accounts: 10,
+            transactions: 3,
+            fees: 123n,
+            liquidityUSD: '456.5',
+            poolLiquidityUSD: '400.25',
+            orderBookLiquidityUSD: '56.25',
+            volumeUSD: 789n * SCALE,
+            swaps: 2,
+            activePools: 7,
+            activeOrderBooks: 4,
+            listedAssets: 21,
+            bridgeIncomingTransactions: 1,
+            bridgeOutgoingTransactions: 2,
+          },
+        ],
+      ]),
+    };
+
+    expect(indexer.createNetworkSnapshotDocuments(analytics, 10, 1_700_000_000, false)).toEqual([]);
+    const documents = indexer.createNetworkSnapshotDocuments(analytics, 10, 1_700_000_000, true);
+
+    expect(documents.map((document) => document.data.type)).toEqual(['DEFAULT', 'HOUR', 'DAY', 'MONTH']);
+    expect(documents[0]).toMatchObject({
+      collection: 'networkSnapshots',
+      data: {
+        accounts: 10,
+        transactions: 3,
+        fees: '123',
+        liquidityUSD: '456.5',
+        poolLiquidityUSD: '400.25',
+        orderBookLiquidityUSD: '56.25',
+        volumeUSD: '789',
+        swaps: 2,
+        activePools: 7,
+        activeOrderBooks: 4,
+        listedAssets: 21,
+        bridgeIncomingTransactions: 1,
+        bridgeOutgoingTransactions: 2,
+      },
+    });
+  });
+
+  it('creates update stream JSON payloads for prices, APY, and asset registration', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createUpdateStreams: (
+        pools: unknown[],
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number }>,
+        prices: Map<string, bigint>,
+        apyByPool: Map<string, string>,
+        blockHeight: number,
+        timestamp: number
+      ) => Array<{ id: string; blockHeight: number; timestamp: number; data: { data: string; block: number } }>;
+    };
+    const poolId = `${XOR}-${KUSD}`;
+    const documents = indexer.createUpdateStreams(
+      [{ id: poolId }],
+      new Map([
+        [XOR, { id: XOR, symbol: 'XOR', name: 'SORA', decimals: 18 }],
+        [KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18 }],
+      ]),
+      new Map([
+        [XOR, 5n * SCALE],
+        [KUSD, SCALE],
+      ]),
+      new Map([[poolId, '0.125']]),
+      88,
+      1_700_000_000
+    );
+    const byId = new Map(documents.map((document) => [document.id, document]));
+
+    expect(JSON.parse(byId.get('price')?.data.data ?? '{}')).toEqual({
+      [XOR]: '5',
+      [KUSD]: '1',
+    });
+    expect(JSON.parse(byId.get('apy')?.data.data ?? '{}')).toEqual({
+      [poolId]: '0.125',
+    });
+    expect(JSON.parse(JSON.parse(byId.get('assetRegistration')?.data.data ?? '{}')[XOR])).toEqual({
+      address: XOR,
+      name: 'SORA',
+      symbol: 'XOR',
+      decimals: 18,
+    });
+    expect([...byId.values()].map((document) => [document.blockHeight, document.timestamp, document.data.block])).toEqual([
+      [88, 1_700_000_000, 88],
+      [88, 1_700_000_000, 88],
+      [88, 1_700_000_000, 88],
+    ]);
   });
 });
 

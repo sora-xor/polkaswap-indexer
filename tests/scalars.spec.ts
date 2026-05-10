@@ -23,6 +23,15 @@ describe('GraphQL scalar compatibility', () => {
     });
   });
 
+  it('round-trips opaque scalar values and null JSON literals', () => {
+    const filter = { id: { eq: 'vault-1' } };
+    const json = { amount: '10', nested: { ok: true } };
+
+    expect(FilterScalars.VaultFilter.parseValue(filter)).toBe(filter);
+    expect(JSONScalar.serialize(json)).toBe(json);
+    expect(JSONScalar.parseLiteral(parseValue('null'), {})).toBeNull();
+  });
+
   it('passes cursor and order-by values through unchanged', () => {
     expect(CursorScalar.parseValue('12')).toBe('12');
     expect(OrderByScalar.parseValue(['TIMESTAMP_DESC', 'ID_DESC'])).toEqual(['TIMESTAMP_DESC', 'ID_DESC']);

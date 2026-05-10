@@ -71,6 +71,7 @@ const NUMERIC_ORDER_FIELDS = new Set([
   'priceChangeDay',
   'volumeDayUSD',
   'volumeWeekUSD',
+  'amount',
 ]);
 const UPSERT_BATCH_SIZE = 1_000;
 
@@ -226,7 +227,12 @@ export class PostgresRepository implements IndexerRepository {
   private readonly pool: pg.Pool;
 
   constructor(databaseUrl: string) {
-    this.pool = new Pool({ connectionString: databaseUrl });
+    this.pool = new Pool({
+      connectionString: databaseUrl,
+      connectionTimeoutMillis: 5_000,
+      query_timeout: 15_000,
+      statement_timeout: 15_000,
+    });
   }
 
   async list(collection: IndexerCollection): Promise<IndexerDocument[]> {
@@ -269,6 +275,17 @@ export class PostgresRepository implements IndexerRepository {
              where collection = $1 and ${where}`,
             values
           );
+    const totalCount = countResult?.rows[0]?.count ?? null;
+    if (limit === 0 && countResult) {
+      return {
+        items: [],
+        totalCount,
+        pageStart: offset,
+        hasNextPage: offset < totalCount,
+        hasPreviousPage: offset > 0,
+      };
+    }
+
     const queryValues = [...values];
     queryValues.push(queryLimit);
     const limitIndex = queryValues.length;
@@ -293,7 +310,6 @@ export class PostgresRepository implements IndexerRepository {
       last === null || last === undefined
         ? windowRows
         : windowRows.slice(pageStartOffset);
-    const totalCount = countResult?.rows[0]?.count ?? null;
     const pageStart = offset + pageStartOffset;
 
     return {

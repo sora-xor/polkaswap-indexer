@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import type { GraphQLResolveInfo } from 'graphql';
 
 import { createSchema } from '../src/graphql/resolvers.js';
 import { MemoryRepository } from '../src/repository/memory.js';
 
 import type { IndexerRepository, RepositoryQueryArgs } from '../src/repository/types.js';
-import type { GraphQLResolveInfo } from 'graphql';
 
 type QueryFunction = NonNullable<IndexerRepository['query']>;
 
@@ -18,7 +18,87 @@ const repositoryWithQuery = (query: QueryFunction): IndexerRepository => ({
   close: async () => undefined,
 });
 
+const repositoryWithoutQuery = (items: Awaited<ReturnType<IndexerRepository['list']>>): IndexerRepository => ({
+  list: async (collection) => items.filter((item) => item.collection === collection),
+  get: async () => null,
+  getMany: async () => new Map(),
+  upsert: async () => undefined,
+  upsertMany: async () => undefined,
+  close: async () => undefined,
+});
+
 describe('Polkaswap indexer schema', () => {
+  it('exposes a stable health resolver', () => {
+    const schema = createSchema();
+    const healthField = schema.getQueryType()?.getFields()._health;
+
+    expect(healthField?.resolve?.({}, {}, { repository: new MemoryRepository() }, {} as never)).toEqual({
+      ok: true,
+      service: 'polkaswap-indexer',
+    });
+  });
+
+  it('derives Explore stats from active market documents and the latest day network snapshot', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'assets',
+        id: 'asset-a',
+        data: { id: 'asset-a', liquidity: '10', liquidityBooks: '0' },
+      },
+      {
+        collection: 'assets',
+        id: 'asset-b',
+        data: { id: 'asset-b', liquidity: '0', liquidityBooks: '5' },
+      },
+      {
+        collection: 'assets',
+        id: 'asset-c',
+        data: { id: 'asset-c', liquidity: '0', liquidityBooks: '0' },
+      },
+      {
+        collection: 'poolXYKs',
+        id: 'pool-a',
+        data: { id: 'pool-a', baseAssetReserves: '1', targetAssetReserves: '2' },
+      },
+      {
+        collection: 'poolXYKs',
+        id: 'pool-b',
+        data: { id: 'pool-b', baseAssetReserves: '0', targetAssetReserves: '2' },
+      },
+      {
+        collection: 'orderBooks',
+        id: 'book-a',
+        data: { id: 'book-a' },
+      },
+      {
+        collection: 'networkSnapshots',
+        id: 'network-old',
+        timestamp: 100,
+        data: { id: 'network-old', type: 'DAY', timestamp: 100, liquidityUSD: '100.25', volumeUSD: '10.5' },
+      },
+      {
+        collection: 'networkSnapshots',
+        id: 'network-latest',
+        timestamp: 200,
+        data: { id: 'network-latest', type: 'DAY', timestamp: 200, liquidityUSD: '250.75', volumeUSD: '45.125' },
+      },
+    ]);
+
+    const schema = createSchema();
+    const exploreStatsField = schema.getQueryType()?.getFields().exploreStats;
+
+    await expect(exploreStatsField?.resolve?.({}, {}, { repository }, {} as never)).resolves.toEqual({
+      id: 'global',
+      tokenCount: 2,
+      poolCount: 1,
+      orderBookCount: 1,
+      liquidityUSD: '250.75',
+      volumeDayUSD: '45.125',
+      updatedAtTimestamp: 200,
+    });
+  });
+
   it('serves SubQuery-compatible asset connections', async () => {
     const repository = new MemoryRepository();
     await repository.upsert({
@@ -62,6 +142,62 @@ describe('Polkaswap indexer schema', () => {
         hasNextPage: false,
         hasPreviousPage: false,
         startCursor: '0',
+      },
+    });
+  });
+
+  it('falls back to list-based filtering, sorting, and pagination when query is unavailable', async () => {
+    const repository = repositoryWithoutQuery([
+      {
+        collection: 'assets',
+        id: 'asset-a',
+        data: { id: 'asset-a', timestamp: 10, priceUSD: '1', liquidity: '0', liquidityBooks: '0' },
+      },
+      {
+        collection: 'assets',
+        id: 'asset-b',
+        data: { id: 'asset-b', timestamp: 20, priceUSD: '2', liquidity: '5', liquidityBooks: '0' },
+      },
+      {
+        collection: 'assets',
+        id: 'asset-c',
+        data: { id: 'asset-c', timestamp: 30, priceUSD: '3', liquidity: '10', liquidityBooks: '0' },
+      },
+    ]);
+    const schema = createSchema();
+    const assetsField = schema.getQueryType()?.getFields().assets;
+
+    const result = await assetsField?.resolve?.(
+      {},
+      {
+        first: 1,
+        offset: 1,
+        filter: { liquidity: { greaterThan: '0' } },
+        orderBy: ['TIMESTAMP_ASC'],
+      },
+      { repository },
+      {} as never
+    );
+
+    expect(result).toEqual({
+      totalCount: 2,
+      edges: [
+        {
+          cursor: '1',
+          node: {
+            id: 'asset-c',
+            timestamp: 30,
+            priceUSD: '3',
+            liquidity: '10',
+            liquidityBooks: '0',
+          },
+        },
+      ],
+      pageInfo: {
+        endCursor: '1',
+        hasNextPage: false,
+        hasPreviousPage: true,
+        startCursor: '1',
       },
     });
   });
@@ -206,6 +342,52 @@ describe('Polkaswap indexer schema', () => {
         hasPreviousPage: true,
         startCursor: '2',
       },
+    });
+  });
+
+  it('requests repository total counts when selected through inline fragments', async () => {
+    const queryArgs: RepositoryQueryArgs[] = [];
+    const repository = repositoryWithQuery(async (_collection, args) => {
+      queryArgs.push(args);
+
+      return {
+        items: [
+          {
+            collection: 'assets',
+            id: 'asset-a',
+            data: { id: 'asset-a', priceUSD: '1', liquidity: '1', liquidityBooks: '0' },
+          },
+        ],
+        totalCount: 1,
+      };
+    });
+    const info = {
+      fieldNodes: [
+        {
+          selectionSet: {
+            selections: [
+              {
+                kind: 'InlineFragment',
+                selectionSet: {
+                  selections: [{ kind: 'Field', name: { value: 'totalCount' } }],
+                },
+              },
+            ],
+          },
+        },
+      ],
+      fragments: {},
+    } as unknown as GraphQLResolveInfo;
+    const schema = createSchema();
+    const assetsField = schema.getQueryType()?.getFields().assets;
+
+    const result = await assetsField?.resolve?.({}, {}, { repository }, info);
+
+    expect(queryArgs).toHaveLength(1);
+    expect(queryArgs[0]?.includeTotalCount).toBe(true);
+    expect(result).toMatchObject({
+      edges: [{ node: { id: 'asset-a' } }],
+      totalCount: 1,
     });
   });
 
@@ -431,6 +613,24 @@ describe('Polkaswap indexer schema', () => {
       governance: { votes: 1, amount: '3', amountUSD: '4' },
       deposit: { incomingUSD: '5', outgoingUSD: '6' },
     });
+  });
+
+  it('exposes extended DeFi fields on network snapshots', () => {
+    const schema = createSchema();
+    const networkSnapshotType = schema.getType('NetworkSnapshot') as { getFields: () => Record<string, { type: unknown }> };
+
+    expect(Object.keys(networkSnapshotType.getFields())).toEqual(
+      expect.arrayContaining([
+        'liquidityUSD',
+        'poolLiquidityUSD',
+        'orderBookLiquidityUSD',
+        'volumeUSD',
+        'swaps',
+        'activePools',
+        'activeOrderBooks',
+        'listedAssets',
+      ])
+    );
   });
 
   it('validates SubQuery-style subscription payload entity scalars', () => {

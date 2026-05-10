@@ -34,6 +34,20 @@ describe('GraphQL filter compatibility', () => {
     ).toBe(false);
   });
 
+  it('matches direct equality and abbreviated comparison operators', () => {
+    expect(
+      matchesFilter(
+        { id: 'asset-a', liquidity: '10', volumeDayUSD: '25', status: 'Trading' },
+        {
+          id: 'asset-a',
+          liquidity: { gt: '9', lte: '10' },
+          volumeDayUSD: { gte: '25', lt: '26' },
+          status: { not_eq: 'Stopped' },
+        }
+      )
+    ).toBe(true);
+  });
+
   it('requires every requested value for array contains filters', () => {
     expect(
       matchesFilter(
@@ -101,6 +115,14 @@ describe('GraphQL filter compatibility', () => {
     );
 
     expect(result.map((item) => item.id)).toEqual(['b', 'c', 'a']);
+  });
+
+  it('defaults to id ordering without mutating the input array', () => {
+    const items = [{ id: 'b' }, { id: 'a' }, { id: 'c' }];
+    const result = sortDocuments(items, undefined);
+
+    expect(result.map((item) => item.id)).toEqual(['a', 'b', 'c']);
+    expect(items.map((item) => item.id)).toEqual(['b', 'a', 'c']);
   });
 
   it('sorts nullish values last for ascending order and first for descending order', () => {

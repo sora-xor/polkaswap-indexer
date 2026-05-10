@@ -59,4 +59,5 @@ export const FilterScalars = {
   ReferrerRewardFilter: opaqueScalar('ReferrerRewardFilter', 'Referrer reward filter object.'),
   VaultEventFilter: opaqueScalar('VaultEventFilter', 'Vault event filter object.'),
   VaultFilter: opaqueScalar('VaultFilter', 'Vault filter object.'),
+  XorBurnFilter: opaqueScalar('XorBurnFilter', 'XOR burn filter object.'),
 };

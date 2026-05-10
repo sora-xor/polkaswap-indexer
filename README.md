@@ -29,6 +29,14 @@ yarn worker
 
 By default the worker reads finalized SORA blocks from `wss://mof2.sora.org`.
 
+For local exchange development before a full worker backfill has completed, seed
+the current XOR/DAI assets, price update stream, recent chart snapshots, and
+SOLSWAP burn campaign history used by the burn page stats:
+
+```sh
+yarn seed:swap-chart
+```
+
 The UI should point `POLKASWAP_INDEXER_ENDPOINT` at the hosted GraphQL URL, for
 example `https://indexer.example.com/graphql`.
 

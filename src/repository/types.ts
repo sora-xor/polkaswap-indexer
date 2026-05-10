@@ -17,7 +17,8 @@ export type IndexerCollection =
   | 'stakingStakers'
   | 'updatesStreams'
   | 'vaults'
-  | 'vaultEvents';
+  | 'vaultEvents'
+  | 'xorBurns';
 
 export type IndexerDocument = {
   collection: IndexerCollection;

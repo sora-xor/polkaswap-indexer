@@ -16,6 +16,7 @@
     "worker": "tsx src/worker/index.ts",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:migrate:dist": "node dist/src/db/migrate.js",
+    "seed:swap-chart": "tsx src/dev/seedSwapChartData.ts",
     "test": "vitest run"
   },
   "dependencies": {

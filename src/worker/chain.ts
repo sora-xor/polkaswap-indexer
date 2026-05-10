@@ -31,6 +31,15 @@ type IndexedCall = {
   hash?: string;
 };
 
+type CallLike = {
+  section?: string;
+  module?: string;
+  method?: string;
+  call?: string;
+  args?: unknown[] | Record<string, unknown>;
+  meta?: { args?: Array<{ name?: string | { toString: () => string } }> };
+};
+
 type BlockExtrinsicContext = {
   id: string;
   module: string;
@@ -99,19 +108,30 @@ type OrderBookAggregate = {
   lastDeals: Array<{ orderId: number; timestamp: number; isBuy: boolean; amount: string; price: string }>;
 };
 
+type NetworkLiquidityStats = {
+  liquidityUSD: string;
+  poolLiquidityUSD: string;
+  orderBookLiquidityUSD: string;
+  activePools: number;
+  activeOrderBooks: number;
+  listedAssets: number;
+};
+
+type NetworkAggregate = NetworkLiquidityStats & {
+  accounts: number;
+  transactions: number;
+  fees: bigint;
+  volumeUSD: bigint;
+  swaps: number;
+  bridgeIncomingTransactions: number;
+  bridgeOutgoingTransactions: number;
+};
+
 type Analytics = {
   assets: Map<string, Map<SnapshotTypeName, AssetAggregate>>;
   pools: Map<string, Map<SnapshotTypeName, PoolAggregate>>;
   orderBooks: Map<string, Map<SnapshotTypeName, OrderBookAggregate>>;
-  network: Map<SnapshotTypeName, {
-    accounts: number;
-    transactions: number;
-    fees: bigint;
-    liquidityUSD: string;
-    volumeUSD: bigint;
-    bridgeIncomingTransactions: number;
-    bridgeOutgoingTransactions: number;
-  }>;
+  network: Map<SnapshotTypeName, NetworkAggregate>;
   assetDayVolumeUSD: Map<string, bigint>;
   assetWeekVolumeUSD: Map<string, bigint>;
   assetDayOpenPrice: Map<string, string>;
@@ -123,10 +143,15 @@ type Analytics = {
   orderBookActiveReserves: Map<string, { baseAssetReserves: bigint; quoteAssetReserves: bigint; liquidityUSD: bigint }>;
 };
 
+type IndexBlockOptions = {
+  refreshDerivedState?: boolean;
+};
+
 const CHAIN_STATE_ID = 'chainState';
 const DECIMALS = 18;
 const SCALE = 10n ** 18n;
 const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000';
+const SORA_NEXUS_XOR_BURN_REMARK_TYPE = 'soraNexusXorClaim';
 const PSWAP = '0x0200050000000000000000000000000000000000000000000000000000000000';
 const DAI = '0x0200060000000000000000000000000000000000000000000000000000000000';
 const XSTUSD = '0x0200080000000000000000000000000000000000000000000000000000000000';
@@ -373,19 +398,170 @@ const getSigner = (extrinsic: { isSigned?: boolean; signer?: { toString: () => s
   return extrinsic.isSigned ? (extrinsic.signer?.toString() ?? '') : '';
 };
 
+/**
+ * Normalizes nested utility-call arguments from either live codec calls or JSON payloads.
+ */
+const normalizeCallArgs = (call: CallLike): Record<string, unknown> => {
+  if (Array.isArray(call.args)) {
+    return codecArgs(call as { args?: unknown[]; meta?: { args?: Array<{ name?: string | { toString: () => string } }> } });
+  }
+  if (call.args && typeof call.args === 'object') return normalizeValue(call.args) as Record<string, unknown>;
+
+  return {};
+};
+
+/**
+ * Projects a nested utility call into the GraphQL shape consumed by the exchange UI.
+ */
+const toIndexedCall = (call: unknown): IndexedCall => {
+  const direct = call as CallLike;
+  if (direct?.section || direct?.module) {
+    return {
+      module: String(direct.section ?? direct.module ?? ''),
+      method: String(direct.method ?? ''),
+      data: { args: normalizeCallArgs(direct) },
+    };
+  }
+
+  const item = toJson(call) as CallLike | null;
+  if (!item || typeof item !== 'object') return { module: '', method: '', data: { args: {} } };
+
+  const callName = String(item.call ?? '');
+  const [callModule = '', callMethod = ''] = callName.split('.');
+
+  return {
+    module: String(item.section ?? item.module ?? callModule),
+    method: String(item.method ?? callMethod),
+    data: { args: normalizeCallArgs(item) },
+  };
+};
+
+/**
+ * Reads utility batch calls before lossy JSON conversion can erase codec call metadata.
+ */
+const getUtilityCallItems = (value: unknown): unknown[] => {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+
+  const items: unknown[] = [];
+  const forEach = (value as { forEach?: (callback: (item: unknown) => void) => void }).forEach;
+  if (typeof forEach === 'function') {
+    forEach.call(value, (item) => items.push(item));
+    return items;
+  }
+
+  if (typeof (value as { [Symbol.iterator]?: unknown })[Symbol.iterator] === 'function') {
+    return Array.from(value as Iterable<unknown>);
+  }
+
+  const json = toJson(value);
+  return Array.isArray(json) ? json : [];
+};
+
 const getUtilityCalls = (extrinsic: { method: { section: string; method: string; args?: unknown[] } }): IndexedCall[] => {
   if (extrinsic.method.section !== 'utility') return [];
 
-  const maybeCalls = toJson(extrinsic.method.args?.[0]);
-  if (!Array.isArray(maybeCalls)) return [];
+  const maybeCalls = getUtilityCallItems(extrinsic.method.args?.[0]);
 
-  return maybeCalls.map((call) => {
-    const item = call as Record<string, unknown>;
-    const callName = String(item.call ?? '');
-    const [module = '', method = ''] = callName.split('.');
-    const args = normalizeValue(item.args) as Record<string, unknown>;
+  return maybeCalls.map(toIndexedCall);
+};
 
-    return { module, method, data: { args } };
+const getCallArgs = (call: IndexedCall): Record<string, unknown> => {
+  const args = call.data.args;
+  return args && typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
+};
+
+const decodeText = (value: unknown): string => {
+  const text = String(value ?? '');
+  if (!text.startsWith('0x')) return text;
+
+  try {
+    return Buffer.from(text.slice(2), 'hex').toString('utf8');
+  } catch {
+    return text;
+  }
+};
+
+const parseSoraNexusRecipient = (remark: unknown): string | undefined => {
+  try {
+    const parsed = JSON.parse(decodeText(remark)) as { type?: unknown; version?: unknown; recipient?: unknown };
+    if (
+      parsed.type === SORA_NEXUS_XOR_BURN_REMARK_TYPE &&
+      parsed.version === 1 &&
+      typeof parsed.recipient === 'string'
+    ) {
+      return parsed.recipient;
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+};
+
+const isXorBurnCall = (call: IndexedCall): boolean => {
+  if (call.module !== 'assets' || call.method !== 'burn') return false;
+
+  const args = getCallArgs(call);
+  return firstString(args, ['assetId', 'asset_id', 'arg0']) === XOR;
+};
+
+const getBatchAllNexusRecipient = (context: BlockExtrinsicContext): string | undefined => {
+  if (context.module !== 'utility' || context.method !== 'batchAll' || context.calls.length !== 2) return undefined;
+
+  const [burnCall, remarkCall] = context.calls;
+  if (!burnCall || !remarkCall || !isXorBurnCall(burnCall) || remarkCall.module !== 'system' || remarkCall.method !== 'remark') {
+    return undefined;
+  }
+
+  const remarkArgs = getCallArgs(remarkCall);
+  return parseSoraNexusRecipient(remarkArgs.remark ?? remarkArgs.arg0);
+};
+
+/**
+ * Emits compact XOR burn documents so the burn page does not need an expensive historyElements scan.
+ */
+const createXorBurnDocuments = (
+  context: BlockExtrinsicContext,
+  blockHeight: number,
+  timestamp: number,
+  assets: Map<string, AssetInfo>
+): IndexerDocument[] => {
+  const createDocument = (id: string, address: string, amount: string, nexusRecipient?: string): IndexerDocument => ({
+    collection: collection('xorBurns'),
+    id,
+    blockHeight,
+    timestamp,
+    data: {
+      id,
+      address,
+      amount,
+      assetId: XOR,
+      blockHeight,
+      timestamp,
+      txHash: context.id,
+      ...(nexusRecipient ? { nexusRecipient } : {}),
+    },
+  });
+
+  if (context.module === 'assets' && context.method === 'burn') {
+    const data = context.history.data as Record<string, unknown>;
+    if (String(data.assetId ?? data.asset_id ?? '') !== XOR || !data.amount) return [];
+
+    return [createDocument(context.id, context.address || context.history.from, String(data.amount))];
+  }
+
+  if (context.module !== 'utility' || (context.method !== 'batchAll' && context.method !== 'batch')) return [];
+
+  const nexusRecipient = getBatchAllNexusRecipient(context);
+  const burnCalls = context.calls.filter(isXorBurnCall);
+
+  return burnCalls.map((call, index) => {
+    const args = getCallArgs(call);
+    const amount = codecToDecimalString(args.amount ?? args.arg1 ?? '0', assets.get(XOR)?.decimals ?? DECIMALS);
+    const id = burnCalls.length === 1 ? context.id : `${context.id}-${index}`;
+
+    return createDocument(id, context.address || context.history.from, amount, nexusRecipient);
   });
 };
 
@@ -780,6 +956,48 @@ const newOrderBookAggregate = (price: string): OrderBookAggregate => ({
   lastDeals: [],
 });
 
+const emptyNetworkLiquidityStats = (): NetworkLiquidityStats => ({
+  liquidityUSD: '0',
+  poolLiquidityUSD: '0',
+  orderBookLiquidityUSD: '0',
+  activePools: 0,
+  activeOrderBooks: 0,
+  listedAssets: 0,
+});
+
+const createNetworkLiquidityStats = (
+  poolLiquidityUSD: string,
+  orderBookLiquidityUSD: string,
+  activePools: number,
+  activeOrderBooks: number,
+  listedAssets: number
+): NetworkLiquidityStats => {
+  const totalLiquidityUSD = scaledToString(
+    decimalStringToScaled(poolLiquidityUSD) + decimalStringToScaled(orderBookLiquidityUSD),
+    8
+  );
+
+  return {
+    liquidityUSD: totalLiquidityUSD,
+    poolLiquidityUSD,
+    orderBookLiquidityUSD,
+    activePools,
+    activeOrderBooks,
+    listedAssets,
+  };
+};
+
+const newNetworkAggregate = (accounts = 0, liquidityStats = emptyNetworkLiquidityStats()): NetworkAggregate => ({
+  ...liquidityStats,
+  accounts,
+  transactions: 0,
+  fees: 0n,
+  volumeUSD: 0n,
+  swaps: 0,
+  bridgeIncomingTransactions: 0,
+  bridgeOutgoingTransactions: 0,
+});
+
 const emptyAnalytics = (): Analytics => ({
   assets: new Map(),
   pools: new Map(),
@@ -800,7 +1018,7 @@ export class ChainIndexer {
   private api: ApiPromise | null = null;
   private assetInfos = new Map<string, AssetInfo>();
   private prices = new Map<string, bigint>();
-  private networkLiquidityUSD = '0';
+  private networkLiquidityStats = emptyNetworkLiquidityStats();
 
   constructor(
     private readonly config: AppConfig,
@@ -831,8 +1049,8 @@ export class ChainIndexer {
     }
   }
 
-  private async setLastIndexedBlock(block: number): Promise<void> {
-    await this.repository.upsert({
+  private createChainStateDocument(block: number): IndexerDocument {
+    return {
       collection: collection('updatesStreams'),
       id: CHAIN_STATE_ID,
       blockHeight: block,
@@ -842,7 +1060,7 @@ export class ChainIndexer {
         block,
         data: JSON.stringify({ lastIndexedBlock: block }),
       },
-    });
+    };
   }
 
   private async backfill(): Promise<void> {
@@ -853,13 +1071,19 @@ export class ChainIndexer {
     const finalizedBlock = finalizedHeader.number.toNumber();
     const lastIndexed = await this.getLastIndexedBlock();
     const startBlock = Math.max(this.config.chainStartBlock, lastIndexed + 1);
+    let indexedAny = false;
 
     for (let block = startBlock; block <= finalizedBlock; block += 1) {
-      await this.indexBlockByNumber(block);
+      await this.indexBlockByNumber(block, { refreshDerivedState: false });
+      indexedAny = true;
 
       if (block % this.config.chainBatchSize === 0) {
         console.info(`Indexed SORA block ${block}/${finalizedBlock}`);
       }
+    }
+
+    if (indexedAny) {
+      await this.refreshDerivedState(finalizedBlock, Math.floor(Date.now() / 1000), true);
     }
   }
 
@@ -875,14 +1099,14 @@ export class ChainIndexer {
     });
   }
 
-  private async indexBlockByNumber(block: number): Promise<void> {
+  private async indexBlockByNumber(block: number, options: IndexBlockOptions = {}): Promise<void> {
     if (!this.api) return;
 
     const hash = await this.api.rpc.chain.getBlockHash(block);
-    await this.indexBlockByHash(hash.toString());
+    await this.indexBlockByHash(hash.toString(), options);
   }
 
-  private async indexBlockByHash(hash: string): Promise<void> {
+  private async indexBlockByHash(hash: string, options: IndexBlockOptions = {}): Promise<void> {
     if (!this.api) return;
 
     const [signedBlock, eventsCodec, timestampNow] = await Promise.all([
@@ -899,6 +1123,7 @@ export class ChainIndexer {
     const touchedAccounts = new Set<string>();
     let totalFees = 0n;
     let volumeUSD = 0n;
+    let swaps = 0;
     let bridgeIncomingTransactions = 0;
     let bridgeOutgoingTransactions = 0;
     const accountPointData = new Map<string, Record<string, unknown>>();
@@ -926,6 +1151,13 @@ export class ChainIndexer {
       const currentAccounts = [...new Set([address, history.from, history.to].filter(Boolean))];
       totalFees += fee;
       volumeUSD += this.extractVolumeUSD(history.data);
+      if (
+        (extrinsic.method.section === 'liquidityProxy' &&
+          (extrinsic.method.method === 'swap' || extrinsic.method.method === 'swapTransfer')) ||
+        callNames.some((name) => name === 'liquidityProxy.swap' || name === 'liquidityProxy.swapTransfer')
+      ) {
+        swaps += 1;
+      }
       if (extrinsic.method.section === 'bridgeMultisig') bridgeIncomingTransactions += 1;
       if (extrinsic.method.section === 'ethBridge') bridgeOutgoingTransactions += 1;
       currentAccounts.forEach((account) => touchedAccounts.add(account));
@@ -974,6 +1206,7 @@ export class ChainIndexer {
         },
       });
 
+      documents.push(...createXorBurnDocuments(context, blockHeight, timestamp, this.assetInfos));
       context.accounts.forEach((account) => latestHistoryByAccount.set(account, context.id));
       this.applyAccountPointUpdates(
         context.accounts,
@@ -1007,20 +1240,25 @@ export class ChainIndexer {
         accounts: touchedAccounts.size,
         transactions: signedBlock.block.extrinsics.length,
         fees: totalFees.toString(),
-        liquidityUSD: this.networkLiquidityUSD,
+        liquidityUSD: this.networkLiquidityStats.liquidityUSD,
+        poolLiquidityUSD: this.networkLiquidityStats.poolLiquidityUSD,
+        orderBookLiquidityUSD: this.networkLiquidityStats.orderBookLiquidityUSD,
         volumeUSD: scaledToString(volumeUSD, 8),
+        swaps,
+        activePools: this.networkLiquidityStats.activePools,
+        activeOrderBooks: this.networkLiquidityStats.activeOrderBooks,
+        listedAssets: this.networkLiquidityStats.listedAssets,
         bridgeIncomingTransactions,
         bridgeOutgoingTransactions,
       },
     });
 
+    documents.push(this.createChainStateDocument(blockHeight));
     await this.repository.upsertMany(documents);
 
-    if (blockHeight % this.config.stateRefreshIntervalBlocks === 0) {
+    if ((options.refreshDerivedState ?? true) && blockHeight % this.config.stateRefreshIntervalBlocks === 0) {
       await this.refreshDerivedState(blockHeight, timestamp, blockHeight % this.config.snapshotIntervalBlocks === 0);
     }
-
-    await this.setLastIndexedBlock(blockHeight);
   }
 
   private extractNetworkFee(events: EventRecord[]): bigint {
@@ -1381,22 +1619,24 @@ export class ChainIndexer {
   private async refreshDerivedState(blockHeight: number, timestamp: number, includeSnapshots: boolean): Promise<void> {
     if (!this.api) return;
 
+    const auxiliaryStoragePromise = Promise.all([
+      (this.api.query as any).poolXYK.poolProviders.entries(),
+      (this.api.query as any).staking.nominators.entries(),
+      (this.api.query as any).referrals.referrers.entries(),
+      (this.api.query as any).kensetsu.cdpDepository.entries(),
+    ]);
     const [
       assetInfos,
       tokenIssuances,
       poolProperties,
       poolReserves,
       poolIssuances,
-      poolProviders,
       orderBooks,
       orderBookBids,
       orderBookAsks,
       orderBookLimitOrders,
       farmingPoolFarmers,
-      nominators,
-      referrers,
-      cdpEntries,
-      systemAccountKeys,
+      indexedAccountCount,
       latestHeader,
     ] = await Promise.all([
       (this.api.query as any).assets.assetInfosV2.entries(),
@@ -1404,7 +1644,6 @@ export class ChainIndexer {
       (this.api.query as any).poolXYK.properties.entries(),
       (this.api.query as any).poolXYK.reserves.entries(),
       (this.api.query as any).poolXYK.totalIssuances.entries(),
-      (this.api.query as any).poolXYK.poolProviders.entries(),
       (this.api.query as any).orderBook.orderBooks.entries(),
       (this.api.query as any).orderBook.bids.entries().catch(() => []),
       (this.api.query as any).orderBook.asks.entries().catch(() => []),
@@ -1412,10 +1651,7 @@ export class ChainIndexer {
       (this.api.query as any).farming?.poolFarmers?.entries
         ? (this.api.query as any).farming.poolFarmers.entries().catch(() => [])
         : [],
-      (this.api.query as any).staking.nominators.entries(),
-      (this.api.query as any).referrals.referrers.entries(),
-      (this.api.query as any).kensetsu.cdpDepository.entries(),
-      (this.api.query as any).system.account.keys().catch(() => []),
+      this.countIndexedAccounts(),
       this.api.rpc.chain.getHeader().catch(() => null),
     ]);
     const effectiveBlockHeight = blockHeight || Number(latestHeader?.number?.toString?.() ?? 0);
@@ -1497,21 +1733,34 @@ export class ChainIndexer {
       assetPoolLiquidity.set(pool.targetAssetId, (assetPoolLiquidity.get(pool.targetAssetId) ?? 0n) + pool.targetAssetReserves);
     }
 
-    const networkLiquidityUSD = scaledToString(
+    const poolLiquidityUSD = scaledToString(
       poolStates.reduce((sum, pool) => sum + decimalStringToScaled(pool.liquidityUSD), 0n),
       8
     );
-    this.networkLiquidityUSD = networkLiquidityUSD;
-    const analytics = await this.buildAnalytics(timestamp, assets, prices, poolStates, networkLiquidityUSD, systemAccountKeys.length);
-    this.mergeLimitOrderStorage(orderBookLimitOrders, assets, prices, analytics);
-    const apyByPool = this.derivePoolApy(poolStates, farmingPoolFarmers, effectiveBlockHeight, prices);
-    const documents: IndexerDocument[] = [];
-    documents.push(
-      ...(await this.createAssetDocuments(assets, prices, assetPoolLiquidity, analytics, effectiveBlockHeight, timestamp, includeSnapshots))
+    const activePools = poolStates.filter((pool) => decimalStringToScaled(pool.liquidityUSD) > 0n).length;
+    const provisionalLiquidityStats = createNetworkLiquidityStats(poolLiquidityUSD, '0', activePools, 0, assets.size);
+    const analytics = await this.buildAnalytics(
+      timestamp,
+      assets,
+      prices,
+      poolStates,
+      provisionalLiquidityStats,
+      indexedAccountCount
     );
-    documents.push(...(await this.createPoolDocuments(poolStates, analytics, apyByPool, effectiveBlockHeight, timestamp, includeSnapshots)));
-    documents.push(
-      ...(await this.createOrderBookDocuments(
+    this.mergeLimitOrderStorage(orderBookLimitOrders, assets, prices, analytics);
+    const orderBookLiquidityUSD = scaledToString(
+      [...analytics.orderBookActiveReserves.values()].reduce((sum, reserves) => sum + reserves.liquidityUSD, 0n),
+      8
+    );
+    const activeOrderBooks = [...analytics.orderBookActiveReserves.values()].filter((reserves) => reserves.liquidityUSD > 0n).length;
+    const liquidityStats = createNetworkLiquidityStats(poolLiquidityUSD, orderBookLiquidityUSD, activePools, activeOrderBooks, assets.size);
+    this.networkLiquidityStats = liquidityStats;
+    this.applyNetworkLiquidityStats(analytics, liquidityStats);
+    const apyByPool = this.derivePoolApy(poolStates, farmingPoolFarmers, effectiveBlockHeight, prices);
+    const [assetDocuments, poolDocuments, orderBookDocuments] = await Promise.all([
+      this.createAssetDocuments(assets, prices, assetPoolLiquidity, analytics, effectiveBlockHeight, timestamp, includeSnapshots),
+      this.createPoolDocuments(poolStates, analytics, apyByPool, effectiveBlockHeight, timestamp, includeSnapshots),
+      this.createOrderBookDocuments(
         orderBooks,
         orderBookBids,
         orderBookAsks,
@@ -1522,16 +1771,28 @@ export class ChainIndexer {
         effectiveBlockHeight,
         timestamp,
         includeSnapshots
-      ))
-    );
-    documents.push(...this.createNetworkSnapshotDocuments(analytics, effectiveBlockHeight, timestamp, includeSnapshots));
-    documents.push(...this.createStakingDocuments(nominators, effectiveBlockHeight, timestamp));
-    documents.push(...this.createReferralDocuments(referrers, effectiveBlockHeight, timestamp));
-    documents.push(...(await this.createVaultDocuments(cdpEntries, effectiveBlockHeight, timestamp)));
-    documents.push(...this.createAccountLiquidityDocuments(poolProviders, poolStates, assets, prices, effectiveBlockHeight, timestamp));
-    documents.push(...this.createUpdateStreams(poolStates, assets, prices, apyByPool, effectiveBlockHeight, timestamp));
+      ),
+    ]);
+    const marketDocuments: IndexerDocument[] = [
+      ...assetDocuments,
+      ...poolDocuments,
+      ...orderBookDocuments,
+      ...this.createNetworkSnapshotDocuments(analytics, effectiveBlockHeight, timestamp, includeSnapshots),
+      ...this.createUpdateStreams(poolStates, assets, prices, apyByPool, effectiveBlockHeight, timestamp),
+    ];
 
-    await this.repository.upsertMany(documents);
+    await this.repository.upsertMany(marketDocuments);
+
+    const [poolProviders, nominators, referrers, cdpEntries] = await auxiliaryStoragePromise;
+    const vaultDocuments = await this.createVaultDocuments(cdpEntries, effectiveBlockHeight, timestamp);
+    const auxiliaryDocuments: IndexerDocument[] = [
+      ...this.createStakingDocuments(nominators, effectiveBlockHeight, timestamp),
+      ...this.createReferralDocuments(referrers, effectiveBlockHeight, timestamp),
+      ...vaultDocuments,
+      ...this.createAccountLiquidityDocuments(poolProviders, poolStates, assets, prices, effectiveBlockHeight, timestamp),
+    ];
+
+    await this.repository.upsertMany(auxiliaryDocuments);
   }
 
   private derivePrices(
@@ -1647,12 +1908,25 @@ export class ChainIndexer {
     return documents;
   }
 
+  private async countIndexedAccounts(): Promise<number> {
+    if (!this.repository.query) {
+      return (await this.repository.list(collection('accounts'))).length;
+    }
+
+    const result = await this.repository.query(collection('accounts'), {
+      first: 0,
+      includeTotalCount: true,
+    });
+
+    return result.totalCount ?? 0;
+  }
+
   private async buildAnalytics(
     timestamp: number,
     assets: Map<string, AssetInfo>,
     prices: Map<string, bigint>,
     pools: PoolState[],
-    networkLiquidityUSD: string,
+    liquidityStats: NetworkLiquidityStats,
     chainAccountCount: number
   ): Promise<Analytics> {
     const analytics = emptyAnalytics();
@@ -1806,23 +2080,15 @@ export class ChainIndexer {
       for (const type of AGGREGATE_SNAPSHOT_TYPES) {
         if (eventTimestamp < timestamp - SNAPSHOT_WINDOW_SECONDS[type]) continue;
 
-        const current =
-          analytics.network.get(type) ?? {
-            accounts: chainAccountCount,
-            transactions: 0,
-            fees: 0n,
-            liquidityUSD: networkLiquidityUSD,
-            volumeUSD: 0n,
-            bridgeIncomingTransactions: 0,
-            bridgeOutgoingTransactions: 0,
-          };
+        const current = analytics.network.get(type) ?? newNetworkAggregate(chainAccountCount, liquidityStats);
         current.transactions += Number(document.data.transactions ?? 0);
         current.fees += codecToBigInt(document.data.fees ?? 0);
         current.volumeUSD += decimalStringToScaled(document.data.volumeUSD ?? '0');
+        current.swaps += Number(document.data.swaps ?? 0);
         current.bridgeIncomingTransactions += Number(document.data.bridgeIncomingTransactions ?? 0);
         current.bridgeOutgoingTransactions += Number(document.data.bridgeOutgoingTransactions ?? 0);
         current.accounts = Math.max(current.accounts, chainAccountCount);
-        current.liquidityUSD = networkLiquidityUSD;
+        Object.assign(current, liquidityStats);
         analytics.network.set(type, current);
       }
     }
@@ -1898,19 +2164,22 @@ export class ChainIndexer {
 
     for (const type of AGGREGATE_SNAPSHOT_TYPES) {
       if (!analytics.network.has(type)) {
-        analytics.network.set(type, {
-          accounts: chainAccountCount,
-          transactions: 0,
-          fees: 0n,
-          liquidityUSD: networkLiquidityUSD,
-          volumeUSD: 0n,
-          bridgeIncomingTransactions: 0,
-          bridgeOutgoingTransactions: 0,
-        });
+        analytics.network.set(type, newNetworkAggregate(chainAccountCount, liquidityStats));
       }
     }
 
     return analytics;
+  }
+
+  /**
+   * Refreshes stock metrics after order-book storage has been merged into the
+   * in-memory analytics snapshot. Flow metrics such as volume and fees stay
+   * aggregated from historical block snapshots.
+   */
+  private applyNetworkLiquidityStats(analytics: Analytics, liquidityStats: NetworkLiquidityStats): void {
+    for (const aggregate of analytics.network.values()) {
+      Object.assign(aggregate, liquidityStats);
+    }
   }
 
   private async createAssetDocuments(
@@ -2307,15 +2576,7 @@ export class ChainIndexer {
 
     return AGGREGATE_SNAPSHOT_TYPES.map((type) => {
       const aggregate =
-        analytics.network.get(type) ?? {
-          accounts: 0,
-          transactions: 0,
-          fees: 0n,
-          liquidityUSD: '0',
-          volumeUSD: 0n,
-          bridgeIncomingTransactions: 0,
-          bridgeOutgoingTransactions: 0,
-        };
+        analytics.network.get(type) ?? newNetworkAggregate(0, this.networkLiquidityStats);
       const id = snapshotId('network', 'all', type, timestamp, blockHeight);
 
       return {
@@ -2331,7 +2592,13 @@ export class ChainIndexer {
           transactions: aggregate.transactions,
           fees: aggregate.fees.toString(),
           liquidityUSD: aggregate.liquidityUSD,
+          poolLiquidityUSD: aggregate.poolLiquidityUSD,
+          orderBookLiquidityUSD: aggregate.orderBookLiquidityUSD,
           volumeUSD: scaledToString(aggregate.volumeUSD, 8),
+          swaps: aggregate.swaps,
+          activePools: aggregate.activePools,
+          activeOrderBooks: aggregate.activeOrderBooks,
+          listedAssets: aggregate.listedAssets,
           bridgeIncomingTransactions: aggregate.bridgeIncomingTransactions,
           bridgeOutgoingTransactions: aggregate.bridgeOutgoingTransactions,
         },

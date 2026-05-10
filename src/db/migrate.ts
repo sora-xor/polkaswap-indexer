@@ -41,7 +41,19 @@ export async function migrate(databaseUrl = readConfig().databaseUrl): Promise<v
       'create index if not exists indexer_documents_collection_account_id_idx on indexer_documents(collection, (data->>\'accountId\'));'
     );
     await pool.query(
+      'create index if not exists indexer_documents_collection_address_idx on indexer_documents(collection, (data->>\'address\'));'
+    );
+    await pool.query(
       'create index if not exists indexer_documents_collection_order_book_id_idx on indexer_documents(collection, (data->>\'orderBookId\'));'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_asset_type_timestamp_id_idx on indexer_documents(collection, (data->>\'assetId\'), (data->>\'type\'), timestamp, id);'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_pool_type_timestamp_id_idx on indexer_documents(collection, (data->>\'poolId\'), (data->>\'type\'), timestamp, id);'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_order_book_type_timestamp_id_idx on indexer_documents(collection, (data->>\'orderBookId\'), (data->>\'type\'), timestamp, id);'
     );
     await pool.query(
       'create index if not exists indexer_documents_collection_status_idx on indexer_documents(collection, (data->>\'status\'));'
@@ -66,6 +78,9 @@ export async function migrate(databaseUrl = readConfig().databaseUrl): Promise<v
     );
     await pool.query(
       'create index if not exists indexer_documents_collection_volume_week_usd_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'volumeWeekUSD\', \'\'), \'0\'))::numeric), id);'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_amount_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'amount\', \'\'), \'0\'))::numeric), id);'
     );
   } finally {
     await pool.end();

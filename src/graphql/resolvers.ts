@@ -101,6 +101,135 @@ const buildConnection = (items: Record<string, unknown>[], args: ConnectionArgs)
   };
 };
 
+const activeAssetFilter = {
+  or: [{ liquidity: { greaterThan: '0' } }, { liquidityBooks: { greaterThan: '0' } }],
+};
+
+const activePoolFilter = {
+  baseAssetReserves: { greaterThan: '0' },
+  targetAssetReserves: { greaterThan: '0' },
+};
+
+const toTimestamp = (document: IndexerDocument): number => {
+  const value = Number(document.timestamp ?? document.data.timestamp ?? 0);
+
+  return Number.isFinite(value) ? value : 0;
+};
+
+const latestByTimestamp = (documents: IndexerDocument[]): IndexerDocument | null => {
+  return (
+    [...documents].sort((left, right) => {
+      const timestampDiff = toTimestamp(right) - toTimestamp(left);
+      if (timestampDiff !== 0) return timestampDiff;
+
+      return right.id.localeCompare(left.id);
+    })[0] ?? null
+  );
+};
+
+const queryCount = async (
+  repository: IndexerRepository,
+  collectionName: IndexerCollection,
+  filter?: Record<string, unknown>
+): Promise<number> => {
+  if (repository.query) {
+    const result = await repository.query(collectionName, {
+      first: 0,
+      filter,
+      includeTotalCount: true,
+    });
+
+    return result.totalCount ?? 0;
+  }
+
+  const documents = await repository.list(collectionName);
+  return documents.filter((document) => matchesFilter(document.data, filter)).length;
+};
+
+const queryFirst = async (
+  repository: IndexerRepository,
+  collectionName: IndexerCollection,
+  args: ConnectionArgs
+): Promise<IndexerDocument | null> => {
+  if (repository.query) {
+    const result = await repository.query(collectionName, {
+      ...args,
+      first: 1,
+      includeTotalCount: false,
+    });
+
+    return result.items[0] ?? null;
+  }
+
+  const documents = await repository.list(collectionName);
+  const connection = buildConnection(
+    documents.map((document) => document.data),
+    { ...args, first: 1 }
+  );
+  const node = connection.edges[0]?.node;
+  if (!node) return null;
+
+  return documents.find((document) => document.data === node || document.id === node.id) ?? null;
+};
+
+const latestNetworkSnapshot = async (repository: IndexerRepository): Promise<IndexerDocument | null> => {
+  if (!repository.query) {
+    const documents = await repository.list(collection('networkSnapshots'));
+    const latestDay = latestByTimestamp(
+      documents.filter((document) => matchesFilter(document.data, { type: { equalTo: 'DAY' } }))
+    );
+
+    if (latestDay) return latestDay;
+
+    const latestDefault = latestByTimestamp(
+      documents.filter((document) => matchesFilter(document.data, { type: { equalTo: 'DEFAULT' } }))
+    );
+
+    return latestDefault ?? latestByTimestamp(documents);
+  }
+
+  const latestDay = await queryFirst(repository, collection('networkSnapshots'), {
+    orderBy: ['TIMESTAMP_DESC'],
+    filter: { type: { equalTo: 'DAY' } },
+  });
+
+  if (latestDay) return latestDay;
+
+  const latestDefault = await queryFirst(repository, collection('networkSnapshots'), {
+    orderBy: ['TIMESTAMP_DESC'],
+    filter: { type: { equalTo: 'DEFAULT' } },
+  });
+
+  if (latestDefault) return latestDefault;
+
+  return queryFirst(repository, collection('networkSnapshots'), { orderBy: ['TIMESTAMP_DESC'] });
+};
+
+/**
+ * Builds the compact data package used by the Explore landing header and tabs.
+ * Values stay derived from existing SubQuery-compatible documents so the API
+ * remains immediately usable with already indexed data.
+ */
+const exploreStatsResolver = async (_parent: unknown, _args: unknown, context: Context) => {
+  const [tokenCount, poolCount, orderBookCount, networkSnapshot] = await Promise.all([
+    queryCount(context.repository, collection('assets'), activeAssetFilter),
+    queryCount(context.repository, collection('poolXYKs'), activePoolFilter),
+    queryCount(context.repository, collection('orderBooks')),
+    latestNetworkSnapshot(context.repository),
+  ]);
+  const networkData = networkSnapshot?.data ?? {};
+
+  return {
+    id: 'global',
+    tokenCount,
+    poolCount,
+    orderBookCount,
+    liquidityUSD: String(networkData.liquidityUSD ?? '0'),
+    volumeDayUSD: String(networkData.volumeUSD ?? '0'),
+    updatedAtTimestamp: networkSnapshot ? toTimestamp(networkSnapshot) : null,
+  };
+};
+
 const connectionResolver =
   (collectionName: IndexerCollection) =>
   async (_parent: unknown, args: ConnectionArgs, context: Context, info?: GraphQLResolveInfo) => {
@@ -255,6 +384,7 @@ export function createSchema(): GraphQLSchema {
         orderBookOrders: connectionResolver(collection('orderBookOrders')),
         orderBookSnapshots: connectionResolver(collection('orderBookSnapshots')),
         historyElements: connectionResolver(collection('historyElements')),
+        xorBurns: connectionResolver(collection('xorBurns')),
         referrerRewards: connectionResolver(collection('referrerRewards')),
         stakingStakers: connectionResolver(collection('stakingStakers')),
         vaults: connectionResolver(collection('vaults')),
@@ -264,6 +394,7 @@ export function createSchema(): GraphQLSchema {
         accountMeta: async (_parent: unknown, args: { id: string }, context: Context) =>
           (await context.repository.get(collection('accountMeta'), args.id))?.data ?? null,
         accountPointSystems: connectionResolver(collection('accountPointSystems')),
+        exploreStats: exploreStatsResolver,
       },
       HistoryElement: {
         calls: (parent: Record<string, unknown>) => ({
