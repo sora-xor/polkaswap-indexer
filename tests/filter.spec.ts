@@ -48,6 +48,27 @@ describe('GraphQL filter compatibility', () => {
     ).toBe(true);
   });
 
+  it('matches stats page direct snapshot filters', () => {
+    expect(
+      matchesFilter(
+        { type: 'HOUR', timestamp: 150 },
+        {
+          type: { equalTo: 'HOUR' },
+          timestamp: { lessThanOrEqualTo: 200, greaterThanOrEqualTo: 120 },
+        }
+      )
+    ).toBe(true);
+    expect(
+      matchesFilter(
+        { type: 'DAY', timestamp: 150 },
+        {
+          type: { equalTo: 'HOUR' },
+          timestamp: { lessThanOrEqualTo: 200, greaterThanOrEqualTo: 120 },
+        }
+      )
+    ).toBe(false);
+  });
+
   it('requires every requested value for array contains filters', () => {
     expect(
       matchesFilter(

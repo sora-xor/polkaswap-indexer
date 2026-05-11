@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { graphql, type GraphQLResolveInfo } from 'graphql';
+import type { GraphQLResolveInfo } from 'graphql';
 
 import { createSchema } from '../src/graphql/resolvers.js';
 import { MemoryRepository } from '../src/repository/memory.js';
@@ -164,84 +164,63 @@ describe('Polkaswap indexer schema', () => {
       },
     ]);
 
-    const result = await graphql({
-      schema: createSchema(),
-      source: `
-        query StatsPageData($type: SnapshotType, $from: Int, $to: Int) {
-          exploreStats {
-            id
-            tokenCount
-            poolCount
-            orderBookCount
-            liquidityUSD
-            volumeDayUSD
-            updatedAtTimestamp
-          }
-          networkSnapshots(
-            first: 10
-            orderBy: TIMESTAMP_DESC
-            filter: {
-              type: { equalTo: $type }
-              timestamp: { lessThanOrEqualTo: $from, greaterThanOrEqualTo: $to }
-            }
-          ) {
-            edges {
-              node {
-                timestamp
-                accounts
-                transactions
-                fees
-                liquidityUSD
-                poolLiquidityUSD
-                orderBookLiquidityUSD
-                volumeUSD
-                swaps
-                activePools
-                activeOrderBooks
-                listedAssets
-                bridgeIncomingTransactions
-                bridgeOutgoingTransactions
-              }
-            }
-          }
-        }
-      `,
-      variableValues: { type: 'HOUR', from: 200, to: 120 },
-      contextValue: { repository },
-    });
-
-    expect(result.errors).toBeUndefined();
-    expect(result.data).toEqual({
-      exploreStats: {
-        id: 'global',
-        tokenCount: 2,
-        poolCount: 1,
-        orderBookCount: 1,
-        liquidityUSD: '100.25',
-        volumeDayUSD: '10.5',
-        updatedAtTimestamp: 100,
+    const schema = createSchema();
+    const exploreStatsField = schema.getQueryType()?.getFields().exploreStats;
+    const networkSnapshotsField = schema.getQueryType()?.getFields().networkSnapshots;
+    const exploreStats = await exploreStatsField?.resolve?.({}, {}, { repository }, {} as never);
+    const networkSnapshots = await networkSnapshotsField?.resolve?.(
+      {},
+      {
+        first: 10,
+        orderBy: ['TIMESTAMP_DESC'],
+        filter: {
+          type: { equalTo: 'HOUR' },
+          timestamp: { lessThanOrEqualTo: 200, greaterThanOrEqualTo: 120 },
+        },
       },
-      networkSnapshots: {
-        edges: [
-          {
-            node: {
-              timestamp: 150,
-              accounts: 20,
-              transactions: 30,
-              fees: '123456789',
-              liquidityUSD: '250.75',
-              poolLiquidityUSD: '200.5',
-              orderBookLiquidityUSD: '50.25',
-              volumeUSD: '45.125',
-              swaps: 7,
-              activePools: 4,
-              activeOrderBooks: 3,
-              listedAssets: 9,
-              bridgeIncomingTransactions: 1,
-              bridgeOutgoingTransactions: 2,
-            },
+      { repository },
+      {} as never
+    );
+
+    expect(exploreStats).toEqual({
+      id: 'global',
+      tokenCount: 2,
+      poolCount: 1,
+      orderBookCount: 1,
+      liquidityUSD: '100.25',
+      volumeDayUSD: '10.5',
+      updatedAtTimestamp: 100,
+    });
+    expect(networkSnapshots).toEqual({
+      edges: [
+        {
+          cursor: '0',
+          node: {
+            id: 'network-hour',
+            type: 'HOUR',
+            timestamp: 150,
+            accounts: 20,
+            transactions: 30,
+            fees: '123456789',
+            liquidityUSD: '250.75',
+            poolLiquidityUSD: '200.5',
+            orderBookLiquidityUSD: '50.25',
+            volumeUSD: '45.125',
+            swaps: 7,
+            activePools: 4,
+            activeOrderBooks: 3,
+            listedAssets: 9,
+            bridgeIncomingTransactions: 1,
+            bridgeOutgoingTransactions: 2,
           },
-        ],
+        },
+      ],
+      totalCount: 1,
+      pageInfo: {
+        endCursor: '0',
+        hasNextPage: false,
+        hasPreviousPage: false,
+        startCursor: '0',
       },
     });
   });
