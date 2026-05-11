@@ -7,6 +7,8 @@ const SCALE = 10n ** 18n;
 const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000';
 const PSWAP = '0x0200050000000000000000000000000000000000000000000000000000000000';
 const DUST_DAI = '0x00a0e746a66b290bd29cbffecc710aefacb98840937229e1e847590006fa0696';
+const ETH = '0x0200070000000000000000000000000000000000000000000000000000000000';
+const XSTUSD = '0x0200080000000000000000000000000000000000000000000000000000000000';
 const KUSD = '0x02000c0000000000000000000000000000000000000000000000000000000000';
 
 const eventRecord = (section: string, method: string, data: Record<string, unknown>) => ({
@@ -80,6 +82,83 @@ describe('ChainIndexer price derivation', () => {
 
     expect(prices.get(XOR)).toBeGreaterThan(5n * SCALE);
     expect(prices.get(XOR)).toBeLessThan(7n * SCALE);
+  });
+
+  it('does not derive global prices from dust or low-liquidity pools', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      derivePrices: (
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        pools: Array<{ baseAssetId: string; targetAssetId: string; baseAssetReserves: bigint; targetAssetReserves: bigint }>
+      ) => Map<string, bigint>;
+    };
+    const dustAsset = '0x0300000000000000000000000000000000000000000000000000000000000000';
+    const lowLiquidityAsset = '0x0400000000000000000000000000000000000000000000000000000000000000';
+
+    const prices = indexer.derivePrices(
+      new Map([
+        [KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 0n }],
+        [XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }],
+        [dustAsset, { id: dustAsset, symbol: 'DUST', name: 'Dust token', decimals: 18, supply: 0n }],
+        [lowLiquidityAsset, { id: lowLiquidityAsset, symbol: 'LOW', name: 'Low liquidity token', decimals: 18, supply: 0n }],
+      ]),
+      [
+        {
+          baseAssetId: KUSD,
+          targetAssetId: XOR,
+          baseAssetReserves: 200n * SCALE,
+          targetAssetReserves: 100n * SCALE,
+        },
+        {
+          baseAssetId: XOR,
+          targetAssetId: dustAsset,
+          baseAssetReserves: 10n * SCALE,
+          targetAssetReserves: 1n,
+        },
+        {
+          baseAssetId: XOR,
+          targetAssetId: lowLiquidityAsset,
+          baseAssetReserves: 10n * SCALE,
+          targetAssetReserves: SCALE,
+        },
+      ]
+    );
+
+    expect(prices.get(XOR)).toBe(2n * SCALE);
+    expect(prices.has(dustAsset)).toBe(false);
+    expect(prices.has(lowLiquidityAsset)).toBe(false);
+  });
+
+  it('prefers deeper target reserves over a shallow pool with more stable-side liquidity', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      derivePrices: (
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        pools: Array<{ baseAssetId: string; targetAssetId: string; baseAssetReserves: bigint; targetAssetReserves: bigint }>
+      ) => Map<string, bigint>;
+    };
+
+    const prices = indexer.derivePrices(
+      new Map([
+        [ETH, { id: ETH, symbol: 'ETH', name: 'Ether', decimals: 18, supply: 0n }],
+        [XSTUSD, { id: XSTUSD, symbol: 'XSTUSD', name: 'SORA Synthetic USD', decimals: 18, supply: 0n }],
+        [KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 0n }],
+      ]),
+      [
+        {
+          baseAssetId: XSTUSD,
+          targetAssetId: ETH,
+          baseAssetReserves: 5_000n * SCALE,
+          targetAssetReserves: SCALE / 50n,
+        },
+        {
+          baseAssetId: KUSD,
+          targetAssetId: ETH,
+          baseAssetReserves: 2_000n * SCALE,
+          targetAssetReserves: SCALE,
+        },
+      ]
+    );
+
+    expect(prices.get(ETH)).toBe(2_000n * SCALE);
   });
 
   it('uses the largest USD leg for transaction volume', () => {
@@ -305,6 +384,105 @@ describe('ChainIndexer price derivation', () => {
       id: 'chainState',
       block: 25_900_001,
       data: JSON.stringify({ lastIndexedBlock: 25_900_001 }),
+    });
+  });
+
+  it('backfills compact XOR burn documents without rewinding chain state', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      backfillXorBurns: (finalizedBlock: number) => Promise<void>;
+    };
+    const burnBlock = 25_043_003;
+    const chainStateBlock = 26_000_000;
+    const nexusRecipient = 'sora-nexus-account';
+    const burnCall = {
+      section: 'assets',
+      method: 'burn',
+      args: [XOR, '10000000000000000000'],
+      meta: { args: [{ name: 'assetId' }, { name: 'amount' }] },
+    };
+    const remarkCall = {
+      section: 'system',
+      method: 'remark',
+      args: [
+        `0x${Buffer.from(
+          JSON.stringify({ type: 'soraNexusXorClaim', version: 1, recipient: nexusRecipient }),
+          'utf8'
+        ).toString('hex')}`,
+      ],
+      meta: { args: [{ name: 'remark' }] },
+    };
+
+    await repository.upsert({
+      collection: 'updatesStreams',
+      id: 'chainState',
+      blockHeight: chainStateBlock,
+      timestamp: 1,
+      data: {
+        id: 'chainState',
+        block: chainStateBlock,
+        data: JSON.stringify({ lastIndexedBlock: chainStateBlock }),
+      },
+    });
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlockHash: async (block: number) => `hash-${block}`,
+          getBlock: async () => ({
+            block: {
+              extrinsics: [
+                {
+                  hash: { toString: () => '0xbackfilledburn' },
+                  method: {
+                    section: 'utility',
+                    method: 'batchAll',
+                    args: [[burnCall, remarkCall]],
+                    meta: { args: [{ name: 'calls' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async (hash: string) =>
+              hash === `hash-${burnBlock}`
+                ? [eventRecord('assets', 'Burn', { address: 'alice', assetId: XOR, amount: '10000000000000000000' })]
+                : [],
+          },
+        },
+      },
+    };
+
+    await indexer.backfillXorBurns(burnBlock + 1);
+
+    const xorBurn = await repository.get('xorBurns', '0xbackfilledburn');
+    const chainState = await repository.get('updatesStreams', 'chainState');
+    const backfillState = await repository.get('updatesStreams', 'xorBurnsBackfill');
+
+    expect(xorBurn?.data).toMatchObject({
+      id: '0xbackfilledburn',
+      address: 'alice',
+      amount: '10',
+      assetId: XOR,
+      blockHeight: burnBlock,
+      txHash: '0xbackfilledburn',
+      nexusRecipient,
+    });
+    expect(chainState?.data).toMatchObject({
+      id: 'chainState',
+      block: chainStateBlock,
+      data: JSON.stringify({ lastIndexedBlock: chainStateBlock }),
+    });
+    expect(backfillState?.data).toMatchObject({
+      id: 'xorBurnsBackfill',
+      block: burnBlock + 1,
+      data: JSON.stringify({ lastIndexedBlock: burnBlock + 1 }),
     });
   });
 

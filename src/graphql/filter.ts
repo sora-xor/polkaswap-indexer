@@ -1,3 +1,5 @@
+import { getOrderField, NUMERIC_ORDER_FIELDS } from './order.js';
+
 export type FilterValue = Record<string, unknown> | null | undefined;
 
 const toComparable = (value: unknown): string | number | boolean | null => {
@@ -100,17 +102,47 @@ export function matchesFilter(item: Record<string, unknown>, filter: FilterValue
   });
 }
 
-const getOrderField = (orderBy: unknown): { field: string; direction: 'asc' | 'desc' } => {
-  const first = Array.isArray(orderBy) ? orderBy[0] : orderBy;
-  const token = String(first ?? 'ID_ASC');
-  const direction = token.endsWith('_DESC') ? 'desc' : 'asc';
-  const rawField = token.replace(/_(ASC|DESC)$/, '').toLowerCase();
-  const parts = rawField.split('_');
-  const field = parts
-    .map((part, index) => (index === 0 ? part : `${part.charAt(0).toUpperCase()}${part.slice(1)}`))
-    .join('');
+/**
+ * Normalizes decimal-like values for exact sorting without converting token
+ * amounts or USD strings to JavaScript floating point numbers.
+ */
+const normalizeDecimal = (value: unknown): { sign: -1 | 0 | 1; integer: string; fraction: string } => {
+  const text = String(value ?? '0').trim();
+  if (!/^-?\d+(\.\d+)?$/.test(text)) return { sign: 0, integer: '0', fraction: '' };
 
-  return { field, direction };
+  const negative = text.startsWith('-');
+  const [integerRaw = '0', fractionRaw = ''] = (negative ? text.slice(1) : text).split('.');
+  const integer = integerRaw.replace(/^0+/, '') || '0';
+  const fraction = fractionRaw.replace(/0+$/, '');
+  const sign = integer === '0' && !fraction ? 0 : negative ? -1 : 1;
+
+  return { sign, integer, fraction };
+};
+
+const compareUnsignedDecimals = (
+  left: { integer: string; fraction: string },
+  right: { integer: string; fraction: string }
+): number => {
+  if (left.integer.length !== right.integer.length) return left.integer.length > right.integer.length ? 1 : -1;
+  if (left.integer !== right.integer) return left.integer > right.integer ? 1 : -1;
+
+  const maxFractionLength = Math.max(left.fraction.length, right.fraction.length);
+  const leftFraction = left.fraction.padEnd(maxFractionLength, '0');
+  const rightFraction = right.fraction.padEnd(maxFractionLength, '0');
+
+  if (leftFraction === rightFraction) return 0;
+  return leftFraction > rightFraction ? 1 : -1;
+};
+
+const compareNumericValues = (left: unknown, right: unknown): number => {
+  const normalizedLeft = normalizeDecimal(left);
+  const normalizedRight = normalizeDecimal(right);
+
+  if (normalizedLeft.sign !== normalizedRight.sign) return normalizedLeft.sign > normalizedRight.sign ? 1 : -1;
+  if (normalizedLeft.sign === 0) return 0;
+
+  const unsignedComparison = compareUnsignedDecimals(normalizedLeft, normalizedRight);
+  return normalizedLeft.sign > 0 ? unsignedComparison : -unsignedComparison;
 };
 
 export function sortDocuments<T extends Record<string, unknown>>(items: T[], orderBy: unknown): T[] {
@@ -127,6 +159,11 @@ export function sortDocuments<T extends Record<string, unknown>>(items: T[], ord
     if (leftNullishRank >= 0 && rightNullishRank >= 0) return leftNullishRank - rightNullishRank;
     if (leftNullishRank >= 0) return factor;
     if (rightNullishRank >= 0) return -factor;
+
+    if (NUMERIC_ORDER_FIELDS.has(field)) {
+      const comparison = compareNumericValues(left, right);
+      return comparison === 0 ? 0 : comparison * factor;
+    }
 
     if (typeof left === 'number' && typeof right === 'number') {
       return left > right ? factor : -factor;

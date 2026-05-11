@@ -4,8 +4,22 @@ import { readConfig } from '../config.js';
 
 const { Pool } = pg;
 
+const NUMERIC_TEXT_PATTERN = "^-?[0-9]+(\\.[0-9]+)?$";
+
+const isSafeJsonField = (field: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(field);
+
+const numericJsonExpression = (field: string): string => {
+  if (!isSafeJsonField(field)) {
+    throw new Error(`Unsupported JSON field in migration index: ${field}`);
+  }
+
+  return `(case when jsonb_typeof(data->'${field}') in ('number', 'string') and nullif(data->>'${field}', '') ~ '${NUMERIC_TEXT_PATTERN}' then (data->>'${field}')::numeric else 0 end)`;
+};
+
 export async function migrate(databaseUrl = readConfig().databaseUrl): Promise<void> {
   const pool = new Pool({ connectionString: databaseUrl });
+  const createNumericIndex = (name: string, field: string) =>
+    pool.query(`create index if not exists ${name} on indexer_documents(collection, ${numericJsonExpression(field)}, id);`);
 
   try {
     await pool.query(`
@@ -58,30 +72,21 @@ export async function migrate(databaseUrl = readConfig().databaseUrl): Promise<v
     await pool.query(
       'create index if not exists indexer_documents_collection_status_idx on indexer_documents(collection, (data->>\'status\'));'
     );
-    await pool.query(
-      'create index if not exists indexer_documents_collection_updated_at_block_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'updatedAtBlock\', \'\'), \'0\'))::numeric), id);'
-    );
-    await pool.query(
-      'create index if not exists indexer_documents_collection_created_at_block_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'createdAtBlock\', \'\'), \'0\'))::numeric), id);'
-    );
-    await pool.query(
-      'create index if not exists indexer_documents_collection_price_change_day_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'priceChangeDay\', \'\'), \'0\'))::numeric), id);'
-    );
-    await pool.query(
-      'create index if not exists indexer_documents_collection_liquidity_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'liquidity\', \'\'), \'0\'))::numeric), id);'
-    );
-    await pool.query(
-      'create index if not exists indexer_documents_collection_liquidity_books_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'liquidityBooks\', \'\'), \'0\'))::numeric), id);'
-    );
-    await pool.query(
-      'create index if not exists indexer_documents_collection_volume_day_usd_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'volumeDayUSD\', \'\'), \'0\'))::numeric), id);'
-    );
-    await pool.query(
-      'create index if not exists indexer_documents_collection_volume_week_usd_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'volumeWeekUSD\', \'\'), \'0\'))::numeric), id);'
-    );
-    await pool.query(
-      'create index if not exists indexer_documents_collection_amount_idx on indexer_documents(collection, ((coalesce(nullif(data->>\'amount\', \'\'), \'0\'))::numeric), id);'
-    );
+    await createNumericIndex('indexer_documents_collection_updated_at_block_idx', 'updatedAtBlock');
+    await createNumericIndex('indexer_documents_collection_created_at_block_idx', 'createdAtBlock');
+    await createNumericIndex('indexer_documents_collection_price_change_day_idx', 'priceChangeDay');
+    await createNumericIndex('indexer_documents_collection_liquidity_idx', 'liquidity');
+    await createNumericIndex('indexer_documents_collection_liquidity_books_idx', 'liquidityBooks');
+    await createNumericIndex('indexer_documents_collection_liquidity_usd_idx', 'liquidityUSD');
+    await createNumericIndex('indexer_documents_collection_price_usd_idx', 'priceUSD');
+    await createNumericIndex('indexer_documents_collection_pool_token_price_usd_idx', 'poolTokenPriceUSD');
+    await createNumericIndex('indexer_documents_collection_price_change_week_idx', 'priceChangeWeek');
+    await createNumericIndex('indexer_documents_collection_volume_day_usd_idx', 'volumeDayUSD');
+    await createNumericIndex('indexer_documents_collection_volume_week_usd_idx', 'volumeWeekUSD');
+    await createNumericIndex('indexer_documents_collection_volume_usd_idx', 'volumeUSD');
+    await createNumericIndex('indexer_documents_collection_base_asset_reserves_idx', 'baseAssetReserves');
+    await createNumericIndex('indexer_documents_collection_target_asset_reserves_idx', 'targetAssetReserves');
+    await createNumericIndex('indexer_documents_collection_amount_idx', 'amount');
   } finally {
     await pool.end();
   }

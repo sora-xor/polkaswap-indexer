@@ -148,15 +148,21 @@ type IndexBlockOptions = {
 };
 
 const CHAIN_STATE_ID = 'chainState';
+const XOR_BURN_BACKFILL_STATE_ID = 'xorBurnsBackfill';
 const DECIMALS = 18;
 const SCALE = 10n ** 18n;
 const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000';
 const SORA_NEXUS_XOR_BURN_REMARK_TYPE = 'soraNexusXorClaim';
+const SORA_XOR_BURN_START_BLOCK = 25_043_003;
+const XOR_BURN_BACKFILL_BATCH_SIZE = 250;
 const PSWAP = '0x0200050000000000000000000000000000000000000000000000000000000000';
 const DAI = '0x0200060000000000000000000000000000000000000000000000000000000000';
 const XSTUSD = '0x0200080000000000000000000000000000000000000000000000000000000000';
 const KUSD = '0x02000c0000000000000000000000000000000000000000000000000000000000';
 const STABLE_ASSET_IDS = new Set([DAI, XSTUSD, KUSD]);
+// Keep shallow pools from becoming global price oracles and inflating Explore TVL.
+const MIN_PRICE_DISCOVERY_LIQUIDITY_USD = 100n * SCALE;
+const MIN_PRICE_DISCOVERY_AMOUNT = 10n ** 16n;
 const SNAPSHOT_TYPES: SnapshotTypeName[] = ['DEFAULT', 'HOUR', 'DAY', 'MONTH', 'BLOCK'];
 const AGGREGATE_SNAPSHOT_TYPES: SnapshotTypeName[] = SNAPSHOT_TYPES.filter((type) => type !== 'BLOCK');
 const SNAPSHOT_WINDOW_SECONDS: Record<SnapshotTypeName, number> = {
@@ -562,6 +568,89 @@ const createXorBurnDocuments = (
     const id = burnCalls.length === 1 ? context.id : `${context.id}-${index}`;
 
     return createDocument(id, context.address || context.history.from, amount, nexusRecipient);
+  });
+};
+
+const getEventExtrinsicIndex = (record: EventRecord): number | null => {
+  if (!record.phase?.isApplyExtrinsic) return null;
+
+  const index = record.phase.asApplyExtrinsic.toNumber();
+  return Number.isFinite(index) ? index : null;
+};
+
+const getXorBurnEvent = (
+  record: EventRecord,
+  assets: Map<string, AssetInfo>
+): { address: string; amount: string; extrinsicIndex: number | null } | null => {
+  if (record.event.section !== 'assets' || record.event.method.toLowerCase() !== 'burn') return null;
+
+  const values = record.event.data.toArray?.() ?? [];
+  const [first, second, third] = values;
+  const [address, assetId, amount] = assetIdToString(first) === XOR ? [second, first, third] : [first, second, third];
+
+  if (!address || !assetId || !amount || assetIdToString(assetId) !== XOR) return null;
+
+  return {
+    address: String(address.toString?.() ?? normalizeValue(address)),
+    amount: codecToDecimalString(amount, assets.get(XOR)?.decimals ?? DECIMALS),
+    extrinsicIndex: getEventExtrinsicIndex(record),
+  };
+};
+
+const getExtrinsicNexusRecipient = (extrinsic: { method: { section: string; method: string; args?: unknown[] } }): string | undefined => {
+  if (extrinsic.method.section !== 'utility' || extrinsic.method.method !== 'batchAll') return undefined;
+
+  const calls = getUtilityCalls(extrinsic);
+  const [burnCall, remarkCall] = calls;
+
+  if (!burnCall || !remarkCall || calls.length !== 2 || !isXorBurnCall(burnCall) || remarkCall.module !== 'system' || remarkCall.method !== 'remark') {
+    return undefined;
+  }
+
+  const remarkArgs = getCallArgs(remarkCall);
+  return parseSoraNexusRecipient(remarkArgs.remark ?? remarkArgs.arg0);
+};
+
+const createXorBurnDocumentsFromEvents = (
+  blockHeight: number,
+  timestamp: number | null,
+  signedBlock: { block: { extrinsics: Array<{ hash?: { toString?: () => string }; method: { section: string; method: string; args?: unknown[] } }> } },
+  events: EventRecord[],
+  assets: Map<string, AssetInfo>
+): IndexerDocument[] => {
+  const extrinsics = signedBlock.block.extrinsics;
+  const burnCountsByTx = new Map<string, number>();
+
+  return events.flatMap((record) => {
+    const burn = getXorBurnEvent(record, assets);
+    if (!burn) return [];
+
+    const extrinsic = burn.extrinsicIndex === null ? undefined : extrinsics[burn.extrinsicIndex];
+    const txHash = extrinsic?.hash?.toString?.();
+    const baseId = txHash || `${blockHeight}-${burn.extrinsicIndex ?? 'event'}`;
+    const txBurnCount = burnCountsByTx.get(baseId) ?? 0;
+    burnCountsByTx.set(baseId, txBurnCount + 1);
+    const id = txBurnCount === 0 ? baseId : `${baseId}-${txBurnCount}`;
+    const nexusRecipient = extrinsic ? getExtrinsicNexusRecipient(extrinsic) : undefined;
+
+    return [
+      {
+        collection: collection('xorBurns'),
+        id,
+        blockHeight,
+        timestamp,
+        data: {
+          id,
+          address: burn.address,
+          amount: burn.amount,
+          assetId: XOR,
+          blockHeight,
+          ...(timestamp === null ? {} : { timestamp }),
+          ...(txHash ? { txHash } : {}),
+          ...(nexusRecipient ? { nexusRecipient } : {}),
+        },
+      },
+    ];
   });
 };
 
@@ -1035,6 +1124,9 @@ export class ChainIndexer {
     await this.refreshDerivedState(finalizedBlock, Math.floor(Date.now() / 1000), true);
     await this.backfill();
     await this.subscribeFinalizedHeads();
+    void this.backfillXorBurns(finalizedBlock).catch((error: unknown) => {
+      console.error('Failed to backfill XOR burn documents', error);
+    });
   }
 
   private async getLastIndexedBlock(): Promise<number> {
@@ -1061,6 +1153,70 @@ export class ChainIndexer {
         data: JSON.stringify({ lastIndexedBlock: block }),
       },
     };
+  }
+
+  private async getXorBurnBackfillBlock(): Promise<number> {
+    const state = await this.repository.get('updatesStreams', XOR_BURN_BACKFILL_STATE_ID);
+    if (!state?.data?.data || typeof state.data.data !== 'string') return SORA_XOR_BURN_START_BLOCK - 1;
+
+    try {
+      const parsed = JSON.parse(state.data.data) as { lastIndexedBlock?: number };
+      return Number(parsed.lastIndexedBlock ?? SORA_XOR_BURN_START_BLOCK - 1);
+    } catch {
+      return SORA_XOR_BURN_START_BLOCK - 1;
+    }
+  }
+
+  private createXorBurnBackfillStateDocument(block: number): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: XOR_BURN_BACKFILL_STATE_ID,
+      blockHeight: block,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: XOR_BURN_BACKFILL_STATE_ID,
+        block,
+        data: JSON.stringify({ lastIndexedBlock: block }),
+      },
+    };
+  }
+
+  private async backfillXorBurns(finalizedBlock: number): Promise<void> {
+    if (!this.api || finalizedBlock < SORA_XOR_BURN_START_BLOCK) return;
+
+    const lastBackfilled = await this.getXorBurnBackfillBlock();
+    const startBlock = Math.max(SORA_XOR_BURN_START_BLOCK, lastBackfilled + 1);
+
+    if (startBlock > finalizedBlock) return;
+
+    for (let block = startBlock; block <= finalizedBlock; block += XOR_BURN_BACKFILL_BATCH_SIZE) {
+      const batchEnd = Math.min(block + XOR_BURN_BACKFILL_BATCH_SIZE - 1, finalizedBlock);
+      const blocks = Array.from({ length: batchEnd - block + 1 }, (_item, index) => block + index);
+      const blockHashes = await Promise.all(blocks.map((blockHeight) => this.api!.rpc.chain.getBlockHash(blockHeight)));
+      const eventsByBlock = (await Promise.all(blockHashes.map((hash) => (this.api!.query as any).system.events.at(hash)))) as EventRecord[][];
+      const burnBlockIndexes = eventsByBlock.flatMap((events, index) =>
+        events.some((event) => getXorBurnEvent(event, this.assetInfos)) ? [index] : []
+      );
+      const signedBlocksByIndex = new Map<number, unknown>();
+
+      if (burnBlockIndexes.length) {
+        const signedBlocks = await Promise.all(burnBlockIndexes.map((index) => this.api!.rpc.chain.getBlock(blockHashes[index])));
+        burnBlockIndexes.forEach((index, resultIndex) => {
+          signedBlocksByIndex.set(index, signedBlocks[resultIndex]);
+        });
+      }
+
+      const documents = burnBlockIndexes.flatMap((index) => {
+        const signedBlock = signedBlocksByIndex.get(index);
+        if (!signedBlock) return [];
+
+        return createXorBurnDocumentsFromEvents(blocks[index], null, signedBlock as any, eventsByBlock[index] ?? [], this.assetInfos);
+      });
+
+      documents.push(this.createXorBurnBackfillStateDocument(batchEnd));
+      await this.repository.upsertMany(documents);
+      console.info(`Backfilled XOR burns through SORA block ${batchEnd}/${finalizedBlock}`);
+    }
   }
 
   private async backfill(): Promise<void> {
@@ -1801,6 +1957,7 @@ export class ChainIndexer {
   ): Map<string, bigint> {
     const prices = new Map<string, bigint>();
     const confidence = new Map<string, bigint>();
+    const depth = new Map<string, bigint>();
     const fixedAssets = new Set<string>();
 
     for (const asset of assets.values()) {
@@ -1827,12 +1984,23 @@ export class ChainIndexer {
         const basePrice = prices.get(pool.baseAssetId);
         const targetPrice = prices.get(pool.targetAssetId);
 
-        const applyCandidate = (assetId: string, price: bigint, candidateConfidence: bigint) => {
-          if (fixedAssets.has(assetId) || price <= 0n || candidateConfidence <= 0n) return;
+        const applyCandidate = (assetId: string, price: bigint, candidateConfidence: bigint, candidateDepth: bigint) => {
+          if (
+            fixedAssets.has(assetId) ||
+            price <= 0n ||
+            candidateConfidence < MIN_PRICE_DISCOVERY_LIQUIDITY_USD ||
+            candidateDepth < MIN_PRICE_DISCOVERY_AMOUNT
+          ) {
+            return;
+          }
 
-          if (candidateConfidence > (confidence.get(assetId) ?? 0n)) {
+          const currentDepth = depth.get(assetId) ?? 0n;
+          const currentConfidence = confidence.get(assetId) ?? 0n;
+
+          if (candidateDepth > currentDepth || (candidateDepth === currentDepth && candidateConfidence > currentConfidence)) {
             prices.set(assetId, price);
             confidence.set(assetId, candidateConfidence);
+            depth.set(assetId, candidateDepth);
             changed = true;
           }
         };
@@ -1843,7 +2011,8 @@ export class ChainIndexer {
           applyCandidate(
             pool.targetAssetId,
             scaledDiv(baseLiquidityUSD, targetNatural),
-            baseConfidence ? baseConfidence < baseLiquidityUSD ? baseConfidence : baseLiquidityUSD : baseLiquidityUSD
+            baseConfidence ? baseConfidence < baseLiquidityUSD ? baseConfidence : baseLiquidityUSD : baseLiquidityUSD,
+            targetNatural
           );
         }
 
@@ -1853,7 +2022,8 @@ export class ChainIndexer {
           applyCandidate(
             pool.baseAssetId,
             scaledDiv(targetLiquidityUSD, baseNatural),
-            targetConfidence ? targetConfidence < targetLiquidityUSD ? targetConfidence : targetLiquidityUSD : targetLiquidityUSD
+            targetConfidence ? targetConfidence < targetLiquidityUSD ? targetConfidence : targetLiquidityUSD : targetLiquidityUSD,
+            baseNatural
           );
         }
       }

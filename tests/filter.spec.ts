@@ -117,6 +117,19 @@ describe('GraphQL filter compatibility', () => {
     expect(result.map((item) => item.id)).toEqual(['b', 'c', 'a']);
   });
 
+  it('sorts USD acronym fields numerically', () => {
+    const result = sortDocuments(
+      [
+        { id: 'low', liquidityUSD: '7.5' },
+        { id: 'high', liquidityUSD: '100' },
+        { id: 'middle', liquidityUSD: '20' },
+      ],
+      ['LIQUIDITY_USD_DESC']
+    );
+
+    expect(result.map((item) => item.id)).toEqual(['high', 'middle', 'low']);
+  });
+
   it('defaults to id ordering without mutating the input array', () => {
     const items = [{ id: 'b' }, { id: 'a' }, { id: 'c' }];
     const result = sortDocuments(items, undefined);

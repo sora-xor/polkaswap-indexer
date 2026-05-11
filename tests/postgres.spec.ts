@@ -127,13 +127,75 @@ describe('PostgresRepository', () => {
       '500',
       'history-9',
     ]);
-    expect(String(selectSql)).toContain("order by coalesce(nullif(data->>'updatedAtBlock', ''), '0')::numeric desc, id desc");
+    expect(String(selectSql)).toContain("jsonb_typeof(data->'updatedAtBlock') in ('number', 'string')");
+    expect(String(selectSql)).toContain("then (data->>'updatedAtBlock')::numeric else 0 end) desc, id desc");
     expect(selectValues).toEqual([...countValues, 10, 0]);
     expect(result).toEqual({
       items: [row],
       totalCount: 2,
       pageStart: 0,
       hasNextPage: true,
+      hasPreviousPage: false,
+    });
+  });
+
+  it('orders USD acronym fields against the stored JSON key', async () => {
+    const row = {
+      collection: 'poolXYKs',
+      id: 'pool-a',
+      data: { id: 'pool-a', liquidityUSD: '100' },
+    } satisfies IndexerDocument;
+    mocks.pool.query.mockResolvedValueOnce({ rows: [row] });
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    const result = await repository.query('poolXYKs', {
+      first: 1,
+      orderBy: ['LIQUIDITY_USD_DESC'],
+      includeTotalCount: false,
+    });
+
+    expect(mocks.pool.query).toHaveBeenCalledTimes(1);
+    expect(String(mocks.pool.query.mock.calls[0]?.[0])).toContain(
+      "jsonb_typeof(data->'liquidityUSD') in ('number', 'string')"
+    );
+    expect(String(mocks.pool.query.mock.calls[0]?.[0])).toContain(
+      "then (data->>'liquidityUSD')::numeric else 0 end) desc, id desc"
+    );
+    expect(result.items).toEqual([row]);
+  });
+
+  it('builds SQL for stats page network snapshot filters', async () => {
+    const row = {
+      collection: 'networkSnapshots',
+      id: 'network-day-200',
+      timestamp: 200,
+      data: { id: 'network-day-200', type: 'DAY', timestamp: 200, liquidityUSD: '250.75', volumeUSD: '45.125' },
+    } satisfies IndexerDocument;
+    mocks.pool.query.mockResolvedValueOnce({ rows: [row] });
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    const result = await repository.query('networkSnapshots', {
+      first: 2,
+      orderBy: ['TIMESTAMP_DESC'],
+      filter: {
+        type: { equalTo: 'DAY' },
+        timestamp: { lessThanOrEqualTo: 300, greaterThanOrEqualTo: 100 },
+      },
+      includeTotalCount: false,
+    });
+
+    expect(mocks.pool.query).toHaveBeenCalledTimes(1);
+    const [sql, values] = mocks.pool.query.mock.calls[0] ?? [];
+    expect(String(sql)).toContain("data->>'type' = $2");
+    expect(String(sql)).toContain('timestamp <= $3::bigint');
+    expect(String(sql)).toContain('timestamp >= $4::bigint');
+    expect(String(sql)).toContain('order by timestamp desc, id desc');
+    expect(values).toEqual(['networkSnapshots', 'DAY', '300', '100', 3, 0]);
+    expect(result).toEqual({
+      items: [row],
+      totalCount: null,
+      pageStart: 0,
+      hasNextPage: false,
       hasPreviousPage: false,
     });
   });

@@ -1,5 +1,7 @@
 import pg from 'pg';
 
+import { getOrderField, NUMERIC_ORDER_FIELDS } from '../graphql/order.js';
+
 import type {
   IndexerCollection,
   IndexerDocument,
@@ -10,24 +12,13 @@ import type {
 
 const { Pool } = pg;
 
+const NUMERIC_TEXT_PATTERN = "^-?[0-9]+(\\.[0-9]+)?$";
+
 const afterToOffset = (after: RepositoryQueryArgs['after']): number => {
   if (after === null || after === undefined || after === '') return 0;
 
   const parsed = Number(after);
   return Number.isFinite(parsed) ? parsed + 1 : 0;
-};
-
-const getOrderField = (orderBy: unknown): { field: string; direction: 'asc' | 'desc' } => {
-  const first = Array.isArray(orderBy) ? orderBy[0] : orderBy;
-  const token = String(first ?? 'ID_ASC');
-  const direction = token.endsWith('_DESC') ? 'desc' : 'asc';
-  const rawField = token.replace(/_(ASC|DESC)$/, '').toLowerCase();
-  const parts = rawField.split('_');
-  const field = parts
-    .map((part, index) => (index === 0 ? part : `${part.charAt(0).toUpperCase()}${part.slice(1)}`))
-    .join('');
-
-  return { field, direction };
 };
 
 const isSafeJsonField = (field: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(field);
@@ -59,20 +50,6 @@ const sqlJsonValue = (field: string): string => {
   return `data->'${field}'`;
 };
 
-const NUMERIC_ORDER_FIELDS = new Set([
-  'timestamp',
-  'blockHeight',
-  'updatedAtBlock',
-  'createdAtBlock',
-  'dexId',
-  'orderId',
-  'liquidity',
-  'liquidityBooks',
-  'priceChangeDay',
-  'volumeDayUSD',
-  'volumeWeekUSD',
-  'amount',
-]);
 const UPSERT_BATCH_SIZE = 1_000;
 
 const sqlNumericField = (field: string): string | null => {
@@ -80,7 +57,7 @@ const sqlNumericField = (field: string): string | null => {
   if (nativeExpression) return nativeExpression;
   if (!NUMERIC_ORDER_FIELDS.has(field)) return null;
 
-  return `coalesce(nullif(${sqlJsonField(field)}, ''), '0')::numeric`;
+  return `(case when jsonb_typeof(data->'${field}') in ('number', 'string') and nullif(${sqlJsonField(field)}, '') ~ '${NUMERIC_TEXT_PATTERN}' then (${sqlJsonField(field)})::numeric else 0 end)`;
 };
 
 const dedupeDocuments = (documents: IndexerDocument[]): IndexerDocument[] => {

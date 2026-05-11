@@ -37,8 +37,13 @@ SOLSWAP burn campaign history used by the burn page stats:
 yarn seed:swap-chart
 ```
 
-The UI should point `POLKASWAP_INDEXER_ENDPOINT` at the hosted GraphQL URL, for
-example `https://indexer.example.com/graphql`.
+The UI should point `POLKASWAP_INDEXER_ENDPOINT` at the hosted GraphQL URL:
+`https://pi.soramitsu.io/graphql`.
+
+Explore views rely on `exploreStats` plus filtered `assets` and `poolXYKs`
+connections. Keep the migration indexes current before serving production
+traffic so count and order-by queries on liquidity, volume, price, and pool
+reserves stay fast.
 
 ## Data Model
 
@@ -57,6 +62,9 @@ The chain worker reads finalized SORA blocks for transaction history and uses
 SORA storage refreshes to maintain the current asset, pool, order-book, vault,
 referral, staking, account-liquidity, snapshot, and stream collections. Historical
 backfill starts at `CHAIN_START_BLOCK` and resumes from the stored chain state.
+SOLSWAP burn stats are backfilled separately into `xorBurns` from block
+`25,043,003`; progress is stored in the `xorBurnsBackfill` update stream so
+redeploys resume without rewinding normal chain indexing.
 
 ## Production Notes
 

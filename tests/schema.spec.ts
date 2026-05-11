@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { GraphQLResolveInfo } from 'graphql';
+import { graphql, type GraphQLResolveInfo } from 'graphql';
 
 import { createSchema } from '../src/graphql/resolvers.js';
 import { MemoryRepository } from '../src/repository/memory.js';
@@ -96,6 +96,153 @@ describe('Polkaswap indexer schema', () => {
       liquidityUSD: '250.75',
       volumeDayUSD: '45.125',
       updatedAtTimestamp: 200,
+    });
+  });
+
+  it('serves the stats page GraphQL data from network snapshots', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'assets',
+        id: 'asset-a',
+        data: { id: 'asset-a', liquidity: '10', liquidityBooks: '0' },
+      },
+      {
+        collection: 'assets',
+        id: 'asset-b',
+        data: { id: 'asset-b', liquidity: '0', liquidityBooks: '5' },
+      },
+      {
+        collection: 'assets',
+        id: 'asset-c',
+        data: { id: 'asset-c', liquidity: '0', liquidityBooks: '0' },
+      },
+      {
+        collection: 'poolXYKs',
+        id: 'pool-a',
+        data: { id: 'pool-a', baseAssetReserves: '1', targetAssetReserves: '2' },
+      },
+      {
+        collection: 'orderBooks',
+        id: 'book-a',
+        data: { id: 'book-a' },
+      },
+      {
+        collection: 'networkSnapshots',
+        id: 'network-day-old',
+        timestamp: 100,
+        data: {
+          id: 'network-day-old',
+          type: 'DAY',
+          timestamp: 100,
+          liquidityUSD: '100.25',
+          volumeUSD: '10.5',
+        },
+      },
+      {
+        collection: 'networkSnapshots',
+        id: 'network-hour',
+        timestamp: 150,
+        data: {
+          id: 'network-hour',
+          type: 'HOUR',
+          timestamp: 150,
+          accounts: 20,
+          transactions: 30,
+          fees: '123456789',
+          liquidityUSD: '250.75',
+          poolLiquidityUSD: '200.5',
+          orderBookLiquidityUSD: '50.25',
+          volumeUSD: '45.125',
+          swaps: 7,
+          activePools: 4,
+          activeOrderBooks: 3,
+          listedAssets: 9,
+          bridgeIncomingTransactions: 1,
+          bridgeOutgoingTransactions: 2,
+        },
+      },
+    ]);
+
+    const result = await graphql({
+      schema: createSchema(),
+      source: `
+        query StatsPageData($type: SnapshotType, $from: Int, $to: Int) {
+          exploreStats {
+            id
+            tokenCount
+            poolCount
+            orderBookCount
+            liquidityUSD
+            volumeDayUSD
+            updatedAtTimestamp
+          }
+          networkSnapshots(
+            first: 10
+            orderBy: TIMESTAMP_DESC
+            filter: {
+              type: { equalTo: $type }
+              timestamp: { lessThanOrEqualTo: $from, greaterThanOrEqualTo: $to }
+            }
+          ) {
+            edges {
+              node {
+                timestamp
+                accounts
+                transactions
+                fees
+                liquidityUSD
+                poolLiquidityUSD
+                orderBookLiquidityUSD
+                volumeUSD
+                swaps
+                activePools
+                activeOrderBooks
+                listedAssets
+                bridgeIncomingTransactions
+                bridgeOutgoingTransactions
+              }
+            }
+          }
+        }
+      `,
+      variableValues: { type: 'HOUR', from: 200, to: 120 },
+      contextValue: { repository },
+    });
+
+    expect(result.errors).toBeUndefined();
+    expect(result.data).toEqual({
+      exploreStats: {
+        id: 'global',
+        tokenCount: 2,
+        poolCount: 1,
+        orderBookCount: 1,
+        liquidityUSD: '100.25',
+        volumeDayUSD: '10.5',
+        updatedAtTimestamp: 100,
+      },
+      networkSnapshots: {
+        edges: [
+          {
+            node: {
+              timestamp: 150,
+              accounts: 20,
+              transactions: 30,
+              fees: '123456789',
+              liquidityUSD: '250.75',
+              poolLiquidityUSD: '200.5',
+              orderBookLiquidityUSD: '50.25',
+              volumeUSD: '45.125',
+              swaps: 7,
+              activePools: 4,
+              activeOrderBooks: 3,
+              listedAssets: 9,
+              bridgeIncomingTransactions: 1,
+              bridgeOutgoingTransactions: 2,
+            },
+          },
+        ],
+      },
     });
   });
 
@@ -629,6 +776,11 @@ describe('Polkaswap indexer schema', () => {
         'activePools',
         'activeOrderBooks',
         'listedAssets',
+        'bridgeIncomingTransactions',
+        'bridgeOutgoingTransactions',
+        'accounts',
+        'transactions',
+        'fees',
       ])
     );
   });
