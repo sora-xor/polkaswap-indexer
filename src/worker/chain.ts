@@ -676,6 +676,25 @@ const collectAssets = (value: unknown): string[] => {
   return [...assets];
 };
 
+const nestedString = (value: unknown): string => {
+  if (typeof value === 'string' && value) return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (typeof value === 'bigint') return value.toString();
+  if (value !== undefined && value !== null && typeof value !== 'object') return String(value);
+
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    const keys = ['EVM', 'Evm', 'evm', 'EVMLegacy', 'evmLegacy', 'Sora', 'sora', 'value', 'id', 'code'];
+
+    for (const key of keys) {
+      const nested = nestedString(record[key]);
+      if (nested) return nested;
+    }
+  }
+
+  return '';
+};
+
 const firstString = (record: Record<string, unknown>, keys: string[]): string => {
   for (const key of keys) {
     const value = record[key];
@@ -686,9 +705,127 @@ const firstString = (record: Record<string, unknown>, keys: string[]): string =>
   return '';
 };
 
+const firstNestedString = (record: Record<string, unknown>, keys: string[]): string => {
+  for (const key of keys) {
+    const value = nestedString(record[key]);
+    if (value) return value;
+  }
+
+  return '';
+};
+
 const findEvent = (events: EventRecord[], section: string, method: string): Record<string, unknown> | null => {
   const match = events.find((item) => item.event.section === section && item.event.method === method);
   return match ? eventData(match.event) : null;
+};
+
+const createAmountData = (assetId: string, amount: unknown, prices: Map<string, bigint>, assets: Map<string, AssetInfo>) => {
+  const info = assets.get(assetId);
+  const raw = codecToBigInt(amount);
+
+  return {
+    amount: codecToDecimalString(amount, info?.decimals ?? DECIMALS),
+    amountUSD: codecUsd(assetId, raw, prices, info?.decimals ?? DECIMALS),
+    assetId,
+  };
+};
+
+const bridgeRequestUpdate = (events: EventRecord[]): { requestHash: string; status: string } => {
+  const event = findEvent(events, 'bridgeProxy', 'RequestStatusUpdate') ?? {};
+
+  return {
+    requestHash: firstNestedString(event, ['requestHash', 'hash', 'arg0']),
+    status: firstNestedString(event, ['status', 'arg1']),
+  };
+};
+
+type AssetMovement = {
+  assetId: string;
+  amount: unknown;
+  recipient: string;
+  sender: string;
+};
+
+const assetMovementFromEvent = (record: EventRecord): AssetMovement | null => {
+  const { event } = record;
+  const data = eventData(event);
+
+  if (event.section === 'assets') {
+    if (event.method === 'Transfer') {
+      return {
+        assetId: firstString(data, ['assetId', 'currencyId', 'arg0']),
+        sender: firstString(data, ['from', 'source', 'arg1']),
+        recipient: firstString(data, ['to', 'dest', 'recipient', 'arg2']),
+        amount: data.amount ?? data.arg3 ?? '0',
+      };
+    }
+
+    if (['Issued', 'Minted', 'Deposited'].includes(event.method)) {
+      return {
+        assetId: firstString(data, ['assetId', 'currencyId', 'arg0']),
+        sender: '',
+        recipient: firstString(data, ['owner', 'who', 'account', 'accountId', 'to', 'recipient', 'arg1']),
+        amount: data.amount ?? data.arg2 ?? '0',
+      };
+    }
+  }
+
+  if (event.section === 'tokens') {
+    if (event.method === 'Transfer') {
+      return {
+        assetId: firstString(data, ['currencyId', 'assetId', 'arg0']),
+        sender: firstString(data, ['from', 'source', 'arg1']),
+        recipient: firstString(data, ['to', 'dest', 'recipient', 'arg2']),
+        amount: data.amount ?? data.arg3 ?? '0',
+      };
+    }
+
+    if (['Deposited', 'Endowed'].includes(event.method)) {
+      return {
+        assetId: firstString(data, ['currencyId', 'assetId', 'arg0']),
+        sender: '',
+        recipient: firstString(data, ['who', 'account', 'accountId', 'to', 'recipient', 'arg1']),
+        amount: data.amount ?? data.arg2 ?? '0',
+      };
+    }
+  }
+
+  if (event.section === 'balances') {
+    if (event.method === 'Transfer') {
+      return {
+        assetId: XOR,
+        sender: firstString(data, ['from', 'source', 'arg0']),
+        recipient: firstString(data, ['to', 'dest', 'recipient', 'arg1']),
+        amount: data.amount ?? data.arg2 ?? '0',
+      };
+    }
+
+    if (['Deposited', 'Endowed'].includes(event.method)) {
+      return {
+        assetId: XOR,
+        sender: '',
+        recipient: firstString(data, ['who', 'account', 'accountId', 'to', 'recipient', 'arg0']),
+        amount: data.amount ?? data.arg1 ?? '0',
+      };
+    }
+  }
+
+  return null;
+};
+
+const findIncomingBridgeMovement = (events: EventRecord[]): AssetMovement | null => {
+  for (const event of events) {
+    const movement = assetMovementFromEvent(event);
+    if (!movement?.assetId || !movement.recipient || movement.amount === undefined || movement.amount === null) continue;
+
+    try {
+      if (codecToBigInt(movement.amount) > 0n) return movement;
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
 };
 
 const groupEventsByExtrinsic = (events: EventRecord[]): Map<number, EventRecord[]> => {
@@ -725,21 +862,11 @@ const createHistoryData = (
     assets: collectAssets(args),
   };
 
-  const withAmount = (assetId: string, amount: unknown) => {
-    const info = assets.get(assetId);
-    const raw = codecToBigInt(amount);
-    return {
-      amount: codecToDecimalString(amount, info?.decimals ?? DECIMALS),
-      amountUSD: codecUsd(assetId, raw, prices, info?.decimals ?? DECIMALS),
-      assetId,
-    };
-  };
-
   if (module === 'assets' && method === 'transfer') {
     const assetId = firstString(args, ['assetId']);
     const to = firstString(args, ['to', 'dest']);
     return {
-      data: { ...withAmount(assetId, args.amount), from: signer, to },
+      data: { ...createAmountData(assetId, args.amount, prices, assets), from: signer, to },
       from: signer,
       to,
       assets: [assetId],
@@ -750,7 +877,7 @@ const createHistoryData = (
     const assetId = firstString(args, ['assetId']);
     const to = firstString(args, ['to']);
     return {
-      data: { ...withAmount(assetId, args.amount), ...(to ? { to } : {}) },
+      data: { ...createAmountData(assetId, args.amount, prices, assets), ...(to ? { to } : {}) },
       from: signer,
       to,
       assets: [assetId],
@@ -905,10 +1032,13 @@ const createHistoryData = (
 
   if (module === 'ethBridge' && method === 'transferToSidechain') {
     const assetId = firstString(args, ['assetId']);
+    const { requestHash, status } = bridgeRequestUpdate(events);
     return {
       data: {
-        ...withAmount(assetId, args.amount),
+        ...createAmountData(assetId, args.amount, prices, assets),
         sidechainAddress: firstString(args, ['to', 'sidechainAddress']),
+        ...(requestHash ? { requestHash } : {}),
+        ...(status ? { status } : {}),
       },
       from: signer,
       to: firstString(args, ['to', 'sidechainAddress']),
@@ -916,7 +1046,87 @@ const createHistoryData = (
     };
   }
 
+  if (module === 'bridgeProxy' && (method === 'burn' || method === 'mint')) {
+    const assetId = firstString(args, ['assetId']);
+    const amount = args.amount ?? args.value ?? '0';
+    const networkId = firstNestedString(args, ['networkId', 'network', 'arg0']);
+    const recipient = firstNestedString(args, ['recipient', 'to', 'dest', 'account', 'arg2']);
+    const sender = firstNestedString(args, ['sender', 'from', 'source']);
+    const { requestHash, status } = bridgeRequestUpdate(events);
+
+    if (method === 'burn') {
+      return {
+        data: {
+          ...createAmountData(assetId, amount, prices, assets),
+          ...(networkId ? { networkId } : {}),
+          ...(recipient ? { recipient } : {}),
+          ...(requestHash ? { requestHash } : {}),
+          ...(status ? { status } : {}),
+        },
+        from: signer,
+        to: recipient,
+        assets: [assetId],
+      };
+    }
+
+    return {
+      data: {
+        ...createAmountData(assetId, amount, prices, assets),
+        ...(networkId ? { networkId } : {}),
+        ...(recipient ? { recipient } : {}),
+        ...(sender ? { sender } : {}),
+        ...(requestHash ? { requestHash } : {}),
+        ...(status ? { status } : {}),
+      },
+      from: recipient || signer,
+      to: sender,
+      assets: [assetId],
+    };
+  }
+
   return result;
+};
+
+const createBridgeProxyIncomingContext = (
+  base: Pick<BlockExtrinsicContext, 'id' | 'module' | 'method' | 'address' | 'failed' | 'calls' | 'callNames' | 'events' | 'fee'>,
+  args: Record<string, unknown>,
+  prices: Map<string, bigint>,
+  assets: Map<string, AssetInfo>
+): BlockExtrinsicContext | null => {
+  if (base.module === 'bridgeProxy' && base.method === 'burn') return null;
+
+  const request = bridgeRequestUpdate(base.events);
+  if (!request.requestHash) return null;
+
+  const movement = findIncomingBridgeMovement(base.events);
+  if (!movement) return null;
+
+  const message = args.message && typeof args.message === 'object' && !Array.isArray(args.message) ? (args.message as Record<string, unknown>) : args;
+  const networkId = firstNestedString(args, ['networkId', 'network', 'arg0']);
+  const recipient = firstNestedString(message, ['dest', 'recipient', 'to', 'account']) || movement.recipient;
+  const sender = firstNestedString(message, ['source', 'sender', 'from']) || movement.sender;
+  const history = {
+    data: {
+      ...createAmountData(movement.assetId, movement.amount, prices, assets),
+      ...(networkId ? { networkId } : {}),
+      recipient,
+      ...(sender ? { sender } : {}),
+      requestHash: request.requestHash,
+      ...(request.status ? { status: request.status } : {}),
+    },
+    from: recipient,
+    to: sender,
+    assets: [movement.assetId],
+  };
+
+  return {
+    ...base,
+    id: `${request.requestHash}-mint`,
+    module: 'bridgeProxy',
+    method: 'mint',
+    history,
+    accounts: [...new Set([recipient, sender].filter(Boolean))],
+  };
 };
 
 const normalizeStakingData = (method: string, args: Record<string, unknown>, prices: Map<string, bigint>) => {
@@ -1356,9 +1566,11 @@ export class ChainIndexer {
         swaps += 1;
       }
       if (extrinsic.method.section === 'bridgeMultisig') bridgeIncomingTransactions += 1;
-      if (extrinsic.method.section === 'ethBridge') bridgeOutgoingTransactions += 1;
+      if (extrinsic.method.section === 'ethBridge' || (extrinsic.method.section === 'bridgeProxy' && extrinsic.method.method === 'burn')) {
+        bridgeOutgoingTransactions += 1;
+      }
       currentAccounts.forEach((account) => touchedAccounts.add(account));
-      extrinsicContexts.push({
+      const context = {
         id,
         module: extrinsic.method.section,
         method: extrinsic.method.method,
@@ -1370,7 +1582,16 @@ export class ChainIndexer {
         events: eventsForExtrinsic,
         accounts: currentAccounts,
         fee,
-      });
+      };
+      extrinsicContexts.push(context);
+
+      const incomingContext = createBridgeProxyIncomingContext(context, args, this.prices, this.assetInfos);
+      if (incomingContext) {
+        volumeUSD += this.extractVolumeUSD(incomingContext.history.data);
+        bridgeIncomingTransactions += 1;
+        incomingContext.accounts.forEach((account) => touchedAccounts.add(account));
+        extrinsicContexts.push(incomingContext);
+      }
     }
 
     const existingAccountMeta = await this.repository.getMany(collection('accountMeta'), [...touchedAccounts]);
@@ -1605,6 +1826,10 @@ export class ChainIndexer {
 
     if (update.module === 'ethBridge') {
       this.addPointDeposit(data, 'outgoingUSD', amountUSD);
+    }
+
+    if (update.module === 'bridgeProxy') {
+      this.addPointDeposit(data, update.method === 'burn' ? 'outgoingUSD' : 'incomingUSD', amountUSD);
     }
 
     if (update.module === 'bridgeMultisig') {
