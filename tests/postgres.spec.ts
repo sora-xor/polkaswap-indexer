@@ -1,3 +1,5 @@
+import { EventEmitter } from 'node:events';
+
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { IndexerDocument } from '../src/repository/types.js';
@@ -39,6 +41,78 @@ describe('PostgresRepository', () => {
     mocks.pool.query.mockReset();
     mocks.pool.connect.mockReset();
     mocks.pool.end.mockReset();
+    delete process.env.POSTGRES_POOL_MAX;
+    delete process.env.POSTGRES_LISTEN_POOL_MAX;
+  });
+
+  it('uses separate pools for regular queries and subscription listeners', () => {
+    process.env.POSTGRES_POOL_MAX = '7';
+    process.env.POSTGRES_LISTEN_POOL_MAX = '3';
+
+    new PostgresRepository(DATABASE_URL);
+
+    expect(mocks.Pool).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        connectionString: DATABASE_URL,
+        max: 7,
+      })
+    );
+    expect(mocks.Pool).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        connectionString: DATABASE_URL,
+        max: 3,
+      })
+    );
+  });
+
+  it('checks database readiness without throwing on query failure', async () => {
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    mocks.pool.query.mockResolvedValueOnce({ rows: [{ '?column?': 1 }] });
+    await expect(repository.healthCheck()).resolves.toBe(true);
+
+    mocks.pool.query.mockRejectedValueOnce(new Error('database unavailable'));
+    await expect(repository.healthCheck()).resolves.toBe(false);
+    expect(mocks.pool.query).toHaveBeenNthCalledWith(1, 'select 1');
+    expect(mocks.pool.query).toHaveBeenNthCalledWith(2, 'select 1');
+  });
+
+  it('shares one Postgres LISTEN client across concurrent watchers', async () => {
+    const assetB = assetDocument('asset-b', 20);
+    const listenClient = Object.assign(new EventEmitter(), {
+      query: vi.fn().mockResolvedValue({ rows: [] }),
+      release: vi.fn(),
+    });
+    mocks.pool.connect.mockResolvedValueOnce(listenClient);
+    mocks.pool.query.mockResolvedValueOnce({ rows: [assetB] });
+    const repository = new PostgresRepository(DATABASE_URL);
+    const watcherA = repository.watch('assets', ['asset-b']);
+    const watcherB = repository.watch('assets', ['asset-b']);
+    const nextA = watcherA.next();
+    const nextB = watcherB.next();
+
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(listenClient.query).toHaveBeenCalledWith('listen indexer_documents');
+
+    listenClient.emit('notification', {
+      channel: 'indexer_documents',
+      payload: JSON.stringify({ collection: 'assets', id: 'asset-b' }),
+    });
+
+    await expect(nextA).resolves.toMatchObject({ done: false, value: assetB });
+    await expect(nextB).resolves.toMatchObject({ done: false, value: assetB });
+    expect(mocks.pool.connect).toHaveBeenCalledTimes(1);
+    expect(mocks.pool.query).toHaveBeenCalledTimes(1);
+    expect(mocks.pool.query.mock.calls[0]?.[1]).toEqual(['assets', ['asset-b']]);
+
+    await watcherA.return(undefined);
+    await watcherB.return(undefined);
+
+    expect(listenClient.query).toHaveBeenCalledWith('unlisten indexer_documents');
+    expect(listenClient.release).toHaveBeenCalledOnce();
   });
 
   it('overfetches one row instead of counting when totalCount is not requested', async () => {
@@ -198,6 +272,39 @@ describe('PostgresRepository', () => {
       hasNextPage: false,
       hasPreviousPage: false,
     });
+  });
+
+  it('ignores nullish optional comparison filter values before SQL casts', async () => {
+    const row = {
+      collection: 'assetSnapshots',
+      id: 'asset-snapshot-a',
+      timestamp: 200,
+      data: { id: 'asset-snapshot-a', type: 'DAY', assetId: 'xor', timestamp: 200 },
+    } satisfies IndexerDocument;
+    mocks.pool.query.mockResolvedValueOnce({ rows: [row] });
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    const result = await repository.query('assetSnapshots', {
+      first: 2,
+      orderBy: ['TIMESTAMP_DESC'],
+      filter: {
+        and: [
+          { type: { equalTo: 'DAY' } },
+          { timestamp: { lessThanOrEqualTo: null, greaterThanOrEqualTo: 'null' } },
+          { blockHeight: { in: [null, 'null'] } },
+        ],
+      },
+      includeTotalCount: false,
+    });
+
+    expect(mocks.pool.query).toHaveBeenCalledTimes(1);
+    const [sql, values] = mocks.pool.query.mock.calls[0] ?? [];
+    expect(String(sql)).toContain("data->>'type' = $2");
+    expect(String(sql)).not.toContain('timestamp <= ');
+    expect(String(sql)).not.toContain('timestamp >= ');
+    expect(String(sql)).not.toContain('block_height = any');
+    expect(values).toEqual(['assetSnapshots', 'DAY', 3, 0]);
+    expect(result.items).toEqual([row]);
   });
 
   it('deduplicates requested ids for getMany while returning documents by id', async () => {

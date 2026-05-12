@@ -102,6 +102,10 @@ export class MemoryRepository implements IndexerRepository {
     this.events.removeAllListeners();
   }
 
+  async healthCheck(): Promise<boolean> {
+    return true;
+  }
+
   async *watch(collection: IndexerCollection, ids: string[] = []): AsyncGenerator<IndexerDocument, void, unknown> {
     const queue: IndexerDocument[] = [];
     let notify: (() => void) | null = null;

@@ -27,6 +27,8 @@ const includesInsensitive = (value: unknown, needle: unknown): boolean => {
   return String(value ?? '').toLowerCase().includes(String(needle ?? '').toLowerCase());
 };
 
+const isNullishFilterValue = (value: unknown): boolean => value === null || value === undefined || value === 'null';
+
 const contains = (value: unknown, expected: unknown): boolean => {
   if (Array.isArray(value)) {
     if (Array.isArray(expected)) {
@@ -46,6 +48,8 @@ const contains = (value: unknown, expected: unknown): boolean => {
 
 const matchesComparison = (actual: unknown, comparison: Record<string, unknown>): boolean => {
   return Object.entries(comparison).every(([operator, expected]) => {
+    if (isNullishFilterValue(expected)) return true;
+
     switch (operator) {
       case 'equalTo':
       case 'eq':

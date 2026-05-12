@@ -1,5 +1,6 @@
 import { makeExecutableSchema } from '@graphql-tools/schema';
 
+import { metrics } from '../metrics.js';
 import { matchesFilter, sortDocuments } from './filter.js';
 import { CursorScalar, FilterScalars, JSONScalar, OrderByScalar } from './scalars.js';
 import { typeDefs } from './schema.js';
@@ -25,6 +26,17 @@ type Edge = {
   node: Record<string, unknown>;
 };
 
+type CacheEntry<T> = {
+  expiresAt: number;
+  value?: T;
+  pending?: Promise<T>;
+};
+
+type CacheOptions = {
+  maxEntries: number;
+  ttlMs: number;
+};
+
 const emptyPageInfo = {
   hasNextPage: false,
   hasPreviousPage: false,
@@ -33,6 +45,92 @@ const emptyPageInfo = {
 };
 
 const collection = (name: IndexerCollection) => name;
+
+const readPositiveInteger = (name: string, fallback: number): number => {
+  const value = Number(process.env[name]);
+
+  return Number.isFinite(value) && value > 0 ? Math.trunc(value) : fallback;
+};
+
+const stableJson = (value: unknown): string => {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`)
+      .join(',')}}`;
+  }
+
+  return JSON.stringify(value) ?? 'undefined';
+};
+
+class TtlCache {
+  private readonly entries = new Map<string, CacheEntry<unknown>>();
+
+  constructor(private readonly options: CacheOptions) {}
+
+  async getOrSet<T>(name: string, key: string, load: () => Promise<T>): Promise<T> {
+    if (this.options.ttlMs <= 0 || this.options.maxEntries <= 0) {
+      metrics.increment('indexer_cache_bypass_total', { cache: name });
+      return load();
+    }
+
+    const now = Date.now();
+    const existing = this.entries.get(key);
+
+    if (existing?.pending) {
+      metrics.increment('indexer_cache_pending_hit_total', { cache: name });
+      return existing.pending as Promise<T>;
+    }
+
+    if (existing && existing.expiresAt > now && 'value' in existing) {
+      metrics.increment('indexer_cache_hit_total', { cache: name });
+      return existing.value as T;
+    }
+
+    metrics.increment('indexer_cache_miss_total', { cache: name });
+    const pending = load();
+    this.entries.set(key, { expiresAt: now + this.options.ttlMs, pending });
+
+    try {
+      const value = await pending;
+      this.entries.set(key, { expiresAt: Date.now() + this.options.ttlMs, value });
+      this.prune();
+      metrics.setGauge('indexer_cache_entries', { cache: 'graphql' }, this.entries.size);
+
+      return value;
+    } catch (error) {
+      this.entries.delete(key);
+      metrics.setGauge('indexer_cache_entries', { cache: 'graphql' }, this.entries.size);
+      throw error;
+    }
+  }
+
+  size(): number {
+    this.pruneExpired();
+    return this.entries.size;
+  }
+
+  private prune(): void {
+    this.pruneExpired();
+
+    while (this.entries.size > this.options.maxEntries) {
+      const oldestKey = this.entries.keys().next().value as string | undefined;
+      if (!oldestKey) return;
+
+      this.entries.delete(oldestKey);
+    }
+    metrics.setGauge('indexer_cache_entries', { cache: 'graphql' }, this.entries.size);
+  }
+
+  private pruneExpired(): void {
+    const now = Date.now();
+
+    for (const [key, entry] of this.entries) {
+      if (!entry.pending && entry.expiresAt <= now) this.entries.delete(key);
+    }
+  }
+}
 
 const afterToOffset = (after: ConnectionArgs['after']): number => {
   if (after === null || after === undefined || after === '') return 0;
@@ -109,6 +207,16 @@ const activePoolFilter = {
   baseAssetReserves: { greaterThan: '0' },
   targetAssetReserves: { greaterThan: '0' },
 };
+
+const cachedConnectionCollections = new Set<IndexerCollection>([
+  'assets',
+  'assetSnapshots',
+  'networkSnapshots',
+  'poolXYKs',
+  'poolSnapshots',
+  'orderBooks',
+  'orderBookSnapshots',
+]);
 
 const toTimestamp = (document: IndexerDocument): number => {
   const value = Number(document.timestamp ?? document.data.timestamp ?? 0);
@@ -230,40 +338,71 @@ const exploreStatsResolver = async (_parent: unknown, _args: unknown, context: C
   };
 };
 
-const connectionResolver =
+const shouldCacheConnection = (collectionName: IndexerCollection, args: ConnectionArgs): boolean => {
+  if (!cachedConnectionCollections.has(collectionName)) return false;
+
+  const first = args.first ?? null;
+  const last = args.last ?? null;
+  const requestedLimit = Math.max(Number(first ?? last ?? 50), 0);
+
+  return requestedLimit <= 100;
+};
+
+const createConnectionResolver =
+  (cache: TtlCache) =>
   (collectionName: IndexerCollection) =>
   async (_parent: unknown, args: ConnectionArgs, context: Context, info?: GraphQLResolveInfo) => {
-    if (context.repository.query) {
-      const includeTotalCount = selectionIncludesField(info, 'totalCount');
-      const result = await context.repository.query(collectionName, { ...args, includeTotalCount });
-      const fallbackTotalCount =
-        result.totalCount ?? (result.pageStart ?? 0) + result.items.length + (result.hasNextPage ? 1 : 0);
-      const { end, pageStart: fallbackPageStart } = paginationWindow(args, fallbackTotalCount);
-      const pageStart = result.pageStart ?? fallbackPageStart;
-      const edges: Edge[] = result.items.map((document, index) => ({
-        cursor: String(pageStart + index),
-        node: document.data,
-      }));
+    const resolveConnection = async () => {
+      if (context.repository.query) {
+        const includeTotalCount = selectionIncludesField(info, 'totalCount');
+        const result = await context.repository.query(collectionName, { ...args, includeTotalCount });
+        const fallbackTotalCount =
+          result.totalCount ?? (result.pageStart ?? 0) + result.items.length + (result.hasNextPage ? 1 : 0);
+        const { end, pageStart: fallbackPageStart } = paginationWindow(args, fallbackTotalCount);
+        const pageStart = result.pageStart ?? fallbackPageStart;
+        const edges: Edge[] = result.items.map((document, index) => ({
+          cursor: String(pageStart + index),
+          node: document.data,
+        }));
 
-      return {
-        edges,
-        totalCount: result.totalCount ?? fallbackTotalCount,
-        pageInfo: edges.length
-          ? {
-              hasNextPage: result.hasNextPage ?? end < fallbackTotalCount,
-              hasPreviousPage: result.hasPreviousPage ?? pageStart > 0,
-              startCursor: edges[0]?.cursor ?? null,
-              endCursor: edges[edges.length - 1]?.cursor ?? null,
-            }
-          : emptyPageInfo,
-      };
-    }
+        return {
+          edges,
+          totalCount: result.totalCount ?? fallbackTotalCount,
+          pageInfo: edges.length
+            ? {
+                hasNextPage: result.hasNextPage ?? end < fallbackTotalCount,
+                hasPreviousPage: result.hasPreviousPage ?? pageStart > 0,
+                startCursor: edges[0]?.cursor ?? null,
+                endCursor: edges[edges.length - 1]?.cursor ?? null,
+              }
+            : emptyPageInfo,
+        };
+      }
 
-    const documents = await context.repository.list(collectionName);
-    return buildConnection(
-      documents.map((document) => document.data),
-      args
-    );
+      const documents = await context.repository.list(collectionName);
+      return buildConnection(
+        documents.map((document) => document.data),
+        args
+      );
+    };
+
+    if (!shouldCacheConnection(collectionName, args)) return resolveConnection();
+
+    const includeTotalCount = selectionIncludesField(info, 'totalCount');
+    const key = `connection:${collectionName}:${stableJson({ ...args, includeTotalCount })}`;
+
+    return cache.getOrSet(`connection_${collectionName}`, key, resolveConnection);
+  };
+
+const createDocumentResolver =
+  (cache: TtlCache) =>
+  (collectionName: IndexerCollection) =>
+  async (_parent: unknown, args: { id: string }, context: Context): Promise<Record<string, unknown> | null> => {
+    const key = `${collectionName}:${args.id}`;
+
+    return cache.getOrSet(`document_${collectionName}`, key, async () => {
+      return (await context.repository.get(collectionName, args.id))?.data ?? null;
+    });
   };
 
 type MutationPayload = {
@@ -360,7 +499,26 @@ const pollingSubscription = (collectionName: IndexerCollection) => ({
     watchSubscription(collectionName, args, context),
 });
 
+const healthResolver = async (_parent: unknown, _args: unknown, context: Context) => {
+  const ok = context.repository.healthCheck ? await context.repository.healthCheck().catch(() => false) : true;
+
+  return { ok, service: 'polkaswap-indexer' };
+};
+
 export function createSchema(): GraphQLSchema {
+  const cache = new TtlCache({
+    maxEntries: readPositiveInteger('GRAPHQL_CACHE_MAX_ENTRIES', 1_000),
+    ttlMs: readPositiveInteger('GRAPHQL_CACHE_TTL_MS', 2_000),
+  });
+  const connectionResolver = createConnectionResolver(cache);
+  const documentResolver = createDocumentResolver(cache);
+  const cachedExploreStatsResolver = (
+    parent: unknown,
+    args: unknown,
+    context: Context
+  ): Promise<Awaited<ReturnType<typeof exploreStatsResolver>>> =>
+    cache.getOrSet('exploreStats', 'exploreStats', () => exploreStatsResolver(parent, args, context));
+
   return makeExecutableSchema({
     typeDefs,
     resolvers: {
@@ -369,17 +527,15 @@ export function createSchema(): GraphQLSchema {
       OrderBy: OrderByScalar,
       ...FilterScalars,
       Query: {
-        _health: () => ({ ok: true, service: 'polkaswap-indexer' }),
-        account: async (_parent: unknown, args: { id: string }, context: Context) =>
-          (await context.repository.get(collection('accounts'), args.id))?.data ?? null,
+        _health: healthResolver,
+        account: documentResolver(collection('accounts')),
         assets: connectionResolver(collection('assets')),
         assetSnapshots: connectionResolver(collection('assetSnapshots')),
         accountLiquiditySnapshots: connectionResolver(collection('accountLiquiditySnapshots')),
         networkSnapshots: connectionResolver(collection('networkSnapshots')),
         poolXYKs: connectionResolver(collection('poolXYKs')),
         poolSnapshots: connectionResolver(collection('poolSnapshots')),
-        orderBook: async (_parent: unknown, args: { id: string }, context: Context) =>
-          (await context.repository.get(collection('orderBooks'), args.id))?.data ?? null,
+        orderBook: documentResolver(collection('orderBooks')),
         orderBooks: connectionResolver(collection('orderBooks')),
         orderBookOrders: connectionResolver(collection('orderBookOrders')),
         orderBookSnapshots: connectionResolver(collection('orderBookSnapshots')),
@@ -389,12 +545,10 @@ export function createSchema(): GraphQLSchema {
         stakingStakers: connectionResolver(collection('stakingStakers')),
         vaults: connectionResolver(collection('vaults')),
         vaultEvents: connectionResolver(collection('vaultEvents')),
-        updatesStream: async (_parent: unknown, args: { id: string }, context: Context) =>
-          (await context.repository.get(collection('updatesStreams'), args.id))?.data ?? null,
-        accountMeta: async (_parent: unknown, args: { id: string }, context: Context) =>
-          (await context.repository.get(collection('accountMeta'), args.id))?.data ?? null,
+        updatesStream: documentResolver(collection('updatesStreams')),
+        accountMeta: documentResolver(collection('accountMeta')),
         accountPointSystems: connectionResolver(collection('accountPointSystems')),
-        exploreStats: exploreStatsResolver,
+        exploreStats: cachedExploreStatsResolver,
       },
       HistoryElement: {
         calls: (parent: Record<string, unknown>) => ({

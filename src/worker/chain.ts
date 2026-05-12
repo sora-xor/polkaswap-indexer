@@ -155,6 +155,7 @@ const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000'
 const SORA_NEXUS_XOR_BURN_REMARK_TYPE = 'soraNexusXorClaim';
 const SORA_XOR_BURN_START_BLOCK = 25_043_003;
 const XOR_BURN_BACKFILL_BATCH_SIZE = 250;
+const FINALIZED_HEAD_RETRY_DELAY_MS = 5_000;
 const PSWAP = '0x0200050000000000000000000000000000000000000000000000000000000000';
 const DAI = '0x0200060000000000000000000000000000000000000000000000000000000000';
 const XSTUSD = '0x0200080000000000000000000000000000000000000000000000000000000000';
@@ -1108,6 +1109,9 @@ export class ChainIndexer {
   private assetInfos = new Map<string, AssetInfo>();
   private prices = new Map<string, bigint>();
   private networkLiquidityStats = emptyNetworkLiquidityStats();
+  private pendingFinalizedBlock = 0;
+  private finalizedHeadDrainRunning = false;
+  private finalizedHeadRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly config: AppConfig,
@@ -1247,12 +1251,49 @@ export class ChainIndexer {
     if (!this.api) return;
 
     await this.api.rpc.chain.subscribeFinalizedHeads(async (header) => {
-      try {
-        await this.indexBlockByHash(header.hash.toString());
-      } catch (error) {
-        console.error(`Failed to index finalized block ${header.number.toString()}`, error);
-      }
+      this.pendingFinalizedBlock = Math.max(this.pendingFinalizedBlock, header.number.toNumber());
+      await this.drainFinalizedHeads();
     });
+  }
+
+  private scheduleFinalizedHeadRetry(): void {
+    if (this.finalizedHeadRetryTimer) return;
+
+    this.finalizedHeadRetryTimer = setTimeout(() => {
+      this.finalizedHeadRetryTimer = null;
+      void this.drainFinalizedHeads();
+    }, FINALIZED_HEAD_RETRY_DELAY_MS);
+  }
+
+  private async drainFinalizedHeads(): Promise<void> {
+    if (!this.api || this.finalizedHeadDrainRunning) return;
+
+    this.finalizedHeadDrainRunning = true;
+
+    try {
+      let nextBlock = (await this.getLastIndexedBlock()) + 1;
+
+      while (nextBlock <= this.pendingFinalizedBlock) {
+        try {
+          await this.indexBlockByNumber(nextBlock);
+          nextBlock += 1;
+        } catch (error) {
+          console.error(`Failed to index finalized block ${nextBlock}`, error);
+          this.scheduleFinalizedHeadRetry();
+          return;
+        }
+      }
+
+      if (this.finalizedHeadRetryTimer) {
+        clearTimeout(this.finalizedHeadRetryTimer);
+        this.finalizedHeadRetryTimer = null;
+      }
+    } catch (error) {
+      console.error('Failed to drain finalized blocks', error);
+      this.scheduleFinalizedHeadRetry();
+    } finally {
+      this.finalizedHeadDrainRunning = false;
+    }
   }
 
   private async indexBlockByNumber(block: number, options: IndexBlockOptions = {}): Promise<void> {

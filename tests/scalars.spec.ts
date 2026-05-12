@@ -23,6 +23,26 @@ describe('GraphQL scalar compatibility', () => {
     });
   });
 
+  it('resolves variables inside opaque filter scalar literals', () => {
+    const literal = parseValue(
+      '{ and: [{ type: { equalTo: $type } }, { assetId: { equalTo: $id } }, { timestamp: { lessThanOrEqualTo: $from } }] }'
+    );
+
+    expect(
+      FilterScalars.AssetSnapshotFilter.parseLiteral(literal, {
+        type: 'DAY',
+        id: 'xor',
+        from: null,
+      })
+    ).toEqual({
+      and: [
+        { type: { equalTo: 'DAY' } },
+        { assetId: { equalTo: 'xor' } },
+        { timestamp: { lessThanOrEqualTo: null } },
+      ],
+    });
+  });
+
   it('round-trips opaque scalar values and null JSON literals', () => {
     const filter = { id: { eq: 'vault-1' } };
     const json = { amount: '10', nested: { ok: true } };

@@ -371,11 +371,6 @@ export const typeDefs = /* GraphQL */ `
     nodes: [HistoryCall!]!
   }
 
-  type HistoryExecution {
-    success: Boolean
-    error: JSON
-  }
-
   type HistoryElement {
     id: String!
     type: String
@@ -386,7 +381,7 @@ export const typeDefs = /* GraphQL */ `
     method: String
     address: String
     networkFee: String
-    execution: HistoryExecution
+    execution: JSON
     data: JSON
     dataFrom: String
     dataTo: String

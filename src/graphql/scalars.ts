@@ -1,6 +1,8 @@
 import { GraphQLScalarType, Kind, type ValueNode } from 'graphql';
 
-const parseObjectLiteral = (ast: ValueNode): unknown => {
+type ScalarVariables = Record<string, unknown> | null | undefined;
+
+const parseObjectLiteral = (ast: ValueNode, variables?: ScalarVariables): unknown => {
   switch (ast.kind) {
     case Kind.STRING:
     case Kind.ENUM:
@@ -10,10 +12,14 @@ const parseObjectLiteral = (ast: ValueNode): unknown => {
       return Number.parseInt(ast.value, 10);
     case Kind.FLOAT:
       return Number.parseFloat(ast.value);
+    case Kind.VARIABLE:
+      return variables?.[ast.name.value] ?? null;
     case Kind.LIST:
-      return ast.values.map(parseObjectLiteral);
+      return ast.values.map((value) => parseObjectLiteral(value, variables));
     case Kind.OBJECT:
-      return Object.fromEntries(ast.fields.map((field) => [field.name.value, parseObjectLiteral(field.value)]));
+      return Object.fromEntries(
+        ast.fields.map((field) => [field.name.value, parseObjectLiteral(field.value, variables)])
+      );
     case Kind.NULL:
       return null;
     default:

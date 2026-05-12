@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { ChainIndexer } from '../src/worker/chain.js';
 import { MemoryRepository } from '../src/repository/memory.js';
@@ -523,6 +523,72 @@ describe('ChainIndexer price derivation', () => {
       { block: 3, refreshDerivedState: false },
     ]);
     expect(refreshes).toEqual([{ blockHeight: 3, includeSnapshots: true }]);
+  });
+
+  it('retries missed finalized blocks before indexing later heads', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      subscribeFinalizedHeads: () => Promise<void>;
+      indexBlockByNumber: (block: number) => Promise<void>;
+    };
+    const indexedBlocks: number[] = [];
+    let finalizedHeadCallback: ((header: { number: { toNumber: () => number } }) => Promise<void>) | undefined;
+
+    await repository.upsert({
+      collection: 'updatesStreams',
+      id: 'chainState',
+      blockHeight: 9,
+      timestamp: 1,
+      data: {
+        id: 'chainState',
+        block: 9,
+        data: JSON.stringify({ lastIndexedBlock: 9 }),
+      },
+    });
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          subscribeFinalizedHeads: async (callback: typeof finalizedHeadCallback) => {
+            finalizedHeadCallback = callback;
+          },
+        },
+      },
+    };
+    indexer.indexBlockByNumber = async (block) => {
+      indexedBlocks.push(block);
+      if (block === 10 && indexedBlocks.length === 1) {
+        throw new Error('transient database failure');
+      }
+
+      await repository.upsert({
+        collection: 'updatesStreams',
+        id: 'chainState',
+        blockHeight: block,
+        timestamp: 1,
+        data: {
+          id: 'chainState',
+          block,
+          data: JSON.stringify({ lastIndexedBlock: block }),
+        },
+      });
+    };
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      await indexer.subscribeFinalizedHeads();
+      await finalizedHeadCallback?.({ number: { toNumber: () => 10 } });
+      expect(indexedBlocks).toEqual([10]);
+      expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(9);
+      expect(consoleError).toHaveBeenCalledWith('Failed to index finalized block 10', expect.any(Error));
+
+      await finalizedHeadCallback?.({ number: { toNumber: () => 12 } });
+      expect(indexedBlocks).toEqual([10, 10, 11, 12]);
+      expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(12);
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it('continues existing account point metadata from the repository', async () => {

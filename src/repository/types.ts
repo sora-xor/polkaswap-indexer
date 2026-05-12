@@ -53,10 +53,14 @@ export type RepositoryQueryResult = {
   hasPreviousPage?: boolean;
 };
 
+export type RepositoryMetricsSnapshot = Record<string, number>;
+
 export interface IndexerRepository {
   list(collection: IndexerCollection): Promise<IndexerDocument[]>;
   query?(collection: IndexerCollection, args: RepositoryQueryArgs): Promise<RepositoryQueryResult>;
   watch?(collection: IndexerCollection, ids?: string[]): AsyncGenerator<IndexerDocument, void, unknown>;
+  metricsSnapshot?(): RepositoryMetricsSnapshot;
+  healthCheck?(): Promise<boolean>;
   get(collection: IndexerCollection, id: string): Promise<IndexerDocument | null>;
   getMany(collection: IndexerCollection, ids: string[]): Promise<Map<string, IndexerDocument>>;
   upsert(document: IndexerDocument): Promise<void>;

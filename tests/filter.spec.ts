@@ -67,6 +67,8 @@ describe('GraphQL filter compatibility', () => {
         }
       )
     ).toBe(false);
+    expect(matchesFilter({ type: 'DAY', timestamp: 150 }, { timestamp: { lessThanOrEqualTo: null } })).toBe(true);
+    expect(matchesFilter({ type: 'DAY', timestamp: 150 }, { timestamp: { greaterThanOrEqualTo: 'null' } })).toBe(true);
   });
 
   it('requires every requested value for array contains filters', () => {

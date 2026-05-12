@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { GraphQLResolveInfo } from 'graphql';
 
 import { createSchema } from '../src/graphql/resolvers.js';
@@ -28,12 +28,26 @@ const repositoryWithoutQuery = (items: Awaited<ReturnType<IndexerRepository['lis
 });
 
 describe('Polkaswap indexer schema', () => {
-  it('exposes a stable health resolver', () => {
+  it('exposes a repository-backed health resolver', async () => {
     const schema = createSchema();
     const healthField = schema.getQueryType()?.getFields()._health;
 
-    expect(healthField?.resolve?.({}, {}, { repository: new MemoryRepository() }, {} as never)).toEqual({
+    await expect(healthField?.resolve?.({}, {}, { repository: new MemoryRepository() }, {} as never)).resolves.toEqual({
       ok: true,
+      service: 'polkaswap-indexer',
+    });
+  });
+
+  it('reports unhealthy when the repository health check fails', async () => {
+    const schema = createSchema();
+    const healthField = schema.getQueryType()?.getFields()._health;
+    const repository = {
+      ...repositoryWithoutQuery([]),
+      healthCheck: async () => false,
+    };
+
+    await expect(healthField?.resolve?.({}, {}, { repository }, {} as never)).resolves.toEqual({
+      ok: false,
       service: 'polkaswap-indexer',
     });
   });
@@ -270,6 +284,63 @@ describe('Polkaswap indexer schema', () => {
         startCursor: '0',
       },
     });
+  });
+
+  it('caches repeated hot connection resolver queries within the TTL window', async () => {
+    const row = {
+      collection: 'assets',
+      id: 'asset-a',
+      data: { id: 'asset-a', liquidity: '10' },
+    } as const;
+    const query = vi.fn<QueryFunction>().mockResolvedValue({
+      items: [row],
+      totalCount: 1,
+      pageStart: 0,
+      hasNextPage: false,
+      hasPreviousPage: false,
+    });
+    const repository = repositoryWithQuery(query);
+    const schema = createSchema();
+    const assetsField = schema.getQueryType()?.getFields().assets;
+    const args = { first: 10, orderBy: ['ID_ASC'] };
+
+    await expect(assetsField?.resolve?.({}, args, { repository }, undefined as never)).resolves.toMatchObject({
+      totalCount: 1,
+    });
+    await expect(assetsField?.resolve?.({}, args, { repository }, undefined as never)).resolves.toMatchObject({
+      totalCount: 1,
+    });
+
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
+  it('caches repeated hot singleton resolver queries within the TTL window', async () => {
+    const get = vi.fn<IndexerRepository['get']>().mockResolvedValue({
+      collection: 'updatesStreams',
+      id: 'chainState',
+      data: { id: 'chainState', block: 123, data: '{"lastIndexedBlock":123}' },
+    });
+    const repository: IndexerRepository = {
+      list: async () => [],
+      query: async () => ({ items: [], totalCount: 0 }),
+      get,
+      getMany: async () => new Map(),
+      upsert: async () => undefined,
+      upsertMany: async () => undefined,
+      close: async () => undefined,
+    };
+    const schema = createSchema();
+    const updatesStreamField = schema.getQueryType()?.getFields().updatesStream;
+    const args = { id: 'chainState' };
+
+    await expect(updatesStreamField?.resolve?.({}, args, { repository }, undefined as never)).resolves.toMatchObject({
+      block: 123,
+    });
+    await expect(updatesStreamField?.resolve?.({}, args, { repository }, undefined as never)).resolves.toMatchObject({
+      block: 123,
+    });
+
+    expect(get).toHaveBeenCalledTimes(1);
   });
 
   it('falls back to list-based filtering, sorting, and pagination when query is unavailable', async () => {
@@ -670,6 +741,25 @@ describe('Polkaswap indexer schema', () => {
   it('keeps SubQuery JSON fields selectable as scalar values', async () => {
     const repository = new MemoryRepository();
     await repository.upsert({
+      collection: 'historyElements',
+      id: 'history-a',
+      data: {
+        id: 'history-a',
+        type: 'CALL',
+        timestamp: 10,
+        blockHash: '0xabc',
+        blockHeight: 1,
+        module: 'liquidityProxy',
+        method: 'swap',
+        address: 'alice',
+        networkFee: '0',
+        execution: { success: true },
+        data: { assetId: 'xor' },
+        dataAssets: ['xor'],
+        calls: [],
+      },
+    });
+    await repository.upsert({
       collection: 'assetSnapshots',
       id: 'asset-snapshot-a',
       data: {
@@ -716,17 +806,31 @@ describe('Polkaswap indexer schema', () => {
     const assetSnapshotType = schema.getType('AssetSnapshot') as { getFields: () => Record<string, { type: unknown }> };
     const orderBookSnapshotType = schema.getType('OrderBookSnapshot') as { getFields: () => Record<string, { type: unknown }> };
     const accountMetaType = schema.getType('AccountMeta') as { getFields: () => Record<string, { type: unknown }> };
+    const historyElementType = schema.getType('HistoryElement') as { getFields: () => Record<string, { type: unknown }> };
     const assetSnapshotsField = schema.getQueryType()?.getFields().assetSnapshots;
     const orderBookSnapshotsField = schema.getQueryType()?.getFields().orderBookSnapshots;
     const accountMetaField = schema.getQueryType()?.getFields().accountMeta;
+    const historyElementsField = schema.getQueryType()?.getFields().historyElements;
     const assetSnapshots = await assetSnapshotsField?.resolve?.({}, {}, { repository }, {} as never);
     const orderBookSnapshots = await orderBookSnapshotsField?.resolve?.({}, {}, { repository }, {} as never);
     const accountMeta = await accountMetaField?.resolve?.({}, { id: 'alice' }, { repository }, {} as never);
+    const historyElements = await historyElementsField?.resolve?.(
+      {},
+      {
+        first: 1,
+        filter: {
+          and: [{ dataAssets: { contains: 'xor' } }, { timestamp: { greaterThan: 1 } }],
+        },
+      },
+      { repository },
+      {} as never
+    );
 
     expect(String(assetSnapshotType.getFields().priceUSD.type)).toBe('JSON');
     expect(String(assetSnapshotType.getFields().volume.type)).toBe('JSON');
     expect(String(orderBookSnapshotType.getFields().price.type)).toBe('JSON');
     expect(String(accountMetaType.getFields().xorFees.type)).toBe('JSON');
+    expect(String(historyElementType.getFields().execution.type)).toBe('JSON');
     expect(assetSnapshots).toMatchObject({
       edges: [{ node: { priceUSD: { close: '2' }, volume: { amountUSD: '10' } } }],
     });
@@ -738,6 +842,10 @@ describe('Polkaswap indexer schema', () => {
       orderBook: { created: 1, closed: 0, amountUSD: '2' },
       governance: { votes: 1, amount: '3', amountUSD: '4' },
       deposit: { incomingUSD: '5', outgoingUSD: '6' },
+    });
+    expect(historyElements).toMatchObject({
+      edges: [{ node: { id: 'history-a', execution: { success: true } } }],
+      totalCount: 1,
     });
   });
 
