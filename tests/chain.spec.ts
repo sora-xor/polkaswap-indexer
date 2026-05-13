@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { ApiPromise } from '@polkadot/api';
 import { ChainIndexer } from '../src/worker/chain.js';
 import { MemoryRepository } from '../src/repository/memory.js';
 
@@ -11,10 +12,10 @@ const ETH = '0x0200070000000000000000000000000000000000000000000000000000000000'
 const XSTUSD = '0x0200080000000000000000000000000000000000000000000000000000000000';
 const KUSD = '0x02000c0000000000000000000000000000000000000000000000000000000000';
 
-const eventRecord = (section: string, method: string, data: Record<string, unknown>) => ({
+const eventRecord = (section: string, method: string, data: Record<string, unknown>, extrinsicIndex = 0) => ({
   phase: {
     isApplyExtrinsic: true,
-    asApplyExtrinsic: { toNumber: () => 0 },
+    asApplyExtrinsic: { toNumber: () => extrinsicIndex },
   },
   event: {
     section,
@@ -782,7 +783,7 @@ describe('ChainIndexer price derivation', () => {
     expect(accountMeta).toBeNull();
   });
 
-  it('does not duplicate outgoing bridgeProxy burns as synthetic incoming history', async () => {
+  it('does not synthesize EVM incoming bridge history for zero asset movement amounts', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
       api: unknown;
@@ -800,6 +801,931 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 47 },
+                hash: { toString: () => '0xinbound-zero-amount-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'relayer' },
+                  hash: { toString: () => '0xinbound-zero-amount' },
+                  method: {
+                    section: 'bridgeChannelInbound',
+                    method: 'submit',
+                    args: [
+                      { EVM: '0x6f' },
+                      {
+                        source: { EVM: '0xsender' },
+                        dest: { Sora: 'alice' },
+                      },
+                    ],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'message' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xrequest-zero-amount', status: 'Done' }),
+              eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: '0' }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000003600' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xinbound-zero-amount-block');
+
+    const synthetic = await repository.get('historyElements', '0xrequest-zero-amount-mint');
+    const snapshot = await repository.get('networkSnapshots', 'block-47');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect(synthetic).toBeNull();
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(0);
+    expect(accountMeta).toBeNull();
+  });
+
+  it('does not synthesize EVM incoming bridge history for failed inbound extrinsics', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 48 },
+                hash: { toString: () => '0xinbound-failed-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'relayer' },
+                  hash: { toString: () => '0xinbound-failed' },
+                  method: {
+                    section: 'bridgeChannelInbound',
+                    method: 'submit',
+                    args: [
+                      { EVM: '0x6f' },
+                      {
+                        source: { EVM: '0xsender' },
+                        dest: { Sora: 'alice' },
+                      },
+                    ],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'message' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('system', 'ExtrinsicFailed', { dispatchError: { module: { index: 1, error: '0x00' } } }),
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xrequest-failed', status: 'Done' }),
+              eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: SCALE.toString() }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000003700' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xinbound-failed-block');
+
+    const original = await repository.get('historyElements', '0xinbound-failed');
+    const synthetic = await repository.get('historyElements', '0xrequest-failed-mint');
+    const snapshot = await repository.get('networkSnapshots', 'block-48');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect((original?.data.execution as { success: boolean }).success).toBe(false);
+    expect(synthetic).toBeNull();
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(0);
+    expect(accountMeta).toBeNull();
+  });
+
+  it('does not synthesize EVM incoming bridge history without an inbound recipient', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 53 },
+                hash: { toString: () => '0xinbound-missing-recipient-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'relayer' },
+                  hash: { toString: () => '0xinbound-missing-recipient' },
+                  method: {
+                    section: 'bridgeChannelInbound',
+                    method: 'submit',
+                    args: [
+                      { EVM: '0x6f' },
+                      {
+                        source: { EVM: '0xsender' },
+                      },
+                    ],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'message' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xrequest-missing-recipient', status: 'Done' }),
+              eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: SCALE.toString() }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000004100' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xinbound-missing-recipient-block');
+
+    const synthetic = await repository.get('historyElements', '0xrequest-missing-recipient-mint');
+    const snapshot = await repository.get('networkSnapshots', 'block-53');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect(synthetic).toBeNull();
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(0);
+    expect(accountMeta).toBeNull();
+  });
+
+  it('does not synthesize EVM incoming bridge history without an external sender', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 54 },
+                hash: { toString: () => '0xinbound-missing-sender-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'relayer' },
+                  hash: { toString: () => '0xinbound-missing-sender' },
+                  method: {
+                    section: 'bridgeChannelInbound',
+                    method: 'submit',
+                    args: [
+                      { EVM: '0x6f' },
+                      {
+                        dest: { Sora: 'alice' },
+                      },
+                    ],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'message' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xrequest-missing-sender', status: 'Done' }),
+              eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: SCALE.toString() }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000004200' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xinbound-missing-sender-block');
+
+    const synthetic = await repository.get('historyElements', '0xrequest-missing-sender-mint');
+    const snapshot = await repository.get('networkSnapshots', 'block-54');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect(synthetic).toBeNull();
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(0);
+    expect(accountMeta).toBeNull();
+  });
+
+  it('does not synthesize EVM incoming bridge history without a network id', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 55 },
+                hash: { toString: () => '0xinbound-missing-network-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'relayer' },
+                  hash: { toString: () => '0xinbound-missing-network' },
+                  method: {
+                    section: 'bridgeChannelInbound',
+                    method: 'submit',
+                    args: [
+                      {
+                        source: { EVM: '0xsender' },
+                        dest: { Sora: 'alice' },
+                      },
+                    ],
+                    meta: {
+                      args: [{ name: 'message' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xrequest-missing-network', status: 'Done' }),
+              eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: SCALE.toString() }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000004300' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xinbound-missing-network-block');
+
+    const synthetic = await repository.get('historyElements', '0xrequest-missing-network-mint');
+    const snapshot = await repository.get('networkSnapshots', 'block-55');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect(synthetic).toBeNull();
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(0);
+    expect(accountMeta).toBeNull();
+  });
+
+  it('does not synthesize EVM incoming bridge history with a malformed network id', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 56 },
+                hash: { toString: () => '0xinbound-malformed-network-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'relayer' },
+                  hash: { toString: () => '0xinbound-malformed-network' },
+                  method: {
+                    section: 'bridgeChannelInbound',
+                    method: 'submit',
+                    args: [
+                      { EVM: '0xnot-hex' },
+                      {
+                        source: { EVM: '0xsender' },
+                        dest: { Sora: 'alice' },
+                      },
+                    ],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'message' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xrequest-malformed-network', status: 'Done' }),
+              eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: SCALE.toString() }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000004400' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xinbound-malformed-network-block');
+
+    const synthetic = await repository.get('historyElements', '0xrequest-malformed-network-mint');
+    const snapshot = await repository.get('networkSnapshots', 'block-56');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect(synthetic).toBeNull();
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(0);
+    expect(accountMeta).toBeNull();
+  });
+
+  it('does not synthesize EVM incoming bridge history for non-completed request statuses', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 57 },
+                hash: { toString: () => '0xinbound-pending-status-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'relayer' },
+                  hash: { toString: () => '0xinbound-pending-status' },
+                  method: {
+                    section: 'bridgeChannelInbound',
+                    method: 'submit',
+                    args: [
+                      { EVM: '0x6f' },
+                      {
+                        source: { EVM: '0xsender' },
+                        dest: { Sora: 'alice' },
+                      },
+                    ],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'message' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xrequest-pending-status', status: 'Pending' }),
+              eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: SCALE.toString() }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000004500' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xinbound-pending-status-block');
+
+    const synthetic = await repository.get('historyElements', '0xrequest-pending-status-mint');
+    const snapshot = await repository.get('networkSnapshots', 'block-57');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect(synthetic).toBeNull();
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(0);
+    expect(accountMeta).toBeNull();
+  });
+
+  it('ignores asset movement events for a different recipient when synthesizing incoming bridge history', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 50 },
+                hash: { toString: () => '0xinbound-recipient-filter-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'relayer' },
+                  hash: { toString: () => '0xinbound-recipient-filter' },
+                  method: {
+                    section: 'bridgeChannelInbound',
+                    method: 'submit',
+                    args: [
+                      { EVM: '0x6f' },
+                      {
+                        source: { EVM: '0xsender' },
+                        dest: { Sora: 'alice' },
+                      },
+                    ],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'message' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xrequest-recipient-filter', status: 'Done' }),
+              eventRecord('assets', 'Transfer', {
+                assetId: XOR,
+                from: 'bob',
+                to: 'mallory',
+                amount: (5n * SCALE).toString(),
+              }),
+              eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: (3n * SCALE).toString() }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000003800' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xinbound-recipient-filter-block');
+
+    const synthetic = await repository.get('historyElements', '0xrequest-recipient-filter-mint');
+    const snapshot = await repository.get('networkSnapshots', 'block-50');
+    const aliceMeta = await repository.get('accountMeta', 'alice');
+    const malloryMeta = await repository.get('accountMeta', 'mallory');
+
+    expect(synthetic?.data).toMatchObject({
+      module: 'bridgeProxy',
+      method: 'mint',
+      dataFrom: 'alice',
+      dataTo: '0xsender',
+      data: {
+        amount: '3',
+        amountUSD: '6',
+        recipient: 'alice',
+      },
+    });
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(1);
+    expect(aliceMeta?.data.deposit).toEqual({ incomingUSD: '6', outgoingUSD: '0' });
+    expect(malloryMeta).toBeNull();
+  });
+
+  it('does not synthesize EVM incoming bridge history when message asset and movement asset differ', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([
+      [XOR, 2n * SCALE],
+      [PSWAP, SCALE],
+    ]);
+    indexer.assetInfos = new Map([
+      [XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }],
+      [PSWAP, { id: PSWAP, symbol: 'PSWAP', name: 'PSWAP', decimals: 18, supply: 0n }],
+    ]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 58 },
+                hash: { toString: () => '0xinbound-asset-mismatch-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'relayer' },
+                  hash: { toString: () => '0xinbound-asset-mismatch' },
+                  method: {
+                    section: 'bridgeChannelInbound',
+                    method: 'submit',
+                    args: [
+                      { EVM: '0x6f' },
+                      {
+                        source: { EVM: '0xsender' },
+                        dest: { Sora: 'alice' },
+                        assetId: XOR,
+                      },
+                    ],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'message' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xrequest-asset-mismatch', status: 'Done' }),
+              eventRecord('assets', 'Issued', { assetId: PSWAP, owner: 'alice', amount: (5n * SCALE).toString() }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000004600' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xinbound-asset-mismatch-block');
+
+    const synthetic = await repository.get('historyElements', '0xrequest-asset-mismatch-mint');
+    const snapshot = await repository.get('networkSnapshots', 'block-58');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect(synthetic).toBeNull();
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(0);
+    expect(accountMeta).toBeNull();
+  });
+
+  it('ignores wrong asset movement and uses the later matching asset for incoming bridge history', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([
+      [XOR, 2n * SCALE],
+      [PSWAP, SCALE],
+    ]);
+    indexer.assetInfos = new Map([
+      [XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }],
+      [PSWAP, { id: PSWAP, symbol: 'PSWAP', name: 'PSWAP', decimals: 18, supply: 0n }],
+    ]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 59 },
+                hash: { toString: () => '0xinbound-asset-filter-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'relayer' },
+                  hash: { toString: () => '0xinbound-asset-filter' },
+                  method: {
+                    section: 'bridgeChannelInbound',
+                    method: 'submit',
+                    args: [
+                      { EVM: '0x6f' },
+                      {
+                        source: { EVM: '0xsender' },
+                        dest: { Sora: 'alice' },
+                        assetId: XOR,
+                      },
+                    ],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'message' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xrequest-asset-filter', status: 'Done' }),
+              eventRecord('assets', 'Issued', { assetId: PSWAP, owner: 'alice', amount: (5n * SCALE).toString() }),
+              eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: (3n * SCALE).toString() }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000004700' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xinbound-asset-filter-block');
+
+    const synthetic = await repository.get('historyElements', '0xrequest-asset-filter-mint');
+    const snapshot = await repository.get('networkSnapshots', 'block-59');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect(synthetic?.data).toMatchObject({
+      module: 'bridgeProxy',
+      method: 'mint',
+      dataFrom: 'alice',
+      dataTo: '0xsender',
+      data: {
+        assetId: XOR,
+        amount: '3',
+        amountUSD: '6',
+        recipient: 'alice',
+      },
+    });
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(1);
+    expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '6', outgoingUSD: '0' });
+  });
+
+  it('does not synthesize EVM incoming bridge history for failed bridge request statuses', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 51 },
+                hash: { toString: () => '0xinbound-failed-status-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'relayer' },
+                  hash: { toString: () => '0xinbound-failed-status' },
+                  method: {
+                    section: 'bridgeChannelInbound',
+                    method: 'submit',
+                    args: [
+                      { EVM: '0x6f' },
+                      {
+                        source: { EVM: '0xsender' },
+                        dest: { Sora: 'alice' },
+                      },
+                    ],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'message' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xrequest-failed-status', status: 'Failed' }),
+              eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: SCALE.toString() }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000003900' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xinbound-failed-status-block');
+
+    const synthetic = await repository.get('historyElements', '0xrequest-failed-status-mint');
+    const snapshot = await repository.get('networkSnapshots', 'block-51');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect(synthetic).toBeNull();
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(0);
+    expect(accountMeta).toBeNull();
+  });
+
+  it('does not synthesize EVM incoming bridge history from events attached to another extrinsic', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 52 },
+                hash: { toString: () => '0xinbound-wrong-phase-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'relayer' },
+                  hash: { toString: () => '0xinbound-wrong-phase' },
+                  method: {
+                    section: 'bridgeChannelInbound',
+                    method: 'submit',
+                    args: [
+                      { EVM: '0x6f' },
+                      {
+                        source: { EVM: '0xsender' },
+                        dest: { Sora: 'alice' },
+                      },
+                    ],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'message' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xrequest-wrong-phase', status: 'Done' }, 1),
+              eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: SCALE.toString() }, 1),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000004000' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xinbound-wrong-phase-block');
+
+    const original = await repository.get('historyElements', '0xinbound-wrong-phase');
+    const synthetic = await repository.get('historyElements', '0xrequest-wrong-phase-mint');
+    const snapshot = await repository.get('networkSnapshots', 'block-52');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect(original?.data).toMatchObject({
+      module: 'bridgeChannelInbound',
+      method: 'submit',
+    });
+    expect(synthetic).toBeNull();
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(0);
+    expect(accountMeta).toBeNull();
+  });
+
+  it('does not duplicate outgoing bridgeProxy burns as synthetic incoming history', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 49 },
                 hash: { toString: () => '0xevmburn-no-duplicate-block' },
               },
               extrinsics: [
@@ -847,7 +1773,7 @@ describe('ChainIndexer price derivation', () => {
 
     const outgoing = await repository.get('historyElements', '0xevmburn-no-duplicate');
     const synthetic = await repository.get('historyElements', '0xburn-request-mint');
-    const snapshot = await repository.get('networkSnapshots', 'block-47');
+    const snapshot = await repository.get('networkSnapshots', 'block-49');
     const accountMeta = await repository.get('accountMeta', 'alice');
 
     expect(outgoing?.data).toMatchObject({
@@ -960,6 +1886,56 @@ describe('ChainIndexer price derivation', () => {
       block: burnBlock + 1,
       data: JSON.stringify({ lastIndexedBlock: burnBlock + 1 }),
     });
+  });
+
+  it('starts compact XOR burn backfill before waiting for normal chain backfill', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      start: () => Promise<void>;
+      refreshDerivedState: (blockHeight: number, timestamp: number, includeSnapshots: boolean) => Promise<void>;
+      backfillXorBurns: (finalizedBlock: number) => Promise<void>;
+      backfill: () => Promise<void>;
+      subscribeFinalizedHeads: () => Promise<void>;
+    };
+    const order: string[] = [];
+    let finishBackfill: (() => void) | undefined;
+    const apiCreate = vi.spyOn(ApiPromise, 'create').mockResolvedValue({
+      rpc: {
+        chain: {
+          getFinalizedHead: async () => '0xfinal',
+          getHeader: async () => ({ number: { toNumber: () => 25_900_000 } }),
+        },
+      },
+    } as never);
+
+    indexer.refreshDerivedState = async () => {
+      order.push('refresh');
+    };
+    indexer.backfillXorBurns = async () => {
+      order.push('xor-burn-backfill');
+    };
+    indexer.backfill = async () => {
+      order.push('normal-backfill-start');
+      await new Promise<void>((resolve) => {
+        finishBackfill = resolve;
+      });
+      order.push('normal-backfill-end');
+    };
+    indexer.subscribeFinalizedHeads = async () => {
+      order.push('subscribe');
+    };
+
+    const startPromise = indexer.start();
+
+    await vi.waitFor(() => {
+      expect(order).toEqual(['refresh', 'xor-burn-backfill', 'normal-backfill-start']);
+    });
+
+    finishBackfill?.();
+    await startPromise;
+
+    expect(order).toEqual(['refresh', 'xor-burn-backfill', 'normal-backfill-start', 'normal-backfill-end', 'subscribe']);
+    apiCreate.mockRestore();
   });
 
   it('skips expensive derived-state refreshes while backfilling historical blocks', async () => {

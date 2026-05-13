@@ -714,6 +714,24 @@ const firstNestedString = (record: Record<string, unknown>, keys: string[]): str
   return '';
 };
 
+const isValidEvmNetworkId = (value: string): boolean => {
+  if (!value) return false;
+
+  if (value.startsWith('0x')) {
+    try {
+      const parsed = BigInt(value);
+
+      return parsed > 0n && parsed <= BigInt(Number.MAX_SAFE_INTEGER);
+    } catch {
+      return false;
+    }
+  }
+
+  const parsed = Number(value);
+
+  return Number.isSafeInteger(parsed) && parsed > 0;
+};
+
 const findEvent = (events: EventRecord[], section: string, method: string): Record<string, unknown> | null => {
   const match = events.find((item) => item.event.section === section && item.event.method === method);
   return match ? eventData(match.event) : null;
@@ -813,10 +831,16 @@ const assetMovementFromEvent = (record: EventRecord): AssetMovement | null => {
   return null;
 };
 
-const findIncomingBridgeMovement = (events: EventRecord[]): AssetMovement | null => {
+const FailedBridgeRequestStatuses = new Set(['Failed', 'Refunded']);
+const CompletedBridgeRequestStatus = 'Done';
+
+/** Finds the asset movement that belongs to an inbound bridge request, scoped by decoded message hints when present. */
+const findIncomingBridgeMovement = (events: EventRecord[], expectedRecipient = '', expectedAssetId = ''): AssetMovement | null => {
   for (const event of events) {
     const movement = assetMovementFromEvent(event);
     if (!movement?.assetId || !movement.recipient || movement.amount === undefined || movement.amount === null) continue;
+    if (expectedRecipient && movement.recipient !== expectedRecipient) continue;
+    if (expectedAssetId && movement.assetId !== expectedAssetId) continue;
 
     try {
       if (codecToBigInt(movement.amount) > 0n) return movement;
@@ -1093,18 +1117,26 @@ const createBridgeProxyIncomingContext = (
   prices: Map<string, bigint>,
   assets: Map<string, AssetInfo>
 ): BlockExtrinsicContext | null => {
+  if (base.failed) return null;
   if (base.module === 'bridgeProxy' && base.method === 'burn') return null;
 
   const request = bridgeRequestUpdate(base.events);
   if (!request.requestHash) return null;
-
-  const movement = findIncomingBridgeMovement(base.events);
-  if (!movement) return null;
+  if (FailedBridgeRequestStatuses.has(request.status) || request.status !== CompletedBridgeRequestStatus) return null;
 
   const message = args.message && typeof args.message === 'object' && !Array.isArray(args.message) ? (args.message as Record<string, unknown>) : args;
   const networkId = firstNestedString(args, ['networkId', 'network', 'arg0']);
-  const recipient = firstNestedString(message, ['dest', 'recipient', 'to', 'account']) || movement.recipient;
-  const sender = firstNestedString(message, ['source', 'sender', 'from']) || movement.sender;
+  if (!isValidEvmNetworkId(networkId)) return null;
+
+  const expectedRecipient = firstNestedString(message, ['dest', 'recipient', 'to', 'account']);
+  const sender = firstNestedString(message, ['source', 'sender', 'from']);
+  const expectedAssetId = firstNestedString(message, ['assetId', 'asset', 'currencyId', 'token']);
+  if (!expectedRecipient || !sender) return null;
+
+  const movement = findIncomingBridgeMovement(base.events, expectedRecipient, expectedAssetId);
+  if (!movement) return null;
+
+  const recipient = expectedRecipient || movement.recipient;
   const history = {
     data: {
       ...createAmountData(movement.assetId, movement.amount, prices, assets),
@@ -1336,11 +1368,13 @@ export class ChainIndexer {
     const finalizedBlock = finalizedHeader.number.toNumber();
 
     await this.refreshDerivedState(finalizedBlock, Math.floor(Date.now() / 1000), true);
-    await this.backfill();
-    await this.subscribeFinalizedHeads();
-    void this.backfillXorBurns(finalizedBlock).catch((error: unknown) => {
+    const xorBurnBackfill = this.backfillXorBurns(finalizedBlock).catch((error: unknown) => {
       console.error('Failed to backfill XOR burn documents', error);
     });
+
+    await this.backfill();
+    await this.subscribeFinalizedHeads();
+    void xorBurnBackfill;
   }
 
   private async getLastIndexedBlock(): Promise<number> {

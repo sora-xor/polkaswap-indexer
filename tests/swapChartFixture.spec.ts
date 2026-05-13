@@ -114,6 +114,51 @@ describe('swap chart fixture data', () => {
     });
   });
 
+  it('includes network snapshots consumed by the stats page', async () => {
+    const repository = new MemoryRepository();
+    const now = 1_700_000_000;
+
+    await repository.upsertMany(createSwapChartFixtureDocuments(now, 88));
+
+    const schema = createSchema();
+    const networkSnapshotsField = schema.getQueryType()?.getFields().networkSnapshots;
+    const result = (await networkSnapshotsField?.resolve?.(
+      {},
+      {
+        first: 4,
+        orderBy: ['TIMESTAMP_DESC'],
+        filter: {
+          and: [
+            { type: { equalTo: 'HOUR' } },
+            { timestamp: { lessThanOrEqualTo: now } },
+            { timestamp: { greaterThanOrEqualTo: now - 24 * 60 * 60 } },
+          ],
+        },
+      },
+      { repository },
+      undefined as never
+    )) as ConnectionResult | undefined;
+
+    expect(result).toMatchObject({
+      totalCount: 25,
+      pageInfo: {
+        hasNextPage: true,
+        hasPreviousPage: false,
+      },
+    });
+    expect(result?.edges).toHaveLength(4);
+    expect(result?.edges[0]?.node).toMatchObject({
+      type: 'HOUR',
+      timestamp: now,
+      liquidityUSD: expect.any(String),
+      volumeUSD: expect.any(String),
+      bridgeIncomingTransactions: expect.any(Number),
+      bridgeOutgoingTransactions: expect.any(Number),
+    });
+    expect(Number(result?.edges[0]?.node.liquidityUSD)).toBeGreaterThan(0);
+    expect(Number(result?.edges[0]?.node.volumeUSD)).toBeGreaterThan(0);
+  });
+
   it('includes SOLSWAP burn history consumed by the burn page stats query', async () => {
     const repository = new MemoryRepository();
     const now = 1_700_000_000;

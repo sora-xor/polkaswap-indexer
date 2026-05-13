@@ -200,6 +200,44 @@ const poolDocuments = (blockHeight: number, timestamp: number): IndexerDocument[
   ];
 };
 
+const networkSnapshotDocuments = (blockHeight: number, timestamp: number): IndexerDocument[] =>
+  SNAPSHOT_WINDOWS.flatMap((window) =>
+    Array.from({ length: window.count }, (_, index) => {
+      const snapshotTimestamp = timestamp - index * window.seconds;
+      const liquidityUSD = 72_458_000 + index * 1_250;
+      const poolLiquidityUSD = 71_950_000 + index * 1_100;
+      const orderBookLiquidityUSD = liquidityUSD - poolLiquidityUSD;
+      const volumeUSD = 1_875_000 + index * 7_500;
+      const fees = (250n + BigInt(index) * 3n) * 10n ** 18n;
+      const id = `network-all-${window.type}-${snapshotTimestamp}`;
+
+      return {
+        collection: 'networkSnapshots',
+        id,
+        blockHeight,
+        timestamp: snapshotTimestamp,
+        data: {
+          id,
+          type: window.type,
+          timestamp: snapshotTimestamp,
+          accounts: 10 + (index % 8),
+          transactions: 120 + index * 3,
+          fees: fees.toString(),
+          liquidityUSD: toFixedPrice(liquidityUSD),
+          poolLiquidityUSD: toFixedPrice(poolLiquidityUSD),
+          orderBookLiquidityUSD: toFixedPrice(orderBookLiquidityUSD),
+          volumeUSD: toFixedPrice(volumeUSD),
+          swaps: 80 + index,
+          activePools: 1,
+          activeOrderBooks: 0,
+          listedAssets: ASSETS.length,
+          bridgeIncomingTransactions: index % 3,
+          bridgeOutgoingTransactions: index % 2,
+        },
+      } satisfies IndexerDocument;
+    })
+  );
+
 const updatesStreamDocuments = (blockHeight: number, timestamp: number): IndexerDocument[] => {
   const priceData = Object.fromEntries(ASSETS.map((asset) => [asset.id, toFixedPrice(asset.basePrice)]));
   const assetRegistration = Object.fromEntries(
@@ -361,6 +399,7 @@ export function createSwapChartFixtureDocuments(now = Math.floor(Date.now() / 10
     ...ASSETS.map((asset) => assetDocument(asset, blockHeight, now)),
     ...ASSETS.flatMap((asset) => assetSnapshotDocuments(asset, blockHeight, now)),
     ...poolDocuments(blockHeight, now),
+    ...networkSnapshotDocuments(blockHeight, now),
     ...updatesStreamDocuments(blockHeight, now),
     ...burnHistoryDocuments(now),
     ...xorBurnDocuments(now),
