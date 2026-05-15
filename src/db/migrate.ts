@@ -58,6 +58,15 @@ export async function migrate(databaseUrl = readConfig().databaseUrl): Promise<v
       'create index if not exists indexer_documents_collection_address_idx on indexer_documents(collection, (data->>\'address\'));'
     );
     await pool.query(
+      'create index if not exists indexer_documents_collection_data_from_idx on indexer_documents(collection, (data->>\'dataFrom\'));'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_data_to_idx on indexer_documents(collection, (data->>\'dataTo\'));'
+    );
+    await pool.query(
+      'create index if not exists indexer_documents_collection_module_method_timestamp_id_idx on indexer_documents(collection, (data->>\'module\'), (data->>\'method\'), timestamp, id);'
+    );
+    await pool.query(
       'create index if not exists indexer_documents_collection_order_book_id_idx on indexer_documents(collection, (data->>\'orderBookId\'));'
     );
     await pool.query(

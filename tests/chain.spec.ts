@@ -507,6 +507,82 @@ describe('ChainIndexer price derivation', () => {
     expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '0', outgoingUSD: '10' });
   });
 
+  it('indexes bridgeMultisig asset movements by recipient for ETH incoming restores', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 43 },
+                hash: { toString: () => '0xethincomingblock' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'bridge-peer' },
+                  hash: { toString: () => '0xethincoming' },
+                  method: {
+                    section: 'bridgeMultisig',
+                    method: 'asMulti',
+                    args: [{ toHex: () => '0ximportincomingrequest', toJSON: () => ({ call: 'expanded' }) }],
+                    meta: { args: [{ name: 'call' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: (4n * SCALE).toString() }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000000500' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xethincomingblock');
+
+    const history = await repository.get('historyElements', '0xethincoming');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect(history?.data).toMatchObject({
+      module: 'bridgeMultisig',
+      method: 'asMulti',
+      address: 'bridge-peer',
+      dataFrom: 'bridge-peer',
+      dataTo: 'alice',
+      dataAssets: [XOR],
+      data: {
+        amount: '4',
+        amountUSD: '8',
+        assetId: XOR,
+        call: '0ximportincomingrequest',
+        to: 'alice',
+      },
+    });
+    expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '8', outgoingUSD: '0' });
+  });
+
   it('indexes bridgeProxy request events as mint history for EVM incoming restores', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {

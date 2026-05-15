@@ -7,6 +7,7 @@ type CodecLike = {
   toJSON?: () => unknown;
   toHuman?: () => unknown;
   toString?: () => string;
+  toHex?: () => string;
 };
 
 type EventRecord = {
@@ -378,6 +379,12 @@ const normalizeKey = (key: string): string => {
   return normalized === 'assetId' || normalized === 'assetID' ? 'assetId' : normalized;
 };
 
+const normalizeCallArgument = (value: unknown): unknown => {
+  const hex = (value as CodecLike | undefined)?.toHex?.();
+
+  return hex || normalizeValue(value);
+};
+
 const codecArgs = (method: { args?: unknown[]; meta?: { args?: Array<{ name?: string | { toString: () => string } }> } }) => {
   const args = method.args ?? [];
   const names = method.meta?.args ?? [];
@@ -386,7 +393,7 @@ const codecArgs = (method: { args?: unknown[]; meta?: { args?: Array<{ name?: st
     args.map((arg, index) => {
       const rawName = names[index]?.name;
       const name = normalizeKey(typeof rawName === 'string' ? rawName : rawName?.toString?.() ?? `arg${index}`);
-      return [name, normalizeValue(arg)];
+      return [name, name === 'call' ? normalizeCallArgument(arg) : normalizeValue(arg)];
     })
   );
 };
@@ -1093,6 +1100,23 @@ const createHistoryData = (
       to: firstString(args, ['to', 'sidechainAddress']),
       assets: [assetId],
     };
+  }
+
+  if (module === 'bridgeMultisig') {
+    const movement = findIncomingBridgeMovement(events);
+
+    if (movement) {
+      return {
+        data: {
+          ...args,
+          ...createAmountData(movement.assetId, movement.amount, prices, assets),
+          to: movement.recipient,
+        },
+        from: movement.sender || signer,
+        to: movement.recipient,
+        assets: [movement.assetId],
+      };
+    }
   }
 
   if (module === 'bridgeProxy' && (method === 'burn' || method === 'mint')) {
