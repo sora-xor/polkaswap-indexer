@@ -80,6 +80,16 @@ const createBlockNetworkSnapshot = (
   },
 });
 
+const expectNoBackfilledNetworkStockMetrics = (document: { data: Record<string, unknown> } | null | undefined) => {
+  expect(document?.data).not.toHaveProperty('accounts');
+  expect(document?.data).not.toHaveProperty('liquidityUSD');
+  expect(document?.data).not.toHaveProperty('poolLiquidityUSD');
+  expect(document?.data).not.toHaveProperty('orderBookLiquidityUSD');
+  expect(document?.data).not.toHaveProperty('activePools');
+  expect(document?.data).not.toHaveProperty('activeOrderBooks');
+  expect(document?.data).not.toHaveProperty('listedAssets');
+};
+
 describe('ChainIndexer price derivation', () => {
   it('prefers liquid stable pools over dust pools for derived asset prices', () => {
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
@@ -2533,12 +2543,8 @@ describe('ChainIndexer price derivation', () => {
     expect(firstDay?.data).toMatchObject({
       type: 'DAY',
       timestamp: 100,
-      accounts: 2,
       transactions: 1,
       fees: '10',
-      liquidityUSD: '100',
-      poolLiquidityUSD: '80',
-      orderBookLiquidityUSD: '20',
       volumeUSD: '1.25',
       swaps: 1,
       bridgeIncomingTransactions: 0,
@@ -2549,12 +2555,8 @@ describe('ChainIndexer price derivation', () => {
     expect(secondDay?.data).toMatchObject({
       type: 'DAY',
       timestamp: 86_500,
-      accounts: 3,
       transactions: 3,
       fees: '30',
-      liquidityUSD: '110',
-      poolLiquidityUSD: '85',
-      orderBookLiquidityUSD: '25',
       volumeUSD: '3.75',
       swaps: 1,
       bridgeIncomingTransactions: 1,
@@ -2565,12 +2567,8 @@ describe('ChainIndexer price derivation', () => {
     expect(thirdDay?.data).toMatchObject({
       type: 'DAY',
       timestamp: 172_900,
-      accounts: 5,
       transactions: 5,
       fees: '50',
-      liquidityUSD: '120',
-      poolLiquidityUSD: '90',
-      orderBookLiquidityUSD: '30',
       volumeUSD: '6',
       bridgeIncomingTransactions: 1,
       bridgeOutgoingTransactions: 2,
@@ -2578,16 +2576,15 @@ describe('ChainIndexer price derivation', () => {
     expect(month?.data).toMatchObject({
       type: 'MONTH',
       timestamp: 172_900,
-      accounts: 5,
       transactions: 6,
       fees: '60',
-      liquidityUSD: '120',
-      poolLiquidityUSD: '90',
-      orderBookLiquidityUSD: '30',
       volumeUSD: '7.25',
       bridgeIncomingTransactions: 1,
       bridgeOutgoingTransactions: 2,
     });
+    for (const document of [firstDay, secondDay, thirdDay, month]) {
+      expectNoBackfilledNetworkStockMetrics(document);
+    }
     expect(state?.data.data).toBe(JSON.stringify({ lastIndexedBlock: 3, lastTimestamp: 172_900 }));
   });
 
