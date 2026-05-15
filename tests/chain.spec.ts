@@ -50,6 +50,36 @@ const config = {
   snapshotIntervalBlocks: 250,
 };
 
+const createBlockNetworkSnapshot = (
+  blockHeight: number,
+  timestamp: number,
+  data: Partial<Record<string, unknown>>
+) => ({
+  collection: 'networkSnapshots' as const,
+  id: `block-${blockHeight}`,
+  blockHeight,
+  timestamp,
+  data: {
+    id: `block-${blockHeight}`,
+    type: 'BLOCK',
+    timestamp,
+    accounts: 0,
+    transactions: 0,
+    fees: '0',
+    liquidityUSD: '0',
+    poolLiquidityUSD: '0',
+    orderBookLiquidityUSD: '0',
+    volumeUSD: '0',
+    swaps: 0,
+    activePools: 0,
+    activeOrderBooks: 0,
+    listedAssets: 0,
+    bridgeIncomingTransactions: 0,
+    bridgeOutgoingTransactions: 0,
+    ...data,
+  },
+});
+
 describe('ChainIndexer price derivation', () => {
   it('prefers liquid stable pools over dust pools for derived asset prices', () => {
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
@@ -1894,7 +1924,8 @@ describe('ChainIndexer price derivation', () => {
       start: () => Promise<void>;
       refreshDerivedState: (blockHeight: number, timestamp: number, includeSnapshots: boolean) => Promise<void>;
       backfillXorBurns: (finalizedBlock: number) => Promise<void>;
-      backfill: () => Promise<void>;
+      backfill: () => Promise<boolean>;
+      backfillNetworkAggregateSnapshots: () => Promise<boolean>;
       subscribeFinalizedHeads: () => Promise<void>;
     };
     const order: string[] = [];
@@ -1920,6 +1951,11 @@ describe('ChainIndexer price derivation', () => {
         finishBackfill = resolve;
       });
       order.push('normal-backfill-end');
+      return false;
+    };
+    indexer.backfillNetworkAggregateSnapshots = async () => {
+      order.push('network-aggregate-backfill');
+      return false;
     };
     indexer.subscribeFinalizedHeads = async () => {
       order.push('subscribe');
@@ -1934,7 +1970,14 @@ describe('ChainIndexer price derivation', () => {
     finishBackfill?.();
     await startPromise;
 
-    expect(order).toEqual(['refresh', 'xor-burn-backfill', 'normal-backfill-start', 'normal-backfill-end', 'subscribe']);
+    expect(order).toEqual([
+      'refresh',
+      'xor-burn-backfill',
+      'normal-backfill-start',
+      'normal-backfill-end',
+      'network-aggregate-backfill',
+      'subscribe',
+    ]);
     apiCreate.mockRestore();
   });
 
@@ -1945,7 +1988,7 @@ describe('ChainIndexer price derivation', () => {
       repository
     ) as unknown as {
       api: unknown;
-      backfill: () => Promise<void>;
+      backfill: () => Promise<boolean>;
       indexBlockByNumber: (block: number, options?: { refreshDerivedState?: boolean }) => Promise<void>;
       refreshDerivedState: (blockHeight: number, timestamp: number, includeSnapshots: boolean) => Promise<void>;
     };
@@ -2434,6 +2477,172 @@ describe('ChainIndexer price derivation', () => {
         listedAssets: 21,
         bridgeIncomingTransactions: 1,
         bridgeOutgoingTransactions: 2,
+      },
+    });
+  });
+
+  it('backfills aggregate network snapshots from indexed block snapshots', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      backfillNetworkAggregateSnapshots: () => Promise<boolean>;
+    };
+
+    await repository.upsertMany([
+      createBlockNetworkSnapshot(1, 100, {
+        accounts: 2,
+        transactions: 1,
+        fees: '10',
+        liquidityUSD: '100',
+        poolLiquidityUSD: '80',
+        orderBookLiquidityUSD: '20',
+        volumeUSD: '1.25',
+        swaps: 1,
+      }),
+      createBlockNetworkSnapshot(2, 86_500, {
+        accounts: 3,
+        transactions: 2,
+        fees: '20',
+        liquidityUSD: '110',
+        poolLiquidityUSD: '85',
+        orderBookLiquidityUSD: '25',
+        volumeUSD: '2.5',
+        bridgeIncomingTransactions: 1,
+      }),
+      createBlockNetworkSnapshot(3, 172_900, {
+        accounts: 5,
+        transactions: 3,
+        fees: '30',
+        liquidityUSD: '120',
+        poolLiquidityUSD: '90',
+        orderBookLiquidityUSD: '30',
+        volumeUSD: '3.5',
+        bridgeOutgoingTransactions: 2,
+      }),
+    ]);
+
+    await expect(indexer.backfillNetworkAggregateSnapshots()).resolves.toBe(true);
+
+    const firstDay = await repository.get('networkSnapshots', 'network-all-DAY-0');
+    const secondDay = await repository.get('networkSnapshots', 'network-all-DAY-86400');
+    const thirdDay = await repository.get('networkSnapshots', 'network-all-DAY-172800');
+    const month = await repository.get('networkSnapshots', 'network-all-MONTH-0');
+    const state = await repository.get('updatesStreams', 'networkAggregateSnapshotsBackfill');
+
+    expect(firstDay?.timestamp).toBe(100);
+    expect(firstDay?.blockHeight).toBe(1);
+    expect(firstDay?.data).toMatchObject({
+      type: 'DAY',
+      timestamp: 100,
+      accounts: 2,
+      transactions: 1,
+      fees: '10',
+      liquidityUSD: '100',
+      poolLiquidityUSD: '80',
+      orderBookLiquidityUSD: '20',
+      volumeUSD: '1.25',
+      swaps: 1,
+      bridgeIncomingTransactions: 0,
+      bridgeOutgoingTransactions: 0,
+    });
+    expect(secondDay?.timestamp).toBe(86_500);
+    expect(secondDay?.blockHeight).toBe(2);
+    expect(secondDay?.data).toMatchObject({
+      type: 'DAY',
+      timestamp: 86_500,
+      accounts: 3,
+      transactions: 3,
+      fees: '30',
+      liquidityUSD: '110',
+      poolLiquidityUSD: '85',
+      orderBookLiquidityUSD: '25',
+      volumeUSD: '3.75',
+      swaps: 1,
+      bridgeIncomingTransactions: 1,
+      bridgeOutgoingTransactions: 0,
+    });
+    expect(thirdDay?.timestamp).toBe(172_900);
+    expect(thirdDay?.blockHeight).toBe(3);
+    expect(thirdDay?.data).toMatchObject({
+      type: 'DAY',
+      timestamp: 172_900,
+      accounts: 5,
+      transactions: 5,
+      fees: '50',
+      liquidityUSD: '120',
+      poolLiquidityUSD: '90',
+      orderBookLiquidityUSD: '30',
+      volumeUSD: '6',
+      bridgeIncomingTransactions: 1,
+      bridgeOutgoingTransactions: 2,
+    });
+    expect(month?.data).toMatchObject({
+      type: 'MONTH',
+      timestamp: 172_900,
+      accounts: 5,
+      transactions: 6,
+      fees: '60',
+      liquidityUSD: '120',
+      poolLiquidityUSD: '90',
+      orderBookLiquidityUSD: '30',
+      volumeUSD: '7.25',
+      bridgeIncomingTransactions: 1,
+      bridgeOutgoingTransactions: 2,
+    });
+    expect(state?.data.data).toBe(JSON.stringify({ lastIndexedBlock: 3, lastTimestamp: 172_900 }));
+  });
+
+  it('keeps existing aggregate network snapshots during backfill', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      backfillNetworkAggregateSnapshots: () => Promise<boolean>;
+    };
+
+    await repository.upsertMany([
+      createBlockNetworkSnapshot(1, 100, {
+        transactions: 1,
+        fees: '10',
+        volumeUSD: '1',
+      }),
+      createBlockNetworkSnapshot(2, 86_500, {
+        transactions: 2,
+        fees: '20',
+        volumeUSD: '2',
+      }),
+      {
+        collection: 'networkSnapshots',
+        id: 'network-all-DAY-86400',
+        blockHeight: 99,
+        timestamp: 86_600,
+        data: {
+          id: 'network-all-DAY-86400',
+          type: 'DAY',
+          timestamp: 86_600,
+          accounts: 42,
+          transactions: 99,
+          fees: '999',
+          liquidityUSD: '999',
+          poolLiquidityUSD: '999',
+          orderBookLiquidityUSD: '0',
+          volumeUSD: '999',
+          swaps: 0,
+          activePools: 0,
+          activeOrderBooks: 0,
+          listedAssets: 0,
+          bridgeIncomingTransactions: 0,
+          bridgeOutgoingTransactions: 0,
+        },
+      },
+    ]);
+
+    await expect(indexer.backfillNetworkAggregateSnapshots()).resolves.toBe(true);
+
+    expect(await repository.get('networkSnapshots', 'network-all-DAY-86400')).toMatchObject({
+      blockHeight: 99,
+      timestamp: 86_600,
+      data: {
+        transactions: 99,
+        fees: '999',
+        volumeUSD: '999',
       },
     });
   });

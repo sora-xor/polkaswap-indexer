@@ -149,6 +149,7 @@ type IndexBlockOptions = {
 
 const CHAIN_STATE_ID = 'chainState';
 const XOR_BURN_BACKFILL_STATE_ID = 'xorBurnsBackfill';
+const NETWORK_AGGREGATE_BACKFILL_STATE_ID = 'networkAggregateSnapshotsBackfill';
 const DECIMALS = 18;
 const SCALE = 10n ** 18n;
 const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000';
@@ -1372,7 +1373,10 @@ export class ChainIndexer {
       console.error('Failed to backfill XOR burn documents', error);
     });
 
-    await this.backfill();
+    const indexedAny = await this.backfill();
+    if (!indexedAny && (await this.backfillNetworkAggregateSnapshots())) {
+      await this.refreshDerivedState(finalizedBlock, Math.floor(Date.now() / 1000), true);
+    }
     await this.subscribeFinalizedHeads();
     void xorBurnBackfill;
   }
@@ -1429,6 +1433,20 @@ export class ChainIndexer {
     };
   }
 
+  private createNetworkAggregateBackfillStateDocument(block: number, timestamp: number): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: NETWORK_AGGREGATE_BACKFILL_STATE_ID,
+      blockHeight: block,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: NETWORK_AGGREGATE_BACKFILL_STATE_ID,
+        block,
+        data: JSON.stringify({ lastIndexedBlock: block, lastTimestamp: timestamp }),
+      },
+    };
+  }
+
   private async backfillXorBurns(finalizedBlock: number): Promise<void> {
     if (!this.api || finalizedBlock < SORA_XOR_BURN_START_BLOCK) return;
 
@@ -1467,8 +1485,8 @@ export class ChainIndexer {
     }
   }
 
-  private async backfill(): Promise<void> {
-    if (!this.api) return;
+  private async backfill(): Promise<boolean> {
+    if (!this.api) return false;
 
     const finalizedHash = await this.api.rpc.chain.getFinalizedHead();
     const finalizedHeader = await this.api.rpc.chain.getHeader(finalizedHash);
@@ -1487,8 +1505,52 @@ export class ChainIndexer {
     }
 
     if (indexedAny) {
+      await this.backfillNetworkAggregateSnapshots();
       await this.refreshDerivedState(finalizedBlock, Math.floor(Date.now() / 1000), true);
     }
+
+    return indexedAny;
+  }
+
+  /**
+   * Builds historical aggregate network snapshots from stored per-block
+   * snapshots. This fills chart history after a backfill where expensive
+   * storage-derived refreshes were intentionally skipped for each block.
+   */
+  private async backfillNetworkAggregateSnapshots(): Promise<boolean> {
+    const state = await this.repository.get(collection('updatesStreams'), NETWORK_AGGREGATE_BACKFILL_STATE_ID);
+    if (state?.data?.data) return false;
+
+    const blockSnapshots = await this.queryAll(collection('networkSnapshots'), {
+      filter: { type: { equalTo: 'BLOCK' } },
+      orderBy: ['TIMESTAMP_ASC'],
+    });
+
+    if (!blockSnapshots.length) {
+      return false;
+    }
+
+    const existingAggregateSnapshotIds = new Set(
+      (
+        await this.queryAll(collection('networkSnapshots'), {
+          filter: { type: { notEqualTo: 'BLOCK' } },
+        })
+      ).map((document) => document.id)
+    );
+    const documents = this.createBackfilledNetworkSnapshotDocuments(blockSnapshots).filter(
+      (document) => !existingAggregateSnapshotIds.has(document.id)
+    );
+
+    for (let index = 0; index < documents.length; index += 1_000) {
+      await this.repository.upsertMany(documents.slice(index, index + 1_000));
+    }
+
+    const latest = blockSnapshots[blockSnapshots.length - 1];
+    const latestBlock = Number(latest.blockHeight ?? latest.data.blockHeight ?? 0);
+    const latestTimestamp = Number(latest.data.timestamp ?? latest.timestamp ?? 0);
+    await this.repository.upsert(this.createNetworkAggregateBackfillStateDocument(latestBlock, latestTimestamp));
+    console.info(`Backfilled ${documents.length} aggregate network snapshots through SORA block ${latestBlock}`);
+    return true;
   }
 
   private async subscribeFinalizedHeads(): Promise<void> {
@@ -3073,6 +3135,139 @@ export class ChainIndexer {
           bridgeOutgoingTransactions: aggregate.bridgeOutgoingTransactions,
         },
       };
+    });
+  }
+
+  private networkLiquidityStatsFromSnapshot(data: Record<string, unknown>): NetworkLiquidityStats {
+    return {
+      liquidityUSD: String(data.liquidityUSD ?? '0'),
+      poolLiquidityUSD: String(data.poolLiquidityUSD ?? '0'),
+      orderBookLiquidityUSD: String(data.orderBookLiquidityUSD ?? '0'),
+      activePools: Number(data.activePools ?? 0),
+      activeOrderBooks: Number(data.activeOrderBooks ?? 0),
+      listedAssets: Number(data.listedAssets ?? 0),
+    };
+  }
+
+  /**
+   * Aggregates BLOCK snapshots into the window documents consumed by the stats
+   * page. Flow metrics are summed over the same rolling windows used by live
+   * snapshot generation and stock metrics such as TVL are taken from the latest
+   * block represented by each generated snapshot.
+   */
+  private createBackfilledNetworkSnapshotDocuments(blockSnapshots: IndexerDocument[]): IndexerDocument[] {
+    type BackfillBlock = {
+      blockHeight: number;
+      timestamp: number;
+      accounts: number;
+      transactions: number;
+      fees: bigint;
+      volumeUSD: bigint;
+      swaps: number;
+      bridgeIncomingTransactions: number;
+      bridgeOutgoingTransactions: number;
+      liquidityStats: NetworkLiquidityStats;
+    };
+    type FlowTotals = Pick<
+      NetworkAggregate,
+      'transactions' | 'fees' | 'volumeUSD' | 'swaps' | 'bridgeIncomingTransactions' | 'bridgeOutgoingTransactions'
+    >;
+
+    const blocks = blockSnapshots
+      .map((document): BackfillBlock | null => {
+        const timestamp = Number(document.data.timestamp ?? document.timestamp ?? 0);
+        if (!Number.isFinite(timestamp) || timestamp <= 0) return null;
+
+        return {
+          blockHeight: Number(document.blockHeight ?? document.data.blockHeight ?? 0),
+          timestamp,
+          accounts: Number(document.data.accounts ?? 0),
+          transactions: Number(document.data.transactions ?? 0),
+          fees: codecToBigInt(document.data.fees ?? 0),
+          volumeUSD: decimalStringToScaled(document.data.volumeUSD ?? '0'),
+          swaps: Number(document.data.swaps ?? 0),
+          bridgeIncomingTransactions: Number(document.data.bridgeIncomingTransactions ?? 0),
+          bridgeOutgoingTransactions: Number(document.data.bridgeOutgoingTransactions ?? 0),
+          liquidityStats: this.networkLiquidityStatsFromSnapshot(document.data),
+        };
+      })
+      .filter((document): document is BackfillBlock => document !== null)
+      .sort((left, right) => {
+        if (left.timestamp !== right.timestamp) return left.timestamp - right.timestamp;
+        return left.blockHeight - right.blockHeight;
+      });
+    const documentsById = new Map<string, IndexerDocument>();
+    const emptyFlowTotals = (): FlowTotals => ({
+      transactions: 0,
+      fees: 0n,
+      volumeUSD: 0n,
+      swaps: 0,
+      bridgeIncomingTransactions: 0,
+      bridgeOutgoingTransactions: 0,
+    });
+    const addBlock = (totals: FlowTotals, block: BackfillBlock): void => {
+      totals.transactions += block.transactions;
+      totals.fees += block.fees;
+      totals.volumeUSD += block.volumeUSD;
+      totals.swaps += block.swaps;
+      totals.bridgeIncomingTransactions += block.bridgeIncomingTransactions;
+      totals.bridgeOutgoingTransactions += block.bridgeOutgoingTransactions;
+    };
+    const removeBlock = (totals: FlowTotals, block: BackfillBlock): void => {
+      totals.transactions -= block.transactions;
+      totals.fees -= block.fees;
+      totals.volumeUSD -= block.volumeUSD;
+      totals.swaps -= block.swaps;
+      totals.bridgeIncomingTransactions -= block.bridgeIncomingTransactions;
+      totals.bridgeOutgoingTransactions -= block.bridgeOutgoingTransactions;
+    };
+
+    for (const type of AGGREGATE_SNAPSHOT_TYPES) {
+      const totals = emptyFlowTotals();
+      let windowStart = 0;
+
+      for (let index = 0; index < blocks.length; index++) {
+        const block = blocks[index];
+        addBlock(totals, block);
+
+        const cutoff = block.timestamp - SNAPSHOT_WINDOW_SECONDS[type];
+        while (windowStart <= index && blocks[windowStart].timestamp < cutoff) {
+          removeBlock(totals, blocks[windowStart]);
+          windowStart++;
+        }
+
+        const id = snapshotId('network', 'all', type, block.timestamp, block.blockHeight);
+        documentsById.set(id, {
+          collection: collection('networkSnapshots'),
+          id,
+          blockHeight: block.blockHeight,
+          timestamp: block.timestamp,
+          data: {
+            id,
+            type,
+            timestamp: block.timestamp,
+            accounts: block.accounts,
+            transactions: totals.transactions,
+            fees: totals.fees.toString(),
+            liquidityUSD: block.liquidityStats.liquidityUSD,
+            poolLiquidityUSD: block.liquidityStats.poolLiquidityUSD,
+            orderBookLiquidityUSD: block.liquidityStats.orderBookLiquidityUSD,
+            volumeUSD: scaledToString(totals.volumeUSD, 8),
+            swaps: totals.swaps,
+            activePools: block.liquidityStats.activePools,
+            activeOrderBooks: block.liquidityStats.activeOrderBooks,
+            listedAssets: block.liquidityStats.listedAssets,
+            bridgeIncomingTransactions: totals.bridgeIncomingTransactions,
+            bridgeOutgoingTransactions: totals.bridgeOutgoingTransactions,
+          },
+        });
+      }
+    }
+
+    return [...documentsById.values()].sort((left, right) => {
+      const timestampDiff = Number(left.timestamp ?? 0) - Number(right.timestamp ?? 0);
+      if (timestampDiff !== 0) return timestampDiff;
+      return left.id.localeCompare(right.id);
     });
   }
 
