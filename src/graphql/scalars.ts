@@ -63,6 +63,7 @@ export const FilterScalars = {
   PoolSnapshotFilter: opaqueScalar('PoolSnapshotFilter', 'Pool snapshot filter object.'),
   PoolXYKFilter: opaqueScalar('PoolXYKFilter', 'Pool XYK filter object.'),
   ReferrerRewardFilter: opaqueScalar('ReferrerRewardFilter', 'Referrer reward filter object.'),
+  StakingValidatorFilter: opaqueScalar('StakingValidatorFilter', 'Staking validator filter object.'),
   VaultEventFilter: opaqueScalar('VaultEventFilter', 'Vault event filter object.'),
   VaultFilter: opaqueScalar('VaultFilter', 'Vault filter object.'),
   XorBurnFilter: opaqueScalar('XorBurnFilter', 'XOR burn filter object.'),

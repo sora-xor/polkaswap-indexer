@@ -303,6 +303,9 @@ const parseJsonString = (value: string): unknown => {
   }
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+
 const assetIdToString = (value: unknown): string => {
   if (!value) return '';
 
@@ -811,6 +814,54 @@ const firstNestedString = (record: Record<string, unknown>, keys: string[]): str
   return '';
 };
 
+/** Returns the first non-empty raw value without coercing nested codec payloads. */
+const firstPresentValue = (record: Record<string, unknown>, keys: string[]): unknown => {
+  for (const key of keys) {
+    const value = record[key];
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+
+  return undefined;
+};
+
+/** Returns the first record-shaped value for variant-style normalized data. */
+const firstRecord = (record: Record<string, unknown>, keys: string[]): Record<string, unknown> | null => {
+  for (const key of keys) {
+    const value = record[key];
+    if (isRecord(value)) return value;
+  }
+
+  return null;
+};
+
+/** Finds a variant object inside the normalized SwapAmount argument shape. */
+const swapAmountVariant = (value: unknown, keys: string[]): Record<string, unknown> | null => {
+  if (!isRecord(value)) return null;
+
+  return firstRecord(value, keys);
+};
+
+/** Extracts the requested input amount from current and legacy swap argument shapes. */
+const swapInputAmountFromArgs = (args: Record<string, unknown>): unknown => {
+  const desiredInput = swapAmountVariant(args.swapAmount, ['WithDesiredInput', 'withDesiredInput']);
+
+  return (
+    firstPresentValue(args, ['amount', 'baseAssetAmount', 'inputAmount']) ??
+    firstPresentValue(desiredInput ?? {}, ['desiredAmountIn', 'desired_amount_in', 'amount', 'arg0'])
+  );
+};
+
+/** Extracts the requested output amount from current and legacy swap argument shapes. */
+const swapOutputAmountFromArgs = (args: Record<string, unknown>): unknown => {
+  const desiredOutput = swapAmountVariant(args.swapAmount, ['WithDesiredOutput', 'withDesiredOutput']);
+
+  return (
+    firstPresentValue(args, ['targetAssetAmount', 'outputAmount']) ??
+    firstPresentValue(desiredOutput ?? {}, ['desiredAmountOut', 'desired_amount_out', 'amount', 'arg0']) ??
+    firstPresentValue(args, ['minOutputAmount'])
+  );
+};
+
 const isValidEvmNetworkId = (value: string): boolean => {
   if (!value) return false;
 
@@ -1040,11 +1091,16 @@ const createHistoryData = (
 
   if (module === 'liquidityProxy' && (method === 'swap' || method === 'swapTransfer')) {
     const exchange = findEvent(events, 'liquidityProxy', 'Exchange') ?? {};
-    const baseAssetId = firstString(args, ['inputAssetId', 'baseAssetId', 'assetId']) || firstString(exchange, ['inputAssetId', 'baseAssetId']);
+    const baseAssetId =
+      firstString(args, ['inputAssetId', 'baseAssetId', 'assetId']) ||
+      firstString(exchange, ['inputAssetId', 'baseAssetId', 'arg2']);
     const targetAssetId =
-      firstString(args, ['outputAssetId', 'targetAssetId']) || firstString(exchange, ['outputAssetId', 'targetAssetId']);
-    const baseAmount = args.amount ?? args.swapAmount ?? exchange.inputAmount ?? '0';
-    const targetAmount = exchange.outputAmount ?? args.minOutputAmount ?? '0';
+      firstString(args, ['outputAssetId', 'targetAssetId']) ||
+      firstString(exchange, ['outputAssetId', 'targetAssetId', 'arg3']);
+    const baseAmount =
+      firstPresentValue(exchange, ['inputAmount', 'baseAssetAmount', 'arg4']) ?? swapInputAmountFromArgs(args) ?? '0';
+    const targetAmount =
+      firstPresentValue(exchange, ['outputAmount', 'targetAssetAmount', 'arg5']) ?? swapOutputAmountFromArgs(args) ?? '0';
     const to = firstString(args, ['receiver', 'to']);
 
     return {
@@ -1482,16 +1538,18 @@ export class ChainIndexer {
     const finalizedBlock = finalizedHeader.number.toNumber();
 
     await this.refreshDerivedState(finalizedBlock, Math.floor(Date.now() / 1000), true);
-    const xorBurnBackfill = this.backfillXorBurns(finalizedBlock).catch((error: unknown) => {
-      console.error('Failed to backfill XOR burn documents', error);
-    });
+    const xorBurnBackfill = this.backfillXorBurns(finalizedBlock).then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error })
+    );
 
     const indexedAny = await this.backfill();
     if (!indexedAny && (await this.backfillNetworkAggregateSnapshots())) {
       await this.refreshDerivedState(finalizedBlock, Math.floor(Date.now() / 1000), true);
     }
+    const xorBurnBackfillResult = await xorBurnBackfill;
+    if (!xorBurnBackfillResult.ok) throw xorBurnBackfillResult.error;
     await this.subscribeFinalizedHeads();
-    void xorBurnBackfill;
   }
 
   private async getLastIndexedBlock(): Promise<number> {
@@ -1759,16 +1817,15 @@ export class ChainIndexer {
   private async indexBlockByHash(hash: string, options: IndexBlockOptions = {}): Promise<void> {
     if (!this.api) return;
 
-    const [signedBlock, eventsCodec, timestampNow] = await Promise.all([
+    const [signedBlock, eventsCodec, timestamp] = await Promise.all([
       this.api.rpc.chain.getBlock(hash),
       (this.api.query as any).system.events.at(hash),
-      (this.api.query as any).timestamp?.now.at(hash).catch(() => null),
+      this.fetchBlockTimestamp(hash),
     ]);
     const events = eventsCodec as unknown as EventRecord[];
     const eventsByExtrinsic = groupEventsByExtrinsic(events);
     const blockHeight = signedBlock.block.header.number.toNumber();
     const blockHash = signedBlock.block.header.hash.toString();
-    const timestamp = timestampNow ? Math.floor(Number(timestampNow.toString()) / 1000) : Math.floor(Date.now() / 1000);
     const documents: IndexerDocument[] = [];
     const touchedAccounts = new Set<string>();
     let totalFees = 0n;
@@ -1968,6 +2025,50 @@ export class ChainIndexer {
 
     supplyByAsset.set(XOR, codecToBigInt(nativeXorIssuance));
     return supplyByAsset;
+  }
+
+  private async fetchNativeXorIssuance(): Promise<unknown> {
+    if (!this.api) throw new Error('Cannot refresh native XOR supply before the chain API is initialized');
+
+    const balances = (this.api.query as any).balances;
+    if (typeof balances?.totalIssuance !== 'function') {
+      throw new Error('balances.totalIssuance is required to refresh native XOR supply');
+    }
+
+    return balances.totalIssuance.call(balances);
+  }
+
+  private async fetchStorageEntries(
+    storage: unknown,
+    label: string,
+    ...args: unknown[]
+  ): Promise<Array<[StorageEntryKey, unknown]>> {
+    const entries = (storage as { entries?: (...args: unknown[]) => Promise<Array<[StorageEntryKey, unknown]>> } | undefined)
+      ?.entries;
+
+    if (typeof entries !== 'function') {
+      throw new Error(`${label}.entries is required to refresh derived state`);
+    }
+
+    return entries.apply(storage, args);
+  }
+
+  private async fetchBlockTimestamp(hash: string): Promise<number> {
+    if (!this.api) throw new Error('Cannot index a block before the chain API is initialized');
+
+    const timestampNow = (this.api.query as any).timestamp?.now;
+    const at = timestampNow?.at;
+    if (typeof at !== 'function') {
+      throw new Error('timestamp.now.at is required to index block timestamps');
+    }
+
+    const codec = await at.call(timestampNow, hash);
+    const timestampMs = Number(codec?.toString?.() ?? codec);
+    if (!Number.isFinite(timestampMs)) {
+      throw new Error(`Invalid timestamp.now value for block ${hash}`);
+    }
+
+    return Math.floor(timestampMs / 1000);
   }
 
   private extractVolumeUSD(data: unknown): bigint {
@@ -2317,13 +2418,13 @@ export class ChainIndexer {
   }
 
   private async refreshDerivedState(blockHeight: number, timestamp: number, includeSnapshots: boolean): Promise<void> {
-    if (!this.api) return;
+    if (!this.api) throw new Error('Cannot refresh derived state before the chain API is initialized');
 
     const auxiliaryStoragePromise = Promise.all([
-      (this.api.query as any).poolXYK.poolProviders.entries(),
-      (this.api.query as any).staking.nominators.entries(),
-      (this.api.query as any).referrals.referrers.entries(),
-      (this.api.query as any).kensetsu.cdpDepository.entries(),
+      this.fetchStorageEntries((this.api.query as any).poolXYK.poolProviders, 'poolXYK.poolProviders'),
+      this.fetchStorageEntries((this.api.query as any).staking.nominators, 'staking.nominators'),
+      this.fetchStorageEntries((this.api.query as any).referrals.referrers, 'referrals.referrers'),
+      this.fetchStorageEntries((this.api.query as any).kensetsu.cdpDepository, 'kensetsu.cdpDepository'),
     ]);
     const [
       assetInfos,
@@ -2337,28 +2438,22 @@ export class ChainIndexer {
       orderBookLimitOrders,
       farmingPoolFarmers,
       indexedAccountCount,
-      latestHeader,
       nativeXorIssuance,
     ] = await Promise.all([
-      (this.api.query as any).assets.assetInfosV2.entries(),
-      (this.api.query as any).tokens.totalIssuance.entries(),
-      (this.api.query as any).poolXYK.properties.entries(),
-      (this.api.query as any).poolXYK.reserves.entries(),
-      (this.api.query as any).poolXYK.totalIssuances.entries(),
-      (this.api.query as any).orderBook.orderBooks.entries(),
-      (this.api.query as any).orderBook.bids.entries().catch(() => []),
-      (this.api.query as any).orderBook.asks.entries().catch(() => []),
-      (this.api.query as any).orderBook.limitOrders.entries().catch(() => []),
-      (this.api.query as any).farming?.poolFarmers?.entries
-        ? (this.api.query as any).farming.poolFarmers.entries().catch(() => [])
-        : [],
+      this.fetchStorageEntries((this.api.query as any).assets.assetInfosV2, 'assets.assetInfosV2'),
+      this.fetchStorageEntries((this.api.query as any).tokens.totalIssuance, 'tokens.totalIssuance'),
+      this.fetchStorageEntries((this.api.query as any).poolXYK.properties, 'poolXYK.properties'),
+      this.fetchStorageEntries((this.api.query as any).poolXYK.reserves, 'poolXYK.reserves'),
+      this.fetchStorageEntries((this.api.query as any).poolXYK.totalIssuances, 'poolXYK.totalIssuances'),
+      this.fetchStorageEntries((this.api.query as any).orderBook.orderBooks, 'orderBook.orderBooks'),
+      this.fetchStorageEntries((this.api.query as any).orderBook.bids, 'orderBook.bids'),
+      this.fetchStorageEntries((this.api.query as any).orderBook.asks, 'orderBook.asks'),
+      this.fetchStorageEntries((this.api.query as any).orderBook.limitOrders, 'orderBook.limitOrders'),
+      this.fetchStorageEntries((this.api.query as any).farming.poolFarmers, 'farming.poolFarmers'),
       this.countIndexedAccounts(),
-      this.api.rpc.chain.getHeader().catch(() => null),
-      (this.api.query as any).balances?.totalIssuance
-        ? (this.api.query as any).balances.totalIssuance().catch(() => 0n)
-        : 0n,
+      this.fetchNativeXorIssuance(),
     ]);
-    const effectiveBlockHeight = blockHeight || Number(latestHeader?.number?.toString?.() ?? 0);
+    const effectiveBlockHeight = blockHeight;
     const supplyByAsset = this.createSupplyByAsset(tokenIssuances, nativeXorIssuance);
 
     const assets = new Map<string, AssetInfo>();
@@ -3458,15 +3553,18 @@ export class ChainIndexer {
       {})[name];
     const value = constant?.toNumber?.();
 
-    return typeof value === 'number' ? value : null;
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
   }
 
   private getMaxNominatorRewardedPerValidator(): number {
-    return (
-      this.getStakingConstNumber('maxNominatorRewardedPerValidator') ??
-      this.getStakingConstNumber('maxExposurePageSize') ??
-      Number.POSITIVE_INFINITY
-    );
+    const value =
+      this.getStakingConstNumber('maxNominatorRewardedPerValidator') ?? this.getStakingConstNumber('maxExposurePageSize');
+
+    if (value === null) {
+      throw new Error('staking.maxNominatorRewardedPerValidator or staking.maxExposurePageSize is required');
+    }
+
+    return value;
   }
 
   private unwrapOption(value: unknown): unknown {
@@ -3478,6 +3576,45 @@ export class ChainIndexer {
     if (option.value !== undefined) return option.value;
 
     return value;
+  }
+
+  private codecRecordCandidates(value: unknown): Record<string, unknown>[] {
+    const candidates: Record<string, unknown>[] = [];
+    const json = toJson(value);
+    const human = toHuman(value);
+
+    if (isRecord(json)) candidates.push(json);
+    if (isRecord(human) && human !== json) candidates.push(human);
+    if (isRecord(value) && value !== json && value !== human) candidates.push(value);
+
+    return candidates;
+  }
+
+  private codecField(value: unknown, field: string): unknown {
+    for (const candidate of this.codecRecordCandidates(value)) {
+      if (field in candidate) return candidate[field];
+    }
+
+    return undefined;
+  }
+
+  private codecArray(value: unknown): unknown[] | null {
+    const unwrapped = this.unwrapOption(value);
+    if (Array.isArray(unwrapped)) return unwrapped;
+
+    const toArray = (unwrapped as { toArray?: () => unknown[] } | undefined)?.toArray;
+    if (typeof toArray === 'function') {
+      const array = toArray.call(unwrapped);
+      if (Array.isArray(array)) return array;
+    }
+
+    const json = toJson(unwrapped);
+    if (Array.isArray(json)) return json;
+
+    const human = toHuman(unwrapped);
+    if (Array.isArray(human)) return human;
+
+    return null;
   }
 
   private codecToNumber(value: unknown): number | null {
@@ -3508,56 +3645,210 @@ export class ChainIndexer {
         commission?: { unwrap?: () => unknown; toString?: () => string };
         blocked?: { isTrue?: boolean; toJSON?: () => unknown; toString?: () => string };
       };
-      const commission = String(prefs.commission?.unwrap?.() ?? prefs.commission?.toString?.() ?? '0');
-      const blockedValue = prefs.blocked?.isTrue ?? prefs.blocked?.toJSON?.() ?? prefs.blocked?.toString?.() ?? false;
+      const address = key.args[0]?.toString?.() ?? key.args[0];
+      const commissionValue = prefs.commission?.unwrap?.() ?? prefs.commission?.toString?.();
+      const blockedValue = prefs.blocked?.isTrue ?? prefs.blocked?.toJSON?.() ?? prefs.blocked?.toString?.();
+
+      if (!address) throw new Error('staking.validators entry is missing a validator address');
+      if (commissionValue === undefined || commissionValue === null) {
+        throw new Error(`staking.validators entry for ${String(address)} is missing commission`);
+      }
+      if (blockedValue === undefined || blockedValue === null) {
+        throw new Error(`staking.validators entry for ${String(address)} is missing blocked status`);
+      }
 
       return {
-        address: String(key.args[0]),
-        commission,
+        address: String(address),
+        commission: String(commissionValue),
         blocked: blockedValue === true || blockedValue === 'true',
       };
     });
   }
 
   private async getEraRewardPoints(era: number): Promise<{ total: number; individual: Map<string, number> }> {
-    if (!this.api) return { total: 0, individual: new Map() };
+    if (!this.api) throw new Error('Cannot read staking reward points before the chain API is initialized');
 
-    const data = await (this.api.query as any).staking.erasRewardPoints(era);
-    const total = this.codecToNumber(data?.total) ?? 0;
+    const erasRewardPoints = (this.api.query as any).staking?.erasRewardPoints;
+    if (typeof erasRewardPoints !== 'function') {
+      throw new Error('staking.erasRewardPoints is required to refresh staking validators');
+    }
+
+    const data = await erasRewardPoints(era);
+    const total = this.codecToNumber(data?.total);
     const individual = new Map<string, number>();
 
-    if (typeof data?.individual?.entries === 'function') {
-      for (const [account, points] of data.individual.entries()) {
-        individual.set(String(account), this.codecToNumber(points) ?? 0);
+    if (total === null) {
+      throw new Error(`staking.erasRewardPoints(${era}) is missing total points`);
+    }
+    if (typeof data?.individual?.entries !== 'function') {
+      throw new Error(`staking.erasRewardPoints(${era}) is missing individual points`);
+    }
+
+    for (const [account, points] of data.individual.entries()) {
+      const parsedPoints = this.codecToNumber(points);
+      if (parsedPoints === null) {
+        throw new Error(`staking.erasRewardPoints(${era}) has invalid points for ${String(account)}`);
       }
+      individual.set(String(account), parsedPoints);
     }
 
     return { total, individual };
   }
 
   private async getEraExposures(era: number): Promise<Map<string, StakingExposure>> {
-    if (!this.api) return new Map();
+    if (!this.api) throw new Error('Cannot read staking exposures before the chain API is initialized');
 
-    const entries = (await (this.api.query as any).staking.erasStakers.entries(era)) as Array<[StorageEntryKey, unknown]>;
+    const staking = (this.api.query as any).staking;
+    if (
+      typeof staking?.erasStakersOverview?.entries === 'function' &&
+      typeof staking?.erasStakersPaged?.entries === 'function'
+    ) {
+      const [overviewEntries, pageEntries] = await Promise.all([
+        this.fetchStorageEntries(staking.erasStakersOverview, 'staking.erasStakersOverview', era),
+        this.fetchStorageEntries(staking.erasStakersPaged, 'staking.erasStakersPaged', era),
+      ]);
+
+      if (overviewEntries.length > 0) return this.getPagedEraExposures(era, overviewEntries, pageEntries);
+      if (pageEntries.length > 0) {
+        throw new Error(`staking.erasStakersPaged(${era}) has pages without staking.erasStakersOverview entries`);
+      }
+    }
+
+    const entries = await this.fetchStorageEntries(staking?.erasStakers, 'staking.erasStakers', era);
+    if (!entries.length) throw new Error(`staking.erasStakers(${era}) returned no validator exposures`);
+
+    return this.parseEraExposureEntries(era, entries);
+  }
+
+  private parseEraExposureEntries(era: number, entries: Array<[StorageEntryKey, unknown]>): Map<string, StakingExposure> {
     const exposures = new Map<string, StakingExposure>();
 
     for (const [key, value] of entries) {
-      const address = String(key.args[1]);
-      const exposure = value as {
-        total?: unknown;
-        own?: unknown;
-        others?: Array<{ who?: unknown; value?: unknown }>;
-      };
-      const others = (exposure.others ?? []).map((item) => ({
-        who: String((item.who as CodecLike | undefined)?.toString?.() ?? item.who ?? ''),
-        value: String((item.value as CodecLike | undefined)?.toString?.() ?? item.value ?? '0'),
-      }));
+      const address = key.args[1]?.toString?.() ?? key.args[1];
+      const total = this.codecField(value, 'total');
+      const own = this.codecField(value, 'own');
+      const othersRaw = this.codecArray(this.codecField(value, 'others'));
 
-      exposures.set(address, {
-        total: codecToBigInt(exposure.total ?? 0),
-        own: String((exposure.own as CodecLike | undefined)?.toString?.() ?? exposure.own ?? '0'),
+      if (!address) throw new Error(`staking.erasStakers(${era}) entry is missing a validator address`);
+      if (total === undefined || total === null) {
+        throw new Error(`staking.erasStakers(${era}) entry for ${String(address)} is missing total exposure`);
+      }
+      if (own === undefined || own === null) {
+        throw new Error(`staking.erasStakers(${era}) entry for ${String(address)} is missing own exposure`);
+      }
+      if (!othersRaw) {
+        throw new Error(`staking.erasStakers(${era}) entry for ${String(address)} is missing nominators`);
+      }
+
+      const others = othersRaw.map((item) => {
+        const whoValue = this.codecField(item, 'who');
+        const nominatorValue = this.codecField(item, 'value');
+        const who = (whoValue as CodecLike | undefined)?.toString?.() ?? whoValue;
+
+        if (!who) throw new Error(`staking.erasStakers(${era}) entry for ${String(address)} has a nominator without an address`);
+        if (nominatorValue === undefined || nominatorValue === null) {
+          throw new Error(`staking.erasStakers(${era}) entry for ${String(address)} has a nominator without exposure`);
+        }
+
+        return {
+          who: String(who),
+          value: codecToBigInt(nominatorValue).toString(),
+        };
+      });
+
+      exposures.set(String(address), {
+        total: codecToBigInt(total),
+        own: codecToBigInt(own).toString(),
         others,
       });
+    }
+
+    return exposures;
+  }
+
+  private async getPagedEraExposures(
+    era: number,
+    overviewEntries: Array<[StorageEntryKey, unknown]>,
+    pageEntries: Array<[StorageEntryKey, unknown]>
+  ): Promise<Map<string, StakingExposure>> {
+    const pagesByValidator = new Map<string, Map<number, Array<{ who: string; value: string }>>>();
+
+    for (const [key, value] of pageEntries) {
+      const address = key.args[1]?.toString?.() ?? key.args[1];
+      const pageIndex = this.codecToNumber(key.args[2]);
+      const pageTotal = this.codecField(value, 'pageTotal');
+      const othersRaw = this.codecArray(this.codecField(value, 'others'));
+
+      if (!address) throw new Error(`staking.erasStakersPaged(${era}) entry is missing a validator address`);
+      if (pageIndex === null) throw new Error(`staking.erasStakersPaged(${era}) entry for ${String(address)} has invalid page`);
+      if (pageIndex < 0) throw new Error(`staking.erasStakersPaged(${era}) entry for ${String(address)} has invalid page`);
+      if (pageTotal === undefined || pageTotal === null) {
+        throw new Error(`staking.erasStakersPaged(${era}) entry for ${String(address)} page ${pageIndex} is missing page total`);
+      }
+      if (!othersRaw) throw new Error(`staking.erasStakersPaged(${era}) entry for ${String(address)} is missing nominators`);
+
+      const others = othersRaw.map((item) => {
+        const whoValue = this.codecField(item, 'who');
+        const nominatorValue = this.codecField(item, 'value');
+        const who = (whoValue as CodecLike | undefined)?.toString?.() ?? whoValue;
+
+        if (!who) throw new Error(`staking.erasStakersPaged(${era}) entry for ${String(address)} has a nominator without an address`);
+        if (nominatorValue === undefined || nominatorValue === null) {
+          throw new Error(`staking.erasStakersPaged(${era}) entry for ${String(address)} has a nominator without exposure`);
+        }
+
+        return { who: String(who), value: codecToBigInt(nominatorValue).toString() };
+      });
+      const pages = pagesByValidator.get(String(address)) ?? new Map<number, Array<{ who: string; value: string }>>();
+      if (pages.has(pageIndex)) {
+        throw new Error(`staking.erasStakersPaged(${era}) has duplicate page ${pageIndex} for validator ${String(address)}`);
+      }
+      pages.set(pageIndex, others);
+      pagesByValidator.set(String(address), pages);
+    }
+
+    const exposures = new Map<string, StakingExposure>();
+    for (const [key, value] of overviewEntries) {
+      const address = key.args[1]?.toString?.() ?? key.args[1];
+      const total = this.codecField(value, 'total');
+      const own = this.codecField(value, 'own');
+      const pageCount = this.codecToNumber(this.codecField(value, 'pageCount'));
+
+      if (!address) throw new Error(`staking.erasStakersOverview(${era}) entry is missing a validator address`);
+      if (total === undefined || total === null) {
+        throw new Error(`staking.erasStakersOverview(${era}) entry for ${String(address)} is missing total exposure`);
+      }
+      if (own === undefined || own === null) {
+        throw new Error(`staking.erasStakersOverview(${era}) entry for ${String(address)} is missing own exposure`);
+      }
+      if (pageCount === null) {
+        throw new Error(`staking.erasStakersOverview(${era}) entry for ${String(address)} has invalid page count`);
+      }
+
+      const pages = pagesByValidator.get(String(address)) ?? new Map<number, Array<{ who: string; value: string }>>();
+      if (pages.size !== pageCount) {
+        throw new Error(`staking.erasStakersPaged(${era}) is missing pages for validator ${String(address)}`);
+      }
+      const others: Array<{ who: string; value: string }> = [];
+      for (let index = 0; index < pageCount; index += 1) {
+        const page = pages.get(index);
+        if (!page) {
+          throw new Error(`staking.erasStakersPaged(${era}) is missing page ${index} for validator ${String(address)}`);
+        }
+        others.push(...page);
+      }
+
+      exposures.set(String(address), {
+        total: codecToBigInt(total),
+        own: codecToBigInt(own).toString(),
+        others,
+      });
+    }
+
+    for (const address of pagesByValidator.keys()) {
+      if (!exposures.has(address)) {
+        throw new Error(`staking.erasStakersOverview(${era}) is missing overview for validator ${address}`);
+      }
     }
 
     return exposures;
@@ -3574,10 +3865,13 @@ export class ChainIndexer {
 
   private async readValidatorIdentity(address: string): Promise<Record<string, unknown> | null> {
     const identityOf = (this.api?.query as any)?.identity?.identityOf;
-    if (!identityOf) return null;
+    if (typeof identityOf !== 'function') {
+      throw new Error('identity.identityOf is required to refresh staking validators');
+    }
 
-    const codec = await Promise.resolve(identityOf(address)).catch(() => null);
-    if (!codec || codec.isEmpty || codec.isNone) return null;
+    const codec = await identityOf(address);
+    if (!codec) throw new Error(`identity.identityOf(${address}) returned no codec`);
+    if (codec.isEmpty || codec.isNone) return null;
 
     const identity = toHuman(this.unwrapOption(codec)) as Record<string, unknown>;
     const info =
@@ -3614,7 +3908,7 @@ export class ChainIndexer {
     commission: string,
     prices: Map<string, bigint>,
     assets: Map<string, AssetInfo>
-  ): string {
+  ): string | null {
     const xorPriceUSD = prices.get(XOR) ?? 0n;
     const valPriceUSD = prices.get(VAL) ?? 0n;
 
@@ -3626,7 +3920,7 @@ export class ChainIndexer {
       xorPriceUSD <= 0n ||
       valPriceUSD <= 0n
     ) {
-      return '0';
+      return null;
     }
 
     const validatorReward = (eraValidatorReward * BigInt(rewardPoints)) / BigInt(totalRewardPoints);
@@ -3651,11 +3945,21 @@ export class ChainIndexer {
     prices: Map<string, bigint>,
     assets: Map<string, AssetInfo>
   ): Promise<IndexerDocument[]> {
+    if (!this.api) throw new Error('Cannot refresh staking validators before the chain API is initialized');
+
     const validatorsStorage = (this.api?.query as any)?.staking?.validators;
     const currentEraStorage = (this.api?.query as any)?.staking?.currentEra;
     const rewardsStorage = (this.api?.query as any)?.staking?.erasValidatorReward;
 
-    if (!validatorsStorage?.entries || !currentEraStorage || !rewardsStorage?.entries) return [];
+    if (typeof validatorsStorage?.entries !== 'function') {
+      throw new Error('staking.validators.entries is required to refresh staking validators');
+    }
+    if (typeof currentEraStorage !== 'function') {
+      throw new Error('staking.currentEra is required to refresh staking validators');
+    }
+    if (typeof rewardsStorage?.entries !== 'function') {
+      throw new Error('staking.erasValidatorReward.entries is required to refresh staking validators');
+    }
 
     const [validatorEntries, currentEraCodec, rewardEntries] = await Promise.all([
       validatorsStorage.entries(),
@@ -3663,31 +3967,50 @@ export class ChainIndexer {
       rewardsStorage.entries(),
     ]);
     const validators = this.formatValidatorPrefs(validatorEntries);
-    const currentEra = this.codecToNumber(currentEraCodec) ?? 0;
+    if (!validators.length) return [];
+
+    const currentEra = this.codecToNumber(currentEraCodec);
+    if (currentEra === null) throw new Error('staking.currentEra returned an invalid era');
+
     const rewardEra = this.latestRewardEra(rewardEntries);
-    const apyEra = rewardEra?.era ?? currentEra;
-    const [rewardPoints, currentExposures, apyExposures, identities] = await Promise.all([
-      this.getEraRewardPoints(apyEra),
+    if (!rewardEra) throw new Error('staking.erasValidatorReward has no completed reward era');
+
+    const apyEra = rewardEra.era;
+    const [rewardPoints, currentExposures, apyExposureEntries, identities] = await Promise.all([
+      this.getEraRewardPoints(rewardEra.era),
       this.getEraExposures(currentEra),
-      apyEra === currentEra ? Promise.resolve(new Map<string, StakingExposure>()) : this.getEraExposures(apyEra),
+      apyEra === currentEra ? Promise.resolve(null) : this.getEraExposures(apyEra),
       mapWithConcurrency(validators, VALIDATOR_IDENTITY_CONCURRENCY, async (validator) => [
         validator.address,
         await this.readValidatorIdentity(validator.address),
       ] as const),
     ]);
+    if (!currentExposures.size) throw new Error(`staking.erasStakers(${currentEra}) returned no validator exposures`);
+
+    const apyExposures = apyExposureEntries ?? currentExposures;
     const identityByAddress = new Map(identities);
     const maxNominatorRewarded = this.getMaxNominatorRewardedPerValidator();
+    const activeValidators = validators.filter((validator) => currentExposures.has(validator.address));
+    if (!activeValidators.length) {
+      throw new Error(`staking.erasStakers(${currentEra}) did not match any staking.validators entries`);
+    }
 
-    return validators.map((validator) => {
-      const exposure = currentExposures.get(validator.address) ?? apyExposures.get(validator.address) ?? {
-        total: 0n,
-        own: '0',
-        others: [],
-      };
-      const apyExposure = apyExposures.get(validator.address) ?? exposure;
+    return activeValidators.map((validator) => {
+      const exposure = currentExposures.get(validator.address);
+      const apyExposure = apyExposures.get(validator.address);
       const identity = identityByAddress.get(validator.address) ?? null;
       const validatorRewardPoints = rewardPoints.individual.get(validator.address) ?? 0;
-      const apy = rewardEra
+
+      if (!exposure) {
+        throw new Error(`staking.erasStakers(${currentEra}) is missing exposure for validator ${validator.address}`);
+      }
+      if (!apyExposure && validatorRewardPoints > 0) {
+        throw new Error(
+          `staking.erasStakers(${apyEra}) has reward points but is missing APY exposure for validator ${validator.address}`
+        );
+      }
+
+      const apy = apyExposure
         ? this.calculateValidatorApy(
             apyExposure.total,
             rewardEra.reward,
@@ -3697,7 +4020,7 @@ export class ChainIndexer {
             prices,
             assets
           )
-        : '0';
+        : null;
 
       return {
         collection: collection('stakingValidators'),

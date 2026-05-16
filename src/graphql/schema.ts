@@ -14,6 +14,7 @@ export const typeDefs = /* GraphQL */ `
   scalar PoolSnapshotFilter
   scalar PoolXYKFilter
   scalar ReferrerRewardFilter
+  scalar StakingValidatorFilter
   scalar VaultEventFilter
   scalar VaultFilter
   scalar XorBurnFilter
@@ -581,7 +582,7 @@ export const typeDefs = /* GraphQL */ `
     xorBurns(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [HistoryElementsOrderBy!], filter: XorBurnFilter): XorBurnConnection!
     referrerRewards(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: ReferrerRewardFilter): ReferrerRewardConnection!
     stakingStakers(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountFilter): StakingStakerConnection!
-    stakingValidators(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountFilter): StakingValidatorConnection!
+    stakingValidators(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: StakingValidatorFilter): StakingValidatorConnection!
     vaults(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: VaultFilter): VaultConnection!
     vaultEvents(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: VaultEventFilter): VaultEventConnection!
     updatesStream(id: String!): UpdatesStream

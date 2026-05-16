@@ -5,6 +5,7 @@ import { readConfig } from '../config.js';
 const { Pool } = pg;
 
 const NUMERIC_TEXT_PATTERN = "^-?[0-9]+(\\.[0-9]+)?$";
+const MIGRATION_LOCK_KEY = 4_350_435_000;
 
 const isSafeJsonField = (field: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(field);
 
@@ -18,11 +19,13 @@ const numericJsonExpression = (field: string): string => {
 
 export async function migrate(databaseUrl = readConfig().databaseUrl): Promise<void> {
   const pool = new Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
   const createNumericIndex = (name: string, field: string) =>
-    pool.query(`create index if not exists ${name} on indexer_documents(collection, ${numericJsonExpression(field)}, id);`);
+    client.query(`create index if not exists ${name} on indexer_documents(collection, ${numericJsonExpression(field)}, id);`);
 
   try {
-    await pool.query(`
+    await client.query('select pg_advisory_lock($1);', [MIGRATION_LOCK_KEY]);
+    await client.query(`
       create table if not exists indexer_documents (
         collection text not null,
         id text not null,
@@ -33,52 +36,61 @@ export async function migrate(databaseUrl = readConfig().databaseUrl): Promise<v
         primary key (collection, id)
       );
     `);
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_timestamp_idx on indexer_documents(collection, timestamp desc);'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_block_idx on indexer_documents(collection, block_height desc);'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_data_gin_idx on indexer_documents using gin(data jsonb_path_ops);'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_timestamp_id_idx on indexer_documents(collection, timestamp, id);'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_type_timestamp_id_idx on indexer_documents(collection, (data->>\'type\'), timestamp, id);'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_asset_id_idx on indexer_documents(collection, (data->>\'assetId\'));'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_account_id_idx on indexer_documents(collection, (data->>\'accountId\'));'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_address_idx on indexer_documents(collection, (data->>\'address\'));'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_data_from_idx on indexer_documents(collection, (data->>\'dataFrom\'));'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_data_to_idx on indexer_documents(collection, (data->>\'dataTo\'));'
     );
-    await pool.query(
+    await client.query(
+      'create index if not exists indexer_documents_history_address_timestamp_idx on indexer_documents((data->>\'address\'), timestamp desc, id desc) where collection = \'historyElements\';'
+    );
+    await client.query(
+      'create index if not exists indexer_documents_history_data_from_timestamp_idx on indexer_documents((data->>\'dataFrom\'), timestamp desc, id desc) where collection = \'historyElements\';'
+    );
+    await client.query(
+      'create index if not exists indexer_documents_history_data_to_timestamp_idx on indexer_documents((data->>\'dataTo\'), timestamp desc, id desc) where collection = \'historyElements\';'
+    );
+    await client.query(
       'create index if not exists indexer_documents_collection_module_method_timestamp_id_idx on indexer_documents(collection, (data->>\'module\'), (data->>\'method\'), timestamp, id);'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_order_book_id_idx on indexer_documents(collection, (data->>\'orderBookId\'));'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_asset_type_timestamp_id_idx on indexer_documents(collection, (data->>\'assetId\'), (data->>\'type\'), timestamp, id);'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_pool_type_timestamp_id_idx on indexer_documents(collection, (data->>\'poolId\'), (data->>\'type\'), timestamp, id);'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_order_book_type_timestamp_id_idx on indexer_documents(collection, (data->>\'orderBookId\'), (data->>\'type\'), timestamp, id);'
     );
-    await pool.query(
+    await client.query(
       'create index if not exists indexer_documents_collection_status_idx on indexer_documents(collection, (data->>\'status\'));'
     );
     await createNumericIndex('indexer_documents_collection_updated_at_block_idx', 'updatedAtBlock');
@@ -100,6 +112,8 @@ export async function migrate(databaseUrl = readConfig().databaseUrl): Promise<v
     await createNumericIndex('indexer_documents_collection_commission_idx', 'commission');
     await createNumericIndex('indexer_documents_collection_reward_points_idx', 'rewardPoints');
   } finally {
+    await client.query('select pg_advisory_unlock($1);', [MIGRATION_LOCK_KEY]).catch(() => undefined);
+    client.release();
     await pool.end();
   }
 }

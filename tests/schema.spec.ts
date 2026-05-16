@@ -738,6 +738,16 @@ describe('Polkaswap indexer schema', () => {
     expect(missingCalls).toEqual({ nodes: [] });
   });
 
+  it('accepts entity-specific staking validator filter variables', () => {
+    const schema = createSchema();
+    const stakingValidatorFilter = schema.getType('StakingValidatorFilter');
+    const stakingValidatorsField = schema.getQueryType()?.getFields().stakingValidators;
+    const filterArg = stakingValidatorsField?.args.find((arg) => arg.name === 'filter');
+
+    expect(stakingValidatorFilter?.toString()).toBe('StakingValidatorFilter');
+    expect(String(filterArg?.type)).toBe('StakingValidatorFilter');
+  });
+
   it('keeps SubQuery JSON fields selectable as scalar values', async () => {
     const repository = new MemoryRepository();
     await repository.upsert({

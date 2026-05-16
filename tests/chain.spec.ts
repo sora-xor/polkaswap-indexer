@@ -255,6 +255,177 @@ describe('ChainIndexer price derivation', () => {
     expect(supplyByAsset.get(KUSD)).toBe(123n);
   });
 
+  it('requires native balances issuance when refreshing XOR supply', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      api: unknown;
+      fetchNativeXorIssuance: () => Promise<unknown>;
+    };
+
+    indexer.api = { query: { balances: {} } };
+
+    await expect(indexer.fetchNativeXorIssuance()).rejects.toThrow(
+      'balances.totalIssuance is required to refresh native XOR supply'
+    );
+  });
+
+  it('propagates native balances issuance query failures', async () => {
+    const failure = new Error('RPC unavailable');
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      api: unknown;
+      fetchNativeXorIssuance: () => Promise<unknown>;
+    };
+
+    indexer.api = {
+      query: {
+        balances: {
+          totalIssuance: vi.fn().mockRejectedValue(failure),
+        },
+      },
+    };
+
+    await expect(indexer.fetchNativeXorIssuance()).rejects.toBe(failure);
+  });
+
+  it('requires storage entry queries instead of using empty collection fallbacks', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      fetchStorageEntries: (storage: unknown, label: string) => Promise<unknown[]>;
+    };
+
+    await expect(indexer.fetchStorageEntries({}, 'orderBook.bids')).rejects.toThrow(
+      'orderBook.bids.entries is required to refresh derived state'
+    );
+  });
+
+  it('propagates block timestamp query failures', async () => {
+    const failure = new Error('timestamp RPC unavailable');
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      api: unknown;
+      fetchBlockTimestamp: (hash: string) => Promise<number>;
+    };
+
+    indexer.api = {
+      query: {
+        timestamp: {
+          now: {
+            at: vi.fn().mockRejectedValue(failure),
+          },
+        },
+      },
+    };
+
+    await expect(indexer.fetchBlockTimestamp('0xblock')).rejects.toBe(failure);
+  });
+
+  it('propagates validator identity query failures', async () => {
+    const failure = new Error('identity RPC unavailable');
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      api: unknown;
+      readValidatorIdentity: (address: string) => Promise<Record<string, unknown> | null>;
+    };
+
+    indexer.api = {
+      query: {
+        identity: {
+          identityOf: vi.fn().mockRejectedValue(failure),
+        },
+      },
+    };
+
+    await expect(indexer.readValidatorIdentity('validator-1')).rejects.toBe(failure);
+  });
+
+  it('requires staking validator storage instead of returning an empty validator stream', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      api: unknown;
+      createStakingValidatorDocuments: (
+        blockHeight: number,
+        timestamp: number,
+        prices: Map<string, bigint>,
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>
+      ) => Promise<unknown[]>;
+    };
+
+    indexer.api = { query: { staking: {} } };
+
+    await expect(indexer.createStakingValidatorDocuments(1, 1, new Map(), new Map())).rejects.toThrow(
+      'staking.validators.entries is required to refresh staking validators'
+    );
+  });
+
+  it('reads paged staking exposure storage from the current SORA runtime shape', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      api: unknown;
+      getEraExposures: (era: number) => Promise<Map<string, { total: bigint; own: string; others: unknown[] }>>;
+    };
+
+    indexer.api = {
+      query: {
+        staking: {
+          erasStakersOverview: {
+            entries: async () => [
+              [
+                { args: [10, 'validator-1'] },
+                { toHuman: () => ({ total: '100', own: '25', pageCount: '1' }) },
+              ],
+            ],
+          },
+          erasStakersPaged: {
+            entries: async () => [
+              [
+                { args: [10, 'validator-1', { toString: () => '0' }] },
+                { toHuman: () => ({ pageTotal: '75', others: [{ who: 'nominator-1', value: '75' }] }) },
+              ],
+            ],
+          },
+        },
+      },
+    };
+
+    const exposures = await indexer.getEraExposures(10);
+
+    expect(exposures.get('validator-1')).toEqual({
+      total: 100n,
+      own: '25',
+      others: [{ who: 'nominator-1', value: '75' }],
+    });
+  });
+
+  it('reads legacy staking exposure storage for eras that predate paged exposure entries', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      api: unknown;
+      getEraExposures: (era: number) => Promise<Map<string, { total: bigint; own: string; others: unknown[] }>>;
+    };
+
+    indexer.api = {
+      query: {
+        staking: {
+          erasStakersOverview: { entries: async () => [] },
+          erasStakersPaged: { entries: async () => [] },
+          erasStakers: {
+            entries: async () => [
+              [
+                { args: [9, 'validator-1'] },
+                {
+                  total: '100',
+                  own: '25',
+                  others: [{ who: 'nominator-1', value: '75' }],
+                },
+              ],
+            ],
+          },
+        },
+      },
+    };
+
+    const exposures = await indexer.getEraExposures(9);
+
+    expect(exposures.get('validator-1')).toEqual({
+      total: 100n,
+      own: '25',
+      others: [{ who: 'nominator-1', value: '75' }],
+    });
+  });
+
   it('adds direct XOR fee burns to asset snapshot burn aggregates', async () => {
     const repository = new MemoryRepository();
     await repository.upsert({
@@ -464,6 +635,96 @@ describe('ChainIndexer price derivation', () => {
       })
     );
     expect(JSON.parse(stream.data.data)[0].apy).toBe('65.7');
+  });
+
+  it('leaves validator APY null when the reward era has no validator exposure or reward points', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      api: unknown;
+      createStakingValidatorDocuments: (
+        blockHeight: number,
+        timestamp: number,
+        prices: Map<string, bigint>,
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>
+      ) => Promise<Array<{ data: Record<string, any> }>>;
+    };
+    const rewardPoints = new Map<object, object>();
+
+    indexer.api = {
+      consts: { staking: { maxNominatorRewardedPerValidator: { toNumber: () => 64 } } },
+      query: {
+        identity: { identityOf: async () => ({ isEmpty: true }) },
+        staking: {
+          validators: {
+            entries: async () => [
+              [{ args: ['validator-1'] }, { commission: { unwrap: () => ({ toString: () => '0' }) }, blocked: { isTrue: false } }],
+            ],
+          },
+          currentEra: async () => ({ toString: () => '10' }),
+          erasValidatorReward: {
+            entries: async () => [[{ args: [{ toString: () => '9' }] }, { unwrap: () => ({ toString: () => '100' }) }]],
+          },
+          erasRewardPoints: async () => ({
+            total: { toString: () => '100' },
+            individual: rewardPoints,
+          }),
+          erasStakers: {
+            entries: async (era: number) =>
+              era === 10
+                ? [
+                    [
+                      { args: [era, 'validator-1'] },
+                      {
+                        total: '100',
+                        own: '25',
+                        others: [{ who: 'nominator-1', value: '75' }],
+                      },
+                    ],
+                  ]
+                : [
+                    [
+                      { args: [era, 'validator-2'] },
+                      {
+                        total: '200',
+                        own: '50',
+                        others: [{ who: 'nominator-2', value: '150' }],
+                      },
+                    ],
+                  ],
+          },
+        },
+      },
+    };
+
+    const documents = await indexer.createStakingValidatorDocuments(
+      12,
+      1_700_000_000,
+      new Map([
+        [XOR, SCALE],
+        [VAL, SCALE],
+      ]),
+      new Map([
+        [XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }],
+        [VAL, { id: VAL, symbol: 'VAL', name: 'VAL', decimals: 18, supply: 0n }],
+      ])
+    );
+
+    expect(documents[0]?.data.apy).toBeNull();
+
+    rewardPoints.set({ toString: () => 'validator-1' }, { toString: () => '1' });
+    await expect(
+      indexer.createStakingValidatorDocuments(
+        12,
+        1_700_000_000,
+        new Map([
+          [XOR, SCALE],
+          [VAL, SCALE],
+        ]),
+        new Map([
+          [XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }],
+          [VAL, { id: VAL, symbol: 'VAL', name: 'VAL', decimals: 18, supply: 0n }],
+        ])
+      )
+    ).rejects.toThrow('has reward points but is missing APY exposure');
   });
 
   it('derives pool APY from farming reward weights and liquidity', () => {
@@ -741,6 +1002,118 @@ describe('ChainIndexer price derivation', () => {
     });
     expect(snapshot?.data.bridgeOutgoingTransactions).toBe(1);
     expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '0', outgoingUSD: '10' });
+  });
+
+  it('indexes liquidityProxy swap history from the actual Exchange event amounts', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([
+      [XOR, 3n * SCALE],
+      [KUSD, SCALE],
+    ]);
+    indexer.assetInfos = new Map([
+      [XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }],
+      [KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 0n }],
+    ]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 44 },
+                hash: { toString: () => '0xswapblock' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xswap' },
+                  method: {
+                    section: 'liquidityProxy',
+                    method: 'swap',
+                    args: [
+                      0,
+                      XOR,
+                      KUSD,
+                      {
+                        WithDesiredInput: {
+                          desiredAmountIn: '0',
+                          minAmountOut: '0',
+                        },
+                      },
+                      'PoolXYK',
+                      'Disabled',
+                    ],
+                    meta: {
+                      args: [
+                        { name: 'dexId' },
+                        { name: 'inputAssetId' },
+                        { name: 'outputAssetId' },
+                        { name: 'swapAmount' },
+                        { name: 'selectedSourceType' },
+                        { name: 'filterMode' },
+                      ],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('liquidityProxy', 'Exchange', {
+                arg0: 'alice',
+                arg1: 0,
+                arg2: XOR,
+                arg3: KUSD,
+                arg4: (5n * SCALE).toString(),
+                arg5: ((499n * SCALE) / 100n).toString(),
+                arg6: '0',
+              }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000000000' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xswapblock');
+
+    const history = await repository.get('historyElements', '0xswap');
+    const snapshot = await repository.get('networkSnapshots', 'block-44');
+
+    expect(history?.data).toMatchObject({
+      module: 'liquidityProxy',
+      method: 'swap',
+      address: 'alice',
+      dataFrom: 'alice',
+      data: {
+        baseAssetId: XOR,
+        targetAssetId: KUSD,
+        selectedMarket: 'PoolXYK',
+        baseAssetAmount: '5',
+        targetAssetAmount: '4.99',
+        baseAssetAmountUSD: '15',
+        targetAssetAmountUSD: '4.99',
+      },
+    });
+    expect(snapshot?.data.swaps).toBe(1);
+    expect(snapshot?.data.volumeUSD).toBe('15');
   });
 
   it('indexes bridgeMultisig asset movements by recipient for ETH incoming restores', async () => {
@@ -2300,6 +2673,40 @@ describe('ChainIndexer price derivation', () => {
       'network-aggregate-backfill',
       'subscribe',
     ]);
+    apiCreate.mockRestore();
+  });
+
+  it('propagates compact XOR burn backfill failures during startup', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      start: () => Promise<void>;
+      refreshDerivedState: (blockHeight: number, timestamp: number, includeSnapshots: boolean) => Promise<void>;
+      backfillXorBurns: (finalizedBlock: number) => Promise<void>;
+      backfill: () => Promise<boolean>;
+      backfillNetworkAggregateSnapshots: () => Promise<boolean>;
+      subscribeFinalizedHeads: () => Promise<void>;
+    };
+    const failure = new Error('xor burn backfill failed');
+    const subscribeFinalizedHeads = vi.fn();
+    const apiCreate = vi.spyOn(ApiPromise, 'create').mockResolvedValue({
+      rpc: {
+        chain: {
+          getFinalizedHead: async () => '0xfinal',
+          getHeader: async () => ({ number: { toNumber: () => 25_900_000 } }),
+        },
+      },
+    } as never);
+
+    indexer.refreshDerivedState = async () => undefined;
+    indexer.backfillXorBurns = async () => {
+      throw failure;
+    };
+    indexer.backfill = async () => false;
+    indexer.backfillNetworkAggregateSnapshots = async () => false;
+    indexer.subscribeFinalizedHeads = subscribeFinalizedHeads;
+
+    await expect(indexer.start()).rejects.toBe(failure);
+    expect(subscribeFinalizedHeads).not.toHaveBeenCalled();
     apiCreate.mockRestore();
   });
 
