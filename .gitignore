@@ -11,6 +11,7 @@ build/
 coverage/
 .nyc_output/
 .vitest/
+.playwright-cli*
 *.tsbuildinfo
 
 # Local environment files

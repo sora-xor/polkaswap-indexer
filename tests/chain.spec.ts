@@ -6,6 +6,7 @@ import { MemoryRepository } from '../src/repository/memory.js';
 
 const SCALE = 10n ** 18n;
 const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000';
+const VAL = '0x0200040000000000000000000000000000000000000000000000000000000000';
 const PSWAP = '0x0200050000000000000000000000000000000000000000000000000000000000';
 const DUST_DAI = '0x00a0e746a66b290bd29cbffecc710aefacb98840937229e1e847590006fa0696';
 const ETH = '0x0200070000000000000000000000000000000000000000000000000000000000';
@@ -228,6 +229,241 @@ describe('ChainIndexer price derivation', () => {
     ]);
 
     expect(fee).toBe(123n);
+  });
+
+  it('mirrors the runtime XOR fee split when deriving direct fee burns', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      extractXorFeeBurn: (networkFee: unknown) => bigint;
+    };
+
+    expect(indexer.extractXorFeeBurn(85n * SCALE)).toBe(20n * SCALE);
+    expect(indexer.extractXorFeeBurn('123')).toBe(30n);
+    expect(indexer.extractXorFeeBurn('0')).toBe(0n);
+  });
+
+  it('uses native balances issuance for XOR asset supply snapshots', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createSupplyByAsset: (
+        tokenIssuances: Array<[{ args: unknown[] }, unknown]>,
+        nativeXorIssuance: unknown
+      ) => Map<string, bigint>;
+    };
+
+    const supplyByAsset = indexer.createSupplyByAsset([[{ args: [KUSD] }, '123']], '999');
+
+    expect(supplyByAsset.get(XOR)).toBe(999n);
+    expect(supplyByAsset.get(KUSD)).toBe(123n);
+  });
+
+  it('adds direct XOR fee burns to asset snapshot burn aggregates', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert({
+      collection: 'historyElements',
+      id: 'fee-history',
+      blockHeight: 10,
+      timestamp: 1_700_000_000,
+      data: {
+        id: 'fee-history',
+        timestamp: 1_700_000_000,
+        module: 'liquidityProxy',
+        method: 'swap',
+        networkFee: (85n * SCALE).toString(),
+        data: {},
+      },
+    });
+    await repository.upsert({
+      collection: 'historyElements',
+      id: '0xrequest-mint',
+      blockHeight: 10,
+      timestamp: 1_700_000_000,
+      data: {
+        id: '0xrequest-mint',
+        timestamp: 1_700_000_000,
+        module: 'bridgeProxy',
+        method: 'mint',
+        networkFee: (85n * SCALE).toString(),
+        data: { requestHash: '0xrequest' },
+      },
+    });
+
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      buildAnalytics: (
+        timestamp: number,
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        prices: Map<string, bigint>,
+        pools: unknown[],
+        liquidityStats: {
+          liquidityUSD: string;
+          poolLiquidityUSD: string;
+          orderBookLiquidityUSD: string;
+          activePools: number;
+          activeOrderBooks: number;
+          listedAssets: number;
+        },
+        chainAccountCount: number
+      ) => Promise<{ assets: Map<string, Map<string, { burn: bigint }>> }>;
+    };
+    const analytics = await indexer.buildAnalytics(
+      1_700_000_000,
+      new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]),
+      new Map([[XOR, SCALE]]),
+      [],
+      {
+        liquidityUSD: '0',
+        poolLiquidityUSD: '0',
+        orderBookLiquidityUSD: '0',
+        activePools: 0,
+        activeOrderBooks: 0,
+        listedAssets: 1,
+      },
+      0
+    );
+
+    expect(analytics.assets.get(XOR)?.get('HOUR')?.burn).toBe(20n * SCALE);
+    expect(analytics.assets.get(XOR)?.get('DAY')?.burn).toBe(20n * SCALE);
+  });
+
+  it('calculates validator APY from latest era reward points, prices, stake, and commission', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      calculateValidatorApy: (
+        validatorTotalStake: bigint,
+        eraValidatorReward: bigint,
+        rewardPoints: number,
+        totalRewardPoints: number,
+        commission: string,
+        prices: Map<string, bigint>,
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>
+      ) => string;
+    };
+
+    expect(
+      indexer.calculateValidatorApy(
+        1_000n * SCALE,
+        1n * SCALE,
+        25,
+        100,
+        '100000000',
+        new Map([
+          [XOR, SCALE],
+          [VAL, 2n * SCALE],
+        ]),
+        new Map([
+          [XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }],
+          [VAL, { id: VAL, symbol: 'VAL', name: 'VAL', decimals: 18, supply: 0n }],
+        ])
+      )
+    ).toBe('65.7');
+  });
+
+  it('creates indexed validator return documents and a compact stream payload', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      api: unknown;
+      createStakingValidatorDocuments: (
+        blockHeight: number,
+        timestamp: number,
+        prices: Map<string, bigint>,
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>
+      ) => Promise<Array<{ collection: string; id: string; data: Record<string, any> }>>;
+      createStakingValidatorsStream: (
+        validatorDocuments: Array<{ collection: string; id: string; data: Record<string, any> }>,
+        blockHeight: number,
+        timestamp: number
+      ) => { collection: string; id: string; data: Record<string, string> };
+    };
+    const account = { toString: () => 'validator-1' };
+    const point = { toString: () => '25' };
+    const reward = { unwrap: () => ({ toString: () => (1n * SCALE).toString() }) };
+    const identity = {
+      isEmpty: false,
+      isNone: false,
+      unwrap: () => ({
+        toHuman: () => ({
+          judgements: [[0, 'KnownGood']],
+          info: { display: { Raw: 'Validator One' }, image: 'None' },
+        }),
+      }),
+    };
+
+    indexer.api = {
+      consts: {
+        staking: {
+          maxNominatorRewardedPerValidator: { toNumber: () => 1 },
+        },
+      },
+      query: {
+        identity: {
+          identityOf: async () => identity,
+        },
+        staking: {
+          validators: {
+            entries: async () => [
+              [
+                { args: ['validator-1'] },
+                {
+                  commission: { unwrap: () => ({ toString: () => '100000000' }) },
+                  blocked: { isTrue: false },
+                },
+              ],
+            ],
+          },
+          currentEra: async () => ({ toString: () => '10' }),
+          erasValidatorReward: {
+            entries: async () => [[{ args: [{ toString: () => '9' }] }, reward]],
+          },
+          erasRewardPoints: async () => ({
+            total: { toString: () => '100' },
+            individual: new Map([[account, point]]),
+          }),
+          erasStakers: {
+            entries: async (era: number) => [
+              [
+                { args: [era, 'validator-1'] },
+                {
+                  total: (1_000n * SCALE).toString(),
+                  own: (100n * SCALE).toString(),
+                  others: [
+                    { who: { toString: () => 'nominator-1' }, value: '1' },
+                    { who: { toString: () => 'nominator-2' }, value: '2' },
+                  ],
+                },
+              ],
+            ],
+          },
+        },
+      },
+    };
+
+    const documents = await indexer.createStakingValidatorDocuments(
+      12,
+      1_700_000_000,
+      new Map([
+        [XOR, SCALE],
+        [VAL, 2n * SCALE],
+      ]),
+      new Map([
+        [XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }],
+        [VAL, { id: VAL, symbol: 'VAL', name: 'VAL', decimals: 18, supply: 0n }],
+      ])
+    );
+    const stream = indexer.createStakingValidatorsStream(documents, 12, 1_700_000_000);
+
+    expect(documents).toHaveLength(1);
+    expect(documents[0]).toEqual(
+      expect.objectContaining({
+        collection: 'stakingValidators',
+        id: 'validator-1',
+        data: expect.objectContaining({
+          address: 'validator-1',
+          apy: '65.7',
+          commission: '100000000',
+          identity: expect.objectContaining({ info: { display: 'Validator One', image: '' } }),
+          isKnownGood: true,
+          isOversubscribed: true,
+          rewardPoints: 25,
+        }),
+      })
+    );
+    expect(JSON.parse(stream.data.data)[0].apy).toBe('65.7');
   });
 
   it('derives pool APY from farming reward weights and liquidity', () => {

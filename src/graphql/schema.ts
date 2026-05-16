@@ -457,6 +457,33 @@ export const typeDefs = /* GraphQL */ `
     totalCount: Int!
   }
 
+  type StakingValidator {
+    id: String!
+    address: String
+    commission: String
+    blocked: Boolean
+    rewardPoints: Int
+    nominators: JSON
+    identity: JSON
+    apy: String
+    isOversubscribed: Boolean
+    isKnownGood: Boolean
+    stake: JSON
+    era: Int
+    updated: Int
+  }
+
+  type StakingValidatorEdge {
+    cursor: Cursor
+    node: StakingValidator!
+  }
+
+  type StakingValidatorConnection {
+    edges: [StakingValidatorEdge!]!
+    pageInfo: PageInfo!
+    totalCount: Int!
+  }
+
   type Vault {
     id: String!
     type: String
@@ -554,6 +581,7 @@ export const typeDefs = /* GraphQL */ `
     xorBurns(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [HistoryElementsOrderBy!], filter: XorBurnFilter): XorBurnConnection!
     referrerRewards(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: ReferrerRewardFilter): ReferrerRewardConnection!
     stakingStakers(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountFilter): StakingStakerConnection!
+    stakingValidators(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountFilter): StakingValidatorConnection!
     vaults(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: VaultFilter): VaultConnection!
     vaultEvents(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: VaultEventFilter): VaultEventConnection!
     updatesStream(id: String!): UpdatesStream

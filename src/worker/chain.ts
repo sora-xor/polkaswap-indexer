@@ -172,12 +172,34 @@ type IndexBlockOptions = {
   refreshDerivedState?: boolean;
 };
 
+type StorageEntryKey = {
+  args: unknown[];
+};
+
+type StakingValidatorInfo = {
+  address: string;
+  commission: string;
+  blocked: boolean;
+};
+
+type StakingExposure = {
+  total: bigint;
+  own: string;
+  others: Array<{ who: string; value: string }>;
+};
+
+type StakingRewardEra = {
+  era: number;
+  reward: bigint;
+};
+
 const CHAIN_STATE_ID = 'chainState';
 const XOR_BURN_BACKFILL_STATE_ID = 'xorBurnsBackfill';
 const NETWORK_AGGREGATE_BACKFILL_STATE_ID = 'networkAggregateSnapshotsBackfill';
 const DECIMALS = 18;
 const SCALE = 10n ** 18n;
 const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000';
+const VAL = '0x0200040000000000000000000000000000000000000000000000000000000000';
 const SORA_NEXUS_XOR_BURN_REMARK_TYPE = 'soraNexusXorClaim';
 const SORA_XOR_BURN_START_BLOCK = 25_043_003;
 const XOR_BURN_BACKFILL_BATCH_SIZE = 250;
@@ -190,6 +212,10 @@ const STABLE_ASSET_IDS = new Set([DAI, XSTUSD, KUSD]);
 // Keep shallow pools from becoming global price oracles and inflating Explore TVL.
 const MIN_PRICE_DISCOVERY_LIQUIDITY_USD = 100n * SCALE;
 const MIN_PRICE_DISCOVERY_AMOUNT = 10n ** 16n;
+const FEE_REFERRER_WEIGHT = 10;
+const FEE_XOR_BURNED_WEIGHT = 20;
+const FEE_VAL_BURNED_WEIGHT = 50;
+const FEE_KUSD_BURNED_WEIGHT = 5;
 const SNAPSHOT_TYPES: SnapshotTypeName[] = ['DEFAULT', 'HOUR', 'DAY', 'MONTH', 'BLOCK'];
 const AGGREGATE_SNAPSHOT_TYPES: SnapshotTypeName[] = SNAPSHOT_TYPES.filter((type) => type !== 'BLOCK');
 const SNAPSHOT_WINDOW_SECONDS: Record<SnapshotTypeName, number> = {
@@ -201,6 +227,9 @@ const SNAPSHOT_WINDOW_SECONDS: Record<SnapshotTypeName, number> = {
 };
 const FARMING_PSWAP_PER_DAY = 2_500_000n * SCALE;
 const DAYS_PER_YEAR = 365n;
+const ERAS_PER_DAY = 4n;
+const COMMISSION_DENOMINATOR = 1_000_000_000n;
+const VALIDATOR_IDENTITY_CONCURRENCY = 8;
 const EVENT_DATA_CACHE = new WeakMap<EventRecord['event'], Record<string, unknown>>();
 
 const activeAggregateSnapshotTypes = (eventTimestamp: number, timestamp: number): SnapshotTypeName[] => {
@@ -214,6 +243,33 @@ const activeAggregateSnapshotTypes = (eventTimestamp: number, timestamp: number)
 };
 
 const collection = <T extends IndexerDocument['collection']>(name: T): T => name;
+
+/** Runs bounded async work so storage-derived refreshes do not flood the RPC node. */
+const mapWithConcurrency = async <T, R>(
+  items: readonly T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>
+): Promise<R[]> => {
+  if (!items.length) return [];
+
+  const limit = Math.max(1, Math.floor(concurrency));
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+
+      if (index >= items.length) return;
+
+      results[index] = await mapper(items[index], index);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return results;
+};
 
 const toJson = (value: unknown): unknown => {
   if (value && typeof value === 'object' && 'toJSON' in value) {
@@ -316,6 +372,15 @@ const codecToDecimalString = (value: unknown, decimals = DECIMALS): string =>
 
 const scaledMul = (left: bigint, right: bigint): bigint => (left * right) / SCALE;
 const scaledDiv = (left: bigint, right: bigint): bigint => (right === 0n ? 0n : (left * SCALE) / right);
+
+/** Mirrors Substrate `Imbalance::ration`: first share is floored, second share keeps the remainder. */
+const splitByRatio = (amount: bigint, first: number, second: number): [bigint, bigint] => {
+  const total = BigInt(first + second);
+  if (total === 0n) return [0n, 0n];
+
+  const firstAmount = (amount * BigInt(first)) / total;
+  return [firstAmount, amount - firstAmount];
+};
 const scaledPow = (base: bigint, exponent: number): bigint => {
   let result = SCALE;
   for (let index = 0; index < exponent; index += 1) {
@@ -1870,6 +1935,41 @@ export class ChainIndexer {
     return total;
   }
 
+  /** Returns the direct XOR burn portion of a withdrawn XOR fee using the runtime split weights. */
+  private extractXorFeeBurn(networkFee: unknown): bigint {
+    const fee = codecToBigInt(networkFee);
+    if (fee <= 0n) return 0n;
+
+    const [, afterReferrer] = splitByRatio(
+      fee,
+      FEE_REFERRER_WEIGHT,
+      FEE_XOR_BURNED_WEIGHT + FEE_VAL_BURNED_WEIGHT + FEE_KUSD_BURNED_WEIGHT
+    );
+    const [, xorAndKusd] = splitByRatio(
+      afterReferrer,
+      FEE_VAL_BURNED_WEIGHT,
+      FEE_XOR_BURNED_WEIGHT + FEE_KUSD_BURNED_WEIGHT
+    );
+    const [, xorBurned] = splitByRatio(xorAndKusd, FEE_KUSD_BURNED_WEIGHT, FEE_XOR_BURNED_WEIGHT);
+
+    return xorBurned;
+  }
+
+  /** Combines ORML token issuance with native Balances issuance, which is where XOR supply is stored. */
+  private createSupplyByAsset(
+    tokenIssuances: Array<[StorageEntryKey, unknown]>,
+    nativeXorIssuance: unknown
+  ): Map<string, bigint> {
+    const supplyByAsset = new Map<string, bigint>();
+
+    for (const [key, value] of tokenIssuances) {
+      supplyByAsset.set(assetIdToString(key.args[0]), codecToBigInt(value));
+    }
+
+    supplyByAsset.set(XOR, codecToBigInt(nativeXorIssuance));
+    return supplyByAsset;
+  }
+
   private extractVolumeUSD(data: unknown): bigint {
     if (!data || typeof data !== 'object') return 0n;
 
@@ -2238,6 +2338,7 @@ export class ChainIndexer {
       farmingPoolFarmers,
       indexedAccountCount,
       latestHeader,
+      nativeXorIssuance,
     ] = await Promise.all([
       (this.api.query as any).assets.assetInfosV2.entries(),
       (this.api.query as any).tokens.totalIssuance.entries(),
@@ -2253,13 +2354,12 @@ export class ChainIndexer {
         : [],
       this.countIndexedAccounts(),
       this.api.rpc.chain.getHeader().catch(() => null),
+      (this.api.query as any).balances?.totalIssuance
+        ? (this.api.query as any).balances.totalIssuance().catch(() => 0n)
+        : 0n,
     ]);
     const effectiveBlockHeight = blockHeight || Number(latestHeader?.number?.toString?.() ?? 0);
-
-    const supplyByAsset = new Map<string, bigint>();
-    for (const [key, value] of tokenIssuances) {
-      supplyByAsset.set(assetIdToString(key.args[0]), codecToBigInt(value));
-    }
+    const supplyByAsset = this.createSupplyByAsset(tokenIssuances, nativeXorIssuance);
 
     const assets = new Map<string, AssetInfo>();
     for (const [key, value] of assetInfos) {
@@ -2384,9 +2484,14 @@ export class ChainIndexer {
     await this.repository.upsertMany(marketDocuments);
 
     const [poolProviders, nominators, referrers, cdpEntries] = await auxiliaryStoragePromise;
-    const vaultDocuments = await this.createVaultDocuments(cdpEntries, effectiveBlockHeight, timestamp);
+    const [vaultDocuments, stakingValidatorDocuments] = await Promise.all([
+      this.createVaultDocuments(cdpEntries, effectiveBlockHeight, timestamp),
+      this.createStakingValidatorDocuments(effectiveBlockHeight, timestamp, prices, assets),
+    ]);
     const auxiliaryDocuments: IndexerDocument[] = [
       ...this.createStakingDocuments(nominators, effectiveBlockHeight, timestamp),
+      ...stakingValidatorDocuments,
+      this.createStakingValidatorsStream(stakingValidatorDocuments, effectiveBlockHeight, timestamp),
       ...this.createReferralDocuments(referrers, effectiveBlockHeight, timestamp),
       ...vaultDocuments,
       ...this.createAccountLiquidityDocuments(poolProviders, poolStates, assets, prices, effectiveBlockHeight, timestamp),
@@ -2622,6 +2727,8 @@ export class ChainIndexer {
       const module = String(document.data.module ?? '');
       const method = String(document.data.method ?? '');
       const activeTypes = activeAggregateSnapshotTypes(eventTimestamp, timestamp);
+      // Synthetic bridge mint rows are derived from the original extrinsic; the original row owns the fee burn.
+      const aggregateXorFeeBurn = !(module === 'bridgeProxy' && method === 'mint' && document.id.endsWith('-mint'));
       const updateAsset = (assetId: string, amount: unknown, amountUSD: unknown): void => {
         if (!assetId) return;
         const currentPrice = scaledToString(prices.get(assetId) ?? 0n, 8);
@@ -2661,6 +2768,20 @@ export class ChainIndexer {
       };
       const volumeUSD = this.extractVolumeUSD(eventData);
       const eventAssets = collectAssets(eventData);
+      const xorFeeBurn = aggregateXorFeeBurn
+        ? reserveToNaturalScaled(
+            this.extractXorFeeBurn(document.data.networkFee),
+            assets.get(XOR)?.decimals ?? DECIMALS
+          )
+        : 0n;
+
+      if (xorFeeBurn > 0n) {
+        const currentPrice = scaledToString(prices.get(XOR) ?? 0n, 8);
+        for (const type of activeTypes) {
+          const aggregate = getAggregate(analytics.assets, XOR, type, () => newAssetAggregate(currentPrice));
+          aggregate.burn += xorFeeBurn;
+        }
+      }
 
       if (eventTimestamp >= timestamp - 86_400) {
         for (const assetId of eventAssets) {
@@ -3328,6 +3449,297 @@ export class ChainIndexer {
         swaps: window.totals.swaps,
         bridgeIncomingTransactions: window.totals.bridgeIncomingTransactions,
         bridgeOutgoingTransactions: window.totals.bridgeOutgoingTransactions,
+      },
+    };
+  }
+
+  private getStakingConstNumber(name: string): number | null {
+    const constant = ((this.api?.consts as unknown as { staking?: Record<string, { toNumber?: () => number } | undefined> })?.staking ??
+      {})[name];
+    const value = constant?.toNumber?.();
+
+    return typeof value === 'number' ? value : null;
+  }
+
+  private getMaxNominatorRewardedPerValidator(): number {
+    return (
+      this.getStakingConstNumber('maxNominatorRewardedPerValidator') ??
+      this.getStakingConstNumber('maxExposurePageSize') ??
+      Number.POSITIVE_INFINITY
+    );
+  }
+
+  private unwrapOption(value: unknown): unknown {
+    if (!value || typeof value !== 'object') return value;
+
+    const option = value as { isEmpty?: boolean; isNone?: boolean; unwrap?: () => unknown; value?: unknown };
+    if (option.isEmpty || option.isNone) return 0n;
+    if (typeof option.unwrap === 'function') return option.unwrap();
+    if (option.value !== undefined) return option.value;
+
+    return value;
+  }
+
+  private codecToNumber(value: unknown): number | null {
+    const unwrapped = this.unwrapOption(value);
+    const text = String((unwrapped as CodecLike | undefined)?.toString?.() ?? unwrapped ?? '');
+    const parsed = Number(text.replace(/,/g, ''));
+
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  private latestRewardEra(rewardEntries: Array<[StorageEntryKey, unknown]>): StakingRewardEra | null {
+    let latest: StakingRewardEra | null = null;
+
+    for (const [key, value] of rewardEntries) {
+      const era = this.codecToNumber(key.args[0]);
+      const reward = codecToBigInt(this.unwrapOption(value));
+
+      if (era === null || reward <= 0n) continue;
+      if (!latest || era > latest.era) latest = { era, reward };
+    }
+
+    return latest;
+  }
+
+  private formatValidatorPrefs(entries: Array<[StorageEntryKey, unknown]>): StakingValidatorInfo[] {
+    return entries.map(([key, value]) => {
+      const prefs = value as {
+        commission?: { unwrap?: () => unknown; toString?: () => string };
+        blocked?: { isTrue?: boolean; toJSON?: () => unknown; toString?: () => string };
+      };
+      const commission = String(prefs.commission?.unwrap?.() ?? prefs.commission?.toString?.() ?? '0');
+      const blockedValue = prefs.blocked?.isTrue ?? prefs.blocked?.toJSON?.() ?? prefs.blocked?.toString?.() ?? false;
+
+      return {
+        address: String(key.args[0]),
+        commission,
+        blocked: blockedValue === true || blockedValue === 'true',
+      };
+    });
+  }
+
+  private async getEraRewardPoints(era: number): Promise<{ total: number; individual: Map<string, number> }> {
+    if (!this.api) return { total: 0, individual: new Map() };
+
+    const data = await (this.api.query as any).staking.erasRewardPoints(era);
+    const total = this.codecToNumber(data?.total) ?? 0;
+    const individual = new Map<string, number>();
+
+    if (typeof data?.individual?.entries === 'function') {
+      for (const [account, points] of data.individual.entries()) {
+        individual.set(String(account), this.codecToNumber(points) ?? 0);
+      }
+    }
+
+    return { total, individual };
+  }
+
+  private async getEraExposures(era: number): Promise<Map<string, StakingExposure>> {
+    if (!this.api) return new Map();
+
+    const entries = (await (this.api.query as any).staking.erasStakers.entries(era)) as Array<[StorageEntryKey, unknown]>;
+    const exposures = new Map<string, StakingExposure>();
+
+    for (const [key, value] of entries) {
+      const address = String(key.args[1]);
+      const exposure = value as {
+        total?: unknown;
+        own?: unknown;
+        others?: Array<{ who?: unknown; value?: unknown }>;
+      };
+      const others = (exposure.others ?? []).map((item) => ({
+        who: String((item.who as CodecLike | undefined)?.toString?.() ?? item.who ?? ''),
+        value: String((item.value as CodecLike | undefined)?.toString?.() ?? item.value ?? '0'),
+      }));
+
+      exposures.set(address, {
+        total: codecToBigInt(exposure.total ?? 0),
+        own: String((exposure.own as CodecLike | undefined)?.toString?.() ?? exposure.own ?? '0'),
+        others,
+      });
+    }
+
+    return exposures;
+  }
+
+  private normalizeIdentityInfoValue(value: unknown): unknown {
+    if (value === 'None' || value === null || value === undefined) return '';
+    if (!Array.isArray(value) && typeof value === 'object' && 'Raw' in value) {
+      return String((value as { Raw?: unknown }).Raw ?? '');
+    }
+
+    return value;
+  }
+
+  private async readValidatorIdentity(address: string): Promise<Record<string, unknown> | null> {
+    const identityOf = (this.api?.query as any)?.identity?.identityOf;
+    if (!identityOf) return null;
+
+    const codec = await Promise.resolve(identityOf(address)).catch(() => null);
+    if (!codec || codec.isEmpty || codec.isNone) return null;
+
+    const identity = toHuman(this.unwrapOption(codec)) as Record<string, unknown>;
+    const info =
+      identity.info && typeof identity.info === 'object' && !Array.isArray(identity.info)
+        ? Object.fromEntries(
+            Object.entries(identity.info as Record<string, unknown>).map(([key, value]) => [
+              key,
+              this.normalizeIdentityInfoValue(value),
+            ])
+          )
+        : {};
+
+    return { ...identity, info };
+  }
+
+  private isKnownGoodIdentity(identity: Record<string, unknown> | null): boolean {
+    const judgements = Array.isArray(identity?.judgements) ? identity.judgements : [];
+
+    return judgements.some((judgement) => {
+      if (Array.isArray(judgement)) return judgement[1] === 'KnownGood';
+      if (judgement && typeof judgement === 'object') return Object.values(judgement).includes('KnownGood');
+      return judgement === 'KnownGood';
+    });
+  }
+
+  /**
+   * Annualizes the latest completed validator-era reward as a nominator return percentage.
+   */
+  private calculateValidatorApy(
+    validatorTotalStake: bigint,
+    eraValidatorReward: bigint,
+    rewardPoints: number,
+    totalRewardPoints: number,
+    commission: string,
+    prices: Map<string, bigint>,
+    assets: Map<string, AssetInfo>
+  ): string {
+    const xorPriceUSD = prices.get(XOR) ?? 0n;
+    const valPriceUSD = prices.get(VAL) ?? 0n;
+
+    if (
+      validatorTotalStake <= 0n ||
+      eraValidatorReward <= 0n ||
+      rewardPoints <= 0 ||
+      totalRewardPoints <= 0 ||
+      xorPriceUSD <= 0n ||
+      valPriceUSD <= 0n
+    ) {
+      return '0';
+    }
+
+    const validatorReward = (eraValidatorReward * BigInt(rewardPoints)) / BigInt(totalRewardPoints);
+    const rewardVal = reserveToNaturalScaled(validatorReward, assets.get(VAL)?.decimals ?? DECIMALS);
+    const rewardUSD = scaledMul(rewardVal, valPriceUSD);
+    const rewardXor = scaledDiv(rewardUSD, xorPriceUSD);
+    const totalStakeXor = reserveToNaturalScaled(validatorTotalStake, assets.get(XOR)?.decimals ?? DECIMALS);
+    const commissionValue = codecToBigInt(commission);
+    const nominatorShare =
+      commissionValue >= COMMISSION_DENOMINATOR
+        ? 0n
+        : SCALE - (commissionValue * SCALE) / COMMISSION_DENOMINATOR;
+    const annualizedReturn = scaledDiv(rewardXor, totalStakeXor) * ERAS_PER_DAY * DAYS_PER_YEAR;
+    const apyPercent = scaledMul(annualizedReturn, nominatorShare) * 100n;
+
+    return scaledToString(apyPercent, 8);
+  }
+
+  private async createStakingValidatorDocuments(
+    blockHeight: number,
+    timestamp: number,
+    prices: Map<string, bigint>,
+    assets: Map<string, AssetInfo>
+  ): Promise<IndexerDocument[]> {
+    const validatorsStorage = (this.api?.query as any)?.staking?.validators;
+    const currentEraStorage = (this.api?.query as any)?.staking?.currentEra;
+    const rewardsStorage = (this.api?.query as any)?.staking?.erasValidatorReward;
+
+    if (!validatorsStorage?.entries || !currentEraStorage || !rewardsStorage?.entries) return [];
+
+    const [validatorEntries, currentEraCodec, rewardEntries] = await Promise.all([
+      validatorsStorage.entries(),
+      currentEraStorage(),
+      rewardsStorage.entries(),
+    ]);
+    const validators = this.formatValidatorPrefs(validatorEntries);
+    const currentEra = this.codecToNumber(currentEraCodec) ?? 0;
+    const rewardEra = this.latestRewardEra(rewardEntries);
+    const apyEra = rewardEra?.era ?? currentEra;
+    const [rewardPoints, currentExposures, apyExposures, identities] = await Promise.all([
+      this.getEraRewardPoints(apyEra),
+      this.getEraExposures(currentEra),
+      apyEra === currentEra ? Promise.resolve(new Map<string, StakingExposure>()) : this.getEraExposures(apyEra),
+      mapWithConcurrency(validators, VALIDATOR_IDENTITY_CONCURRENCY, async (validator) => [
+        validator.address,
+        await this.readValidatorIdentity(validator.address),
+      ] as const),
+    ]);
+    const identityByAddress = new Map(identities);
+    const maxNominatorRewarded = this.getMaxNominatorRewardedPerValidator();
+
+    return validators.map((validator) => {
+      const exposure = currentExposures.get(validator.address) ?? apyExposures.get(validator.address) ?? {
+        total: 0n,
+        own: '0',
+        others: [],
+      };
+      const apyExposure = apyExposures.get(validator.address) ?? exposure;
+      const identity = identityByAddress.get(validator.address) ?? null;
+      const validatorRewardPoints = rewardPoints.individual.get(validator.address) ?? 0;
+      const apy = rewardEra
+        ? this.calculateValidatorApy(
+            apyExposure.total,
+            rewardEra.reward,
+            validatorRewardPoints,
+            rewardPoints.total,
+            validator.commission,
+            prices,
+            assets
+          )
+        : '0';
+
+      return {
+        collection: collection('stakingValidators'),
+        id: validator.address,
+        blockHeight,
+        timestamp,
+        data: {
+          id: validator.address,
+          address: validator.address,
+          commission: validator.commission,
+          blocked: validator.blocked,
+          rewardPoints: validatorRewardPoints,
+          nominators: exposure.others,
+          identity,
+          apy,
+          isOversubscribed: exposure.others.length > maxNominatorRewarded,
+          isKnownGood: this.isKnownGoodIdentity(identity),
+          stake: {
+            total: exposure.total.toString(),
+            own: exposure.own,
+          },
+          era: apyEra,
+          updated: timestamp,
+        },
+      };
+    });
+  }
+
+  private createStakingValidatorsStream(
+    validatorDocuments: IndexerDocument[],
+    blockHeight: number,
+    timestamp: number
+  ): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: 'stakingValidators',
+      blockHeight,
+      timestamp,
+      data: {
+        id: 'stakingValidators',
+        block: blockHeight,
+        data: JSON.stringify(validatorDocuments.map((document) => document.data)),
       },
     };
   }

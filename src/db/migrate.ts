@@ -96,6 +96,9 @@ export async function migrate(databaseUrl = readConfig().databaseUrl): Promise<v
     await createNumericIndex('indexer_documents_collection_base_asset_reserves_idx', 'baseAssetReserves');
     await createNumericIndex('indexer_documents_collection_target_asset_reserves_idx', 'targetAssetReserves');
     await createNumericIndex('indexer_documents_collection_amount_idx', 'amount');
+    await createNumericIndex('indexer_documents_collection_apy_idx', 'apy');
+    await createNumericIndex('indexer_documents_collection_commission_idx', 'commission');
+    await createNumericIndex('indexer_documents_collection_reward_points_idx', 'rewardPoints');
   } finally {
     await pool.end();
   }

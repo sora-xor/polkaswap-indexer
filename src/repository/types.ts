@@ -15,6 +15,7 @@ export type IndexerCollection =
   | 'poolSnapshots'
   | 'referrerRewards'
   | 'stakingStakers'
+  | 'stakingValidators'
   | 'updatesStreams'
   | 'vaults'
   | 'vaultEvents'

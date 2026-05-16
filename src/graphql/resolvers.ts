@@ -543,6 +543,7 @@ export function createSchema(): GraphQLSchema {
         xorBurns: connectionResolver(collection('xorBurns')),
         referrerRewards: connectionResolver(collection('referrerRewards')),
         stakingStakers: connectionResolver(collection('stakingStakers')),
+        stakingValidators: connectionResolver(collection('stakingValidators')),
         vaults: connectionResolver(collection('vaults')),
         vaultEvents: connectionResolver(collection('vaultEvents')),
         updatesStream: documentResolver(collection('updatesStreams')),
