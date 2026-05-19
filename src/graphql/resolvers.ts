@@ -1,11 +1,16 @@
 import { makeExecutableSchema } from '@graphql-tools/schema';
 
+import {
+  ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID,
+  hasCompletedAccountTransactionsBackfill,
+  normalizeIndexedAccountId,
+} from '../account-activity.js';
 import { metrics } from '../metrics.js';
 import { matchesFilter, sortDocuments } from './filter.js';
 import { CursorScalar, FilterScalars, JSONScalar, OrderByScalar } from './scalars.js';
 import { typeDefs } from './schema.js';
 
-import type { IndexerCollection, IndexerDocument, IndexerRepository } from '../repository/types.js';
+import type { IndexerCollection, IndexerDocument, IndexerRepository, RepositoryQueryArgs } from '../repository/types.js';
 import type { GraphQLResolveInfo, GraphQLSchema, SelectionNode } from 'graphql';
 
 type Context = {
@@ -280,6 +285,121 @@ const queryFirst = async (
   return documents.find((document) => document.data === node || document.id === node.id) ?? null;
 };
 
+const ACCOUNT_ACTIVITY_PAGE_SIZE = 1_000;
+
+type NetworkAccountActivityArgs = {
+  from: number;
+  to: number;
+};
+
+type NetworkAccountActivityRange = {
+  from: number;
+  to: number;
+};
+
+const normalizeNetworkAccountActivityRange = (args: NetworkAccountActivityArgs): NetworkAccountActivityRange | null => {
+  const from = Number(args.from);
+  const to = Number(args.to);
+
+  if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 0 || to < 0) return null;
+
+  return {
+    from: Math.min(from, to),
+    to: Math.max(from, to),
+  };
+};
+
+const networkAccountActivityCacheKey = (args: NetworkAccountActivityArgs): string => {
+  const range = normalizeNetworkAccountActivityRange(args);
+  return range ? `networkAccountActivity:${range.from}:${range.to}` : 'networkAccountActivity:invalid';
+};
+
+const addAccountId = (accounts: Set<string>, value: unknown): void => {
+  const accountId = normalizeIndexedAccountId(value);
+  if (accountId) accounts.add(accountId);
+};
+
+const visitRangeDocuments = async (
+  repository: IndexerRepository,
+  collectionName: IndexerCollection,
+  from: number,
+  to: number,
+  visit: (document: IndexerDocument) => void
+): Promise<void> => {
+  const rangeStart = Math.min(from, to);
+  const rangeEnd = Math.max(from, to);
+  const filter = { timestamp: { greaterThanOrEqualTo: rangeStart, lessThanOrEqualTo: rangeEnd } };
+
+  if (!repository.query) {
+    const documents = await repository.list(collectionName);
+    documents.filter((document) => matchesFilter(document.data, filter)).forEach(visit);
+    return;
+  }
+
+  let seek: RepositoryQueryArgs['seek'];
+
+  while (true) {
+    const result = await repository.query(collectionName, {
+      first: ACCOUNT_ACTIVITY_PAGE_SIZE,
+      includeTotalCount: false,
+      orderBy: ['TIMESTAMP_ASC'],
+      filter,
+      seek,
+    });
+
+    result.items.forEach(visit);
+
+    const last = result.items.at(-1);
+    if (!last || !result.hasNextPage) return;
+
+    seek = {
+      field: 'timestamp',
+      value: toTimestamp(last),
+      id: last.id,
+      direction: 'asc',
+    };
+  }
+};
+
+/**
+ * Counts unique accounts that participated in transactions over a selected
+ * timestamp range. Explicit account transaction documents are preferred, while
+ * legacy history rows keep the metric useful for already-indexed data.
+ */
+const networkAccountActivityResolver = async (_parent: unknown, args: NetworkAccountActivityArgs, context: Context) => {
+  const range = normalizeNetworkAccountActivityRange(args);
+  if (!range) {
+    return {
+      id: 'network-account-activity-invalid',
+      from: 0,
+      to: 0,
+      activeAccounts: 0,
+    };
+  }
+
+  const accounts = new Set<string>();
+
+  await visitRangeDocuments(context.repository, collection('accountTransactions'), range.from, range.to, (document) => {
+    addAccountId(accounts, document.data.accountId);
+  });
+
+  const backfillState = await context.repository.get(collection('updatesStreams'), ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID);
+  if (!hasCompletedAccountTransactionsBackfill(backfillState?.data?.data)) {
+    await visitRangeDocuments(context.repository, collection('historyElements'), range.from, range.to, (document) => {
+      addAccountId(accounts, document.data.address);
+      addAccountId(accounts, document.data.dataFrom);
+      addAccountId(accounts, document.data.dataTo);
+    });
+  }
+
+  return {
+    id: `network-account-activity-${range.from}-${range.to}`,
+    from: range.from,
+    to: range.to,
+    activeAccounts: accounts.size,
+  };
+};
+
 const latestNetworkSnapshot = async (repository: IndexerRepository): Promise<IndexerDocument | null> => {
   if (!repository.query) {
     const documents = await repository.list(collection('networkSnapshots'));
@@ -518,6 +638,14 @@ export function createSchema(): GraphQLSchema {
     context: Context
   ): Promise<Awaited<ReturnType<typeof exploreStatsResolver>>> =>
     cache.getOrSet('exploreStats', 'exploreStats', () => exploreStatsResolver(parent, args, context));
+  const cachedNetworkAccountActivityResolver = (
+    parent: unknown,
+    args: NetworkAccountActivityArgs,
+    context: Context
+  ): Promise<Awaited<ReturnType<typeof networkAccountActivityResolver>>> =>
+    cache.getOrSet('networkAccountActivity', networkAccountActivityCacheKey(args), () =>
+      networkAccountActivityResolver(parent, args, context)
+    );
 
   return makeExecutableSchema({
     typeDefs,
@@ -550,6 +678,7 @@ export function createSchema(): GraphQLSchema {
         accountMeta: documentResolver(collection('accountMeta')),
         accountPointSystems: connectionResolver(collection('accountPointSystems')),
         exploreStats: cachedExploreStatsResolver,
+        networkAccountActivity: cachedNetworkAccountActivityResolver,
       },
       HistoryElement: {
         calls: (parent: Record<string, unknown>) => ({

@@ -1,5 +1,11 @@
 import { ApiPromise, WsProvider } from '@polkadot/api';
 
+import {
+  ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID,
+  hasCompletedAccountTransactionsBackfill,
+  normalizeIndexedAccountId,
+  uniqueIndexedAccountIds,
+} from '../account-activity.js';
 import type { AppConfig } from '../config.js';
 import type { IndexerCollection, IndexerDocument, IndexerRepository, RepositoryQueryArgs } from '../repository/types.js';
 
@@ -119,6 +125,7 @@ type NetworkLiquidityStats = {
 };
 
 type NetworkAggregate = NetworkLiquidityStats & {
+  /** Number of accounts first seen by the indexer during this snapshot window. */
   accounts: number;
   transactions: number;
   fees: bigint;
@@ -131,6 +138,7 @@ type NetworkAggregate = NetworkLiquidityStats & {
 type NetworkBackfillBlock = {
   blockHeight: number;
   timestamp: number;
+  accounts: number;
   transactions: number;
   fees: bigint;
   volumeUSD: bigint;
@@ -141,7 +149,7 @@ type NetworkBackfillBlock = {
 
 type NetworkBackfillFlowTotals = Pick<
   NetworkAggregate,
-  'transactions' | 'fees' | 'volumeUSD' | 'swaps' | 'bridgeIncomingTransactions' | 'bridgeOutgoingTransactions'
+  'accounts' | 'transactions' | 'fees' | 'volumeUSD' | 'swaps' | 'bridgeIncomingTransactions' | 'bridgeOutgoingTransactions'
 >;
 
 type NetworkBackfillWindow = {
@@ -172,6 +180,12 @@ type IndexBlockOptions = {
   refreshDerivedState?: boolean;
 };
 
+type DerivedStateRefreshRequest = {
+  blockHeight: number;
+  timestamp: number;
+  includeSnapshots: boolean;
+};
+
 type StorageEntryKey = {
   args: unknown[];
 };
@@ -193,17 +207,39 @@ type StakingRewardEra = {
   reward: bigint;
 };
 
+type AccountPointUpdate = {
+  module: string;
+  method: string;
+  data: unknown;
+  fee: bigint;
+  failed?: boolean;
+};
+
+type NetworkTransactionCounters = {
+  transactions: number;
+  swaps: number;
+  bridgeIncomingTransactions: number;
+  bridgeOutgoingTransactions: number;
+};
+
 const CHAIN_STATE_ID = 'chainState';
 const XOR_BURN_BACKFILL_STATE_ID = 'xorBurnsBackfill';
 const NETWORK_AGGREGATE_BACKFILL_STATE_ID = 'networkAggregateSnapshotsBackfill';
+const NETWORK_TRANSACTION_COUNTER_REPAIR_STATE_ID = 'networkTransactionCounterRepair-v1';
+const ASSET_PRICE_OUTLIER_CLEANUP_STATE_ID = 'assetSnapshotPriceOutlierCleanup-v1';
 const DECIMALS = 18;
 const SCALE = 10n ** 18n;
 const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000';
 const VAL = '0x0200040000000000000000000000000000000000000000000000000000000000';
+const XOR_SUPPLY_REDENOMINATION_FACTOR = 1_000_000n;
 const SORA_NEXUS_XOR_BURN_REMARK_TYPE = 'soraNexusXorClaim';
 const SORA_XOR_BURN_START_BLOCK = 25_043_003;
 const XOR_BURN_BACKFILL_BATCH_SIZE = 250;
+const ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE = 1_000;
 const FINALIZED_HEAD_RETRY_DELAY_MS = 5_000;
+const FINALIZED_HEAD_POLL_INTERVAL_MS = 1_000;
+const DERIVED_STATE_REFRESH_RETRY_DELAY_MS = 15_000;
+const CHAIN_RPC_TIMEOUT_MS = 15_000;
 const PSWAP = '0x0200050000000000000000000000000000000000000000000000000000000000';
 const DAI = '0x0200060000000000000000000000000000000000000000000000000000000000';
 const XSTUSD = '0x0200080000000000000000000000000000000000000000000000000000000000';
@@ -211,7 +247,12 @@ const KUSD = '0x02000c0000000000000000000000000000000000000000000000000000000000
 const STABLE_ASSET_IDS = new Set([DAI, XSTUSD, KUSD]);
 // Keep shallow pools from becoming global price oracles and inflating Explore TVL.
 const MIN_PRICE_DISCOVERY_LIQUIDITY_USD = 100n * SCALE;
-const MIN_PRICE_DISCOVERY_AMOUNT = 10n ** 16n;
+// Require meaningful natural depth on the asset being priced. Sub-0.5 token pools
+// are too easy to skew, even when the stable side happens to exceed $100.
+const MIN_PRICE_DISCOVERY_AMOUNT = SCALE / 2n;
+const ASSET_PRICE_OUTLIER_RATIO = 20n;
+const ASSET_PRICE_OUTLIER_NEIGHBOR_WINDOW_SECONDS = 30 * 86_400;
+const ASSET_PRICE_OUTLIER_MIN_NEIGHBORS = 3;
 const FEE_REFERRER_WEIGHT = 10;
 const FEE_XOR_BURNED_WEIGHT = 20;
 const FEE_VAL_BURNED_WEIGHT = 50;
@@ -219,7 +260,7 @@ const FEE_KUSD_BURNED_WEIGHT = 5;
 const SNAPSHOT_TYPES: SnapshotTypeName[] = ['DEFAULT', 'HOUR', 'DAY', 'MONTH', 'BLOCK'];
 const AGGREGATE_SNAPSHOT_TYPES: SnapshotTypeName[] = SNAPSHOT_TYPES.filter((type) => type !== 'BLOCK');
 const SNAPSHOT_WINDOW_SECONDS: Record<SnapshotTypeName, number> = {
-  DEFAULT: 86_400,
+  DEFAULT: 5 * 60,
   HOUR: 3_600,
   DAY: 86_400,
   MONTH: 30 * 86_400,
@@ -243,6 +284,29 @@ const activeAggregateSnapshotTypes = (eventTimestamp: number, timestamp: number)
 };
 
 const collection = <T extends IndexerDocument['collection']>(name: T): T => name;
+
+const emptyNetworkTransactionCounters = (): NetworkTransactionCounters => ({
+  transactions: 0,
+  swaps: 0,
+  bridgeIncomingTransactions: 0,
+  bridgeOutgoingTransactions: 0,
+});
+
+const isLiquidityProxySwap = (module: string, method: string, callNames: string[] = []): boolean =>
+  (module === 'liquidityProxy' && (method === 'swap' || method === 'swapTransfer')) ||
+  callNames.some((name) => name === 'liquidityProxy.swap' || name === 'liquidityProxy.swapTransfer');
+
+const isBridgeOutgoing = (module: string, method: string): boolean =>
+  module === 'ethBridge' || (module === 'bridgeProxy' && method === 'burn');
+
+const isSyntheticBridgeIncoming = (id: string, module: string, method: string): boolean =>
+  module === 'bridgeProxy' && method === 'mint' && id.endsWith('-mint');
+
+const isBridgeIncoming = (id: string, module: string, method: string): boolean =>
+  module === 'bridgeMultisig' || isSyntheticBridgeIncoming(id, module, method);
+
+const historyExecutionSucceeded = (execution: unknown): boolean =>
+  !execution || typeof execution !== 'object' || (execution as Record<string, unknown>).success !== false;
 
 /** Runs bounded async work so storage-derived refreshes do not flood the RPC node. */
 const mapWithConcurrency = async <T, R>(
@@ -269,6 +333,21 @@ const mapWithConcurrency = async <T, R>(
 
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
   return results;
+};
+
+const withTimeout = async <T>(promise: Promise<T>, label: string, timeoutMs = CHAIN_RPC_TIMEOUT_MS): Promise<T> => {
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 };
 
 const toJson = (value: unknown): unknown => {
@@ -368,6 +447,14 @@ const decimalStringToScaled = (value: unknown): bigint => {
   const scaled = BigInt(integer || '0') * SCALE + BigInt(fraction.padEnd(18, '0').slice(0, 18) || '0');
 
   return negative ? -scaled : scaled;
+};
+
+const positiveDecimalStringToScaled = (value: unknown): bigint | null => {
+  const text = String(value ?? '');
+  if (!/^[0-9]+(?:\.[0-9]+)?$/.test(text)) return null;
+
+  const scaled = decimalStringToScaled(text);
+  return scaled > 0n ? scaled : null;
 };
 
 const codecToDecimalString = (value: unknown, decimals = DECIMALS): string =>
@@ -1327,7 +1414,7 @@ const createBridgeProxyIncomingContext = (
     module: 'bridgeProxy',
     method: 'mint',
     history,
-    accounts: [...new Set([recipient, sender].filter(Boolean))],
+    accounts: uniqueIndexedAccountIds([recipient, sender]),
   };
 };
 
@@ -1378,7 +1465,67 @@ const snapshotBucket = (type: string, timestamp: number, blockHeight = 0): numbe
 const snapshotId = (prefix: string, id: string, type: string, timestamp: number, blockHeight = 0): string =>
   `${prefix}-${id}-${type}-${snapshotBucket(type, timestamp, blockHeight)}`;
 
+const accountTransactionId = (historyElementId: string, account: string): string => `${historyElementId}-${account}`;
+
 const emptyPriceOhlc = (price: string): PriceOhlc => ({ open: price, high: price, low: price, close: price });
+
+const snapshotDocumentTimestamp = (document: IndexerDocument): number => {
+  const timestamp = Number(document.timestamp ?? document.data.timestamp ?? 0);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+};
+
+const priceOhlcValues = (price: unknown): bigint[] | null => {
+  if (!price || typeof price !== 'object') return null;
+
+  const record = price as Record<string, unknown>;
+  const values = ['open', 'high', 'low', 'close'].map((field) => positiveDecimalStringToScaled(record[field]));
+
+  return values.every((value): value is bigint => value !== null) ? values : null;
+};
+
+const priceOhlcClose = (price: unknown): bigint | null => {
+  if (!price || typeof price !== 'object') return null;
+  return positiveDecimalStringToScaled((price as Record<string, unknown>).close);
+};
+
+const medianBigInt = (values: bigint[]): bigint => {
+  if (!values.length) return 0n;
+
+  const sorted = [...values].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  return sorted[Math.floor(sorted.length / 2)] ?? 0n;
+};
+
+const isPriceOutlierAgainstBaseline = (value: bigint, baseline: bigint): boolean =>
+  baseline > 0n && (value > baseline * ASSET_PRICE_OUTLIER_RATIO || baseline > value * ASSET_PRICE_OUTLIER_RATIO);
+
+const snapshotVolumeUsd = (document: IndexerDocument): bigint => {
+  const volume = document.data.volume;
+  if (!volume || typeof volume !== 'object') return 0n;
+
+  return positiveDecimalStringToScaled((volume as Record<string, unknown>).amountUSD) ?? 0n;
+};
+
+const isAssetSnapshotPriceOutlier = (document: IndexerDocument, group: IndexerDocument[]): boolean => {
+  if (snapshotVolumeUsd(document) !== 0n) return false;
+
+  const values = priceOhlcValues(document.data.priceUSD);
+  if (!values) return false;
+
+  const timestamp = snapshotDocumentTimestamp(document);
+  const nearbyCloses = group
+    .filter(
+      (candidate) =>
+        candidate.id !== document.id &&
+        Math.abs(snapshotDocumentTimestamp(candidate) - timestamp) <= ASSET_PRICE_OUTLIER_NEIGHBOR_WINDOW_SECONDS
+    )
+    .map((candidate) => priceOhlcClose(candidate.data.priceUSD))
+    .filter((value): value is bigint => value !== null);
+
+  if (nearbyCloses.length < ASSET_PRICE_OUTLIER_MIN_NEIGHBORS) return false;
+
+  const baseline = medianBigInt(nearbyCloses);
+  return values.some((value) => isPriceOutlierAgainstBaseline(value, baseline));
+};
 
 const minDecimalString = (left: string, right: string): string => (decimalStringToScaled(left) <= decimalStringToScaled(right) ? left : right);
 
@@ -1524,6 +1671,11 @@ export class ChainIndexer {
   private pendingFinalizedBlock = 0;
   private finalizedHeadDrainRunning = false;
   private finalizedHeadRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private finalizedHeadPollTimer: ReturnType<typeof setInterval> | null = null;
+  private finalizedHeadPollRunning = false;
+  private derivedStateRefreshRunning = false;
+  private derivedStateRefreshRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingDerivedStateRefresh: DerivedStateRefreshRequest | null = null;
 
   constructor(
     private readonly config: AppConfig,
@@ -1533,23 +1685,32 @@ export class ChainIndexer {
   async start(): Promise<void> {
     const provider = new WsProvider(this.config.soraWsEndpoint);
     this.api = await ApiPromise.create({ provider });
-    const finalizedHash = await this.api.rpc.chain.getFinalizedHead();
-    const finalizedHeader = await this.api.rpc.chain.getHeader(finalizedHash);
+    const finalizedHash = await withTimeout(this.api.rpc.chain.getFinalizedHead(), 'chain.getFinalizedHead()');
+    const finalizedHeader = await withTimeout(this.api.rpc.chain.getHeader(finalizedHash), `chain.getHeader(${finalizedHash.toString()})`);
     const finalizedBlock = finalizedHeader.number.toNumber();
 
-    await this.refreshDerivedState(finalizedBlock, Math.floor(Date.now() / 1000), true);
-    const xorBurnBackfill = this.backfillXorBurns(finalizedBlock).then(
-      () => ({ ok: true as const }),
-      (error: unknown) => ({ ok: false as const, error })
-    );
-
+    await this.refreshIndexingState();
     const indexedAny = await this.backfill();
-    if (!indexedAny && (await this.backfillNetworkAggregateSnapshots())) {
-      await this.refreshDerivedState(finalizedBlock, Math.floor(Date.now() / 1000), true);
-    }
-    const xorBurnBackfillResult = await xorBurnBackfill;
-    if (!xorBurnBackfillResult.ok) throw xorBurnBackfillResult.error;
     await this.subscribeFinalizedHeads();
+    void this.runStartupMaintenance(finalizedBlock, indexedAny).catch((error: unknown) => {
+      console.error('Startup maintenance failed', error);
+    });
+  }
+
+  private async runStartupMaintenance(finalizedBlock: number, indexedAny: boolean): Promise<void> {
+    await this.cleanupAssetSnapshotPriceOutliers();
+    await this.backfillAccountTransactions();
+    await this.repairNetworkTransactionCounters();
+    let shouldRefreshDerivedState = indexedAny;
+
+    if (!indexedAny && (await this.backfillNetworkAggregateSnapshots())) {
+      shouldRefreshDerivedState = true;
+    }
+    if (shouldRefreshDerivedState) {
+      const latestIndexedBlock = await this.getLastIndexedBlock();
+      this.requestDerivedStateRefresh(Math.max(finalizedBlock, latestIndexedBlock), Math.floor(Date.now() / 1000), true);
+    }
+    await this.backfillXorBurns(finalizedBlock);
   }
 
   private async getLastIndexedBlock(): Promise<number> {
@@ -1618,6 +1779,337 @@ export class ChainIndexer {
     };
   }
 
+  private createNetworkTransactionCounterRepairStateDocument(
+    latestBlock: number,
+    blockSnapshotsUpdated: number,
+    aggregateSnapshotsUpdated: number
+  ): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: NETWORK_TRANSACTION_COUNTER_REPAIR_STATE_ID,
+      blockHeight: latestBlock,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: NETWORK_TRANSACTION_COUNTER_REPAIR_STATE_ID,
+        block: latestBlock,
+        data: JSON.stringify({ latestBlock, blockSnapshotsUpdated, aggregateSnapshotsUpdated }),
+      },
+    };
+  }
+
+  private createAssetPriceOutlierCleanupStateDocument(deletedCount: number): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: ASSET_PRICE_OUTLIER_CLEANUP_STATE_ID,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: ASSET_PRICE_OUTLIER_CLEANUP_STATE_ID,
+        data: JSON.stringify({ deletedCount }),
+      },
+    };
+  }
+
+  private createAccountTransactionsBackfillStateDocument(
+    processedDocuments: number,
+    writtenDocuments: number,
+    blockHeight: number,
+    timestamp: number
+  ): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID,
+      blockHeight,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID,
+        block: blockHeight,
+        data: JSON.stringify({
+          processedDocuments,
+          writtenDocuments,
+          lastIndexedBlock: blockHeight,
+          lastTimestamp: timestamp,
+        }),
+      },
+    };
+  }
+
+  /**
+   * Removes legacy zero-volume asset snapshots whose OHLC prices are extreme
+   * outliers versus nearby snapshots for the same asset and interval.
+   */
+  private async cleanupAssetSnapshotPriceOutliers(): Promise<boolean> {
+    const state = await this.repository.get(collection('updatesStreams'), ASSET_PRICE_OUTLIER_CLEANUP_STATE_ID);
+    if (state) return false;
+
+    const groups = new Map<string, IndexerDocument[]>();
+    for await (const page of this.queryPages(collection('assetSnapshots'), { orderBy: ['TIMESTAMP_ASC'] })) {
+      for (const document of page) {
+        const type = String(document.data.type ?? '');
+        if (!AGGREGATE_SNAPSHOT_TYPES.includes(type as SnapshotTypeName)) continue;
+
+        const assetId = String(document.data.assetId ?? '');
+        if (!assetId) continue;
+
+        const key = `${assetId}\0${type}`;
+        const group = groups.get(key) ?? [];
+        group.push(document);
+        groups.set(key, group);
+      }
+    }
+
+    const outlierIds = new Set<string>();
+    for (const group of groups.values()) {
+      group.sort((left, right) => snapshotDocumentTimestamp(left) - snapshotDocumentTimestamp(right));
+
+      for (const document of group) {
+        if (isAssetSnapshotPriceOutlier(document, group)) {
+          outlierIds.add(document.id);
+        }
+      }
+    }
+
+    const ids = [...outlierIds];
+    for (let start = 0; start < ids.length; start += 1_000) {
+      await this.repository.deleteMany(collection('assetSnapshots'), ids.slice(start, start + 1_000));
+    }
+
+    await this.repository.upsert(this.createAssetPriceOutlierCleanupStateDocument(ids.length));
+    if (ids.length) console.info(`Deleted ${ids.length} zero-volume asset snapshot price outliers`);
+    return ids.length > 0;
+  }
+
+  /**
+   * Creates compact per-account transaction rows for data indexed before the
+   * `accountTransactions` collection existed. A completion marker lets GraphQL
+   * avoid legacy history scans after the one-time migration has finished.
+   */
+  private async backfillAccountTransactions(): Promise<boolean> {
+    const state = await this.repository.get(collection('updatesStreams'), ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID);
+    if (hasCompletedAccountTransactionsBackfill(state?.data?.data)) return false;
+
+    const documents: IndexerDocument[] = [];
+    let processedDocuments = 0;
+    let writtenDocuments = 0;
+    let latestBlock = 0;
+    let latestTimestamp = 0;
+    const flush = async (): Promise<void> => {
+      if (!documents.length) return;
+
+      const batch = documents.splice(0, documents.length);
+      await this.repository.upsertMany(batch);
+      writtenDocuments += batch.length;
+      await this.drainFinalizedHeads();
+    };
+
+    for await (const page of this.queryPages(collection('historyElements'), { orderBy: ['TIMESTAMP_ASC'] })) {
+      for (const document of page) {
+        processedDocuments += 1;
+        const blockHeight = Number(document.blockHeight ?? document.data.blockHeight ?? latestBlock);
+        const timestamp = Number(document.timestamp ?? document.data.timestamp ?? latestTimestamp);
+        if (Number.isFinite(blockHeight)) latestBlock = Math.max(latestBlock, blockHeight);
+        if (Number.isFinite(timestamp)) latestTimestamp = Math.max(latestTimestamp, timestamp);
+
+        documents.push(...this.createAccountTransactionDocumentsFromHistory(document));
+        if (documents.length >= ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE) await flush();
+      }
+    }
+
+    await flush();
+    await this.repository.upsert(
+      this.createAccountTransactionsBackfillStateDocument(processedDocuments, writtenDocuments, latestBlock, latestTimestamp)
+    );
+    if (writtenDocuments) console.info(`Backfilled ${writtenDocuments} account transaction rows from legacy history`);
+
+    return writtenDocuments > 0;
+  }
+
+  private addNetworkTransactionCounters(target: NetworkTransactionCounters, delta: NetworkTransactionCounters): void {
+    target.transactions += delta.transactions;
+    target.swaps += delta.swaps;
+    target.bridgeIncomingTransactions += delta.bridgeIncomingTransactions;
+    target.bridgeOutgoingTransactions += delta.bridgeOutgoingTransactions;
+  }
+
+  private networkTransactionCountersFromHistory(document: IndexerDocument): { blockHeight: number; counters: NetworkTransactionCounters } | null {
+    const blockHeight = Number(document.blockHeight ?? document.data.blockHeight ?? 0);
+    if (!Number.isFinite(blockHeight) || blockHeight <= 0) return null;
+
+    const id = String(document.data.id ?? document.id);
+    const module = String(document.data.module ?? '');
+    const method = String(document.data.method ?? '');
+    const callNames = Array.isArray(document.data.callNames) ? document.data.callNames.map(String) : [];
+    const counters = emptyNetworkTransactionCounters();
+    const fee = codecToBigInt(document.data.networkFee ?? 0);
+    const syntheticBridgeIncoming = isSyntheticBridgeIncoming(id, module, method);
+
+    if (fee > 0n && !syntheticBridgeIncoming) counters.transactions += 1;
+    if (!historyExecutionSucceeded(document.data.execution)) return { blockHeight, counters };
+
+    if (isLiquidityProxySwap(module, method, callNames)) counters.swaps += 1;
+    if (isBridgeIncoming(id, module, method)) counters.bridgeIncomingTransactions += 1;
+    if (isBridgeOutgoing(module, method)) counters.bridgeOutgoingTransactions += 1;
+
+    return { blockHeight, counters };
+  }
+
+  private async collectNetworkTransactionCountersByBlock(): Promise<Map<number, NetworkTransactionCounters>> {
+    const countersByBlock = new Map<number, NetworkTransactionCounters>();
+
+    for await (const page of this.queryPages(collection('historyElements'), { orderBy: ['BLOCK_HEIGHT_ASC'] })) {
+      for (const document of page) {
+        const result = this.networkTransactionCountersFromHistory(document);
+        if (!result) continue;
+
+        const counters = countersByBlock.get(result.blockHeight) ?? emptyNetworkTransactionCounters();
+        this.addNetworkTransactionCounters(counters, result.counters);
+        countersByBlock.set(result.blockHeight, counters);
+      }
+
+      await this.drainFinalizedHeads();
+    }
+
+    return countersByBlock;
+  }
+
+  private networkTransactionCountersChanged(document: IndexerDocument, counters: NetworkTransactionCounters): boolean {
+    return (
+      Number(document.data.transactions ?? 0) !== counters.transactions ||
+      Number(document.data.swaps ?? 0) !== counters.swaps ||
+      Number(document.data.bridgeIncomingTransactions ?? 0) !== counters.bridgeIncomingTransactions ||
+      Number(document.data.bridgeOutgoingTransactions ?? 0) !== counters.bridgeOutgoingTransactions
+    );
+  }
+
+  private withNetworkTransactionCounters(document: IndexerDocument, counters: NetworkTransactionCounters): IndexerDocument {
+    return {
+      ...document,
+      data: {
+        ...document.data,
+        transactions: counters.transactions,
+        swaps: counters.swaps,
+        bridgeIncomingTransactions: counters.bridgeIncomingTransactions,
+        bridgeOutgoingTransactions: counters.bridgeOutgoingTransactions,
+      },
+    };
+  }
+
+  /**
+   * Repairs legacy network transaction counters that previously counted unsigned
+   * inherent extrinsics and failed business actions. Existing aggregate rows keep
+   * their stock metrics while their transaction-like counters are recomputed from
+   * corrected block snapshots.
+   */
+  private async repairNetworkTransactionCounters(): Promise<boolean> {
+    const state = await this.repository.get(collection('updatesStreams'), NETWORK_TRANSACTION_COUNTER_REPAIR_STATE_ID);
+    if (state) return false;
+
+    const countersByBlock = await this.collectNetworkTransactionCountersByBlock();
+    const aggregateSnapshots = new Map<string, IndexerDocument>();
+
+    for await (const page of this.queryPages(collection('networkSnapshots'), {
+      filter: { type: { notEqualTo: 'BLOCK' } },
+    })) {
+      page.forEach((document) => aggregateSnapshots.set(document.id, document));
+    }
+
+    const windows = this.createNetworkBackfillWindows();
+    const blockUpdates: IndexerDocument[] = [];
+    const aggregateUpdates: IndexerDocument[] = [];
+    let latestBlock = 0;
+    let blockSnapshotsUpdated = 0;
+    let aggregateSnapshotsUpdated = 0;
+
+    const flushBlockUpdates = async (): Promise<void> => {
+      if (!blockUpdates.length) return;
+
+      const batch = blockUpdates.splice(0, blockUpdates.length);
+      await this.repository.upsertMany(batch);
+    };
+
+    const flushAggregateUpdates = async (): Promise<void> => {
+      if (!aggregateUpdates.length) return;
+
+      const batch = aggregateUpdates.splice(0, aggregateUpdates.length);
+      await this.repository.upsertMany(batch);
+    };
+
+    const enqueueAggregateRepair = async (document: IndexerDocument | null): Promise<void> => {
+      if (!document) return;
+
+      const existing = aggregateSnapshots.get(document.id);
+      if (!existing) return;
+
+      const counters = {
+        transactions: Number(document.data.transactions ?? 0),
+        swaps: Number(document.data.swaps ?? 0),
+        bridgeIncomingTransactions: Number(document.data.bridgeIncomingTransactions ?? 0),
+        bridgeOutgoingTransactions: Number(document.data.bridgeOutgoingTransactions ?? 0),
+      };
+
+      if (!this.networkTransactionCountersChanged(existing, counters)) return;
+
+      aggregateUpdates.push(this.withNetworkTransactionCounters(existing, counters));
+      aggregateSnapshotsUpdated += 1;
+
+      if (aggregateUpdates.length >= 1_000) await flushAggregateUpdates();
+    };
+
+    for await (const page of this.queryPages(collection('networkSnapshots'), {
+      filter: { type: { equalTo: 'BLOCK' } },
+      orderBy: ['BLOCK_HEIGHT_ASC'],
+    })) {
+      for (const document of page) {
+        const blockHeight = Number(document.blockHeight ?? document.data.blockHeight ?? 0);
+        if (!Number.isFinite(blockHeight) || blockHeight <= 0) continue;
+
+        latestBlock = Math.max(latestBlock, blockHeight);
+        const counters = countersByBlock.get(blockHeight) ?? emptyNetworkTransactionCounters();
+        const repairedBlockDocument = this.networkTransactionCountersChanged(document, counters)
+          ? this.withNetworkTransactionCounters(document, counters)
+          : document;
+
+        if (repairedBlockDocument !== document) {
+          blockUpdates.push(repairedBlockDocument);
+          blockSnapshotsUpdated += 1;
+        }
+
+        const block = this.networkBackfillBlockFromSnapshot(repairedBlockDocument);
+        if (!block) continue;
+
+        for (const window of windows) {
+          const nextDocument = this.advanceNetworkBackfillWindow(window, block);
+          if (window.pendingDocument && window.pendingDocument.id !== nextDocument.id) {
+            await enqueueAggregateRepair(window.pendingDocument);
+          }
+          window.pendingDocument = nextDocument;
+        }
+
+        if (blockUpdates.length >= 1_000) await flushBlockUpdates();
+      }
+
+      await this.drainFinalizedHeads();
+    }
+
+    for (const window of windows) {
+      await enqueueAggregateRepair(window.pendingDocument);
+      window.pendingDocument = null;
+    }
+
+    await flushBlockUpdates();
+    await flushAggregateUpdates();
+    await this.repository.upsert(
+      this.createNetworkTransactionCounterRepairStateDocument(latestBlock, blockSnapshotsUpdated, aggregateSnapshotsUpdated)
+    );
+
+    if (blockSnapshotsUpdated || aggregateSnapshotsUpdated) {
+      console.info(
+        `Repaired ${blockSnapshotsUpdated} block and ${aggregateSnapshotsUpdated} aggregate network transaction snapshots`
+      );
+    }
+
+    return blockSnapshotsUpdated > 0 || aggregateSnapshotsUpdated > 0;
+  }
+
   private async backfillXorBurns(finalizedBlock: number): Promise<void> {
     if (!this.api || finalizedBlock < SORA_XOR_BURN_START_BLOCK) return;
 
@@ -1627,17 +2119,31 @@ export class ChainIndexer {
     if (startBlock > finalizedBlock) return;
 
     for (let block = startBlock; block <= finalizedBlock; block += XOR_BURN_BACKFILL_BATCH_SIZE) {
+      await this.drainFinalizedHeads();
+
       const batchEnd = Math.min(block + XOR_BURN_BACKFILL_BATCH_SIZE - 1, finalizedBlock);
       const blocks = Array.from({ length: batchEnd - block + 1 }, (_item, index) => block + index);
-      const blockHashes = await Promise.all(blocks.map((blockHeight) => this.api!.rpc.chain.getBlockHash(blockHeight)));
-      const eventsByBlock = (await Promise.all(blockHashes.map((hash) => (this.api!.query as any).system.events.at(hash)))) as EventRecord[][];
+      const blockHashes = await Promise.all(
+        blocks.map((blockHeight) =>
+          withTimeout(this.api!.rpc.chain.getBlockHash(blockHeight), `chain.getBlockHash(${blockHeight})`)
+        )
+      );
+      const eventsByBlock = (await Promise.all(
+        blockHashes.map((hash, index) =>
+          withTimeout((this.api!.query as any).system.events.at(hash), `system.events.at(${blocks[index]})`)
+        )
+      )) as EventRecord[][];
       const burnBlockIndexes = eventsByBlock.flatMap((events, index) =>
         events.some((event) => getXorBurnEvent(event, this.assetInfos)) ? [index] : []
       );
       const signedBlocksByIndex = new Map<number, unknown>();
 
       if (burnBlockIndexes.length) {
-        const signedBlocks = await Promise.all(burnBlockIndexes.map((index) => this.api!.rpc.chain.getBlock(blockHashes[index])));
+        const signedBlocks = await Promise.all(
+          burnBlockIndexes.map((index) =>
+            withTimeout(this.api!.rpc.chain.getBlock(blockHashes[index]), `chain.getBlock(${blocks[index]})`)
+          )
+        );
         burnBlockIndexes.forEach((index, resultIndex) => {
           signedBlocksByIndex.set(index, signedBlocks[resultIndex]);
         });
@@ -1659,8 +2165,8 @@ export class ChainIndexer {
   private async backfill(): Promise<boolean> {
     if (!this.api) return false;
 
-    const finalizedHash = await this.api.rpc.chain.getFinalizedHead();
-    const finalizedHeader = await this.api.rpc.chain.getHeader(finalizedHash);
+    const finalizedHash = await withTimeout(this.api.rpc.chain.getFinalizedHead(), 'chain.getFinalizedHead()');
+    const finalizedHeader = await withTimeout(this.api.rpc.chain.getHeader(finalizedHash), `chain.getHeader(${finalizedHash.toString()})`);
     const finalizedBlock = finalizedHeader.number.toNumber();
     const lastIndexed = await this.getLastIndexedBlock();
     const startBlock = Math.max(this.config.chainStartBlock, lastIndexed + 1);
@@ -1677,7 +2183,6 @@ export class ChainIndexer {
 
     if (indexedAny) {
       await this.backfillNetworkAggregateSnapshots();
-      await this.refreshDerivedState(finalizedBlock, Math.floor(Date.now() / 1000), true);
     }
 
     return indexedAny;
@@ -1738,6 +2243,7 @@ export class ChainIndexer {
           window.pendingDocument = existingAggregateSnapshotIds.has(nextDocument.id) ? null : nextDocument;
         }
       }
+      await this.drainFinalizedHeads();
     }
 
     if (!processedBlocks) return false;
@@ -1761,10 +2267,39 @@ export class ChainIndexer {
   private async subscribeFinalizedHeads(): Promise<void> {
     if (!this.api) return;
 
-    await this.api.rpc.chain.subscribeFinalizedHeads(async (header) => {
+    await this.api.rpc.chain.subscribeFinalizedHeads((header) => {
       this.pendingFinalizedBlock = Math.max(this.pendingFinalizedBlock, header.number.toNumber());
-      await this.drainFinalizedHeads();
+      void this.drainFinalizedHeads();
     });
+
+    this.startFinalizedHeadPolling();
+    await this.updatePendingFinalizedBlockFromRpc();
+  }
+
+  private async updatePendingFinalizedBlockFromRpc(): Promise<void> {
+    if (!this.api) return;
+
+    const finalizedHash = await withTimeout(this.api.rpc.chain.getFinalizedHead(), 'chain.getFinalizedHead()');
+    const finalizedHeader = await withTimeout(this.api.rpc.chain.getHeader(finalizedHash), `chain.getHeader(${finalizedHash.toString()})`);
+    this.pendingFinalizedBlock = Math.max(this.pendingFinalizedBlock, finalizedHeader.number.toNumber());
+    await this.drainFinalizedHeads();
+  }
+
+  private startFinalizedHeadPolling(): void {
+    if (this.finalizedHeadPollTimer) return;
+
+    this.finalizedHeadPollTimer = setInterval(() => {
+      if (this.finalizedHeadPollRunning) return;
+
+      this.finalizedHeadPollRunning = true;
+      this.updatePendingFinalizedBlockFromRpc()
+        .catch((error: unknown) => {
+          console.error('Failed to poll finalized head', error);
+        })
+        .finally(() => {
+          this.finalizedHeadPollRunning = false;
+        });
+    }, FINALIZED_HEAD_POLL_INTERVAL_MS);
   }
 
   private scheduleFinalizedHeadRetry(): void {
@@ -1810,7 +2345,7 @@ export class ChainIndexer {
   private async indexBlockByNumber(block: number, options: IndexBlockOptions = {}): Promise<void> {
     if (!this.api) return;
 
-    const hash = await this.api.rpc.chain.getBlockHash(block);
+    const hash = await withTimeout(this.api.rpc.chain.getBlockHash(block), `chain.getBlockHash(${block})`);
     await this.indexBlockByHash(hash.toString(), options);
   }
 
@@ -1818,9 +2353,9 @@ export class ChainIndexer {
     if (!this.api) return;
 
     const [signedBlock, eventsCodec, timestamp] = await Promise.all([
-      this.api.rpc.chain.getBlock(hash),
-      (this.api.query as any).system.events.at(hash),
-      this.fetchBlockTimestamp(hash),
+      withTimeout(this.api.rpc.chain.getBlock(hash), `chain.getBlock(${hash})`),
+      withTimeout((this.api.query as any).system.events.at(hash), `system.events.at(${hash})`),
+      withTimeout(this.fetchBlockTimestamp(hash), `timestamp.now.at(${hash})`),
     ]);
     const events = eventsCodec as unknown as EventRecord[];
     const eventsByExtrinsic = groupEventsByExtrinsic(events);
@@ -1829,6 +2364,7 @@ export class ChainIndexer {
     const documents: IndexerDocument[] = [];
     const touchedAccounts = new Set<string>();
     let totalFees = 0n;
+    let feePayingSignedTransactions = 0;
     let volumeUSD = 0n;
     let swaps = 0;
     let bridgeIncomingTransactions = 0;
@@ -1855,18 +2391,15 @@ export class ChainIndexer {
       );
       const id = extrinsic.hash?.toString?.() || `${blockHeight}-${index}`;
       const fee = this.extractNetworkFee(eventsForExtrinsic);
-      const currentAccounts = [...new Set([address, history.from, history.to].filter(Boolean))];
+      if (extrinsic.isSigned && fee > 0n) feePayingSignedTransactions += 1;
+      const currentAccounts = uniqueIndexedAccountIds([address, history.from, history.to]);
       totalFees += fee;
-      volumeUSD += this.extractVolumeUSD(history.data);
-      if (
-        (extrinsic.method.section === 'liquidityProxy' &&
-          (extrinsic.method.method === 'swap' || extrinsic.method.method === 'swapTransfer')) ||
-        callNames.some((name) => name === 'liquidityProxy.swap' || name === 'liquidityProxy.swapTransfer')
-      ) {
+      if (!failed) volumeUSD += this.extractVolumeUSD(history.data);
+      if (!failed && isLiquidityProxySwap(extrinsic.method.section, extrinsic.method.method, callNames)) {
         swaps += 1;
       }
-      if (extrinsic.method.section === 'bridgeMultisig') bridgeIncomingTransactions += 1;
-      if (extrinsic.method.section === 'ethBridge' || (extrinsic.method.section === 'bridgeProxy' && extrinsic.method.method === 'burn')) {
+      if (!failed && extrinsic.method.section === 'bridgeMultisig') bridgeIncomingTransactions += 1;
+      if (!failed && isBridgeOutgoing(extrinsic.method.section, extrinsic.method.method)) {
         bridgeOutgoingTransactions += 1;
       }
       currentAccounts.forEach((account) => touchedAccounts.add(account));
@@ -1924,7 +2457,8 @@ export class ChainIndexer {
         },
       });
 
-      documents.push(...createXorBurnDocuments(context, blockHeight, timestamp, this.assetInfos));
+      documents.push(...this.createAccountTransactionDocuments(context, blockHeight, timestamp));
+      if (!context.failed) documents.push(...createXorBurnDocuments(context, blockHeight, timestamp, this.assetInfos));
       context.accounts.forEach((account) => latestHistoryByAccount.set(account, context.id));
       this.applyAccountPointUpdates(
         context.accounts,
@@ -1936,6 +2470,7 @@ export class ChainIndexer {
           method: context.method,
           data: context.history.data,
           fee: context.fee,
+          failed: context.failed,
         },
         existingAccountMeta
       );
@@ -1946,6 +2481,8 @@ export class ChainIndexer {
       ...this.createFinalAccountDocuments([...touchedAccounts], latestHistoryByAccount, blockHeight, timestamp, accountPointData)
     );
 
+    const newAccountCount = [...touchedAccounts].filter((account) => !existingAccountMeta.has(account)).length;
+
     documents.push({
       collection: collection('networkSnapshots'),
       id: `block-${blockHeight}`,
@@ -1955,8 +2492,8 @@ export class ChainIndexer {
         id: `block-${blockHeight}`,
         type: 'BLOCK',
         timestamp,
-        accounts: touchedAccounts.size,
-        transactions: signedBlock.block.extrinsics.length,
+        accounts: newAccountCount,
+        transactions: feePayingSignedTransactions,
         fees: totalFees.toString(),
         liquidityUSD: this.networkLiquidityStats.liquidityUSD,
         poolLiquidityUSD: this.networkLiquidityStats.poolLiquidityUSD,
@@ -1975,7 +2512,68 @@ export class ChainIndexer {
     await this.repository.upsertMany(documents);
 
     if ((options.refreshDerivedState ?? true) && blockHeight % this.config.stateRefreshIntervalBlocks === 0) {
-      await this.refreshDerivedState(blockHeight, timestamp, blockHeight % this.config.snapshotIntervalBlocks === 0);
+      this.requestDerivedStateRefresh(blockHeight, timestamp, blockHeight % this.config.snapshotIntervalBlocks === 0);
+    }
+  }
+
+  private mergeDerivedStateRefreshRequests(
+    left: DerivedStateRefreshRequest | null,
+    right: DerivedStateRefreshRequest | null
+  ): DerivedStateRefreshRequest | null {
+    if (!left) return right;
+    if (!right) return left;
+
+    const latest = left.blockHeight >= right.blockHeight ? left : right;
+    return {
+      ...latest,
+      includeSnapshots: left.includeSnapshots || right.includeSnapshots,
+    };
+  }
+
+  private requestDerivedStateRefresh(blockHeight: number, timestamp: number, includeSnapshots: boolean): void {
+    this.pendingDerivedStateRefresh = this.mergeDerivedStateRefreshRequests(this.pendingDerivedStateRefresh, {
+      blockHeight,
+      timestamp,
+      includeSnapshots,
+    });
+    void this.drainDerivedStateRefreshQueue();
+  }
+
+  private scheduleDerivedStateRefreshRetry(): void {
+    if (this.derivedStateRefreshRetryTimer) return;
+
+    this.derivedStateRefreshRetryTimer = setTimeout(() => {
+      this.derivedStateRefreshRetryTimer = null;
+      void this.drainDerivedStateRefreshQueue();
+    }, DERIVED_STATE_REFRESH_RETRY_DELAY_MS);
+    this.derivedStateRefreshRetryTimer.unref?.();
+  }
+
+  private async drainDerivedStateRefreshQueue(): Promise<void> {
+    if (this.derivedStateRefreshRunning) return;
+
+    const request = this.pendingDerivedStateRefresh;
+    if (!request) return;
+
+    this.pendingDerivedStateRefresh = null;
+    this.derivedStateRefreshRunning = true;
+
+    try {
+      await this.refreshDerivedState(request.blockHeight, request.timestamp, request.includeSnapshots);
+      if (this.derivedStateRefreshRetryTimer) {
+        clearTimeout(this.derivedStateRefreshRetryTimer);
+        this.derivedStateRefreshRetryTimer = null;
+      }
+    } catch (error) {
+      console.error(`Failed to refresh derived state at SORA block ${request.blockHeight}`, error);
+      this.pendingDerivedStateRefresh = this.mergeDerivedStateRefreshRequests(request, this.pendingDerivedStateRefresh);
+      this.scheduleDerivedStateRefreshRetry();
+    } finally {
+      this.derivedStateRefreshRunning = false;
+    }
+
+    if (this.pendingDerivedStateRefresh && !this.derivedStateRefreshRetryTimer) {
+      void this.drainDerivedStateRefreshQueue();
     }
   }
 
@@ -2012,7 +2610,11 @@ export class ChainIndexer {
     return xorBurned;
   }
 
-  /** Combines ORML token issuance with native Balances issuance, which is where XOR supply is stored. */
+  /**
+   * Combines ORML token issuance with native Balances issuance, which is where XOR supply is stored.
+   * Native XOR issuance is still exposed in the pre-redenomination scale, while asset snapshots are
+   * consumed as current XOR units by Polkaswap and external supply displays.
+   */
   private createSupplyByAsset(
     tokenIssuances: Array<[StorageEntryKey, unknown]>,
     nativeXorIssuance: unknown
@@ -2023,7 +2625,7 @@ export class ChainIndexer {
       supplyByAsset.set(assetIdToString(key.args[0]), codecToBigInt(value));
     }
 
-    supplyByAsset.set(XOR, codecToBigInt(nativeXorIssuance));
+    supplyByAsset.set(XOR, codecToBigInt(nativeXorIssuance) / XOR_SUPPLY_REDENOMINATION_FACTOR);
     return supplyByAsset;
   }
 
@@ -2092,7 +2694,7 @@ export class ChainIndexer {
     blockHeight: number,
     timestamp: number,
     pendingPointData: Map<string, Record<string, unknown>>,
-    update?: { module: string; method: string; data: unknown; fee: bigint },
+    update?: AccountPointUpdate,
     existingAccountMeta?: Map<string, IndexerDocument>
   ): Promise<IndexerDocument[]> {
     const accountMeta =
@@ -2108,12 +2710,70 @@ export class ChainIndexer {
     return this.createFinalAccountDocuments(accounts, latestHistoryByAccount, blockHeight, timestamp, pendingPointData);
   }
 
+  /**
+   * Stores one row per account involved in each indexed transaction so range
+   * stats can count distinct active accounts without scanning transaction JSON.
+   */
+  private createAccountTransactionDocuments(
+    context: Pick<BlockExtrinsicContext, 'id' | 'accounts'>,
+    blockHeight: number,
+    timestamp: number
+  ): IndexerDocument[] {
+    return uniqueIndexedAccountIds(context.accounts).map((account) => {
+      const id = accountTransactionId(context.id, account);
+
+      return {
+        collection: collection('accountTransactions'),
+        id,
+        blockHeight,
+        timestamp,
+        data: {
+          id,
+          accountId: account,
+          historyElementId: context.id,
+          blockHeight,
+          timestamp,
+        },
+      };
+    });
+  }
+
+  /**
+   * Reconstructs per-account transaction rows from legacy history documents.
+   * Only indexer-owned account fields are considered; hex external recipients
+   * and asset identifiers are filtered by `normalizeIndexedAccountId`.
+   */
+  private createAccountTransactionDocumentsFromHistory(document: IndexerDocument): IndexerDocument[] {
+    const historyElementId = String(document.data.id ?? document.id);
+    const blockHeight = Number(document.blockHeight ?? document.data.blockHeight ?? 0);
+    const timestamp = Number(document.timestamp ?? document.data.timestamp ?? 0);
+    const accounts = uniqueIndexedAccountIds([document.data.address, document.data.dataFrom, document.data.dataTo]);
+
+    return accounts.map((account) => {
+      const id = accountTransactionId(historyElementId, account);
+
+      return {
+        collection: collection('accountTransactions'),
+        id,
+        blockHeight: Number.isFinite(blockHeight) ? blockHeight : 0,
+        timestamp: Number.isFinite(timestamp) ? timestamp : 0,
+        data: {
+          id,
+          accountId: normalizeIndexedAccountId(account),
+          historyElementId,
+          blockHeight: Number.isFinite(blockHeight) ? blockHeight : 0,
+          timestamp: Number.isFinite(timestamp) ? timestamp : 0,
+        },
+      };
+    });
+  }
+
   private applyAccountPointUpdates(
     accounts: string[],
     blockHeight: number,
     timestamp: number,
     pendingPointData: Map<string, Record<string, unknown>>,
-    update: { module: string; method: string; data: unknown; fee: bigint } | undefined,
+    update: AccountPointUpdate | undefined,
     existingAccountMeta: Map<string, IndexerDocument>
   ): void {
     for (const account of accounts) {
@@ -2169,7 +2829,7 @@ export class ChainIndexer {
 
   private applyAccountPointUpdate(
     current: Record<string, unknown>,
-    update?: { module: string; method: string; data: unknown; fee: bigint }
+    update?: AccountPointUpdate
   ): Record<string, unknown> {
     const data = this.clonePointData(current);
     if (!update) return data;
@@ -2177,6 +2837,8 @@ export class ChainIndexer {
     if (update.fee > 0n) {
       this.addPointVolume(data, 'xorFees', codecToDecimalString(update.fee), codecUsd(XOR, update.fee, this.prices));
     }
+
+    if (update.failed) return data;
 
     const payload = Array.isArray(update.data) ? {} : ((update.data ?? {}) as Record<string, unknown>);
     const amountUSD = String(payload.amountUSD ?? payload.collateralAmountUSD ?? payload.debtAmountUSD ?? '0');
@@ -2417,6 +3079,111 @@ export class ChainIndexer {
     ];
   }
 
+  private async refreshIndexingState(): Promise<void> {
+    if (!this.api) throw new Error('Cannot refresh indexing state before the chain API is initialized');
+
+    const [
+      assetInfos,
+      tokenIssuances,
+      poolProperties,
+      poolReserves,
+      poolIssuances,
+      orderBookLimitOrders,
+      nativeXorIssuance,
+    ] = await Promise.all([
+      this.fetchStorageEntries((this.api.query as any).assets.assetInfosV2, 'assets.assetInfosV2'),
+      this.fetchStorageEntries((this.api.query as any).tokens.totalIssuance, 'tokens.totalIssuance'),
+      this.fetchStorageEntries((this.api.query as any).poolXYK.properties, 'poolXYK.properties'),
+      this.fetchStorageEntries((this.api.query as any).poolXYK.reserves, 'poolXYK.reserves'),
+      this.fetchStorageEntries((this.api.query as any).poolXYK.totalIssuances, 'poolXYK.totalIssuances'),
+      this.fetchStorageEntries((this.api.query as any).orderBook.limitOrders, 'orderBook.limitOrders'),
+      this.fetchNativeXorIssuance(),
+    ]);
+    const supplyByAsset = this.createSupplyByAsset(tokenIssuances, nativeXorIssuance);
+    const assets = new Map<string, AssetInfo>();
+
+    for (const [key, value] of assetInfos) {
+      const id = assetIdToString(key.args[0]);
+      const human = toHuman(value) as Record<string, unknown>;
+      assets.set(id, {
+        id,
+        symbol: String(human.symbol ?? ''),
+        name: String(human.name ?? ''),
+        decimals: Number(human.precision ?? DECIMALS),
+        supply: supplyByAsset.get(id) ?? 0n,
+      });
+    }
+    this.assetInfos = assets;
+
+    const poolAccounts = new Map<string, string>();
+    for (const [key, value] of poolProperties) {
+      const baseAssetId = assetIdToString(key.args[0]);
+      const targetAssetId = assetIdToString(key.args[1]);
+      const human = toHuman(value);
+      const poolAccount = Array.isArray(human) ? String(human[0] ?? '') : '';
+      poolAccounts.set(`${baseAssetId}-${targetAssetId}`, poolAccount);
+    }
+
+    const issuanceByPoolAccount = new Map<string, bigint>();
+    for (const [key, value] of poolIssuances) {
+      issuanceByPoolAccount.set(String(key.args[0]), codecToBigInt(value));
+    }
+
+    const poolsRaw: Array<{
+      baseAssetId: string;
+      targetAssetId: string;
+      baseAssetReserves: bigint;
+      targetAssetReserves: bigint;
+    }> = (poolReserves as Array<[any, any]>).map(([key, value]) => {
+      const reserves = toJson(value);
+      return {
+        baseAssetId: assetIdToString(key.args[0]),
+        targetAssetId: assetIdToString(key.args[1]),
+        baseAssetReserves: codecToBigInt(Array.isArray(reserves) ? reserves[0] : 0),
+        targetAssetReserves: codecToBigInt(Array.isArray(reserves) ? reserves[1] : 0),
+      };
+    });
+    const prices = this.derivePrices(assets, poolsRaw);
+    this.prices = prices;
+
+    const poolStates: PoolState[] = poolsRaw.map((pool) => {
+      const id = `${pool.baseAssetId}-${pool.targetAssetId}`;
+      const poolAccount = poolAccounts.get(id) ?? '';
+      const baseLiquidity = scaledMul(
+        scaledDiv(pool.baseAssetReserves, 10n ** BigInt(assets.get(pool.baseAssetId)?.decimals ?? DECIMALS)),
+        prices.get(pool.baseAssetId) ?? 0n
+      );
+      const targetLiquidity = scaledMul(
+        scaledDiv(pool.targetAssetReserves, 10n ** BigInt(assets.get(pool.targetAssetId)?.decimals ?? DECIMALS)),
+        prices.get(pool.targetAssetId) ?? 0n
+      );
+      const liquidity = baseLiquidity + targetLiquidity;
+
+      return {
+        id,
+        ...pool,
+        poolAccount,
+        poolTokenSupply: issuanceByPoolAccount.get(poolAccount) ?? 0n,
+        liquidityUSD: scaledToString(liquidity, 8),
+        priceUSD: scaledToString(prices.get(pool.targetAssetId) ?? 0n, 8),
+      };
+    });
+    const poolLiquidityUSD = scaledToString(
+      poolStates.reduce((sum, pool) => sum + decimalStringToScaled(pool.liquidityUSD), 0n),
+      8
+    );
+    const activePools = poolStates.filter((pool) => decimalStringToScaled(pool.liquidityUSD) > 0n).length;
+    const analytics = emptyAnalytics();
+
+    this.mergeLimitOrderStorage(orderBookLimitOrders, assets, prices, analytics);
+    const orderBookLiquidityUSD = scaledToString(
+      [...analytics.orderBookActiveReserves.values()].reduce((sum, reserves) => sum + reserves.liquidityUSD, 0n),
+      8
+    );
+    const activeOrderBooks = [...analytics.orderBookActiveReserves.values()].filter((reserves) => reserves.liquidityUSD > 0n).length;
+    this.networkLiquidityStats = createNetworkLiquidityStats(poolLiquidityUSD, orderBookLiquidityUSD, activePools, activeOrderBooks, assets.size);
+  }
+
   private async refreshDerivedState(blockHeight: number, timestamp: number, includeSnapshots: boolean): Promise<void> {
     if (!this.api) throw new Error('Cannot refresh derived state before the chain API is initialized');
 
@@ -2437,7 +3204,6 @@ export class ChainIndexer {
       orderBookAsks,
       orderBookLimitOrders,
       farmingPoolFarmers,
-      indexedAccountCount,
       nativeXorIssuance,
     ] = await Promise.all([
       this.fetchStorageEntries((this.api.query as any).assets.assetInfosV2, 'assets.assetInfosV2'),
@@ -2450,7 +3216,6 @@ export class ChainIndexer {
       this.fetchStorageEntries((this.api.query as any).orderBook.asks, 'orderBook.asks'),
       this.fetchStorageEntries((this.api.query as any).orderBook.limitOrders, 'orderBook.limitOrders'),
       this.fetchStorageEntries((this.api.query as any).farming.poolFarmers, 'farming.poolFarmers'),
-      this.countIndexedAccounts(),
       this.fetchNativeXorIssuance(),
     ]);
     const effectiveBlockHeight = blockHeight;
@@ -2539,8 +3304,7 @@ export class ChainIndexer {
       assets,
       prices,
       poolStates,
-      provisionalLiquidityStats,
-      indexedAccountCount
+      provisionalLiquidityStats
     );
     this.mergeLimitOrderStorage(orderBookLimitOrders, assets, prices, analytics);
     const orderBookLiquidityUSD = scaledToString(
@@ -2742,51 +3506,42 @@ export class ChainIndexer {
     return documents;
   }
 
-  private async countIndexedAccounts(): Promise<number> {
-    if (!this.repository.query) {
-      return (await this.repository.list(collection('accounts'))).length;
-    }
-
-    const result = await this.repository.query(collection('accounts'), {
-      first: 0,
-      includeTotalCount: true,
-    });
-
-    return result.totalCount ?? 0;
-  }
-
   private async buildAnalytics(
     timestamp: number,
     assets: Map<string, AssetInfo>,
     prices: Map<string, bigint>,
     pools: PoolState[],
-    liquidityStats: NetworkLiquidityStats,
-    chainAccountCount: number
+    liquidityStats: NetworkLiquidityStats
   ): Promise<Analytics> {
     const analytics = emptyAnalytics();
     const since = timestamp - SNAPSHOT_WINDOW_SECONDS.MONTH;
-    const [history, blockSnapshots, orderBookOrders, assetDaySnapshots, orderBookDaySnapshots] = await Promise.all([
-      this.queryAll(collection('historyElements'), {
-        filter: { timestamp: { greaterThanOrEqualTo: since } },
-        orderBy: ['TIMESTAMP_ASC'],
-      }),
-      this.queryAll(collection('networkSnapshots'), {
-        filter: { and: [{ type: { equalTo: 'BLOCK' } }, { timestamp: { greaterThanOrEqualTo: since } }] },
-        orderBy: ['TIMESTAMP_ASC'],
-      }),
-      this.queryAll(collection('orderBookOrders'), {
-        filter: { timestamp: { greaterThanOrEqualTo: since } },
-        orderBy: ['TIMESTAMP_ASC'],
-      }),
-      this.queryAll(collection('assetSnapshots'), {
-        filter: { and: [{ type: { equalTo: 'DAY' } }, { timestamp: { greaterThanOrEqualTo: timestamp - 7 * 86_400 } }] },
-        orderBy: ['TIMESTAMP_ASC'],
-      }),
-      this.queryAll(collection('orderBookSnapshots'), {
-        filter: { and: [{ type: { equalTo: 'DAY' } }, { timestamp: { greaterThanOrEqualTo: timestamp - 86_400 } }] },
-        orderBy: ['TIMESTAMP_ASC'],
-      }),
-    ]);
+    const [history, blockSnapshots, orderBookOrders, assetDaySnapshots, orderBookDaySnapshots, accountMetaDocuments] =
+      await Promise.all([
+        this.queryAll(collection('historyElements'), {
+          filter: { timestamp: { greaterThanOrEqualTo: since } },
+          orderBy: ['TIMESTAMP_ASC'],
+        }),
+        this.queryAll(collection('networkSnapshots'), {
+          filter: { and: [{ type: { equalTo: 'BLOCK' } }, { timestamp: { greaterThanOrEqualTo: since } }] },
+          orderBy: ['TIMESTAMP_ASC'],
+        }),
+        this.queryAll(collection('orderBookOrders'), {
+          filter: { timestamp: { greaterThanOrEqualTo: since } },
+          orderBy: ['TIMESTAMP_ASC'],
+        }),
+        this.queryAll(collection('assetSnapshots'), {
+          filter: { and: [{ type: { equalTo: 'DAY' } }, { timestamp: { greaterThanOrEqualTo: timestamp - 7 * 86_400 } }] },
+          orderBy: ['TIMESTAMP_ASC'],
+        }),
+        this.queryAll(collection('orderBookSnapshots'), {
+          filter: { and: [{ type: { equalTo: 'DAY' } }, { timestamp: { greaterThanOrEqualTo: timestamp - 86_400 } }] },
+          orderBy: ['TIMESTAMP_ASC'],
+        }),
+        this.queryAll(collection('accountMeta'), {
+          filter: { createdAtTimestamp: { greaterThanOrEqualTo: since } },
+          orderBy: ['TIMESTAMP_ASC'],
+        }),
+      ]);
     const poolById = new Map(pools.map((pool) => [pool.id, pool]));
 
     for (const asset of assets.values()) {
@@ -2930,14 +3685,25 @@ export class ChainIndexer {
       for (const type of AGGREGATE_SNAPSHOT_TYPES) {
         if (eventTimestamp < timestamp - SNAPSHOT_WINDOW_SECONDS[type]) continue;
 
-        const current = analytics.network.get(type) ?? newNetworkAggregate(chainAccountCount, liquidityStats);
+        const current = analytics.network.get(type) ?? newNetworkAggregate(0, liquidityStats);
         current.transactions += Number(document.data.transactions ?? 0);
         current.fees += codecToBigInt(document.data.fees ?? 0);
         current.volumeUSD += decimalStringToScaled(document.data.volumeUSD ?? '0');
         current.swaps += Number(document.data.swaps ?? 0);
         current.bridgeIncomingTransactions += Number(document.data.bridgeIncomingTransactions ?? 0);
         current.bridgeOutgoingTransactions += Number(document.data.bridgeOutgoingTransactions ?? 0);
-        current.accounts = Math.max(current.accounts, chainAccountCount);
+        Object.assign(current, liquidityStats);
+        analytics.network.set(type, current);
+      }
+    }
+
+    for (const document of accountMetaDocuments) {
+      const createdAtTimestamp = Number(document.data.createdAtTimestamp ?? document.timestamp ?? 0);
+      for (const type of AGGREGATE_SNAPSHOT_TYPES) {
+        if (createdAtTimestamp < timestamp - SNAPSHOT_WINDOW_SECONDS[type]) continue;
+
+        const current = analytics.network.get(type) ?? newNetworkAggregate(0, liquidityStats);
+        current.accounts += 1;
         Object.assign(current, liquidityStats);
         analytics.network.set(type, current);
       }
@@ -3014,7 +3780,7 @@ export class ChainIndexer {
 
     for (const type of AGGREGATE_SNAPSHOT_TYPES) {
       if (!analytics.network.has(type)) {
-        analytics.network.set(type, newNetworkAggregate(chainAccountCount, liquidityStats));
+        analytics.network.set(type, newNetworkAggregate(0, liquidityStats));
       }
     }
 
@@ -3458,6 +4224,7 @@ export class ChainIndexer {
 
   private emptyNetworkBackfillFlowTotals(): NetworkBackfillFlowTotals {
     return {
+      accounts: 0,
       transactions: 0,
       fees: 0n,
       volumeUSD: 0n,
@@ -3486,6 +4253,7 @@ export class ChainIndexer {
     return {
       blockHeight,
       timestamp,
+      accounts: Number(document.data.accounts ?? 0),
       transactions: Number(document.data.transactions ?? 0),
       fees: codecToBigInt(document.data.fees ?? 0),
       volumeUSD: decimalStringToScaled(document.data.volumeUSD ?? '0'),
@@ -3496,6 +4264,7 @@ export class ChainIndexer {
   }
 
   private addNetworkBackfillBlock(totals: NetworkBackfillFlowTotals, block: NetworkBackfillBlock): void {
+    totals.accounts += block.accounts;
     totals.transactions += block.transactions;
     totals.fees += block.fees;
     totals.volumeUSD += block.volumeUSD;
@@ -3505,6 +4274,7 @@ export class ChainIndexer {
   }
 
   private removeNetworkBackfillBlock(totals: NetworkBackfillFlowTotals, block: NetworkBackfillBlock): void {
+    totals.accounts -= block.accounts;
     totals.transactions -= block.transactions;
     totals.fees -= block.fees;
     totals.volumeUSD -= block.volumeUSD;
@@ -3538,6 +4308,7 @@ export class ChainIndexer {
         id,
         type: window.type,
         timestamp: block.timestamp,
+        accounts: window.totals.accounts,
         transactions: window.totals.transactions,
         fees: window.totals.fees.toString(),
         volumeUSD: scaledToString(window.totals.volumeUSD, 8),

@@ -274,6 +274,13 @@ export const typeDefs = /* GraphQL */ `
     totalCount: Int!
   }
 
+  type NetworkAccountActivity {
+    id: String!
+    from: Int!
+    to: Int!
+    activeAccounts: Int!
+  }
+
   type ExploreStats {
     id: String!
     tokenCount: Int!
@@ -589,6 +596,7 @@ export const typeDefs = /* GraphQL */ `
     accountMeta(id: String!): AccountMeta
     accountPointSystems(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountFilter): AccountPointSystemConnection!
     exploreStats: ExploreStats!
+    networkAccountActivity(from: Int!, to: Int!): NetworkAccountActivity!
   }
 
   type Subscription {

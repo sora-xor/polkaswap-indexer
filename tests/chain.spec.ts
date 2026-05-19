@@ -81,8 +81,33 @@ const createBlockNetworkSnapshot = (
   },
 });
 
+const createAssetSnapshot = (
+  id: string,
+  timestamp: number,
+  priceUSD: { open: string; high: string; low: string; close: string },
+  volumeUSD = '0'
+) => ({
+  collection: 'assetSnapshots' as const,
+  id,
+  blockHeight: 1,
+  timestamp,
+  data: {
+    id,
+    assetId: XOR,
+    timestamp,
+    type: 'DEFAULT',
+    supply: '0',
+    mint: '0',
+    burn: '0',
+    priceUSD,
+    volume: {
+      amount: '0',
+      amountUSD: volumeUSD,
+    },
+  },
+});
+
 const expectNoBackfilledNetworkStockMetrics = (document: { data: Record<string, unknown> } | null | undefined) => {
-  expect(document?.data).not.toHaveProperty('accounts');
   expect(document?.data).not.toHaveProperty('liquidityUSD');
   expect(document?.data).not.toHaveProperty('poolLiquidityUSD');
   expect(document?.data).not.toHaveProperty('orderBookLiquidityUSD');
@@ -170,6 +195,121 @@ describe('ChainIndexer price derivation', () => {
     expect(prices.has(lowLiquidityAsset)).toBe(false);
   });
 
+  it('rejects shallow stable pools with enough stable-side liquidity to imply bad asset prices', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      derivePrices: (
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        pools: Array<{ baseAssetId: string; targetAssetId: string; baseAssetReserves: bigint; targetAssetReserves: bigint }>
+      ) => Map<string, bigint>;
+    };
+
+    const prices = indexer.derivePrices(
+      new Map([
+        [XOR, { id: XOR, symbol: 'XOR', name: 'SORA', decimals: 18, supply: 0n }],
+        [XSTUSD, { id: XSTUSD, symbol: 'XSTUSD', name: 'SORA Synthetic USD', decimals: 18, supply: 0n }],
+      ]),
+      [
+        {
+          baseAssetId: XOR,
+          targetAssetId: XSTUSD,
+          baseAssetReserves: 267_093_660_969_057_671n,
+          targetAssetReserves: 122_541_250_000_000_000_000n,
+        },
+      ]
+    );
+
+    expect(prices.has(XOR)).toBe(false);
+  });
+
+  it('still derives XOR from a current-depth stable pool', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      derivePrices: (
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        pools: Array<{ baseAssetId: string; targetAssetId: string; baseAssetReserves: bigint; targetAssetReserves: bigint }>
+      ) => Map<string, bigint>;
+    };
+
+    const prices = indexer.derivePrices(
+      new Map([
+        [XOR, { id: XOR, symbol: 'XOR', name: 'SORA', decimals: 18, supply: 0n }],
+        [KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 0n }],
+      ]),
+      [
+        {
+          baseAssetId: XOR,
+          targetAssetId: KUSD,
+          baseAssetReserves: 54_108_391_503_195_511_939n,
+          targetAssetReserves: 284_137_450_352_029_888_903n,
+        },
+      ]
+    );
+
+    expect(prices.get(XOR)).toBeGreaterThan(5n * SCALE);
+    expect(prices.get(XOR)).toBeLessThan(6n * SCALE);
+  });
+
+  it('cleans zero-volume asset snapshot price outliers while preserving isolated historical highs', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      cleanupAssetSnapshotPriceOutliers: () => Promise<boolean>;
+    };
+    const normalPrice = (price: string) => ({ open: price, high: price, low: price, close: price });
+    const documents = [
+      createAssetSnapshot('asset-xor-DEFAULT-legacy-high', 1_619_543_754, normalPrice('362.29477681')),
+      createAssetSnapshot('asset-xor-DEFAULT-bad-1', 1_778_368_470, normalPrice('362.29477681')),
+      createAssetSnapshot('asset-xor-DEFAULT-bad-2', 1_778_457_186, {
+        open: '588.29698412',
+        high: '588.29698412',
+        low: '458.83773967',
+        close: '458.83773967',
+      }),
+      createAssetSnapshot('asset-xor-DEFAULT-bad-3', 1_778_542_932, {
+        open: '458.83773967',
+        high: '458.83773967',
+        low: '5.72015908',
+        close: '5.81993769',
+      }),
+      createAssetSnapshot('asset-xor-DEFAULT-good-1', 1_778_630_016, normalPrice('5.81522438')),
+      createAssetSnapshot('asset-xor-DEFAULT-good-2', 1_778_715_546, normalPrice('5.20150076')),
+      createAssetSnapshot('asset-xor-DEFAULT-good-3', 1_778_802_738, normalPrice('5.41743442')),
+      createAssetSnapshot('asset-xor-DEFAULT-good-4', 1_778_888_436, normalPrice('5.62856663')),
+      createAssetSnapshot('asset-xor-DEFAULT-volume-spike', 1_778_930_000, normalPrice('362.29477681'), '1'),
+    ];
+    await repository.upsertMany(documents);
+
+    await expect(indexer.cleanupAssetSnapshotPriceOutliers()).resolves.toBe(true);
+
+    const remainingIds = new Set((await repository.list('assetSnapshots')).map((document) => document.id));
+    expect(remainingIds.has('asset-xor-DEFAULT-bad-1')).toBe(false);
+    expect(remainingIds.has('asset-xor-DEFAULT-bad-2')).toBe(false);
+    expect(remainingIds.has('asset-xor-DEFAULT-bad-3')).toBe(false);
+    expect(remainingIds.has('asset-xor-DEFAULT-legacy-high')).toBe(true);
+    expect(remainingIds.has('asset-xor-DEFAULT-volume-spike')).toBe(true);
+    expect(await repository.get('updatesStreams', 'assetSnapshotPriceOutlierCleanup-v1')).not.toBeNull();
+  });
+
+  it('does not re-run asset snapshot outlier cleanup once the cleanup state exists', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      cleanupAssetSnapshotPriceOutliers: () => Promise<boolean>;
+    };
+    await repository.upsert({
+      collection: 'updatesStreams',
+      id: 'assetSnapshotPriceOutlierCleanup-v1',
+      data: { id: 'assetSnapshotPriceOutlierCleanup-v1', data: JSON.stringify({ deletedCount: 0 }) },
+    });
+    await repository.upsert(createAssetSnapshot('asset-xor-DEFAULT-bad-state-kept', 1_778_368_470, {
+      open: '362.29477681',
+      high: '362.29477681',
+      low: '362.29477681',
+      close: '362.29477681',
+    }));
+
+    await expect(indexer.cleanupAssetSnapshotPriceOutliers()).resolves.toBe(false);
+
+    expect(await repository.get('assetSnapshots', 'asset-xor-DEFAULT-bad-state-kept')).not.toBeNull();
+  });
+
   it('prefers deeper target reserves over a shallow pool with more stable-side liquidity', () => {
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
       derivePrices: (
@@ -241,7 +381,7 @@ describe('ChainIndexer price derivation', () => {
     expect(indexer.extractXorFeeBurn('0')).toBe(0n);
   });
 
-  it('uses native balances issuance for XOR asset supply snapshots', () => {
+  it('normalizes native balances issuance for XOR asset supply snapshots', () => {
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
       createSupplyByAsset: (
         tokenIssuances: Array<[{ args: unknown[] }, unknown]>,
@@ -249,9 +389,10 @@ describe('ChainIndexer price derivation', () => {
       ) => Map<string, bigint>;
     };
 
-    const supplyByAsset = indexer.createSupplyByAsset([[{ args: [KUSD] }, '123']], '999');
+    const legacyNativeXorIssuance = (999n * SCALE * 1_000_000n + 123n).toString();
+    const supplyByAsset = indexer.createSupplyByAsset([[{ args: [KUSD] }, '123']], legacyNativeXorIssuance);
 
-    expect(supplyByAsset.get(XOR)).toBe(999n);
+    expect(supplyByAsset.get(XOR)).toBe(999n * SCALE);
     expect(supplyByAsset.get(KUSD)).toBe(123n);
   });
 
@@ -470,8 +611,7 @@ describe('ChainIndexer price derivation', () => {
           activePools: number;
           activeOrderBooks: number;
           listedAssets: number;
-        },
-        chainAccountCount: number
+        }
       ) => Promise<{ assets: Map<string, Map<string, { burn: bigint }>> }>;
     };
     const analytics = await indexer.buildAnalytics(
@@ -486,8 +626,7 @@ describe('ChainIndexer price derivation', () => {
         activePools: 0,
         activeOrderBooks: 0,
         listedAssets: 1,
-      },
-      0
+      }
     );
 
     expect(analytics.assets.get(XOR)?.get('HOUR')?.burn).toBe(20n * SCALE);
@@ -823,6 +962,322 @@ describe('ChainIndexer price derivation', () => {
     expect(meta?.xorBurned).toEqual({ amount: '2', amountUSD: '10' });
   });
 
+  it('counts only newly indexed accounts in block network snapshots', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    await repository.upsert({
+      collection: 'accountMeta',
+      id: 'alice',
+      blockHeight: 1,
+      timestamp: 100,
+      data: { id: 'alice', accountId: 'alice', createdAtBlock: 1, createdAtTimestamp: 100 },
+    });
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 42 },
+                hash: { toString: () => '0xblock' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xtransfer' },
+                  method: {
+                    section: 'assets',
+                    method: 'transfer',
+                    args: [XOR, 'bob', SCALE.toString()],
+                    meta: { args: [{ name: 'assetId' }, { name: 'to' }, { name: 'amount' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 0)],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000000000' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xblock');
+
+    const snapshot = await repository.get('networkSnapshots', 'block-42');
+    const aliceActivity = await repository.get('accountTransactions', '0xtransfer-alice');
+    const bobActivity = await repository.get('accountTransactions', '0xtransfer-bob');
+
+    expect(snapshot?.data.accounts).toBe(1);
+    expect(snapshot?.data.transactions).toBe(1);
+    expect(aliceActivity?.data).toMatchObject({
+      accountId: 'alice',
+      historyElementId: '0xtransfer',
+      blockHeight: 42,
+      timestamp: 1_700_000_000,
+    });
+    expect(bobActivity?.data).toMatchObject({
+      accountId: 'bob',
+      historyElementId: '0xtransfer',
+      blockHeight: 42,
+      timestamp: 1_700_000_000,
+    });
+  });
+
+  it('counts only signed fee-paying extrinsics as block network transactions', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 43 },
+                hash: { toString: () => '0xblock-transactions' },
+              },
+              extrinsics: [
+                {
+                  isSigned: false,
+                  hash: { toString: () => '0xtimestamp' },
+                  method: {
+                    section: 'timestamp',
+                    method: 'set',
+                    args: ['1700000000000'],
+                    meta: { args: [{ name: 'now' }] },
+                  },
+                },
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xfee-transfer' },
+                  method: {
+                    section: 'assets',
+                    method: 'transfer',
+                    args: [XOR, 'bob', SCALE.toString()],
+                    meta: { args: [{ name: 'assetId' }, { name: 'to' }, { name: 'amount' }] },
+                  },
+                },
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'carol' },
+                  hash: { toString: () => '0xfree-remark' },
+                  method: {
+                    section: 'system',
+                    method: 'remark',
+                    args: ['0x00'],
+                    meta: { args: [{ name: 'remark' }] },
+                  },
+                },
+                {
+                  isSigned: false,
+                  hash: { toString: () => '0xunsigned-fee-event' },
+                  method: {
+                    section: 'system',
+                    method: 'remark',
+                    args: ['0x01'],
+                    meta: { args: [{ name: 'remark' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 1),
+              eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 3),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000000000' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xblock-transactions');
+
+    const snapshot = await repository.get('networkSnapshots', 'block-43');
+
+    expect(snapshot?.data.transactions).toBe(1);
+    expect(snapshot?.data.fees).toBe((2n * SCALE).toString());
+  });
+
+  it('does not count failed swaps as business volume while still counting the paid transaction fee', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 60 },
+                hash: { toString: () => '0xfailed-swap-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xfailed-swap' },
+                  method: {
+                    section: 'liquidityProxy',
+                    method: 'swap',
+                    args: [
+                      0,
+                      XOR,
+                      KUSD,
+                      { WithDesiredInput: { desiredAmountIn: (5n * SCALE).toString(), minAmountOut: '0' } },
+                      'PoolXYK',
+                      'Disabled',
+                    ],
+                    meta: {
+                      args: [
+                        { name: 'dexId' },
+                        { name: 'inputAssetId' },
+                        { name: 'outputAssetId' },
+                        { name: 'swapAmount' },
+                        { name: 'selectedSourceType' },
+                        { name: 'filterMode' },
+                      ],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }),
+              eventRecord('system', 'ExtrinsicFailed', {}),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000000000' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xfailed-swap-block');
+
+    const snapshot = await repository.get('networkSnapshots', 'block-60');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect(snapshot?.data.transactions).toBe(1);
+    expect(snapshot?.data.swaps).toBe(0);
+    expect(snapshot?.data.volumeUSD).toBe('0');
+    expect(snapshot?.data.fees).toBe(SCALE.toString());
+    expect(accountMeta?.data.xorFees).toEqual({ amount: '1', amountUSD: '2' });
+  });
+
+  it('does not count failed bridge burns as outgoing bridge volume or deposits', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 61 },
+                hash: { toString: () => '0xfailed-bridge-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xfailed-bridge-burn' },
+                  method: {
+                    section: 'bridgeProxy',
+                    method: 'burn',
+                    args: [{ EVM: '0x6f' }, XOR, { EVM: '0xrecipient' }, (5n * SCALE).toString()],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'assetId' }, { name: 'recipient' }, { name: 'amount' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }),
+              eventRecord('system', 'ExtrinsicFailed', {}),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000000000' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xfailed-bridge-block');
+
+    const snapshot = await repository.get('networkSnapshots', 'block-61');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+
+    expect(snapshot?.data.transactions).toBe(1);
+    expect(snapshot?.data.bridgeOutgoingTransactions).toBe(0);
+    expect(snapshot?.data.volumeUSD).toBe('0');
+    expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '0', outgoingUSD: '0' });
+    expect(accountMeta?.data.xorFees).toEqual({ amount: '1', amountUSD: '2' });
+  });
+
   it('indexes utility batch burn calls for burn page stats', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
@@ -983,6 +1438,8 @@ describe('ChainIndexer price derivation', () => {
     const history = await repository.get('historyElements', '0xevmburn');
     const snapshot = await repository.get('networkSnapshots', 'block-42');
     const accountMeta = await repository.get('accountMeta', 'alice');
+    const aliceActivity = await repository.get('accountTransactions', '0xevmburn-alice');
+    const externalActivity = await repository.get('accountTransactions', '0xevmburn-0xrecipient');
 
     expect(history?.data).toMatchObject({
       module: 'bridgeProxy',
@@ -1002,6 +1459,8 @@ describe('ChainIndexer price derivation', () => {
     });
     expect(snapshot?.data.bridgeOutgoingTransactions).toBe(1);
     expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '0', outgoingUSD: '10' });
+    expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: '0xevmburn' });
+    expect(externalActivity).toBeNull();
   });
 
   it('indexes liquidityProxy swap history from the actual Exchange event amounts', async () => {
@@ -1173,6 +1632,8 @@ describe('ChainIndexer price derivation', () => {
 
     const history = await repository.get('historyElements', '0xethincoming');
     const accountMeta = await repository.get('accountMeta', 'alice');
+    const aliceActivity = await repository.get('accountTransactions', '0xethincoming-alice');
+    const bridgeSignerActivity = await repository.get('accountTransactions', '0xethincoming-bridge-peer');
 
     expect(history?.data).toMatchObject({
       module: 'bridgeMultisig',
@@ -1190,6 +1651,8 @@ describe('ChainIndexer price derivation', () => {
       },
     });
     expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '8', outgoingUSD: '0' });
+    expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: '0xethincoming' });
+    expect(bridgeSignerActivity).toBeNull();
   });
 
   it('indexes bridgeProxy request events as mint history for EVM incoming restores', async () => {
@@ -2514,11 +2977,156 @@ describe('ChainIndexer price derivation', () => {
     expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '0', outgoingUSD: '4' });
   });
 
+  it('backfills account transaction rows from legacy history without external hex addresses', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      backfillAccountTransactions: () => Promise<boolean>;
+    };
+
+    await repository.upsertMany([
+      {
+        collection: 'historyElements',
+        id: 'legacy-a',
+        blockHeight: 1,
+        timestamp: 100,
+        data: {
+          id: 'legacy-a',
+          blockHeight: 1,
+          timestamp: 100,
+          address: 'alice',
+          dataFrom: 'alice',
+          dataTo: '0xrecipient',
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: 'legacy-b',
+        blockHeight: 2,
+        timestamp: 200,
+        data: {
+          id: 'legacy-b',
+          blockHeight: 2,
+          timestamp: 200,
+          address: '0xbridgepeer',
+          dataFrom: '0xsender',
+          dataTo: 'bob',
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: 'legacy-c',
+        blockHeight: 'not-a-number' as never,
+        timestamp: 'not-a-number' as never,
+        data: {
+          id: 'legacy-c',
+          blockHeight: 'not-a-number',
+          timestamp: 'not-a-number',
+          address: ' alice ',
+          dataFrom: 'not an account',
+          dataTo: { toString: () => 'carol' },
+        },
+      },
+    ]);
+
+    await expect(indexer.backfillAccountTransactions()).resolves.toBe(true);
+
+    const aliceActivity = await repository.get('accountTransactions', 'legacy-a-alice');
+    const bobActivity = await repository.get('accountTransactions', 'legacy-b-bob');
+    const duplicateAliceActivity = await repository.get('accountTransactions', 'legacy-c-alice');
+    const externalRecipient = await repository.get('accountTransactions', 'legacy-a-0xrecipient');
+    const externalSender = await repository.get('accountTransactions', 'legacy-b-0xsender');
+    const malformedText = await repository.get('accountTransactions', 'legacy-c-not an account');
+    const objectCoercion = await repository.get('accountTransactions', 'legacy-c-carol');
+    const backfillState = await repository.get('updatesStreams', 'accountTransactionsBackfill-v1');
+
+    expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: 'legacy-a', timestamp: 100 });
+    expect(bobActivity?.data).toMatchObject({ accountId: 'bob', historyElementId: 'legacy-b', timestamp: 200 });
+    expect(duplicateAliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: 'legacy-c', timestamp: 0 });
+    expect(externalRecipient).toBeNull();
+    expect(externalSender).toBeNull();
+    expect(malformedText).toBeNull();
+    expect(objectCoercion).toBeNull();
+    expect(backfillState?.data).toMatchObject({
+      id: 'accountTransactionsBackfill-v1',
+      block: 2,
+      data: JSON.stringify({ processedDocuments: 3, writtenDocuments: 3, lastIndexedBlock: 2, lastTimestamp: 200 }),
+    });
+    await expect(indexer.backfillAccountTransactions()).resolves.toBe(false);
+    await expect(repository.list('accountTransactions')).resolves.toHaveLength(3);
+  });
+
+  it('does not trust a corrupt account transaction backfill marker', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      backfillAccountTransactions: () => Promise<boolean>;
+    };
+
+    await repository.upsertMany([
+      {
+        collection: 'updatesStreams',
+        id: 'accountTransactionsBackfill-v1',
+        data: { id: 'accountTransactionsBackfill-v1', data: 'not-json' },
+      },
+      {
+        collection: 'historyElements',
+        id: 'legacy-corrupt-state',
+        blockHeight: 9,
+        timestamp: 900,
+        data: { id: 'legacy-corrupt-state', blockHeight: 9, timestamp: 900, address: 'bob' },
+      },
+    ]);
+
+    await expect(indexer.backfillAccountTransactions()).resolves.toBe(true);
+
+    expect(await repository.get('accountTransactions', 'legacy-corrupt-state-bob')).not.toBeNull();
+    expect((await repository.get('updatesStreams', 'accountTransactionsBackfill-v1'))?.data.data).toBe(
+      JSON.stringify({ processedDocuments: 1, writtenDocuments: 1, lastIndexedBlock: 9, lastTimestamp: 900 })
+    );
+  });
+
+  it('does not trust structurally invalid account transaction backfill markers', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      backfillAccountTransactions: () => Promise<boolean>;
+    };
+
+    await repository.upsertMany([
+      {
+        collection: 'updatesStreams',
+        id: 'accountTransactionsBackfill-v1',
+        data: {
+          id: 'accountTransactionsBackfill-v1',
+          data: JSON.stringify({
+            processedDocuments: '1',
+            writtenDocuments: 1,
+            lastIndexedBlock: -1,
+            lastTimestamp: 900,
+          }),
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: 'legacy-invalid-state-shape',
+        blockHeight: 10,
+        timestamp: 1_000,
+        data: { id: 'legacy-invalid-state-shape', blockHeight: 10, timestamp: 1_000, address: 'carol' },
+      },
+    ]);
+
+    await expect(indexer.backfillAccountTransactions()).resolves.toBe(true);
+
+    expect(await repository.get('accountTransactions', 'legacy-invalid-state-shape-carol')).not.toBeNull();
+    expect((await repository.get('updatesStreams', 'accountTransactionsBackfill-v1'))?.data.data).toBe(
+      JSON.stringify({ processedDocuments: 1, writtenDocuments: 1, lastIndexedBlock: 10, lastTimestamp: 1_000 })
+    );
+  });
+
   it('backfills compact XOR burn documents without rewinding chain state', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
       api: unknown;
       backfillXorBurns: (finalizedBlock: number) => Promise<void>;
+      drainFinalizedHeads: () => Promise<void>;
     };
     const burnBlock = 25_043_003;
     const chainStateBlock = 26_000_000;
@@ -2585,6 +3193,7 @@ describe('ChainIndexer price derivation', () => {
         },
       },
     };
+    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
 
     await indexer.backfillXorBurns(burnBlock + 1);
 
@@ -2611,16 +3220,21 @@ describe('ChainIndexer price derivation', () => {
       block: burnBlock + 1,
       data: JSON.stringify({ lastIndexedBlock: burnBlock + 1 }),
     });
+    expect(indexer.drainFinalizedHeads).toHaveBeenCalled();
   });
 
-  it('starts compact XOR burn backfill before waiting for normal chain backfill', async () => {
+  it('subscribes to finalized heads before running startup maintenance backfills', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
       start: () => Promise<void>;
+      refreshIndexingState: () => Promise<void>;
       refreshDerivedState: (blockHeight: number, timestamp: number, includeSnapshots: boolean) => Promise<void>;
       backfillXorBurns: (finalizedBlock: number) => Promise<void>;
       backfill: () => Promise<boolean>;
+      backfillAccountTransactions: () => Promise<boolean>;
       backfillNetworkAggregateSnapshots: () => Promise<boolean>;
+      cleanupAssetSnapshotPriceOutliers: () => Promise<boolean>;
+      repairNetworkTransactionCounters: () => Promise<boolean>;
       subscribeFinalizedHeads: () => Promise<void>;
     };
     const order: string[] = [];
@@ -2634,8 +3248,12 @@ describe('ChainIndexer price derivation', () => {
       },
     } as never);
 
-    indexer.refreshDerivedState = async () => {
-      order.push('refresh');
+    indexer.refreshIndexingState = async () => {
+      order.push('indexing-state-refresh');
+    };
+    indexer.cleanupAssetSnapshotPriceOutliers = async () => {
+      order.push('cleanup');
+      return false;
     };
     indexer.backfillXorBurns = async () => {
       order.push('xor-burn-backfill');
@@ -2646,6 +3264,14 @@ describe('ChainIndexer price derivation', () => {
         finishBackfill = resolve;
       });
       order.push('normal-backfill-end');
+      return false;
+    };
+    indexer.backfillAccountTransactions = async () => {
+      order.push('account-backfill');
+      return false;
+    };
+    indexer.repairNetworkTransactionCounters = async () => {
+      order.push('repair-network-counters');
       return false;
     };
     indexer.backfillNetworkAggregateSnapshots = async () => {
@@ -2659,31 +3285,40 @@ describe('ChainIndexer price derivation', () => {
     const startPromise = indexer.start();
 
     await vi.waitFor(() => {
-      expect(order).toEqual(['refresh', 'xor-burn-backfill', 'normal-backfill-start']);
+      expect(order).toEqual(['indexing-state-refresh', 'normal-backfill-start']);
     });
 
     finishBackfill?.();
     await startPromise;
 
-    expect(order).toEqual([
-      'refresh',
-      'xor-burn-backfill',
-      'normal-backfill-start',
-      'normal-backfill-end',
-      'network-aggregate-backfill',
-      'subscribe',
-    ]);
+    await vi.waitFor(() => {
+      expect(order).toEqual([
+        'indexing-state-refresh',
+        'normal-backfill-start',
+        'normal-backfill-end',
+        'subscribe',
+        'cleanup',
+        'account-backfill',
+        'repair-network-counters',
+        'network-aggregate-backfill',
+        'xor-burn-backfill',
+      ]);
+    });
     apiCreate.mockRestore();
   });
 
-  it('propagates compact XOR burn backfill failures during startup', async () => {
+  it('logs compact XOR burn backfill failures after finalized-head subscription is established', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
       start: () => Promise<void>;
+      refreshIndexingState: () => Promise<void>;
       refreshDerivedState: (blockHeight: number, timestamp: number, includeSnapshots: boolean) => Promise<void>;
       backfillXorBurns: (finalizedBlock: number) => Promise<void>;
       backfill: () => Promise<boolean>;
+      backfillAccountTransactions: () => Promise<boolean>;
       backfillNetworkAggregateSnapshots: () => Promise<boolean>;
+      cleanupAssetSnapshotPriceOutliers: () => Promise<boolean>;
+      repairNetworkTransactionCounters: () => Promise<boolean>;
       subscribeFinalizedHeads: () => Promise<void>;
     };
     const failure = new Error('xor burn backfill failed');
@@ -2697,17 +3332,28 @@ describe('ChainIndexer price derivation', () => {
       },
     } as never);
 
-    indexer.refreshDerivedState = async () => undefined;
+    indexer.refreshIndexingState = async () => undefined;
+    indexer.cleanupAssetSnapshotPriceOutliers = async () => false;
     indexer.backfillXorBurns = async () => {
       throw failure;
     };
     indexer.backfill = async () => false;
+    indexer.backfillAccountTransactions = async () => false;
+    indexer.repairNetworkTransactionCounters = async () => false;
     indexer.backfillNetworkAggregateSnapshots = async () => false;
     indexer.subscribeFinalizedHeads = subscribeFinalizedHeads;
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
-    await expect(indexer.start()).rejects.toBe(failure);
-    expect(subscribeFinalizedHeads).not.toHaveBeenCalled();
-    apiCreate.mockRestore();
+    try {
+      await expect(indexer.start()).resolves.toBeUndefined();
+      expect(subscribeFinalizedHeads).toHaveBeenCalledOnce();
+      await vi.waitFor(() => {
+        expect(consoleError).toHaveBeenCalledWith('Startup maintenance failed', failure);
+      });
+    } finally {
+      consoleError.mockRestore();
+      apiCreate.mockRestore();
+    }
   });
 
   it('skips expensive derived-state refreshes while backfilling historical blocks', async () => {
@@ -2746,7 +3392,64 @@ describe('ChainIndexer price derivation', () => {
       { block: 2, refreshDerivedState: false },
       { block: 3, refreshDerivedState: false },
     ]);
-    expect(refreshes).toEqual([{ blockHeight: 3, includeSnapshots: true }]);
+    expect(refreshes).toEqual([]);
+  });
+
+  it('keeps finalized block indexing committed when a scheduled derived-state refresh fails', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(
+      { ...config, stateRefreshIntervalBlocks: 1, snapshotIntervalBlocks: 1 },
+      repository
+    ) as unknown as {
+      api: unknown;
+      indexBlockByNumber: (block: number) => Promise<void>;
+      refreshDerivedState: (blockHeight: number, timestamp: number, includeSnapshots: boolean) => Promise<void>;
+    };
+    const failure = new Error('refresh query timeout');
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlockHash: async () => ({ toString: () => '0xblock' }),
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 10 },
+                hash: { toString: () => '0xblock' },
+              },
+              extrinsics: [],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1000000' }),
+          },
+        },
+      },
+    };
+    indexer.refreshDerivedState = async () => {
+      throw failure;
+    };
+
+    try {
+      await indexer.indexBlockByNumber(10);
+
+      expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(10);
+      await vi.waitFor(() => {
+        expect(consoleError).toHaveBeenCalledWith('Failed to refresh derived state at SORA block 10', failure);
+      });
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it('retries missed finalized blocks before indexing later heads', async () => {
@@ -2777,6 +3480,8 @@ describe('ChainIndexer price derivation', () => {
           subscribeFinalizedHeads: async (callback: typeof finalizedHeadCallback) => {
             finalizedHeadCallback = callback;
           },
+          getFinalizedHead: async () => '0xfinal',
+          getHeader: async () => ({ number: { toNumber: () => 9 } }),
         },
       },
     };
@@ -2803,16 +3508,71 @@ describe('ChainIndexer price derivation', () => {
     try {
       await indexer.subscribeFinalizedHeads();
       await finalizedHeadCallback?.({ number: { toNumber: () => 10 } });
-      expect(indexedBlocks).toEqual([10]);
+      await vi.waitFor(() => {
+        expect(indexedBlocks).toEqual([10]);
+      });
       expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(9);
       expect(consoleError).toHaveBeenCalledWith('Failed to index finalized block 10', expect.any(Error));
 
       await finalizedHeadCallback?.({ number: { toNumber: () => 12 } });
-      expect(indexedBlocks).toEqual([10, 10, 11, 12]);
+      await vi.waitFor(() => {
+        expect(indexedBlocks).toEqual([10, 10, 11, 12]);
+      });
       expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(12);
     } finally {
       consoleError.mockRestore();
     }
+  });
+
+  it('drains to the latest finalized block immediately after subscribing', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      subscribeFinalizedHeads: () => Promise<void>;
+      indexBlockByNumber: (block: number) => Promise<void>;
+    };
+    const indexedBlocks: number[] = [];
+
+    await repository.upsert({
+      collection: 'updatesStreams',
+      id: 'chainState',
+      blockHeight: 9,
+      timestamp: 1,
+      data: {
+        id: 'chainState',
+        block: 9,
+        data: JSON.stringify({ lastIndexedBlock: 9 }),
+      },
+    });
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          subscribeFinalizedHeads: async () => undefined,
+          getFinalizedHead: async () => '0xfinal',
+          getHeader: async () => ({ number: { toNumber: () => 12 } }),
+        },
+      },
+    };
+    indexer.indexBlockByNumber = async (block) => {
+      indexedBlocks.push(block);
+      await repository.upsert({
+        collection: 'updatesStreams',
+        id: 'chainState',
+        blockHeight: block,
+        timestamp: 1,
+        data: {
+          id: 'chainState',
+          block,
+          data: JSON.stringify({ lastIndexedBlock: block }),
+        },
+      });
+    };
+
+    await indexer.subscribeFinalizedHeads();
+
+    expect(indexedBlocks).toEqual([10, 11, 12]);
+    expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(12);
   });
 
   it('continues existing account point metadata from the repository', async () => {
@@ -3154,6 +3914,410 @@ describe('ChainIndexer price derivation', () => {
     ]);
   });
 
+  it('buckets default asset snapshots into five-minute chart windows', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createAssetDocuments: (
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        prices: Map<string, bigint>,
+        liquidity: Map<string, bigint>,
+        analytics: {
+          assets: Map<string, Map<string, unknown>>;
+          assetDayVolumeUSD: Map<string, bigint>;
+          assetWeekVolumeUSD: Map<string, bigint>;
+          assetDayOpenPrice: Map<string, string>;
+          assetWeekOpenPrice: Map<string, string>;
+          assetOrderBookLiquidity: Map<string, bigint>;
+        },
+        blockHeight: number,
+        timestamp: number,
+        includeSnapshots: boolean
+      ) => Promise<Array<{ collection: string; id: string; data: Record<string, unknown> }>>;
+    };
+    const timestamp = 1_700_000_349;
+    const assets = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'SORA', decimals: 18, supply: 1_000n * SCALE }]]);
+    const analytics = {
+      assets: new Map(),
+      assetDayVolumeUSD: new Map(),
+      assetWeekVolumeUSD: new Map(),
+      assetDayOpenPrice: new Map(),
+      assetWeekOpenPrice: new Map(),
+      assetOrderBookLiquidity: new Map(),
+    };
+
+    const documents = await indexer.createAssetDocuments(
+      assets,
+      new Map([[XOR, 5n * SCALE]]),
+      new Map(),
+      analytics,
+      77,
+      timestamp,
+      true
+    );
+
+    const defaultSnapshot = documents.find((document) => document.collection === 'assetSnapshots' && document.data.type === 'DEFAULT');
+    const daySnapshot = documents.find((document) => document.collection === 'assetSnapshots' && document.data.type === 'DAY');
+
+    expect(defaultSnapshot?.id).toBe(`asset-${XOR}-DEFAULT-1700000100`);
+    expect(defaultSnapshot?.data.timestamp).toBe(timestamp);
+    expect(daySnapshot?.id).toBe(`asset-${XOR}-DAY-1699920000`);
+  });
+
+  it('does not roll default asset snapshots into the next five-minute window early', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createAssetDocuments: (
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        prices: Map<string, bigint>,
+        liquidity: Map<string, bigint>,
+        analytics: {
+          assets: Map<string, Map<string, unknown>>;
+          assetDayVolumeUSD: Map<string, bigint>;
+          assetWeekVolumeUSD: Map<string, bigint>;
+          assetDayOpenPrice: Map<string, string>;
+          assetWeekOpenPrice: Map<string, string>;
+          assetOrderBookLiquidity: Map<string, bigint>;
+        },
+        blockHeight: number,
+        timestamp: number,
+        includeSnapshots: boolean
+      ) => Promise<Array<{ collection: string; id: string; data: Record<string, unknown> }>>;
+    };
+    const assets = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'SORA', decimals: 18, supply: 1_000n * SCALE }]]);
+    const analytics = {
+      assets: new Map(),
+      assetDayVolumeUSD: new Map(),
+      assetWeekVolumeUSD: new Map(),
+      assetDayOpenPrice: new Map(),
+      assetWeekOpenPrice: new Map(),
+      assetOrderBookLiquidity: new Map(),
+    };
+    const defaultSnapshotId = async (timestamp: number): Promise<string | undefined> => {
+      const documents = await indexer.createAssetDocuments(
+        assets,
+        new Map([[XOR, 5n * SCALE]]),
+        new Map(),
+        analytics,
+        77,
+        timestamp,
+        true
+      );
+
+      return documents.find((document) => document.collection === 'assetSnapshots' && document.data.type === 'DEFAULT')?.id;
+    };
+
+    await expect(defaultSnapshotId(1_700_000_399)).resolves.toBe(`asset-${XOR}-DEFAULT-1700000100`);
+    await expect(defaultSnapshotId(1_700_000_400)).resolves.toBe(`asset-${XOR}-DEFAULT-1700000400`);
+  });
+
+  it('does not let block height change default asset snapshot buckets', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createAssetDocuments: (
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        prices: Map<string, bigint>,
+        liquidity: Map<string, bigint>,
+        analytics: {
+          assets: Map<string, Map<string, unknown>>;
+          assetDayVolumeUSD: Map<string, bigint>;
+          assetWeekVolumeUSD: Map<string, bigint>;
+          assetDayOpenPrice: Map<string, string>;
+          assetWeekOpenPrice: Map<string, string>;
+          assetOrderBookLiquidity: Map<string, bigint>;
+        },
+        blockHeight: number,
+        timestamp: number,
+        includeSnapshots: boolean
+      ) => Promise<Array<{ collection: string; id: string; data: Record<string, unknown> }>>;
+    };
+    const timestamp = 1_700_000_349;
+    const assets = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'SORA', decimals: 18, supply: 1_000n * SCALE }]]);
+    const analytics = {
+      assets: new Map(),
+      assetDayVolumeUSD: new Map(),
+      assetWeekVolumeUSD: new Map(),
+      assetDayOpenPrice: new Map(),
+      assetWeekOpenPrice: new Map(),
+      assetOrderBookLiquidity: new Map(),
+    };
+    const assetDocuments = async (blockHeight: number) =>
+      await indexer.createAssetDocuments(
+        assets,
+        new Map([[XOR, 5n * SCALE]]),
+        new Map(),
+        analytics,
+        blockHeight,
+        timestamp,
+        true
+      );
+
+    const firstBlockDocuments = await assetDocuments(77);
+    const secondBlockDocuments = await assetDocuments(78);
+    const firstDefault = firstBlockDocuments.find(
+      (document) => document.collection === 'assetSnapshots' && document.data.type === 'DEFAULT'
+    );
+    const secondDefault = secondBlockDocuments.find(
+      (document) => document.collection === 'assetSnapshots' && document.data.type === 'DEFAULT'
+    );
+    const firstBlock = firstBlockDocuments.find(
+      (document) => document.collection === 'assetSnapshots' && document.data.type === 'BLOCK'
+    );
+    const secondBlock = secondBlockDocuments.find(
+      (document) => document.collection === 'assetSnapshots' && document.data.type === 'BLOCK'
+    );
+
+    expect(firstDefault?.id).toBe(secondDefault?.id);
+    expect(firstDefault?.id).toBe(`asset-${XOR}-DEFAULT-1700000100`);
+    expect(firstBlock?.id).toBe(`asset-${XOR}-BLOCK-77`);
+    expect(secondBlock?.id).toBe(`asset-${XOR}-BLOCK-78`);
+  });
+
+  it('buckets default pool snapshots into five-minute chart windows', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createPoolDocuments: (
+        pools: Array<{
+          id: string;
+          baseAssetId: string;
+          targetAssetId: string;
+          baseAssetReserves: bigint;
+          targetAssetReserves: bigint;
+          poolAccount: string;
+          poolTokenSupply: bigint;
+          liquidityUSD: string;
+          priceUSD: string;
+        }>,
+        analytics: {
+          pools: Map<string, Map<string, unknown>>;
+        },
+        apyByPool: Map<string, string>,
+        blockHeight: number,
+        timestamp: number,
+        includeSnapshots: boolean
+      ) => Promise<Array<{ collection: string; id: string; data: Record<string, unknown> }>>;
+    };
+    const timestamp = 1_700_000_349;
+    const poolId = `${XOR}-${KUSD}`;
+    const analytics = {
+      pools: new Map(),
+    };
+
+    const documents = await indexer.createPoolDocuments(
+      [
+        {
+          id: poolId,
+          baseAssetId: XOR,
+          targetAssetId: KUSD,
+          baseAssetReserves: 100n * SCALE,
+          targetAssetReserves: 500n * SCALE,
+          poolAccount: 'pool-account',
+          poolTokenSupply: 1_000n * SCALE,
+          liquidityUSD: '1000',
+          priceUSD: '5',
+        },
+      ],
+      analytics,
+      new Map(),
+      77,
+      timestamp,
+      true
+    );
+
+    const defaultSnapshot = documents.find((document) => document.collection === 'poolSnapshots' && document.data.type === 'DEFAULT');
+    const daySnapshot = documents.find((document) => document.collection === 'poolSnapshots' && document.data.type === 'DAY');
+
+    expect(defaultSnapshot?.id).toBe(`pool-${poolId}-DEFAULT-1700000100`);
+    expect(defaultSnapshot?.data.timestamp).toBe(timestamp);
+    expect(daySnapshot?.id).toBe(`pool-${poolId}-DAY-1699920000`);
+  });
+
+  it('buckets default order book snapshots into five-minute chart windows', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createOrderBookDocuments: (
+        orderBooks: unknown[],
+        bids: unknown[],
+        asks: unknown[],
+        limitOrders: unknown[],
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        prices: Map<string, bigint>,
+        analytics: {
+          orderBooks: Map<string, Map<string, unknown>>;
+          orderBookActiveReserves: Map<string, { baseAssetReserves: bigint; quoteAssetReserves: bigint; liquidityUSD: bigint }>;
+          orderBookDayVolumeUSD: Map<string, bigint>;
+          orderBookDayOpenPrice: Map<string, string>;
+        },
+        blockHeight: number,
+        timestamp: number,
+        includeSnapshots: boolean
+      ) => Promise<Array<{ collection: string; id: string; data: Record<string, unknown> }>>;
+    };
+    const timestamp = 1_700_000_349;
+    const orderBookId = `0-${XOR}-${KUSD}`;
+    const assets = new Map([
+      [XOR, { id: XOR, symbol: 'XOR', name: 'SORA', decimals: 18, supply: 1_000n * SCALE }],
+      [KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 1_000n * SCALE }],
+    ]);
+    const analytics = {
+      orderBooks: new Map(),
+      orderBookActiveReserves: new Map(),
+      orderBookDayVolumeUSD: new Map(),
+      orderBookDayOpenPrice: new Map(),
+    };
+
+    const documents = await indexer.createOrderBookDocuments(
+      [[{ args: [{ dexId: 0, base: XOR, quote: KUSD }] }, { status: 'Trade' }]],
+      [],
+      [],
+      [],
+      assets,
+      new Map([
+        [XOR, 5n * SCALE],
+        [KUSD, SCALE],
+      ]),
+      analytics,
+      77,
+      timestamp,
+      true
+    );
+
+    const defaultSnapshot = documents.find(
+      (document) => document.collection === 'orderBookSnapshots' && document.data.type === 'DEFAULT'
+    );
+    const daySnapshot = documents.find(
+      (document) => document.collection === 'orderBookSnapshots' && document.data.type === 'DAY'
+    );
+
+    expect(defaultSnapshot?.id).toBe(`orderBook-${orderBookId}-DEFAULT-1700000100`);
+    expect(defaultSnapshot?.data.timestamp).toBe(timestamp);
+    expect(daySnapshot?.id).toBe(`orderBook-${orderBookId}-DAY-1699920000`);
+  });
+
+  it('does not emit price chart snapshots when snapshots are disabled', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createAssetDocuments: (
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        prices: Map<string, bigint>,
+        liquidity: Map<string, bigint>,
+        analytics: {
+          assets: Map<string, Map<string, unknown>>;
+          assetDayVolumeUSD: Map<string, bigint>;
+          assetWeekVolumeUSD: Map<string, bigint>;
+          assetDayOpenPrice: Map<string, string>;
+          assetWeekOpenPrice: Map<string, string>;
+          assetOrderBookLiquidity: Map<string, bigint>;
+        },
+        blockHeight: number,
+        timestamp: number,
+        includeSnapshots: boolean
+      ) => Promise<Array<{ collection: string; id: string; data: Record<string, unknown> }>>;
+      createPoolDocuments: (
+        pools: Array<{
+          id: string;
+          baseAssetId: string;
+          targetAssetId: string;
+          baseAssetReserves: bigint;
+          targetAssetReserves: bigint;
+          poolAccount: string;
+          poolTokenSupply: bigint;
+          liquidityUSD: string;
+          priceUSD: string;
+        }>,
+        analytics: {
+          pools: Map<string, Map<string, unknown>>;
+        },
+        apyByPool: Map<string, string>,
+        blockHeight: number,
+        timestamp: number,
+        includeSnapshots: boolean
+      ) => Promise<Array<{ collection: string; id: string; data: Record<string, unknown> }>>;
+      createOrderBookDocuments: (
+        orderBooks: unknown[],
+        bids: unknown[],
+        asks: unknown[],
+        limitOrders: unknown[],
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        prices: Map<string, bigint>,
+        analytics: {
+          orderBooks: Map<string, Map<string, unknown>>;
+          orderBookActiveReserves: Map<string, { baseAssetReserves: bigint; quoteAssetReserves: bigint; liquidityUSD: bigint }>;
+          orderBookDayVolumeUSD: Map<string, bigint>;
+          orderBookDayOpenPrice: Map<string, string>;
+        },
+        blockHeight: number,
+        timestamp: number,
+        includeSnapshots: boolean
+      ) => Promise<Array<{ collection: string; id: string; data: Record<string, unknown> }>>;
+    };
+    const timestamp = 1_700_000_349;
+    const assets = new Map([
+      [XOR, { id: XOR, symbol: 'XOR', name: 'SORA', decimals: 18, supply: 1_000n * SCALE }],
+      [KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 1_000n * SCALE }],
+    ]);
+    const poolId = `${XOR}-${KUSD}`;
+    const assetAnalytics = {
+      assets: new Map(),
+      assetDayVolumeUSD: new Map(),
+      assetWeekVolumeUSD: new Map(),
+      assetDayOpenPrice: new Map(),
+      assetWeekOpenPrice: new Map(),
+      assetOrderBookLiquidity: new Map(),
+    };
+    const poolAnalytics = {
+      pools: new Map(),
+    };
+    const orderBookAnalytics = {
+      orderBooks: new Map(),
+      orderBookActiveReserves: new Map(),
+      orderBookDayVolumeUSD: new Map(),
+      orderBookDayOpenPrice: new Map(),
+    };
+
+    const assetDocuments = await indexer.createAssetDocuments(
+      assets,
+      new Map([[XOR, 5n * SCALE]]),
+      new Map(),
+      assetAnalytics,
+      77,
+      timestamp,
+      false
+    );
+    const poolDocuments = await indexer.createPoolDocuments(
+      [
+        {
+          id: poolId,
+          baseAssetId: XOR,
+          targetAssetId: KUSD,
+          baseAssetReserves: 100n * SCALE,
+          targetAssetReserves: 500n * SCALE,
+          poolAccount: 'pool-account',
+          poolTokenSupply: 1_000n * SCALE,
+          liquidityUSD: '1000',
+          priceUSD: '5',
+        },
+      ],
+      poolAnalytics,
+      new Map(),
+      77,
+      timestamp,
+      false
+    );
+    const orderBookDocuments = await indexer.createOrderBookDocuments(
+      [[{ args: [{ dexId: 0, base: XOR, quote: KUSD }] }, { status: 'Trade' }]],
+      [],
+      [],
+      [],
+      assets,
+      new Map([
+        [XOR, 5n * SCALE],
+        [KUSD, SCALE],
+      ]),
+      orderBookAnalytics,
+      77,
+      timestamp,
+      false
+    );
+
+    expect(assetDocuments.map((document) => document.collection)).toEqual(['assets', 'assets']);
+    expect(poolDocuments.map((document) => document.collection)).toEqual(['poolXYKs']);
+    expect(orderBookDocuments.map((document) => document.collection)).toEqual(['orderBooks']);
+  });
+
   it('creates network snapshots only for aggregate windows', () => {
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
       createNetworkSnapshotDocuments: (
@@ -3161,7 +4325,7 @@ describe('ChainIndexer price derivation', () => {
         blockHeight: number,
         timestamp: number,
         includeSnapshots: boolean
-      ) => Array<{ collection: string; data: Record<string, unknown> }>;
+      ) => Array<{ collection: string; id: string; data: Record<string, unknown> }>;
     };
     const analytics = {
       network: new Map([
@@ -3190,6 +4354,7 @@ describe('ChainIndexer price derivation', () => {
     const documents = indexer.createNetworkSnapshotDocuments(analytics, 10, 1_700_000_000, true);
 
     expect(documents.map((document) => document.data.type)).toEqual(['DEFAULT', 'HOUR', 'DAY', 'MONTH']);
+    expect(documents[0].id).toBe('network-all-DEFAULT-1699999800');
     expect(documents[0]).toMatchObject({
       collection: 'networkSnapshots',
       data: {
@@ -3208,6 +4373,228 @@ describe('ChainIndexer price derivation', () => {
         bridgeOutgoingTransactions: 2,
       },
     });
+  });
+
+  it('does not let block height change default network aggregate buckets', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createNetworkSnapshotDocuments: (
+        analytics: unknown,
+        blockHeight: number,
+        timestamp: number,
+        includeSnapshots: boolean
+      ) => Array<{ collection: string; id: string; data: Record<string, unknown> }>;
+    };
+    const analytics = {
+      network: new Map(),
+    };
+    const timestamp = 1_700_000_349;
+
+    const firstBlockDocuments = indexer.createNetworkSnapshotDocuments(analytics, 77, timestamp, true);
+    const secondBlockDocuments = indexer.createNetworkSnapshotDocuments(analytics, 78, timestamp, true);
+    const firstDefault = firstBlockDocuments.find((document) => document.data.type === 'DEFAULT');
+    const secondDefault = secondBlockDocuments.find((document) => document.data.type === 'DEFAULT');
+
+    expect(firstBlockDocuments.some((document) => document.data.type === 'BLOCK')).toBe(false);
+    expect(firstDefault?.id).toBe(secondDefault?.id);
+    expect(firstDefault?.id).toBe('network-all-DEFAULT-1700000100');
+  });
+
+  it('does not roll default network aggregates into the next five-minute window early', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createNetworkSnapshotDocuments: (
+        analytics: unknown,
+        blockHeight: number,
+        timestamp: number,
+        includeSnapshots: boolean
+      ) => Array<{ collection: string; id: string; data: Record<string, unknown> }>;
+    };
+    const analytics = {
+      network: new Map(),
+    };
+    const defaultSnapshotId = (timestamp: number): string | undefined => {
+      const documents = indexer.createNetworkSnapshotDocuments(analytics, 77, timestamp, true);
+      return documents.find((document) => document.data.type === 'DEFAULT')?.id;
+    };
+
+    expect(defaultSnapshotId(1_700_000_399)).toBe('network-all-DEFAULT-1700000100');
+    expect(defaultSnapshotId(1_700_000_400)).toBe('network-all-DEFAULT-1700000400');
+  });
+
+  it('aggregates network account counts from account creation timestamps', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      buildAnalytics: (
+        timestamp: number,
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        prices: Map<string, bigint>,
+        pools: unknown[],
+        liquidityStats: {
+          liquidityUSD: string;
+          poolLiquidityUSD: string;
+          orderBookLiquidityUSD: string;
+          activePools: number;
+          activeOrderBooks: number;
+          listedAssets: number;
+        }
+      ) => Promise<{ network: Map<string, { accounts: number; transactions: number }> }>;
+    };
+
+    await repository.upsertMany([
+      createBlockNetworkSnapshot(1, 100, { accounts: 99, transactions: 1 }),
+      createBlockNetworkSnapshot(2, 4_000, { accounts: 99, transactions: 2 }),
+      createBlockNetworkSnapshot(3, 7_000, { accounts: 99, transactions: 3 }),
+      {
+        collection: 'accountMeta',
+        id: 'old-account',
+        blockHeight: 1,
+        timestamp: 100,
+        data: { id: 'old-account', accountId: 'old-account', createdAtTimestamp: 100 },
+      },
+      {
+        collection: 'accountMeta',
+        id: 'hour-account',
+        blockHeight: 2,
+        timestamp: 4_000,
+        data: { id: 'hour-account', accountId: 'hour-account', createdAtTimestamp: 4_000 },
+      },
+      {
+        collection: 'accountMeta',
+        id: 'default-account',
+        blockHeight: 3,
+        timestamp: 7_000,
+        data: { id: 'default-account', accountId: 'default-account', createdAtTimestamp: 7_000 },
+      },
+    ]);
+
+    const analytics = await indexer.buildAnalytics(
+      7_300,
+      new Map(),
+      new Map(),
+      [],
+      {
+        liquidityUSD: '0',
+        poolLiquidityUSD: '0',
+        orderBookLiquidityUSD: '0',
+        activePools: 0,
+        activeOrderBooks: 0,
+        listedAssets: 0,
+      }
+    );
+
+    expect(analytics.network.get('DEFAULT')).toMatchObject({ accounts: 1, transactions: 3 });
+    expect(analytics.network.get('HOUR')).toMatchObject({ accounts: 2, transactions: 5 });
+    expect(analytics.network.get('DAY')).toMatchObject({ accounts: 3, transactions: 6 });
+  });
+
+  it('repairs legacy network transaction counters from history rows and updates existing aggregates', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      repairNetworkTransactionCounters: () => Promise<boolean>;
+    };
+
+    await repository.upsertMany([
+      createBlockNetworkSnapshot(1, 100, { transactions: 2, swaps: 0, bridgeIncomingTransactions: 0 }),
+      createBlockNetworkSnapshot(2, 200, { transactions: 1, swaps: 0, bridgeIncomingTransactions: 0 }),
+      createBlockNetworkSnapshot(3, 300, { transactions: 4, swaps: 0, bridgeIncomingTransactions: 0 }),
+      {
+        collection: 'networkSnapshots',
+        id: 'network-all-DAY-0',
+        blockHeight: 3,
+        timestamp: 300,
+        data: {
+          id: 'network-all-DAY-0',
+          type: 'DAY',
+          timestamp: 300,
+          transactions: 99,
+          swaps: 99,
+          bridgeIncomingTransactions: 99,
+          bridgeOutgoingTransactions: 99,
+          liquidityUSD: '123',
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: '0xpaid-transfer',
+        blockHeight: 1,
+        timestamp: 100,
+        data: {
+          id: '0xpaid-transfer',
+          blockHeight: 1,
+          timestamp: 100,
+          module: 'assets',
+          method: 'transfer',
+          networkFee: SCALE.toString(),
+          execution: { success: true },
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: '0xinbound-mint',
+        blockHeight: 1,
+        timestamp: 100,
+        data: {
+          id: '0xinbound-mint',
+          blockHeight: 1,
+          timestamp: 100,
+          module: 'bridgeProxy',
+          method: 'mint',
+          networkFee: SCALE.toString(),
+          execution: { success: true },
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: '0xpaid-swap',
+        blockHeight: 3,
+        timestamp: 300,
+        data: {
+          id: '0xpaid-swap',
+          blockHeight: 3,
+          timestamp: 300,
+          module: 'liquidityProxy',
+          method: 'swap',
+          networkFee: SCALE.toString(),
+          execution: { success: true },
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: '0xfailed-bridge',
+        blockHeight: 3,
+        timestamp: 300,
+        data: {
+          id: '0xfailed-bridge',
+          blockHeight: 3,
+          timestamp: 300,
+          module: 'bridgeProxy',
+          method: 'burn',
+          networkFee: SCALE.toString(),
+          execution: { success: false },
+        },
+      },
+    ]);
+
+    await expect(indexer.repairNetworkTransactionCounters()).resolves.toBe(true);
+
+    await expect(repository.get('networkSnapshots', 'block-1')).resolves.toMatchObject({
+      data: { transactions: 1, swaps: 0, bridgeIncomingTransactions: 1, bridgeOutgoingTransactions: 0 },
+    });
+    await expect(repository.get('networkSnapshots', 'block-2')).resolves.toMatchObject({
+      data: { transactions: 0, swaps: 0, bridgeIncomingTransactions: 0, bridgeOutgoingTransactions: 0 },
+    });
+    await expect(repository.get('networkSnapshots', 'block-3')).resolves.toMatchObject({
+      data: { transactions: 2, swaps: 1, bridgeIncomingTransactions: 0, bridgeOutgoingTransactions: 0 },
+    });
+    await expect(repository.get('networkSnapshots', 'network-all-DAY-0')).resolves.toMatchObject({
+      data: {
+        transactions: 3,
+        swaps: 1,
+        bridgeIncomingTransactions: 1,
+        bridgeOutgoingTransactions: 0,
+        liquidityUSD: '123',
+      },
+    });
+    await expect(repository.get('updatesStreams', 'networkTransactionCounterRepair-v1')).resolves.not.toBeNull();
   });
 
   it('backfills aggregate network snapshots from indexed block snapshots', async () => {
@@ -3262,6 +4649,7 @@ describe('ChainIndexer price derivation', () => {
     expect(firstDay?.data).toMatchObject({
       type: 'DAY',
       timestamp: 100,
+      accounts: 2,
       transactions: 1,
       fees: '10',
       volumeUSD: '1.25',
@@ -3274,6 +4662,7 @@ describe('ChainIndexer price derivation', () => {
     expect(secondDay?.data).toMatchObject({
       type: 'DAY',
       timestamp: 86_500,
+      accounts: 5,
       transactions: 3,
       fees: '30',
       volumeUSD: '3.75',
@@ -3286,6 +4675,7 @@ describe('ChainIndexer price derivation', () => {
     expect(thirdDay?.data).toMatchObject({
       type: 'DAY',
       timestamp: 172_900,
+      accounts: 8,
       transactions: 5,
       fees: '50',
       volumeUSD: '6',
@@ -3295,6 +4685,7 @@ describe('ChainIndexer price derivation', () => {
     expect(month?.data).toMatchObject({
       type: 'MONTH',
       timestamp: 172_900,
+      accounts: 10,
       transactions: 6,
       fees: '60',
       volumeUSD: '7.25',

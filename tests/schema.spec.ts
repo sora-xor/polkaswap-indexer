@@ -8,6 +8,27 @@ import type { IndexerRepository, RepositoryQueryArgs } from '../src/repository/t
 
 type QueryFunction = NonNullable<IndexerRepository['query']>;
 
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+const ss58FixtureAccount = (index: number): string => {
+  let value = index + 1;
+  let encoded = '';
+
+  while (value > 0) {
+    encoded = BASE58_ALPHABET[value % BASE58_ALPHABET.length] + encoded;
+    value = Math.floor(value / BASE58_ALPHABET.length);
+  }
+
+  return encoded.padStart(48, '1');
+};
+
+const completedAccountActivityBackfillData = JSON.stringify({
+  processedDocuments: 1,
+  writtenDocuments: 1,
+  lastIndexedBlock: 1,
+  lastTimestamp: 1,
+});
+
 const repositoryWithQuery = (query: QueryFunction): IndexerRepository => ({
   list: async () => [],
   query,
@@ -15,6 +36,7 @@ const repositoryWithQuery = (query: QueryFunction): IndexerRepository => ({
   getMany: async () => new Map(),
   upsert: async () => undefined,
   upsertMany: async () => undefined,
+  deleteMany: async () => undefined,
   close: async () => undefined,
 });
 
@@ -24,6 +46,7 @@ const repositoryWithoutQuery = (items: Awaited<ReturnType<IndexerRepository['lis
   getMany: async () => new Map(),
   upsert: async () => undefined,
   upsertMany: async () => undefined,
+  deleteMany: async () => undefined,
   close: async () => undefined,
 });
 
@@ -239,6 +262,260 @@ describe('Polkaswap indexer schema', () => {
     });
   });
 
+  it('counts unique transaction-active accounts over a stats range', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'accountTransactions',
+        id: 'tx-a-alice',
+        timestamp: 100,
+        data: { id: 'tx-a-alice', accountId: 'alice', historyElementId: 'tx-a', timestamp: 100 },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'tx-b-alice',
+        timestamp: 150,
+        data: { id: 'tx-b-alice', accountId: 'alice', historyElementId: 'tx-b', timestamp: 150 },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'tx-c-bob',
+        timestamp: 200,
+        data: { id: 'tx-c-bob', accountId: 'bob', historyElementId: 'tx-c', timestamp: 200 },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'tx-d-old',
+        timestamp: 50,
+        data: { id: 'tx-d-old', accountId: 'old', historyElementId: 'tx-d', timestamp: 50 },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'tx-e-external',
+        timestamp: 160,
+        data: { id: 'tx-e-external', accountId: '0xexternal', historyElementId: 'tx-e', timestamp: 160 },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'tx-f-malformed',
+        timestamp: 170,
+        data: { id: 'tx-f-malformed', accountId: '<script>alert(1)</script>', historyElementId: 'tx-f', timestamp: 170 },
+      },
+      {
+        collection: 'historyElements',
+        id: 'legacy-carol',
+        timestamp: 180,
+        data: {
+          id: 'legacy-carol',
+          timestamp: 180,
+          address: 'carol',
+          dataFrom: '0xexternal',
+          dataTo: 'dave',
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: 'legacy-malformed',
+        timestamp: 190,
+        data: {
+          id: 'legacy-malformed',
+          timestamp: 190,
+          address: 'not an account',
+          dataFrom: { account: 'eve' },
+          dataTo: '0XABCDEF',
+        },
+      },
+    ]);
+
+    const schema = createSchema();
+    const activityField = schema.getQueryType()?.getFields().networkAccountActivity;
+
+    await expect(activityField?.resolve?.({}, { from: 220, to: 90 }, { repository }, {} as never)).resolves.toEqual({
+      id: 'network-account-activity-90-220',
+      from: 90,
+      to: 220,
+      activeAccounts: 4,
+    });
+  });
+
+  it('falls back to legacy history when the activity backfill marker is corrupt', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'accountTransactions',
+        id: 'tx-a-alice',
+        timestamp: 100,
+        data: { id: 'tx-a-alice', accountId: 'alice', historyElementId: 'tx-a', timestamp: 100 },
+      },
+      {
+        collection: 'historyElements',
+        id: 'legacy-bob',
+        timestamp: 120,
+        data: { id: 'legacy-bob', timestamp: 120, address: 'bob', dataFrom: '0xexternal', dataTo: 'carol' },
+      },
+      {
+        collection: 'updatesStreams',
+        id: 'accountTransactionsBackfill-v1',
+        data: { id: 'accountTransactionsBackfill-v1', data: 'not-json' },
+      },
+    ]);
+
+    const schema = createSchema();
+    const activityField = schema.getQueryType()?.getFields().networkAccountActivity;
+
+    await expect(activityField?.resolve?.({}, { from: 90, to: 130 }, { repository }, {} as never)).resolves.toMatchObject({
+      activeAccounts: 3,
+    });
+  });
+
+  it('counts active accounts across seek-paginated account activity pages without duplicates', async () => {
+    const repository = new MemoryRepository();
+    const accounts = Array.from({ length: 1_005 }, (_item, index) => ss58FixtureAccount(index));
+
+    await repository.upsertMany([
+      ...accounts.map((accountId, index) => ({
+        collection: 'accountTransactions' as const,
+        id: `paged-${String(index).padStart(4, '0')}`,
+        timestamp: 120,
+        data: { id: `paged-${String(index).padStart(4, '0')}`, accountId, historyElementId: `paged-${index}`, timestamp: 120 },
+      })),
+      {
+        collection: 'accountTransactions',
+        id: 'paged-duplicate',
+        timestamp: 120,
+        data: { id: 'paged-duplicate', accountId: accounts[0], historyElementId: 'paged-duplicate', timestamp: 120 },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'paged-malformed',
+        timestamp: 120,
+        data: { id: 'paged-malformed', accountId: 'attacker', historyElementId: 'paged-malformed', timestamp: 120 },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'paged-before-range',
+        timestamp: 89,
+        data: { id: 'paged-before-range', accountId: ss58FixtureAccount(1_006), historyElementId: 'paged-before-range', timestamp: 89 },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'paged-after-range',
+        timestamp: 131,
+        data: { id: 'paged-after-range', accountId: ss58FixtureAccount(1_007), historyElementId: 'paged-after-range', timestamp: 131 },
+      },
+      {
+        collection: 'historyElements',
+        id: 'legacy-ignored-after-valid-backfill',
+        timestamp: 120,
+        data: { id: 'legacy-ignored-after-valid-backfill', address: 'bob', timestamp: 120 },
+      },
+      {
+        collection: 'updatesStreams',
+        id: 'accountTransactionsBackfill-v1',
+        data: { id: 'accountTransactionsBackfill-v1', data: completedAccountActivityBackfillData },
+      },
+    ]);
+
+    const schema = createSchema();
+    const activityField = schema.getQueryType()?.getFields().networkAccountActivity;
+
+    await expect(activityField?.resolve?.({}, { from: 90, to: 130 }, { repository }, {} as never)).resolves.toMatchObject({
+      activeAccounts: 1_005,
+    });
+  });
+
+  it('does not scan account activity collections for invalid timestamp ranges', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert({
+      collection: 'accountTransactions',
+      id: 'tx-a-alice',
+      timestamp: 100,
+      data: { id: 'tx-a-alice', accountId: 'alice', historyElementId: 'tx-a', timestamp: 100 },
+    });
+    const querySpy = vi.spyOn(repository, 'query');
+    const getSpy = vi.spyOn(repository, 'get');
+    const schema = createSchema();
+    const activityField = schema.getQueryType()?.getFields().networkAccountActivity;
+
+    await expect(activityField?.resolve?.({}, { from: -1, to: 130 }, { repository }, {} as never)).resolves.toEqual({
+      id: 'network-account-activity-invalid',
+      from: 0,
+      to: 0,
+      activeAccounts: 0,
+    });
+    await expect(activityField?.resolve?.({}, { from: Number.NaN, to: 130 }, { repository }, {} as never)).resolves.toEqual({
+      id: 'network-account-activity-invalid',
+      from: 0,
+      to: 0,
+      activeAccounts: 0,
+    });
+    expect(querySpy).not.toHaveBeenCalled();
+    expect(getSpy).not.toHaveBeenCalled();
+  });
+
+  it('normalizes reversed active-account ranges before cache lookup', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'accountTransactions',
+        id: 'tx-a-alice',
+        timestamp: 100,
+        data: { id: 'tx-a-alice', accountId: 'alice', historyElementId: 'tx-a', timestamp: 100 },
+      },
+      {
+        collection: 'updatesStreams',
+        id: 'accountTransactionsBackfill-v1',
+        data: { id: 'accountTransactionsBackfill-v1', data: completedAccountActivityBackfillData },
+      },
+    ]);
+    const querySpy = vi.spyOn(repository, 'query');
+    const schema = createSchema();
+    const activityField = schema.getQueryType()?.getFields().networkAccountActivity;
+
+    await expect(activityField?.resolve?.({}, { from: 130, to: 90 }, { repository }, {} as never)).resolves.toMatchObject({
+      id: 'network-account-activity-90-130',
+      activeAccounts: 1,
+    });
+    await expect(activityField?.resolve?.({}, { from: 90, to: 130 }, { repository }, {} as never)).resolves.toMatchObject({
+      id: 'network-account-activity-90-130',
+      activeAccounts: 1,
+    });
+    expect(querySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses account transaction rows only after the legacy activity backfill is marked complete', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'accountTransactions',
+        id: 'tx-a-alice',
+        timestamp: 100,
+        data: { id: 'tx-a-alice', accountId: 'alice', historyElementId: 'tx-a', timestamp: 100 },
+      },
+      {
+        collection: 'historyElements',
+        id: 'legacy-bob',
+        timestamp: 120,
+        data: { id: 'legacy-bob', timestamp: 120, address: 'bob', dataFrom: 'bob', dataTo: 'carol' },
+      },
+      {
+        collection: 'updatesStreams',
+        id: 'accountTransactionsBackfill-v1',
+        data: {
+          id: 'accountTransactionsBackfill-v1',
+          data: completedAccountActivityBackfillData,
+        },
+      },
+    ]);
+
+    const schema = createSchema();
+    const activityField = schema.getQueryType()?.getFields().networkAccountActivity;
+
+    await expect(activityField?.resolve?.({}, { from: 90, to: 130 }, { repository }, {} as never)).resolves.toMatchObject({
+      activeAccounts: 1,
+    });
+  });
+
   it('serves SubQuery-compatible asset connections', async () => {
     const repository = new MemoryRepository();
     await repository.upsert({
@@ -327,6 +604,7 @@ describe('Polkaswap indexer schema', () => {
       getMany: async () => new Map(),
       upsert: async () => undefined,
       upsertMany: async () => undefined,
+      deleteMany: async () => undefined,
       close: async () => undefined,
     };
     const schema = createSchema();

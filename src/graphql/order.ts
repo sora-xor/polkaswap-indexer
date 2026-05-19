@@ -8,6 +8,7 @@ export const NUMERIC_ORDER_FIELDS = new Set([
   'blockHeight',
   'updatedAtBlock',
   'createdAtBlock',
+  'createdAtTimestamp',
   'dexId',
   'orderId',
   'accounts',

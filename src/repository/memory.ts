@@ -97,6 +97,15 @@ export class MemoryRepository implements IndexerRepository {
     }
   }
 
+  async deleteMany(collection: IndexerCollection, ids: string[]): Promise<void> {
+    const documents = this.documents.get(collection);
+    if (!documents) return;
+
+    for (const id of ids) {
+      documents.delete(id);
+    }
+  }
+
   async close(): Promise<void> {
     this.documents.clear();
     this.events.removeAllListeners();

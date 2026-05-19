@@ -51,6 +51,7 @@ Documents are stored in `indexer_documents` as denormalized JSON. The GraphQL
 schema projects those documents into the fields consumed by Polkaswap:
 
 - account and transaction history
+- per-account transaction activity for unique active-account stats
 - asset prices and snapshots
 - pool and order-book stats
 - network snapshots
@@ -62,7 +63,14 @@ The chain worker reads finalized SORA blocks for transaction history and uses
 SORA storage refreshes to maintain the current asset, pool, order-book, vault,
 referral, staking, account-liquidity, snapshot, and stream collections. Historical
 backfill starts at `CHAIN_START_BLOCK` and resumes from the stored chain state.
-SOLSWAP burn stats are backfilled separately into `xorBurns` from block
+The `accountTransactions` collection stores one row per account involved in an
+indexed transaction. The `networkAccountActivity` GraphQL query counts distinct
+accounts from that collection over a requested timestamp range for the exchange
+stats page. On first startup after this collection is introduced, the worker
+backfills it from legacy `historyElements`, filters external hex addresses out of
+the active-account metric, and records completion in
+`accountTransactionsBackfill-v1` so future stats queries skip legacy history
+scans. SOLSWAP burn stats are backfilled separately into `xorBurns` from block
 `25,043,003`; progress is stored in the `xorBurnsBackfill` update stream so
 redeploys resume without rewinding normal chain indexing.
 

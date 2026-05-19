@@ -152,6 +152,21 @@ describe('MemoryRepository queries', () => {
     expect(result.get('asset-b')?.data).toMatchObject({ id: 'asset-b', timestamp: 20 });
   });
 
+  it('deletes requested documents without affecting other collections', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      assetDocument('asset-a', 10),
+      assetDocument('asset-b', 20),
+      { collection: 'poolXYKs', id: 'asset-a', data: { id: 'asset-a' } },
+    ]);
+
+    await repository.deleteMany('assets', ['asset-a', 'missing', 'asset-a']);
+
+    await expect(repository.get('assets', 'asset-a')).resolves.toBeNull();
+    await expect(repository.get('assets', 'asset-b')).resolves.not.toBeNull();
+    await expect(repository.get('poolXYKs', 'asset-a')).resolves.not.toBeNull();
+  });
+
   it('copies top-level document data on upsert', async () => {
     const repository = new MemoryRepository();
     const document = assetDocument('asset-a', 10);

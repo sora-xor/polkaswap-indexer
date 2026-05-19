@@ -2,6 +2,7 @@ export type IndexerCollection =
   | 'accounts'
   | 'accountMeta'
   | 'accountPointSystems'
+  | 'accountTransactions'
   | 'accountLiquiditySnapshots'
   | 'assets'
   | 'assetSnapshots'
@@ -66,5 +67,6 @@ export interface IndexerRepository {
   getMany(collection: IndexerCollection, ids: string[]): Promise<Map<string, IndexerDocument>>;
   upsert(document: IndexerDocument): Promise<void>;
   upsertMany(documents: IndexerDocument[]): Promise<void>;
+  deleteMany(collection: IndexerCollection, ids: string[]): Promise<void>;
   close(): Promise<void>;
 }

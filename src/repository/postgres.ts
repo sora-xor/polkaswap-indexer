@@ -58,11 +58,14 @@ const UPSERT_BATCH_SIZE = 1_000;
 const WATCH_FLUSH_DELAY_MS = 25;
 const WATCH_IDLE_WAKE_INTERVAL_MS = 30_000;
 
-const readPoolMax = (name: string, fallback: number): number => {
+const readPositiveInt = (name: string, fallback: number): number => {
   const value = Number(process.env[name]);
 
   return Number.isFinite(value) && value > 0 ? Math.trunc(value) : fallback;
 };
+
+const readPoolMax = (name: string, fallback: number): number => readPositiveInt(name, fallback);
+const readTimeoutMs = (name: string, fallback: number): number => readPositiveInt(name, fallback);
 
 type WatchSubscriber = {
   id: number;
@@ -247,9 +250,9 @@ export class PostgresRepository implements IndexerRepository {
   constructor(databaseUrl: string) {
     const baseConfig = {
       connectionString: databaseUrl,
-      connectionTimeoutMillis: 10_000,
-      query_timeout: 30_000,
-      statement_timeout: 30_000,
+      connectionTimeoutMillis: readTimeoutMs('POSTGRES_CONNECTION_TIMEOUT_MS', 10_000),
+      query_timeout: readTimeoutMs('POSTGRES_QUERY_TIMEOUT_MS', 120_000),
+      statement_timeout: readTimeoutMs('POSTGRES_STATEMENT_TIMEOUT_MS', 120_000),
     };
 
     this.pool = new Pool({
@@ -456,6 +459,24 @@ export class PostgresRepository implements IndexerRepository {
       } finally {
         client.release();
       }
+    });
+  }
+
+  async deleteMany(collection: IndexerCollection, ids: string[]): Promise<void> {
+    const uniqueIds = [...new Set(ids)];
+    if (!uniqueIds.length) return;
+
+    await this.recordOperation('deleteMany', collection, async () => {
+      await this.pool.query(
+        `with deleted as (
+           delete from indexer_documents
+           where collection = $1 and id = any($2::text[])
+           returning collection, id
+         )
+         select pg_notify('indexer_documents', json_build_object('collection', collection, 'id', id)::text)
+         from deleted`,
+        [collection, uniqueIds]
+      );
     });
   }
 

@@ -43,11 +43,17 @@ describe('PostgresRepository', () => {
     mocks.pool.end.mockReset();
     delete process.env.POSTGRES_POOL_MAX;
     delete process.env.POSTGRES_LISTEN_POOL_MAX;
+    delete process.env.POSTGRES_CONNECTION_TIMEOUT_MS;
+    delete process.env.POSTGRES_QUERY_TIMEOUT_MS;
+    delete process.env.POSTGRES_STATEMENT_TIMEOUT_MS;
   });
 
   it('uses separate pools for regular queries and subscription listeners', () => {
     process.env.POSTGRES_POOL_MAX = '7';
     process.env.POSTGRES_LISTEN_POOL_MAX = '3';
+    process.env.POSTGRES_CONNECTION_TIMEOUT_MS = '15000';
+    process.env.POSTGRES_QUERY_TIMEOUT_MS = '90000';
+    process.env.POSTGRES_STATEMENT_TIMEOUT_MS = '95000';
 
     new PostgresRepository(DATABASE_URL);
 
@@ -55,6 +61,9 @@ describe('PostgresRepository', () => {
       1,
       expect.objectContaining({
         connectionString: DATABASE_URL,
+        connectionTimeoutMillis: 15_000,
+        query_timeout: 90_000,
+        statement_timeout: 95_000,
         max: 7,
       })
     );
@@ -62,6 +71,9 @@ describe('PostgresRepository', () => {
       2,
       expect.objectContaining({
         connectionString: DATABASE_URL,
+        connectionTimeoutMillis: 15_000,
+        query_timeout: 90_000,
+        statement_timeout: 95_000,
         max: 3,
       })
     );
@@ -320,6 +332,18 @@ describe('PostgresRepository', () => {
     expect(mocks.pool.query.mock.calls[0]?.[1]).toEqual(['assets', ['asset-b', 'asset-a']]);
     expect([...result.keys()]).toEqual(['asset-b', 'asset-a']);
     expect(result.get('asset-a')).toEqual(assetA);
+  });
+
+  it('deduplicates ids before deleting documents', async () => {
+    mocks.pool.query.mockResolvedValueOnce({ rows: [] });
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    await repository.deleteMany('assetSnapshots', ['snapshot-a', 'snapshot-b', 'snapshot-a']);
+
+    expect(mocks.pool.query).toHaveBeenCalledTimes(1);
+    expect(String(mocks.pool.query.mock.calls[0]?.[0])).toContain('delete from indexer_documents');
+    expect(String(mocks.pool.query.mock.calls[0]?.[0])).toContain('pg_notify');
+    expect(mocks.pool.query.mock.calls[0]?.[1]).toEqual(['assetSnapshots', ['snapshot-a', 'snapshot-b']]);
   });
 
   it('deduplicates bulk upserts by primary key and writes the latest document payload', async () => {
