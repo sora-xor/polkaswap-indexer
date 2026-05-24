@@ -43,6 +43,19 @@ describe('GraphQL scalar compatibility', () => {
     });
   });
 
+  it('parses adversarial object keys without mutating JavaScript prototypes', () => {
+    const literal = parseValue('{ __proto__: { polluted: true }, constructor: { prototype: { polluted: true } }, id: "safe" }');
+    const parsed = FilterScalars.AssetFilter.parseLiteral(literal, {}) as Record<string, unknown>;
+
+    expect(Object.prototype).not.toHaveProperty('polluted');
+    expect({}).not.toHaveProperty('polluted');
+    expect(Object.prototype.hasOwnProperty.call(parsed, '__proto__')).toBe(true);
+    expect(parsed).toMatchObject({
+      id: 'safe',
+      constructor: { prototype: { polluted: true } },
+    });
+  });
+
   it('round-trips opaque scalar values and null JSON literals', () => {
     const filter = { id: { eq: 'vault-1' } };
     const json = { amount: '10', nested: { ok: true } };

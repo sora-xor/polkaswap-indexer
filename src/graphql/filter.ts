@@ -2,6 +2,22 @@ import { getOrderField, NUMERIC_ORDER_FIELDS } from './order.js';
 
 export type FilterValue = Record<string, unknown> | null | undefined;
 
+const UNSAFE_PATH_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype']);
+const hasOwn = (value: object, key: string): boolean => Object.prototype.hasOwnProperty.call(value, key);
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+const isFilterRecord = (value: unknown): value is Record<string, unknown> => {
+  if (!isRecord(value)) return false;
+
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+};
+const isSafePath = (path: string): boolean => {
+  const segments = path.split('.');
+
+  return segments.length > 0 && segments.every((segment) => segment.length > 0 && !UNSAFE_PATH_SEGMENTS.has(segment));
+};
+
 const toComparable = (value: unknown): string | number | boolean | null => {
   if (value === null || value === undefined) return null;
   if (typeof value === 'number' || typeof value === 'boolean') return value;
@@ -15,8 +31,10 @@ const toNumber = (value: unknown): number => {
 };
 
 const getPath = (item: Record<string, unknown>, path: string): unknown => {
+  if (!isSafePath(path)) return undefined;
+
   return path.split('.').reduce<unknown>((value, key) => {
-    if (value && typeof value === 'object') {
+    if (isRecord(value) && hasOwn(value, key)) {
       return (value as Record<string, unknown>)[key];
     }
     return undefined;
@@ -37,8 +55,10 @@ const contains = (value: unknown, expected: unknown): boolean => {
     return value.includes(expected);
   }
 
-  if (value && typeof value === 'object' && expected && typeof expected === 'object') {
+  if (isRecord(value) && isRecord(expected)) {
     return Object.entries(expected as Record<string, unknown>).every(([key, expectedValue]) => {
+      if (!isSafePath(key) || !hasOwn(value, key)) return false;
+
       return (value as Record<string, unknown>)[key] === expectedValue;
     });
   }
@@ -61,6 +81,9 @@ const matchesComparison = (actual: unknown, comparison: Record<string, unknown>)
         return toComparable(actual) !== toComparable(expected);
       case 'in':
         return Array.isArray(expected) && expected.map(toComparable).includes(toComparable(actual));
+      case 'notIn':
+      case 'not_in':
+        return Array.isArray(expected) && !expected.map(toComparable).includes(toComparable(actual));
       case 'greaterThan':
       case 'gt':
         return toNumber(actual) > toNumber(expected);
@@ -87,18 +110,22 @@ const matchesComparison = (actual: unknown, comparison: Record<string, unknown>)
  * Evaluates the SubQuery-style filter objects produced by the Polkaswap UI.
  */
 export function matchesFilter(item: Record<string, unknown>, filter: FilterValue): boolean {
-  if (!filter || !Object.keys(filter).length) return true;
+  if (!filter) return true;
+  if (!isFilterRecord(filter)) return false;
+  if (!Object.keys(filter).length) return true;
 
   return Object.entries(filter).every(([field, condition]) => {
     if (field === 'and') {
-      return Array.isArray(condition) && condition.every((entry) => matchesFilter(item, entry as FilterValue));
+      return Array.isArray(condition) && condition.every((entry) => isFilterRecord(entry) && matchesFilter(item, entry));
     }
 
     if (field === 'or') {
-      return Array.isArray(condition) && condition.some((entry) => matchesFilter(item, entry as FilterValue));
+      return Array.isArray(condition) && condition.some((entry) => isFilterRecord(entry) && matchesFilter(item, entry));
     }
 
-    if (condition && typeof condition === 'object' && !Array.isArray(condition)) {
+    if (!isSafePath(field)) return false;
+
+    if (isFilterRecord(condition)) {
       return matchesComparison(getPath(item, field), condition as Record<string, unknown>);
     }
 

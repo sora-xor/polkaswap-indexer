@@ -319,6 +319,82 @@ describe('PostgresRepository', () => {
     expect(result.items).toEqual([row]);
   });
 
+  it('builds SQL for SORA mobile notIn history filters without broadening them', async () => {
+    const row = {
+      collection: 'historyElements',
+      id: 'history-transfer',
+      timestamp: 200,
+      data: { id: 'history-transfer', address: 'alice', method: 'transfer', timestamp: 200 },
+    } satisfies IndexerDocument;
+    mocks.pool.query.mockResolvedValueOnce({ rows: [row] });
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    const result = await repository.query('historyElements', {
+      first: 10,
+      orderBy: ['TIMESTAMP_DESC'],
+      filter: {
+        or: [
+          { address: 'alice', method: { notIn: ['swap', 'rewarded'] } },
+          { dataTo: 'alice', method: { not_in: ['swap', 'rewarded'] } },
+        ],
+      },
+      includeTotalCount: false,
+    });
+
+    expect(mocks.pool.query).toHaveBeenCalledTimes(1);
+    const [sql, values] = mocks.pool.query.mock.calls[0] ?? [];
+    expect(String(sql)).toContain("data->>'address' = $2");
+    expect(String(sql)).toContain("(data->>'method' is null or not (data->>'method' = any($3::text[])))");
+    expect(String(sql)).toContain("data->>'dataTo' = $4");
+    expect(String(sql)).toContain("(data->>'method' is null or not (data->>'method' = any($5::text[])))");
+    expect(String(sql)).toContain('order by timestamp desc, id desc');
+    expect(values).toEqual([
+      'historyElements',
+      'alice',
+      ['swap', 'rewarded'],
+      'alice',
+      ['swap', 'rewarded'],
+      11,
+      0,
+    ]);
+    expect(result.items).toEqual([row]);
+  });
+
+  it('fails closed for malformed or unsupported comparison filters', async () => {
+    mocks.pool.query.mockResolvedValueOnce({ rows: [] });
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    await repository.query('historyElements', {
+      first: 1,
+      filter: {
+        and: 'not-an-array',
+        method: { in: 'swap' },
+        id: { startsWith: 'history-' },
+      },
+      includeTotalCount: false,
+    });
+
+    expect(mocks.pool.query).toHaveBeenCalledTimes(1);
+    const [sql, values] = mocks.pool.query.mock.calls[0] ?? [];
+    expect(String(sql)).toContain('where collection = $1 and (false and (false) and (false))');
+    expect(values).toEqual(['historyElements', 2, 0]);
+  });
+
+  it('rejects adversarial JSON field names before building SQL', async () => {
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    await expect(
+      repository.query('historyElements', {
+        first: 1,
+        filter: {
+          "id') or true --": { equalTo: 'history-a' },
+        },
+        includeTotalCount: false,
+      })
+    ).rejects.toThrow("Unsupported JSON field in repository query: id') or true --");
+    expect(mocks.pool.query).not.toHaveBeenCalled();
+  });
+
   it('deduplicates requested ids for getMany while returning documents by id', async () => {
     const assetA = assetDocument('asset-a', 10);
     const assetB = assetDocument('asset-b', 20);

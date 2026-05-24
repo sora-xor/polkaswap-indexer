@@ -103,6 +103,27 @@ describe('GraphQL filter compatibility', () => {
     ).toBe(true);
   });
 
+  it('matches SubQuery notIn filters used by the SORA mobile history query', () => {
+    expect(
+      matchesFilter(
+        { method: 'transfer' },
+        { method: { notIn: ['swap', 'rewarded'] } }
+      )
+    ).toBe(true);
+    expect(
+      matchesFilter(
+        { method: 'swap' },
+        { method: { notIn: ['swap', 'rewarded'] } }
+      )
+    ).toBe(false);
+    expect(
+      matchesFilter(
+        { method: 'rewarded' },
+        { method: { not_in: ['swap', 'rewarded'] } }
+      )
+    ).toBe(false);
+  });
+
   it('matches nested path and substring filters', () => {
     expect(
       matchesFilter(
@@ -125,6 +146,39 @@ describe('GraphQL filter compatibility', () => {
 
   it('rejects unsupported comparison operators', () => {
     expect(matchesFilter({ id: 'asset-a' }, { id: { startsWith: 'asset' } })).toBe(false);
+  });
+
+  it('fails closed for malformed logical filters and non-object branches', () => {
+    expect(matchesFilter({ id: 'asset-a' }, { and: { id: { equalTo: 'asset-a' } } })).toBe(false);
+    expect(matchesFilter({ id: 'asset-a' }, { or: { id: { equalTo: 'asset-a' } } })).toBe(false);
+    expect(matchesFilter({ id: 'asset-a' }, { and: [{ id: { equalTo: 'asset-a' } }, 'not-a-filter'] })).toBe(false);
+    expect(matchesFilter({ id: 'asset-a' }, { or: ['not-a-filter', { id: { equalTo: 'asset-b' } }] })).toBe(false);
+    expect(matchesFilter({ id: 'asset-a' }, 'not-a-filter' as never)).toBe(false);
+  });
+
+  it('does not match inherited or prototype-polluted paths', () => {
+    Object.defineProperty(Object.prototype, 'polkaswapIndexerPolluted', {
+      configurable: true,
+      value: 'owned',
+    });
+
+    const metadata = Object.create({ verified: true }) as Record<string, unknown>;
+    metadata.source = 'chain';
+
+    try {
+      expect(
+        matchesFilter({}, { '__proto__.polkaswapIndexerPolluted': { equalTo: 'owned' } })
+      ).toBe(false);
+      expect(
+        matchesFilter({ constructor: { prototype: { polkaswapIndexerPolluted: 'owned' } } }, {
+          'constructor.prototype.polkaswapIndexerPolluted': { equalTo: 'owned' },
+        })
+      ).toBe(false);
+      expect(matchesFilter({ metadata }, { metadata: { contains: { verified: true } } })).toBe(false);
+      expect(matchesFilter({ id: 'asset-a' }, { '__proto__': { notEqualTo: 'asset-b' } })).toBe(false);
+    } finally {
+      delete (Object.prototype as { polkaswapIndexerPolluted?: unknown }).polkaswapIndexerPolluted;
+    }
   });
 
   it('sorts SubQuery order tokens by camel-cased document fields', () => {
