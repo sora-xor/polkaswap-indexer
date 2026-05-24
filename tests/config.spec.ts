@@ -46,8 +46,8 @@ describe('runtime configuration', () => {
       soraWsEndpoint: 'wss://mof2.sora.org',
       chainStartBlock: 0,
       chainBatchSize: 25,
-      stateRefreshIntervalBlocks: 250,
-      snapshotIntervalBlocks: 250,
+      stateRefreshIntervalBlocks: 25,
+      snapshotIntervalBlocks: 25,
     });
   });
 

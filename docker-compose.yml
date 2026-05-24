@@ -31,8 +31,8 @@ services:
       DATABASE_URL: postgres://polkaswap:polkaswap@postgres:5432/polkaswap_indexer
       SORA_WS_ENDPOINT: wss://mof2.sora.org
       CHAIN_BATCH_SIZE: 25
-      CHAIN_STATE_REFRESH_INTERVAL_BLOCKS: 250
-      CHAIN_SNAPSHOT_INTERVAL_BLOCKS: 250
+      CHAIN_STATE_REFRESH_INTERVAL_BLOCKS: 25
+      CHAIN_SNAPSHOT_INTERVAL_BLOCKS: 25
     command: ["node", "dist/src/worker/index.js"]
 
 volumes:

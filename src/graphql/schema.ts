@@ -4,9 +4,13 @@ export const typeDefs = /* GraphQL */ `
   scalar OrderBy
   scalar AccountFilter
   scalar AccountLiquiditySnapshotFilter
+  scalar AccountPositionFilter
+  scalar AccountTradeFilter
   scalar AssetFilter
   scalar AssetSnapshotFilter
   scalar HistoryElementFilter
+  scalar MarketFilter
+  scalar MarketOrderbookFilter
   scalar NetworkSnapshotFilter
   scalar OrderBookFilter
   scalar OrderBookOrderFilter
@@ -289,6 +293,136 @@ export const typeDefs = /* GraphQL */ `
     liquidityUSD: String!
     volumeDayUSD: String!
     updatedAtTimestamp: Int
+  }
+
+  type AccountPosition {
+    id: String!
+    account: String
+    marketId: Int
+    outcome: String
+    shares: String
+    costBasisUsd: String
+    marketValueUsd: String
+    realizedPnlUsd: String
+    unrealizedPnlUsd: String
+    claimablePayoutUsd: String
+    status: String
+    updatedAt: String
+    market: Market
+  }
+
+  type AccountPositionEdge {
+    cursor: Cursor
+    node: AccountPosition!
+  }
+
+  type AccountPositionConnection {
+    edges: [AccountPositionEdge!]!
+    pageInfo: PageInfo!
+    totalCount: Int!
+  }
+
+  type AccountTrade {
+    id: String!
+    account: String
+    marketId: Int
+    side: String
+    outcome: String
+    collateralUsd: String
+    collateralAmountUsd: String
+    shares: String
+    sharesAmount: String
+    price: String
+    executionPrice: String
+    feeUsd: String
+    feeAmountUsd: String
+    realizedPnlUsd: String
+    timestamp: String
+    blockNumber: Int
+    blockHash: String
+    extrinsicHash: String
+    market: Market
+  }
+
+  type AccountTradeEdge {
+    cursor: Cursor
+    node: AccountTrade!
+  }
+
+  type AccountTradeConnection {
+    edges: [AccountTradeEdge!]!
+    pageInfo: PageInfo!
+    totalCount: Int!
+  }
+
+  type Market {
+    id: String!
+    marketId: Int
+    conditionId: Int
+    title: String
+    category: String
+    description: String
+    oracle: String
+    resolutionSource: String
+    closeBlock: Int
+    status: String
+    creator: String
+    collateralAsset: String
+    seedLiquidity: String
+    liquidityUSD: String
+    volumeUSD: String
+    probability: Float
+    priceYes: Float
+    collateral: String
+    yesShares: String
+    noShares: String
+    resolutionOutcome: String
+    governancePallet: String
+    governanceBody: String
+    governanceKind: String
+    governanceProposalIndex: Int
+    governanceReferendumIndex: Int
+    governanceMotionHash: String
+    governancePollId: Int
+    governanceUrl: String
+    updatedAtBlock: Int
+    timestamp: Int
+  }
+
+  type MarketEdge {
+    cursor: Cursor
+    node: Market!
+  }
+
+  type MarketConnection {
+    edges: [MarketEdge!]!
+    pageInfo: PageInfo!
+    totalCount: Int!
+  }
+
+  type MarketOrderLevel {
+    price: Float!
+    quantity: Float!
+  }
+
+  type MarketOrderbook {
+    id: String!
+    marketId: Int
+    bids: [MarketOrderLevel!]!
+    asks: [MarketOrderLevel!]!
+    updatedAtBlock: Int
+    timestamp: Int
+  }
+
+  type MarketOrderbookEdge {
+    cursor: Cursor
+    node: MarketOrderbook!
+  }
+
+  type MarketOrderbookConnection {
+    edges: [MarketOrderbookEdge!]!
+    pageInfo: PageInfo!
+    totalCount: Int!
   }
 
   type OrderBook {
@@ -578,6 +712,10 @@ export const typeDefs = /* GraphQL */ `
     assets(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AssetFilter): AssetConnection!
     assetSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AssetSnapshotFilter): AssetSnapshotConnection!
     accountLiquiditySnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountLiquiditySnapshotFilter): AccountLiquiditySnapshotConnection!
+    market(id: String!): Market
+    markets(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: MarketFilter): MarketConnection!
+    marketOrderbook(marketId: Int!): MarketOrderbook
+    marketOrderbooks(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: MarketOrderbookFilter): MarketOrderbookConnection!
     networkSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: NetworkSnapshotFilter): NetworkSnapshotConnection!
     poolXYKs(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: PoolXYKFilter): PoolXYKConnection!
     poolSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: PoolSnapshotFilter): PoolSnapshotConnection!
@@ -595,6 +733,8 @@ export const typeDefs = /* GraphQL */ `
     updatesStream(id: String!): UpdatesStream
     accountMeta(id: String!): AccountMeta
     accountPointSystems(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountFilter): AccountPointSystemConnection!
+    accountPositions(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountPositionFilter, where: AccountPositionFilter): AccountPositionConnection!
+    accountTrades(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountTradeFilter, where: AccountTradeFilter): AccountTradeConnection!
     exploreStats: ExploreStats!
     networkAccountActivity(from: Int!, to: Int!): NetworkAccountActivity!
   }

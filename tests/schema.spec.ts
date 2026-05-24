@@ -75,6 +75,73 @@ describe('Polkaswap indexer schema', () => {
     });
   });
 
+  it('exposes Polkamarkt market and market orderbook data', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'markets',
+        id: '3',
+        timestamp: 200,
+        data: {
+          id: '3',
+          marketId: 3,
+          title: 'Will KUSD stay at peg?',
+          volumeUSD: '250',
+          governancePallet: 'democracy',
+          governanceBody: 'Democracy',
+          governanceKind: 'Referendum',
+          governanceReferendumIndex: 124,
+        },
+      },
+      {
+        collection: 'marketOrderbooks',
+        id: '3',
+        timestamp: 200,
+        data: {
+          id: '3',
+          marketId: 3,
+          bids: [{ price: 0.59, quantity: 100 }],
+          asks: [{ price: 0.61, quantity: 80 }],
+        },
+      },
+    ]);
+    const schema = createSchema();
+    const marketsField = schema.getQueryType()?.getFields().markets;
+    const marketOrderbookField = schema.getQueryType()?.getFields().marketOrderbook;
+
+    const markets = await marketsField?.resolve?.(
+      {},
+      { first: 10, orderBy: ['VOLUME_USD_DESC'] },
+      { repository },
+      {} as GraphQLResolveInfo
+    );
+    const orderbook = await marketOrderbookField?.resolve?.({}, { marketId: 3 }, { repository }, {} as never);
+
+    expect(markets).toMatchObject({
+      edges: [
+        {
+          node: {
+            id: '3',
+            marketId: 3,
+            title: 'Will KUSD stay at peg?',
+            volumeUSD: '250',
+            governancePallet: 'democracy',
+            governanceBody: 'Democracy',
+            governanceKind: 'Referendum',
+            governanceReferendumIndex: 124,
+          },
+        },
+      ],
+      totalCount: 1,
+    });
+    expect(orderbook).toMatchObject({
+      id: '3',
+      marketId: 3,
+      bids: [{ price: 0.59, quantity: 100 }],
+      asks: [{ price: 0.61, quantity: 80 }],
+    });
+  });
+
   it('derives Explore stats from active market documents and the latest day network snapshot', async () => {
     const repository = new MemoryRepository();
     await repository.upsertMany([
@@ -513,6 +580,85 @@ describe('Polkaswap indexer schema', () => {
 
     await expect(activityField?.resolve?.({}, { from: 90, to: 130 }, { repository }, {} as never)).resolves.toMatchObject({
       activeAccounts: 1,
+    });
+  });
+
+  it('keeps legacy Polkamarkt account activity fields schema-compatible', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'accountTransactions',
+        id: 'history-a-alice',
+        blockHeight: 12,
+        timestamp: 200,
+        data: {
+          id: 'history-a-alice',
+          accountId: 'alice',
+          historyElementId: 'history-a',
+          blockHeight: 12,
+          timestamp: 200,
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: 'history-a',
+        blockHeight: 12,
+        timestamp: 200,
+        data: {
+          id: 'history-a',
+          timestamp: 200,
+          blockHash: '0xabc',
+          blockHeight: 12,
+          module: 'polkamarkt',
+          method: 'buy',
+          address: 'alice',
+          data: {
+            marketId: 7,
+            outcome: 'YES',
+            collateralUsd: '5',
+            shares: '10',
+            price: '0.5',
+          },
+        },
+      },
+    ]);
+    const schema = createSchema();
+    const queryFields = schema.getQueryType()?.getFields();
+    const positionsField = queryFields?.accountPositions;
+    const tradesField = queryFields?.accountTrades;
+
+    expect(positionsField?.args.map((arg) => arg.name)).toContain('where');
+    expect(tradesField?.args.map((arg) => arg.name)).toContain('where');
+
+    const positions = await positionsField?.resolve?.(
+      {},
+      { where: { account_eq: 'alice' }, first: 10, orderBy: ['UPDATED_AT_DESC'] },
+      { repository },
+      {} as never
+    );
+    const trades = (await tradesField?.resolve?.(
+      {},
+      { where: { account_eq: 'alice' }, first: 10, orderBy: ['TIMESTAMP_DESC'] },
+      { repository },
+      {} as never
+    )) as { edges: Array<{ node: Record<string, unknown> }>; totalCount: number };
+
+    expect(positions).toMatchObject({ edges: [], totalCount: 0 });
+    expect(trades.totalCount).toBe(1);
+    expect(trades.edges[0]?.node).toMatchObject({
+      id: 'history-a-alice',
+      account: 'alice',
+      marketId: 7,
+      side: 'buy',
+      outcome: 'YES',
+      collateralUsd: '5',
+      shares: '10',
+      price: '0.5',
+      timestamp: '1970-01-01T00:03:20.000Z',
+      blockNumber: 12,
+      blockHash: '0xabc',
+      extrinsicHash: 'history-a',
+      market: { id: '7', marketId: 7 },
     });
   });
 

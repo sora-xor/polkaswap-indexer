@@ -67,8 +67,8 @@ Configuration is read in `src/config.ts`.
 - `SORA_WS_ENDPOINT`, default `wss://mof2.sora.org`
 - `CHAIN_START_BLOCK`, default `0`
 - `CHAIN_BATCH_SIZE`, default `25`
-- `CHAIN_STATE_REFRESH_INTERVAL_BLOCKS`, default `250`
-- `CHAIN_SNAPSHOT_INTERVAL_BLOCKS`, default `250`
+- `CHAIN_STATE_REFRESH_INTERVAL_BLOCKS`, default `25`
+- `CHAIN_SNAPSHOT_INTERVAL_BLOCKS`, default `25`
 
 The worker resumes from the stored `updatesStreams` document with id
 `chainState`. If you need to re-index from an earlier block, clear or adjust that

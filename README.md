@@ -54,14 +54,17 @@ schema projects those documents into the fields consumed by Polkaswap:
 - per-account transaction activity for unique active-account stats
 - asset prices and snapshots
 - pool and order-book stats
+- Polkamarkt prediction markets from runtime storage, including explicit SORA
+  governance references encoded in condition resolution sources
 - network snapshots
 - vault, staking, referral, and stream records
 - point-system account metadata
 - update streams for fiat prices, APY, asset registration, accounts, and order books
 
 The chain worker reads finalized SORA blocks for transaction history and uses
-SORA storage refreshes to maintain the current asset, pool, order-book, vault,
-referral, staking, account-liquidity, snapshot, and stream collections. Historical
+SORA storage refreshes to maintain the current asset, pool, order-book,
+Polkamarkt market, vault, referral, staking, account-liquidity, snapshot, and
+stream collections. Historical
 backfill starts at `CHAIN_START_BLOCK` and resumes from the stored chain state.
 The `accountTransactions` collection stores one row per account involved in an
 indexed transaction. The `networkAccountActivity` GraphQL query counts distinct
@@ -81,4 +84,5 @@ database. For a fresh production deployment, set `CHAIN_START_BLOCK` to the
 earliest block you need indexed; a full-chain backfill is intentionally long.
 Use `CHAIN_STATE_REFRESH_INTERVAL_BLOCKS` to control how often storage-derived
 collections are refreshed during block processing, and
-`CHAIN_SNAPSHOT_INTERVAL_BLOCKS` to control chart snapshot density.
+`CHAIN_SNAPSHOT_INTERVAL_BLOCKS` to control chart snapshot density. Both default
+to `25` so stats aggregates stay close to finalized block progress.

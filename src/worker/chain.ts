@@ -61,6 +61,28 @@ type BlockExtrinsicContext = {
   fee: bigint;
 };
 
+type ExtrinsicLike = {
+  isSigned?: boolean;
+  signer?: { toString: () => string };
+  hash?: { toString?: () => string };
+  method: {
+    section: string;
+    method: string;
+    args?: unknown[];
+    meta?: { args?: Array<{ name?: string | { toString: () => string } }> };
+  };
+};
+
+type SignedBlockLike = {
+  block: {
+    header?: {
+      number?: { toNumber: () => number };
+      hash?: { toString: () => string };
+    };
+    extrinsics: ExtrinsicLike[];
+  };
+};
+
 type AssetInfo = {
   id: string;
   symbol: string;
@@ -224,6 +246,7 @@ type NetworkTransactionCounters = {
 
 const CHAIN_STATE_ID = 'chainState';
 const XOR_BURN_BACKFILL_STATE_ID = 'xorBurnsBackfill';
+const BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID = 'bridgeProxyHistoryBackfill-v1';
 const NETWORK_AGGREGATE_BACKFILL_STATE_ID = 'networkAggregateSnapshotsBackfill';
 const NETWORK_TRANSACTION_COUNTER_REPAIR_STATE_ID = 'networkTransactionCounterRepair-v1';
 const ASSET_PRICE_OUTLIER_CLEANUP_STATE_ID = 'assetSnapshotPriceOutlierCleanup-v1';
@@ -233,8 +256,11 @@ const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000'
 const VAL = '0x0200040000000000000000000000000000000000000000000000000000000000';
 const XOR_SUPPLY_REDENOMINATION_FACTOR = 1_000_000n;
 const SORA_NEXUS_XOR_BURN_REMARK_TYPE = 'soraNexusXorClaim';
+const LIBERLAND_NETWORK_ID = 'Liberland';
 const SORA_XOR_BURN_START_BLOCK = 25_043_003;
 const XOR_BURN_BACKFILL_BATCH_SIZE = 250;
+const BRIDGE_PROXY_HISTORY_BACKFILL_BATCH_SIZE = 500;
+const BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY = 16;
 const ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE = 1_000;
 const FINALIZED_HEAD_RETRY_DELAY_MS = 5_000;
 const FINALIZED_HEAD_POLL_INTERVAL_MS = 1_000;
@@ -424,6 +450,15 @@ const codecToBigInt = (value: unknown): bigint => {
   if (stringValue.startsWith('0x')) return BigInt(stringValue);
 
   return BigInt(stringValue);
+};
+
+/** Parses persisted referral reward codec amounts without letting malformed rows stop indexing. */
+const referrerRewardAmount = (value: unknown): bigint => {
+  try {
+    return codecToBigInt(value);
+  } catch {
+    return 0n;
+  }
 };
 
 const decimalToString = (value: bigint, decimals = DECIMALS, precision = 18): string => {
@@ -871,7 +906,31 @@ const nestedString = (value: unknown): string => {
 
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     const record = value as Record<string, unknown>;
-    const keys = ['EVM', 'Evm', 'evm', 'EVMLegacy', 'evmLegacy', 'Sora', 'sora', 'value', 'id', 'code'];
+    const keys = [
+      'EVM',
+      'Evm',
+      'evm',
+      'EVMLegacy',
+      'evmLegacy',
+      'Sub',
+      'sub',
+      'Sora',
+      'sora',
+      'Liberland',
+      'liberland',
+      'Parachain',
+      'parachain',
+      'TON',
+      'Ton',
+      'ton',
+      'Unknown',
+      'unknown',
+      'Root',
+      'root',
+      'value',
+      'id',
+      'code',
+    ];
 
     for (const key of keys) {
       const nested = nestedString(record[key]);
@@ -965,6 +1024,42 @@ const isValidEvmNetworkId = (value: string): boolean => {
   const parsed = Number(value);
 
   return Number.isSafeInteger(parsed) && parsed > 0;
+};
+
+/** Returns true for the standalone Substrate network currently restored through bridgeProxy history. */
+const isLiberlandBridgeNetwork = (value: string): boolean => value.toLowerCase() === LIBERLAND_NETWORK_ID.toLowerCase();
+
+/** Classifies bridgeProxy network identifiers that can be restored into bridge history rows. */
+const bridgeNetworkType = (networkId: string): string => {
+  if (isLiberlandBridgeNetwork(networkId)) return 'Sub';
+  if (isValidEvmNetworkId(networkId)) return 'Evm';
+
+  return '';
+};
+
+/** Adds explicit external-network metadata used by bridge history consumers. */
+const bridgeNetworkData = (networkId: string): Record<string, string> => {
+  const externalNetworkType = bridgeNetworkType(networkId);
+
+  return {
+    ...(networkId ? { networkId } : {}),
+    ...(externalNetworkType ? { externalNetwork: isLiberlandBridgeNetwork(networkId) ? LIBERLAND_NETWORK_ID : networkId } : {}),
+    ...(externalNetworkType ? { externalNetworkType } : {}),
+  };
+};
+
+/** Keeps external Liberland SS58 addresses out of local SORA account activity rows. */
+const historyIndexedAccounts = (
+  module: string,
+  method: string,
+  address: string,
+  history: { data: unknown; from: string; to: string }
+): string[] => {
+  if (module === 'bridgeProxy' && isRecord(history.data) && bridgeNetworkType(String(history.data.networkId ?? '')) === 'Sub') {
+    return uniqueIndexedAccountIds(method === 'mint' ? [history.from || address] : [address, history.from]);
+  }
+
+  return uniqueIndexedAccountIds([address, history.from, history.to]);
 };
 
 const findEvent = (events: EventRecord[], section: string, method: string): Record<string, unknown> | null => {
@@ -1339,7 +1434,7 @@ const createHistoryData = (
       return {
         data: {
           ...createAmountData(assetId, amount, prices, assets),
-          ...(networkId ? { networkId } : {}),
+          ...bridgeNetworkData(networkId),
           ...(recipient ? { recipient } : {}),
           ...(requestHash ? { requestHash } : {}),
           ...(status ? { status } : {}),
@@ -1353,7 +1448,7 @@ const createHistoryData = (
     return {
       data: {
         ...createAmountData(assetId, amount, prices, assets),
-        ...(networkId ? { networkId } : {}),
+        ...bridgeNetworkData(networkId),
         ...(recipient ? { recipient } : {}),
         ...(sender ? { sender } : {}),
         ...(requestHash ? { requestHash } : {}),
@@ -1383,7 +1478,7 @@ const createBridgeProxyIncomingContext = (
 
   const message = args.message && typeof args.message === 'object' && !Array.isArray(args.message) ? (args.message as Record<string, unknown>) : args;
   const networkId = firstNestedString(args, ['networkId', 'network', 'arg0']);
-  if (!isValidEvmNetworkId(networkId)) return null;
+  if (!bridgeNetworkType(networkId)) return null;
 
   const expectedRecipient = firstNestedString(message, ['dest', 'recipient', 'to', 'account']);
   const sender = firstNestedString(message, ['source', 'sender', 'from']);
@@ -1397,7 +1492,7 @@ const createBridgeProxyIncomingContext = (
   const history = {
     data: {
       ...createAmountData(movement.assetId, movement.amount, prices, assets),
-      ...(networkId ? { networkId } : {}),
+      ...bridgeNetworkData(networkId),
       recipient,
       ...(sender ? { sender } : {}),
       requestHash: request.requestHash,
@@ -1414,7 +1509,10 @@ const createBridgeProxyIncomingContext = (
     module: 'bridgeProxy',
     method: 'mint',
     history,
-    accounts: uniqueIndexedAccountIds([recipient, sender]),
+    accounts:
+      bridgeNetworkType(networkId) === 'Sub'
+        ? historyIndexedAccounts('bridgeProxy', 'mint', base.address, history)
+        : uniqueIndexedAccountIds([recipient, sender]),
   };
 };
 
@@ -1674,6 +1772,7 @@ export class ChainIndexer {
   private finalizedHeadPollTimer: ReturnType<typeof setInterval> | null = null;
   private finalizedHeadPollRunning = false;
   private derivedStateRefreshRunning = false;
+  private bridgeProxyHistoryRuntimeAvailable = false;
   private derivedStateRefreshRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingDerivedStateRefresh: DerivedStateRefreshRequest | null = null;
 
@@ -1711,6 +1810,7 @@ export class ChainIndexer {
       this.requestDerivedStateRefresh(Math.max(finalizedBlock, latestIndexedBlock), Math.floor(Date.now() / 1000), true);
     }
     await this.backfillXorBurns(finalizedBlock);
+    await this.backfillBridgeProxyHistory(finalizedBlock);
   }
 
   private async getLastIndexedBlock(): Promise<number> {
@@ -1759,6 +1859,39 @@ export class ChainIndexer {
       timestamp: Math.floor(Date.now() / 1000),
       data: {
         id: XOR_BURN_BACKFILL_STATE_ID,
+        block,
+        data: JSON.stringify({ lastIndexedBlock: block }),
+      },
+    };
+  }
+
+  private bridgeProxyHistoryBackfillStartBlock(): number {
+    return 0;
+  }
+
+  private async getBridgeProxyHistoryBackfillBlock(): Promise<number> {
+    const beforeStart = this.bridgeProxyHistoryBackfillStartBlock() - 1;
+    const state = await this.repository.get('updatesStreams', BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID);
+    if (!state?.data?.data || typeof state.data.data !== 'string') return beforeStart;
+
+    try {
+      const parsed = JSON.parse(state.data.data) as { lastIndexedBlock?: number };
+      const block = Number(parsed.lastIndexedBlock);
+
+      return Number.isFinite(block) ? Math.max(Math.trunc(block), beforeStart) : beforeStart;
+    } catch {
+      return beforeStart;
+    }
+  }
+
+  private createBridgeProxyHistoryBackfillStateDocument(block: number): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID,
+      blockHeight: block,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID,
         block,
         data: JSON.stringify({ lastIndexedBlock: block }),
       },
@@ -2162,6 +2295,213 @@ export class ChainIndexer {
     }
   }
 
+  private async backfillBridgeProxyHistory(finalizedBlock: number): Promise<void> {
+    if (!this.api) return;
+
+    const lastBackfilled = await this.getBridgeProxyHistoryBackfillBlock();
+    const startBlock = Math.max(this.bridgeProxyHistoryBackfillStartBlock(), lastBackfilled + 1);
+
+    if (startBlock > finalizedBlock) return;
+
+    for (let block = startBlock; block <= finalizedBlock; block += BRIDGE_PROXY_HISTORY_BACKFILL_BATCH_SIZE) {
+      await this.drainFinalizedHeads();
+
+      const batchEnd = Math.min(block + BRIDGE_PROXY_HISTORY_BACKFILL_BATCH_SIZE - 1, finalizedBlock);
+      const blocks = Array.from({ length: batchEnd - block + 1 }, (_item, index) => block + index);
+      const blockHashes = await mapWithConcurrency(
+        blocks,
+        BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
+        (blockHeight) => withTimeout(this.api!.rpc.chain.getBlockHash(blockHeight), `chain.getBlockHash(${blockHeight})`)
+      );
+      let scanBlockIndexes = blocks.map((_blockHeight, index) => index);
+
+      if (!this.bridgeProxyHistoryRuntimeAvailable) {
+        const batchEndHasBridgeRuntime = await this.hasBridgeProxyHistoryRuntime(
+          blockHashes[blockHashes.length - 1]?.toString() ?? '',
+          batchEnd
+        );
+
+        if (!batchEndHasBridgeRuntime) {
+          await this.repository.upsert(this.createBridgeProxyHistoryBackfillStateDocument(batchEnd));
+          console.info(`Backfilled bridgeProxy history through SORA block ${batchEnd}/${finalizedBlock}`);
+          continue;
+        }
+
+        const runtimeAvailability = await mapWithConcurrency(
+          blockHashes,
+          BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
+          (hash, index) => this.hasBridgeProxyHistoryRuntime(hash.toString(), blocks[index])
+        );
+        scanBlockIndexes = runtimeAvailability.flatMap((available, index) => (available ? [index] : []));
+        this.bridgeProxyHistoryRuntimeAvailable = scanBlockIndexes.length > 0;
+      }
+
+      const signedBlocks = (await mapWithConcurrency(
+        scanBlockIndexes,
+        BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
+        (index) => withTimeout(this.api!.rpc.chain.getBlock(blockHashes[index]), `chain.getBlock(${blocks[index]})`)
+      )) as SignedBlockLike[];
+      const bridgeBlockIndexes = signedBlocks.flatMap((signedBlock, resultIndex) =>
+        this.hasBridgeProxyHistoryExtrinsics(signedBlock) ? [scanBlockIndexes[resultIndex]] : []
+      );
+      const signedBlocksByIndex = new Map<number, SignedBlockLike>(
+        scanBlockIndexes.map((blockIndex, resultIndex) => [blockIndex, signedBlocks[resultIndex]])
+      );
+      const batchDocuments: IndexerDocument[] = [];
+      const accountTransactionDocuments: IndexerDocument[] = [];
+      const historyElementIds: string[] = [];
+
+      if (bridgeBlockIndexes.length) {
+        const bridgeBlocks = await mapWithConcurrency(
+          bridgeBlockIndexes,
+          BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
+          async (index) => {
+            const hash = blockHashes[index]?.toString();
+            if (!hash) throw new Error(`Missing block hash for bridgeProxy history backfill block ${blocks[index]}`);
+
+            const [events, timestamp] = await Promise.all([
+              this.fetchHistoricalSystemEvents(hash, blocks[index]),
+              this.fetchHistoricalBlockTimestamp(hash, blocks[index]),
+            ]);
+
+            return {
+              signedBlock: signedBlocksByIndex.get(index) as SignedBlockLike,
+              events,
+              timestamp,
+            };
+          }
+        );
+
+        for (const { signedBlock, events, timestamp } of bridgeBlocks) {
+          const { blockHeight, blockHash, contexts } = this.createBridgeProxyHistoryContexts(signedBlock, events);
+
+          for (const context of contexts) {
+            historyElementIds.push(context.id);
+            batchDocuments.push(this.createHistoryElementDocument(context, blockHeight, timestamp, blockHash));
+            accountTransactionDocuments.push(...this.createAccountTransactionDocuments(context, blockHeight, timestamp));
+          }
+        }
+      }
+
+      await this.repository.upsertMany(batchDocuments);
+      await this.upsertAndPruneAccountTransactionDocuments(historyElementIds, accountTransactionDocuments);
+      await this.repository.upsert(this.createBridgeProxyHistoryBackfillStateDocument(batchEnd));
+      console.info(`Backfilled bridgeProxy history through SORA block ${batchEnd}/${finalizedBlock}`);
+    }
+  }
+
+  private async hasBridgeProxyHistoryRuntime(hash: string, blockHeight: number): Promise<boolean> {
+    if (!this.api) throw new Error('Cannot inspect historical metadata before the chain API is initialized');
+    if (!hash) throw new Error(`Missing block hash for historical metadata at SORA block ${blockHeight}`);
+
+    const getMetadata = (this.api.rpc as unknown as { state?: { getMetadata?: (hash: string) => Promise<unknown> } }).state?.getMetadata;
+    if (typeof getMetadata !== 'function') {
+      throw new Error('state.getMetadata is required to find the bridgeProxy history start');
+    }
+
+    const metadata = await withTimeout(getMetadata.call((this.api.rpc as any).state, hash), `state.getMetadata(${blockHeight})`);
+    const pallets = (metadata as { asLatest?: { pallets?: Iterable<{ name?: { toString?: () => string } }> } }).asLatest?.pallets;
+
+    if (pallets) {
+      for (const pallet of pallets) {
+        const name = pallet.name?.toString?.() ?? '';
+        if (name === 'bridgeProxy' || name === 'bridgeChannelInbound') return true;
+      }
+
+      return false;
+    }
+
+    const json = (metadata as CodecLike | undefined)?.toJSON?.();
+    return JSON.stringify(json ?? '').includes('bridgeProxy') || JSON.stringify(json ?? '').includes('bridgeChannelInbound');
+  }
+
+  private hasBridgeProxyHistoryExtrinsics(signedBlock: SignedBlockLike): boolean {
+    return signedBlock.block.extrinsics.some((extrinsic) => {
+      const section = extrinsic.method.section;
+
+      return section === 'bridgeProxy' || section === 'bridgeChannelInbound';
+    });
+  }
+
+  private createBridgeProxyHistoryContexts(
+    signedBlock: SignedBlockLike,
+    events: EventRecord[]
+  ): { blockHeight: number; blockHash: string; contexts: BlockExtrinsicContext[] } {
+    const eventsByExtrinsic = groupEventsByExtrinsic(events);
+    const blockHeight = signedBlock.block.header?.number?.toNumber() ?? 0;
+    const blockHash = signedBlock.block.header?.hash?.toString() ?? '';
+    const contexts: BlockExtrinsicContext[] = [];
+
+    for (const [index, extrinsic] of signedBlock.block.extrinsics.entries()) {
+      const eventsForExtrinsic = eventsByExtrinsic.get(index) ?? [];
+      if (!eventsForExtrinsic.some((record) => record.event.section === 'bridgeProxy')) continue;
+
+      const failed = eventsForExtrinsic.find(({ event }) => event.section === 'system' && event.method === 'ExtrinsicFailed');
+      const args = codecArgs(extrinsic.method);
+      const calls = getUtilityCalls(extrinsic);
+      const callNames = calls.map((call) => `${call.module}.${call.method}`);
+      const address = getSigner(extrinsic);
+      const history = createHistoryData(
+        extrinsic.method.section,
+        extrinsic.method.method,
+        args,
+        eventsForExtrinsic,
+        address,
+        this.prices,
+        this.assetInfos
+      );
+      const id = extrinsic.hash?.toString?.() || `${blockHeight}-${index}`;
+      const fee = this.extractNetworkFee(eventsForExtrinsic);
+      const context: BlockExtrinsicContext = {
+        id,
+        module: extrinsic.method.section,
+        method: extrinsic.method.method,
+        address,
+        failed: Boolean(failed),
+        history,
+        calls,
+        callNames,
+        events: eventsForExtrinsic,
+        accounts: historyIndexedAccounts(extrinsic.method.section, extrinsic.method.method, address, history),
+        fee,
+      };
+
+      if (context.module === 'bridgeProxy' && (context.method === 'burn' || context.method === 'mint')) {
+        contexts.push(context);
+      }
+
+      const incomingContext = createBridgeProxyIncomingContext(context, args, this.prices, this.assetInfos);
+      if (incomingContext) contexts.push(incomingContext);
+    }
+
+    return { blockHeight, blockHash, contexts };
+  }
+
+  private async upsertAndPruneAccountTransactionDocuments(
+    historyElementIds: string[],
+    documents: IndexerDocument[]
+  ): Promise<void> {
+    const uniqueHistoryElementIds = [...new Set(historyElementIds)];
+    if (!uniqueHistoryElementIds.length) return;
+
+    const expectedIds = new Set(documents.map((document) => document.id));
+    const staleIds: string[] = [];
+
+    await this.repository.upsertMany(documents);
+
+    for await (const page of this.queryPages(collection('accountTransactions'), {
+      filter: { historyElementId: { in: uniqueHistoryElementIds } },
+    })) {
+      for (const document of page) {
+        if (!expectedIds.has(document.id)) staleIds.push(document.id);
+      }
+    }
+
+    for (let start = 0; start < staleIds.length; start += ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE) {
+      await this.repository.deleteMany(collection('accountTransactions'), staleIds.slice(start, start + ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE));
+    }
+  }
+
   private async backfill(): Promise<boolean> {
     if (!this.api) return false;
 
@@ -2392,7 +2732,7 @@ export class ChainIndexer {
       const id = extrinsic.hash?.toString?.() || `${blockHeight}-${index}`;
       const fee = this.extractNetworkFee(eventsForExtrinsic);
       if (extrinsic.isSigned && fee > 0n) feePayingSignedTransactions += 1;
-      const currentAccounts = uniqueIndexedAccountIds([address, history.from, history.to]);
+      const currentAccounts = historyIndexedAccounts(extrinsic.method.section, extrinsic.method.method, address, history);
       totalFees += fee;
       if (!failed) volumeUSD += this.extractVolumeUSD(history.data);
       if (!failed && isLiquidityProxySwap(extrinsic.method.section, extrinsic.method.method, callNames)) {
@@ -2430,33 +2770,7 @@ export class ChainIndexer {
     const existingAccountMeta = await this.repository.getMany(collection('accountMeta'), [...touchedAccounts]);
 
     for (const context of extrinsicContexts) {
-      documents.push({
-        collection: collection('historyElements'),
-        id: context.id,
-        blockHeight,
-        timestamp,
-        data: {
-          id: context.id,
-          type: 'CALL',
-          timestamp,
-          blockHash,
-          blockHeight,
-          module: context.module,
-          method: context.method,
-          address: context.address,
-          networkFee: context.fee.toString(),
-          execution: context.failed
-            ? { success: false, error: { moduleErrorId: 0, moduleErrorIndex: 0 } }
-            : { success: true },
-          data: context.history.data,
-          dataFrom: context.history.from || context.address,
-          dataTo: context.history.to,
-          dataAssets: context.history.assets,
-          callNames: context.callNames,
-          calls: context.calls,
-        },
-      });
-
+      documents.push(this.createHistoryElementDocument(context, blockHeight, timestamp, blockHash));
       documents.push(...this.createAccountTransactionDocuments(context, blockHeight, timestamp));
       if (!context.failed) documents.push(...createXorBurnDocuments(context, blockHeight, timestamp, this.assetInfos));
       context.accounts.forEach((account) => latestHistoryByAccount.set(account, context.id));
@@ -2509,7 +2823,7 @@ export class ChainIndexer {
     });
 
     documents.push(this.createChainStateDocument(blockHeight));
-    await this.repository.upsertMany(documents);
+    await this.repository.upsertMany(await this.prepareReferrerRewardDocuments(documents));
 
     if ((options.refreshDerivedState ?? true) && blockHeight % this.config.stateRefreshIntervalBlocks === 0) {
       this.requestDerivedStateRefresh(blockHeight, timestamp, blockHeight % this.config.snapshotIntervalBlocks === 0);
@@ -2655,6 +2969,56 @@ export class ChainIndexer {
     return entries.apply(storage, args);
   }
 
+  private async fetchOptionalStorageEntries(
+    storage: unknown,
+    _label: string,
+    ...args: unknown[]
+  ): Promise<Array<[StorageEntryKey, unknown]>> {
+    const entries = (storage as { entries?: (...args: unknown[]) => Promise<Array<[StorageEntryKey, unknown]>> } | undefined)
+      ?.entries;
+
+    if (typeof entries !== 'function') return [];
+
+    return entries.apply(storage, args);
+  }
+
+  private async fetchApiAt(hash: string, label: string): Promise<{ query: unknown }> {
+    if (!this.api) throw new Error(`Cannot fetch historical chain state for ${label} before the chain API is initialized`);
+
+    const at = (this.api as unknown as { at?: (hash: string) => Promise<{ query: unknown }> }).at;
+    if (typeof at !== 'function') {
+      throw new Error('api.at is required to decode historical chain state');
+    }
+
+    return withTimeout(at.call(this.api, hash), `api.at(${label})`);
+  }
+
+  private async fetchHistoricalSystemEvents(hash: string, blockHeight: number): Promise<EventRecord[]> {
+    const apiAt = await this.fetchApiAt(hash, `SORA block ${blockHeight}`);
+    const system = (apiAt.query as { system?: { events?: () => Promise<unknown> } }).system;
+    if (typeof system?.events !== 'function') {
+      throw new Error(`system.events is required to decode historical SORA block ${blockHeight}`);
+    }
+
+    return (await withTimeout(system.events.call(system), `system.events(${blockHeight})`)) as EventRecord[];
+  }
+
+  private async fetchHistoricalBlockTimestamp(hash: string, blockHeight: number): Promise<number> {
+    const apiAt = await this.fetchApiAt(hash, `SORA block ${blockHeight}`);
+    const timestampNow = (apiAt.query as { timestamp?: { now?: () => Promise<unknown> } }).timestamp?.now;
+    if (typeof timestampNow !== 'function') {
+      throw new Error(`timestamp.now is required to index historical SORA block ${blockHeight}`);
+    }
+
+    const codec = await withTimeout(timestampNow(), `timestamp.now(${blockHeight})`);
+    const timestampMs = Number((codec as CodecLike | undefined)?.toString?.() ?? codec);
+    if (!Number.isFinite(timestampMs)) {
+      throw new Error(`Invalid timestamp.now value for historical SORA block ${blockHeight}`);
+    }
+
+    return Math.floor(timestampMs / 1000);
+  }
+
   private async fetchBlockTimestamp(hash: string): Promise<number> {
     if (!this.api) throw new Error('Cannot index a block before the chain API is initialized');
 
@@ -2708,6 +3072,38 @@ export class ChainIndexer {
     this.applyAccountPointUpdates(accounts, blockHeight, timestamp, pendingPointData, update, accountMeta);
 
     return this.createFinalAccountDocuments(accounts, latestHistoryByAccount, blockHeight, timestamp, pendingPointData);
+  }
+
+  private createHistoryElementDocument(
+    context: BlockExtrinsicContext,
+    blockHeight: number,
+    timestamp: number,
+    blockHash: string
+  ): IndexerDocument {
+    return {
+      collection: collection('historyElements'),
+      id: context.id,
+      blockHeight,
+      timestamp,
+      data: {
+        id: context.id,
+        type: 'CALL',
+        timestamp,
+        blockHash,
+        blockHeight,
+        module: context.module,
+        method: context.method,
+        address: context.address,
+        networkFee: context.fee.toString(),
+        execution: context.failed ? { success: false, error: { moduleErrorId: 0, moduleErrorIndex: 0 } } : { success: true },
+        data: context.history.data,
+        dataFrom: context.history.from || context.address,
+        dataTo: context.history.to,
+        dataAssets: context.history.assets,
+        callNames: context.callNames,
+        calls: context.calls,
+      },
+    };
   }
 
   /**
@@ -2877,7 +3273,7 @@ export class ChainIndexer {
       this.addPointDeposit(data, 'incomingUSD', amountUSD);
     }
 
-    if (update.module.includes('democracy') || update.module.includes('referenda') || update.method.toLowerCase().includes('vote')) {
+    if (update.module.includes('democracy') || update.method.toLowerCase().includes('vote')) {
       const governance = data.governance as Record<string, unknown>;
       governance.votes = Number(governance.votes ?? 0) + 1;
       governance.amount = addDecimalStrings(governance.amount ?? '0', payload.amount ?? payload.balance ?? '0');
@@ -2921,6 +3317,40 @@ export class ChainIndexer {
   private addPointDeposit(data: Record<string, unknown>, field: 'incomingUSD' | 'outgoingUSD', amountUSD: unknown): void {
     const deposit = data.deposit as Record<string, unknown>;
     deposit[field] = addDecimalStrings(deposit[field] ?? '0', amountUSD, 8);
+  }
+
+  /**
+   * Keeps indexed referral rows as one fast lookup surface for both invited
+   * users and accumulated rewards. Event rows carry positive reward deltas,
+   * while storage refresh rows carry zero and must not erase prior rewards.
+   */
+  private async prepareReferrerRewardDocuments(documents: IndexerDocument[]): Promise<IndexerDocument[]> {
+    const rewardDocuments = documents.filter((document) => document.collection === collection('referrerRewards'));
+    if (!rewardDocuments.length) return documents;
+
+    const existing = await this.repository.getMany(
+      collection('referrerRewards'),
+      rewardDocuments.map((document) => document.id)
+    );
+    const totals = new Map<string, bigint>();
+
+    return documents.map((document) => {
+      if (document.collection !== collection('referrerRewards')) return document;
+
+      const previousAmount = totals.get(document.id) ?? referrerRewardAmount(existing.get(document.id)?.data.amount ?? 0);
+      const incomingAmount = referrerRewardAmount(document.data.amount);
+      const amount = incomingAmount > 0n ? previousAmount + incomingAmount : previousAmount;
+
+      totals.set(document.id, amount);
+
+      return {
+        ...document,
+        data: {
+          ...document.data,
+          amount: amount.toString(),
+        },
+      };
+    });
   }
 
   private createEventDocuments(events: EventRecord[], blockHeight: number, timestamp: number, signer: string): IndexerDocument[] {
@@ -3203,6 +3633,12 @@ export class ChainIndexer {
       orderBookBids,
       orderBookAsks,
       orderBookLimitOrders,
+      polkamarktConditions,
+      polkamarktMarkets,
+      polkamarktPools,
+      polkamarktVolumes,
+      polkamarktTotals,
+      polkamarktResolutions,
       farmingPoolFarmers,
       nativeXorIssuance,
     ] = await Promise.all([
@@ -3215,6 +3651,12 @@ export class ChainIndexer {
       this.fetchStorageEntries((this.api.query as any).orderBook.bids, 'orderBook.bids'),
       this.fetchStorageEntries((this.api.query as any).orderBook.asks, 'orderBook.asks'),
       this.fetchStorageEntries((this.api.query as any).orderBook.limitOrders, 'orderBook.limitOrders'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.conditions, 'polkamarkt.conditions'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.markets, 'polkamarkt.markets'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketPools, 'polkamarkt.marketPools'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketVolume, 'polkamarkt.marketVolume'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketPositionTotals, 'polkamarkt.marketPositionTotals'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketResolution, 'polkamarkt.marketResolution'),
       this.fetchStorageEntries((this.api.query as any).farming.poolFarmers, 'farming.poolFarmers'),
       this.fetchNativeXorIssuance(),
     ]);
@@ -3332,10 +3774,22 @@ export class ChainIndexer {
         includeSnapshots
       ),
     ]);
+    const polkamarktMarketDocuments = this.createPolkamarktMarketDocuments(
+      polkamarktConditions,
+      polkamarktMarkets,
+      polkamarktPools,
+      polkamarktVolumes,
+      polkamarktTotals,
+      polkamarktResolutions,
+      assets,
+      effectiveBlockHeight,
+      timestamp
+    );
     const marketDocuments: IndexerDocument[] = [
       ...assetDocuments,
       ...poolDocuments,
       ...orderBookDocuments,
+      ...polkamarktMarketDocuments,
       ...this.createNetworkSnapshotDocuments(analytics, effectiveBlockHeight, timestamp, includeSnapshots),
       ...this.createUpdateStreams(poolStates, assets, prices, apyByPool, effectiveBlockHeight, timestamp),
     ];
@@ -3356,7 +3810,7 @@ export class ChainIndexer {
       ...this.createAccountLiquidityDocuments(poolProviders, poolStates, assets, prices, effectiveBlockHeight, timestamp),
     ];
 
-    await this.repository.upsertMany(auxiliaryDocuments);
+    await this.repository.upsertMany(await this.prepareReferrerRewardDocuments(auxiliaryDocuments));
   }
 
   private derivePrices(
@@ -4025,6 +4479,262 @@ export class ChainIndexer {
     }
 
     return result;
+  }
+
+  private storageKeyNumber(key: StorageEntryKey): number | null {
+    const raw = normalizeValue(key.args?.[0]);
+    const parsed = Number(raw);
+
+    return Number.isSafeInteger(parsed) ? parsed : null;
+  }
+
+  private normalizedRecord(value: unknown): Record<string, unknown> {
+    const normalized = normalizeValue(value);
+    if (isRecord(normalized)) return normalized;
+
+    const human = toHuman(value);
+    if (isRecord(human)) {
+      return Object.fromEntries(Object.entries(human).map(([key, item]) => [normalizeKey(key), item]));
+    }
+
+    return {};
+  }
+
+  private decodeMetadataText(value: unknown): string {
+    const normalized = normalizeValue(value);
+
+    if (typeof normalized === 'string') {
+      if (/^0x[0-9a-fA-F]*$/.test(normalized) && normalized.length > 2) {
+        return Buffer.from(normalized.slice(2), 'hex').toString('utf8').trim();
+      }
+
+      return normalized.trim();
+    }
+
+    if (Array.isArray(normalized)) {
+      const bytes = normalized.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item >= 0 && item <= 255);
+      if (bytes.length) return Buffer.from(bytes).toString('utf8').trim();
+    }
+
+    if (isRecord(normalized)) {
+      for (const key of ['value', 'inner', 'raw']) {
+        const decoded = this.decodeMetadataText(normalized[key]);
+        if (decoded) return decoded;
+      }
+    }
+
+    return '';
+  }
+
+  private variantName(value: unknown): string {
+    const normalized = normalizeValue(value);
+    if (typeof normalized === 'string') return normalized;
+
+    if (isRecord(normalized)) {
+      const explicit = normalized.type ?? normalized.status ?? normalized.outcome;
+      if (typeof explicit === 'string') return explicit;
+
+      const key = Object.keys(normalized).find((item) => normalized[item] === null || normalized[item] === true || normalized[item] === undefined);
+      if (key) return key.charAt(0).toUpperCase() + key.slice(1);
+    }
+
+    return '';
+  }
+
+  private safeCodecToBigInt(value: unknown): bigint {
+    try {
+      return codecToBigInt(value ?? 0);
+    } catch {
+      return 0n;
+    }
+  }
+
+  private normalizeSoraGovernancePallet(value: string): string | null {
+    const normalized = value.replace(/[\s_-]/g, '').toLowerCase();
+    if (normalized === 'democracy') return 'democracy';
+    if (normalized === 'council') return 'council';
+    if (normalized === 'technicalcommittee') return 'technicalCommittee';
+    if (normalized === 'ceres' || normalized === 'ceresgovernance' || normalized === 'ceresgovernanceplatform') {
+      return 'ceresGovernancePlatform';
+    }
+    if (normalized === 'hermes' || normalized === 'hermesgovernance' || normalized === 'hermesgovernanceplatform') {
+      return 'hermesGovernancePlatform';
+    }
+    return null;
+  }
+
+  private parseSoraGovernanceReference(source: string): Record<string, unknown> {
+    const match = source
+      .trim()
+      .match(/^(?:sora:governance:|sora:\/\/governance\/)([A-Za-z-]+)[:/]([A-Za-z-]+)[:/]([A-Za-z0-9]+|0x[0-9a-fA-F]+)$/);
+    if (!match) return {};
+
+    const pallet = this.normalizeSoraGovernancePallet(match[1] ?? '');
+    if (!pallet) return {};
+
+    const kindToken = (match[2] ?? '').replace(/[\s_-]/g, '').toLowerCase();
+    const reference = match[3] ?? '';
+    const numericReference = Number(reference);
+    const numberValue = Number.isInteger(numericReference) && numericReference > 0 ? numericReference : undefined;
+    const base: Record<string, unknown> = {
+      governancePallet: pallet,
+      governanceBody:
+        pallet === 'technicalCommittee'
+          ? 'Technical Committee'
+          : pallet === 'ceresGovernancePlatform'
+            ? 'Ceres Governance'
+            : pallet === 'hermesGovernancePlatform'
+              ? 'Hermes Governance'
+              : pallet.charAt(0).toUpperCase() + pallet.slice(1),
+    };
+
+    if (pallet === 'democracy' && kindToken === 'referendum') {
+      return { ...base, governanceKind: 'Referendum', governanceReferendumIndex: numberValue };
+    }
+
+    if (pallet === 'democracy' && (kindToken === 'proposal' || kindToken === 'publicproposal')) {
+      return { ...base, governanceKind: 'PublicProposal', governanceProposalIndex: numberValue };
+    }
+
+    if (pallet === 'council' && kindToken === 'motion') {
+      return {
+        ...base,
+        governanceKind: 'CouncilMotion',
+        governanceMotionHash: reference.startsWith('0x') ? reference : undefined,
+        governanceProposalIndex: reference.startsWith('0x') ? undefined : numberValue,
+      };
+    }
+
+    if (pallet === 'technicalCommittee' && kindToken === 'motion') {
+      return {
+        ...base,
+        governanceKind: 'TechnicalCommitteeMotion',
+        governanceMotionHash: reference.startsWith('0x') ? reference : undefined,
+        governanceProposalIndex: reference.startsWith('0x') ? undefined : numberValue,
+      };
+    }
+
+    if (pallet === 'ceresGovernancePlatform' && kindToken === 'poll') {
+      return { ...base, governanceKind: 'CeresPoll', governancePollId: numberValue };
+    }
+
+    if (pallet === 'hermesGovernancePlatform' && kindToken === 'poll') {
+      return { ...base, governanceKind: 'HermesPoll', governancePollId: numberValue };
+    }
+
+    return {};
+  }
+
+  private createPolkamarktMarketDocuments(
+    conditions: Array<[StorageEntryKey, unknown]>,
+    markets: Array<[StorageEntryKey, unknown]>,
+    pools: Array<[StorageEntryKey, unknown]>,
+    volumes: Array<[StorageEntryKey, unknown]>,
+    totals: Array<[StorageEntryKey, unknown]>,
+    resolutions: Array<[StorageEntryKey, unknown]>,
+    assets: Map<string, AssetInfo>,
+    blockHeight: number,
+    timestamp: number
+  ): IndexerDocument[] {
+    const conditionsById = new Map<number, Record<string, unknown>>();
+    const poolsByMarket = new Map<number, Record<string, unknown>>();
+    const volumesByMarket = new Map<number, bigint>();
+    const totalsByMarket = new Map<number, Record<string, unknown>>();
+    const resolutionsByMarket = new Map<number, string>();
+
+    for (const [key, value] of conditions) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      conditionsById.set(id, this.normalizedRecord(value));
+    }
+
+    for (const [key, value] of pools) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      poolsByMarket.set(id, this.normalizedRecord(value));
+    }
+
+    for (const [key, value] of volumes) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      volumesByMarket.set(id, this.safeCodecToBigInt(value));
+    }
+
+    for (const [key, value] of totals) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      totalsByMarket.set(id, this.normalizedRecord(value));
+    }
+
+    for (const [key, value] of resolutions) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      resolutionsByMarket.set(id, this.variantName(value));
+    }
+
+    return markets.flatMap(([key, value]) => {
+      const marketId = this.storageKeyNumber(key);
+      if (marketId === null) return [];
+
+      const market = this.normalizedRecord(value);
+      const conditionId = Number(market.conditionId ?? market.condition ?? -1);
+      const condition = conditionsById.get(conditionId);
+      const title = this.decodeMetadataText(condition?.question);
+      if (!title) return [];
+
+      const pool = poolsByMarket.get(marketId) ?? {};
+      const totalsForMarket = totalsByMarket.get(marketId) ?? {};
+      const collateralAsset = assetIdToString(market.collateralAsset);
+      const decimals = assets.get(collateralAsset)?.decimals ?? DECIMALS;
+      const seedLiquidity = this.safeCodecToBigInt(market.seedLiquidity);
+      const collateral = this.safeCodecToBigInt(pool.collateral ?? seedLiquidity);
+      const yesShares = this.safeCodecToBigInt(pool.yes ?? totalsForMarket.totalYesShares ?? seedLiquidity);
+      const noShares = this.safeCodecToBigInt(pool.no ?? totalsForMarket.totalNoShares ?? seedLiquidity);
+      const volume = volumesByMarket.get(marketId) ?? 0n;
+      const probability =
+        yesShares + noShares > 0n
+          ? Number((noShares * 10_000n) / (yesShares + noShares)) / 100
+          : null;
+      const liquidityUSD = decimalToString(collateral, decimals, 8);
+      const volumeUSD = decimalToString(volume, decimals, 8);
+      const oracle = this.decodeMetadataText(condition?.oracle);
+      const resolutionSource = this.decodeMetadataText(condition?.resolutionSource);
+      const governance = resolutionSource ? this.parseSoraGovernanceReference(resolutionSource) : {};
+
+      return [
+        {
+          collection: collection('markets'),
+          id: String(marketId),
+          blockHeight,
+          timestamp,
+          data: {
+            id: String(marketId),
+            marketId,
+            conditionId,
+            title,
+            category: 'Other',
+            oracle,
+            resolutionSource,
+            closeBlock: Number(market.closeBlock ?? 0),
+            status: this.variantName(market.status),
+            creator: String(market.creator ?? ''),
+            collateralAsset,
+            seedLiquidity: decimalToString(seedLiquidity, decimals, 8),
+            liquidityUSD,
+            volumeUSD,
+            probability,
+            priceYes: probability === null ? null : probability / 100,
+            collateral: decimalToString(collateral, decimals, 8),
+            yesShares: decimalToString(yesShares, decimals, 8),
+            noShares: decimalToString(noShares, decimals, 8),
+            resolutionOutcome: resolutionsByMarket.get(marketId) ?? null,
+            ...governance,
+            updatedAtBlock: blockHeight,
+            timestamp,
+          },
+        },
+      ];
+    });
   }
 
   private async createOrderBookDocuments(

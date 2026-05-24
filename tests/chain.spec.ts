@@ -12,6 +12,7 @@ const DUST_DAI = '0x00a0e746a66b290bd29cbffecc710aefacb98840937229e1e847590006fa
 const ETH = '0x0200070000000000000000000000000000000000000000000000000000000000';
 const XSTUSD = '0x0200080000000000000000000000000000000000000000000000000000000000';
 const KUSD = '0x02000c0000000000000000000000000000000000000000000000000000000000';
+const LIBERLAND_ACCOUNT = '5GrwvaEF5zXb26Fz9rcQpDWSxZ9zC7d4L4sUx8m6RRnF9jqw';
 
 const eventRecord = (section: string, method: string, data: Record<string, unknown>, extrinsicIndex = 0) => ({
   phase: {
@@ -1463,6 +1464,93 @@ describe('ChainIndexer price derivation', () => {
     expect(externalActivity).toBeNull();
   });
 
+  it('indexes bridgeProxy burn history for outgoing Liberland bridge transfers without treating the external account as local', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 45 },
+                hash: { toString: () => '0xliberlandoutblock' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xliberlandout' },
+                  method: {
+                    section: 'bridgeProxy',
+                    method: 'burn',
+                    args: [{ Sub: 'Liberland' }, XOR, { Liberland: LIBERLAND_ACCOUNT }, (7n * SCALE).toString()],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'assetId' }, { name: 'recipient' }, { name: 'amount' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xliberlandrequest', status: 'Done' }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000002000' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xliberlandoutblock');
+
+    const history = await repository.get('historyElements', '0xliberlandout');
+    const snapshot = await repository.get('networkSnapshots', 'block-45');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+    const aliceActivity = await repository.get('accountTransactions', '0xliberlandout-alice');
+    const externalActivity = await repository.get('accountTransactions', `0xliberlandout-${LIBERLAND_ACCOUNT}`);
+
+    expect(history?.data).toMatchObject({
+      module: 'bridgeProxy',
+      method: 'burn',
+      address: 'alice',
+      dataFrom: 'alice',
+      dataTo: LIBERLAND_ACCOUNT,
+      data: {
+        assetId: XOR,
+        amount: '7',
+        amountUSD: '14',
+        networkId: 'Liberland',
+        externalNetwork: 'Liberland',
+        externalNetworkType: 'Sub',
+        recipient: LIBERLAND_ACCOUNT,
+        requestHash: '0xliberlandrequest',
+        status: 'Done',
+      },
+    });
+    expect(snapshot?.data.bridgeOutgoingTransactions).toBe(1);
+    expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '0', outgoingUSD: '14' });
+    expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: '0xliberlandout' });
+    expect(externalActivity).toBeNull();
+  });
+
   it('indexes liquidityProxy swap history from the actual Exchange event amounts', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
@@ -1748,6 +1836,108 @@ describe('ChainIndexer price derivation', () => {
     });
     expect(snapshot?.data.bridgeIncomingTransactions).toBe(1);
     expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '6', outgoingUSD: '0' });
+  });
+
+  it('indexes bridgeProxy request events as mint history for incoming Liberland bridge transfers', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 46 },
+                hash: { toString: () => '0xliberlandinblock' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'relayer' },
+                  hash: { toString: () => '0xliberlandinboundsubmit' },
+                  method: {
+                    section: 'bridgeChannelInbound',
+                    method: 'submit',
+                    args: [
+                      { Sub: 'Liberland' },
+                      {
+                        source: { Liberland: LIBERLAND_ACCOUNT },
+                        dest: { Sora: 'alice' },
+                        assetId: XOR,
+                      },
+                    ],
+                    meta: {
+                      args: [{ name: 'networkId' }, { name: 'message' }],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xliberlandinrequest', status: 'Done' }),
+              eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: (4n * SCALE).toString() }),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000003000' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xliberlandinblock');
+
+    const original = await repository.get('historyElements', '0xliberlandinboundsubmit');
+    const history = await repository.get('historyElements', '0xliberlandinrequest-mint');
+    const snapshot = await repository.get('networkSnapshots', 'block-46');
+    const accountMeta = await repository.get('accountMeta', 'alice');
+    const aliceActivity = await repository.get('accountTransactions', '0xliberlandinrequest-mint-alice');
+    const externalActivity = await repository.get('accountTransactions', `0xliberlandinrequest-mint-${LIBERLAND_ACCOUNT}`);
+
+    expect(original?.data).toMatchObject({
+      module: 'bridgeChannelInbound',
+      method: 'submit',
+      address: 'relayer',
+    });
+    expect(history?.data).toMatchObject({
+      module: 'bridgeProxy',
+      method: 'mint',
+      address: 'relayer',
+      dataFrom: 'alice',
+      dataTo: LIBERLAND_ACCOUNT,
+      data: {
+        assetId: XOR,
+        amount: '4',
+        amountUSD: '8',
+        networkId: 'Liberland',
+        externalNetwork: 'Liberland',
+        externalNetworkType: 'Sub',
+        recipient: 'alice',
+        sender: LIBERLAND_ACCOUNT,
+        requestHash: '0xliberlandinrequest',
+        status: 'Done',
+      },
+    });
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(1);
+    expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '8', outgoingUSD: '0' });
+    expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: '0xliberlandinrequest-mint' });
+    expect(externalActivity).toBeNull();
   });
 
   it('does not synthesize EVM incoming bridge history without a request hash event', async () => {
@@ -3223,6 +3413,317 @@ describe('ChainIndexer price derivation', () => {
     expect(indexer.drainFinalizedHeads).toHaveBeenCalled();
   });
 
+  it('backfills bridgeProxy burn history from the first block without rewinding live chain state', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer({ ...config, chainStartBlock: 123 }, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      backfillBridgeProxyHistory: (finalizedBlock: number) => Promise<void>;
+      drainFinalizedHeads: () => Promise<void>;
+    };
+    const chainStateBlock = 26_000_000;
+    const bridgeBlock = 5;
+    const blockHashCalls: number[] = [];
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    await repository.upsert({
+      collection: 'updatesStreams',
+      id: 'chainState',
+      blockHeight: chainStateBlock,
+      timestamp: 1,
+      data: {
+        id: 'chainState',
+        block: chainStateBlock,
+        data: JSON.stringify({ lastIndexedBlock: chainStateBlock }),
+      },
+    });
+    await repository.upsert({
+      collection: 'accountTransactions',
+      id: `0xbridgebackfill-${LIBERLAND_ACCOUNT}`,
+      blockHeight: bridgeBlock,
+      timestamp: 1,
+      data: {
+        id: `0xbridgebackfill-${LIBERLAND_ACCOUNT}`,
+        accountId: LIBERLAND_ACCOUNT,
+        historyElementId: '0xbridgebackfill',
+        blockHeight: bridgeBlock,
+        timestamp: 1,
+      },
+    });
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlockHash: async (block: number) => {
+            blockHashCalls.push(block);
+            return `hash-${block}`;
+          },
+          getBlock: async (hash: string) => {
+            const block = Number(hash.replace('hash-', ''));
+            return {
+              block: {
+                header: {
+                  number: { toNumber: () => block },
+                  hash: { toString: () => `0xblock-${block}` },
+                },
+                extrinsics:
+                  block === bridgeBlock
+                    ? [
+                        {
+                          isSigned: true,
+                          signer: { toString: () => 'alice' },
+                          hash: { toString: () => '0xbridgebackfill' },
+                          method: {
+                            section: 'bridgeProxy',
+                            method: 'burn',
+                            args: [{ Sub: 'Liberland' }, XOR, { Liberland: LIBERLAND_ACCOUNT }, (7n * SCALE).toString()],
+                            meta: {
+                              args: [{ name: 'networkId' }, { name: 'assetId' }, { name: 'recipient' }, { name: 'amount' }],
+                            },
+                          },
+                        },
+                      ]
+                    : [],
+              },
+            };
+          },
+        },
+        state: {
+          getMetadata: async () => ({
+            asLatest: {
+              pallets: [{ name: { toString: () => 'bridgeProxy' } }],
+            },
+          }),
+        },
+      },
+      at: async (hash: string) => ({
+        query: {
+          system: {
+            events: async () =>
+              hash === `hash-${bridgeBlock}`
+                ? [eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xbridgebackfillrequest', status: 'Done' })]
+                : [],
+          },
+          timestamp: {
+            now: async () => ({ toString: () => '1700000002000' }),
+          },
+        },
+      }),
+      query: {
+        system: {
+          events: {
+            at: async (hash: string) =>
+              hash === `hash-${bridgeBlock}`
+                ? [eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xbridgebackfillrequest', status: 'Done' })]
+                : [],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000002000' }),
+          },
+        },
+      },
+    };
+    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
+
+    await indexer.backfillBridgeProxyHistory(bridgeBlock + 1);
+
+    const history = await repository.get('historyElements', '0xbridgebackfill');
+    const aliceActivity = await repository.get('accountTransactions', '0xbridgebackfill-alice');
+    const externalActivity = await repository.get('accountTransactions', `0xbridgebackfill-${LIBERLAND_ACCOUNT}`);
+    const chainState = await repository.get('updatesStreams', 'chainState');
+    const backfillState = await repository.get('updatesStreams', 'bridgeProxyHistoryBackfill-v1');
+
+    expect(blockHashCalls).toContain(0);
+    expect(history?.data).toMatchObject({
+      module: 'bridgeProxy',
+      method: 'burn',
+      address: 'alice',
+      dataFrom: 'alice',
+      dataTo: LIBERLAND_ACCOUNT,
+      data: {
+        assetId: XOR,
+        amount: '7',
+        amountUSD: '14',
+        networkId: 'Liberland',
+        externalNetwork: 'Liberland',
+        externalNetworkType: 'Sub',
+        recipient: LIBERLAND_ACCOUNT,
+        requestHash: '0xbridgebackfillrequest',
+        status: 'Done',
+      },
+    });
+    expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: '0xbridgebackfill' });
+    expect(externalActivity).toBeNull();
+    await expect(repository.list('accounts')).resolves.toHaveLength(0);
+    await expect(repository.list('accountMeta')).resolves.toHaveLength(0);
+    await expect(repository.list('networkSnapshots')).resolves.toHaveLength(0);
+    expect(chainState?.data).toMatchObject({
+      id: 'chainState',
+      block: chainStateBlock,
+      data: JSON.stringify({ lastIndexedBlock: chainStateBlock }),
+    });
+    expect(backfillState?.data).toMatchObject({
+      id: 'bridgeProxyHistoryBackfill-v1',
+      block: bridgeBlock + 1,
+      data: JSON.stringify({ lastIndexedBlock: bridgeBlock + 1 }),
+    });
+    expect(indexer.drainFinalizedHeads).toHaveBeenCalled();
+  });
+
+  it('backfills completed incoming bridgeProxy mint history without indexing the external Liberland account', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      backfillBridgeProxyHistory: (finalizedBlock: number) => Promise<void>;
+      drainFinalizedHeads: () => Promise<void>;
+    };
+    const bridgeBlock = 7;
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    await repository.upsert({
+      collection: 'accountTransactions',
+      id: `0xincomingbackfillrequest-mint-${LIBERLAND_ACCOUNT}`,
+      blockHeight: bridgeBlock,
+      timestamp: 1,
+      data: {
+        id: `0xincomingbackfillrequest-mint-${LIBERLAND_ACCOUNT}`,
+        accountId: LIBERLAND_ACCOUNT,
+        historyElementId: '0xincomingbackfillrequest-mint',
+        blockHeight: bridgeBlock,
+        timestamp: 1,
+      },
+    });
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlockHash: async (block: number) => `hash-${block}`,
+          getBlock: async (hash: string) => {
+            const block = Number(hash.replace('hash-', ''));
+            return {
+              block: {
+                header: {
+                  number: { toNumber: () => block },
+                  hash: { toString: () => `0xblock-${block}` },
+                },
+                extrinsics:
+                  block === bridgeBlock
+                    ? [
+                        {
+                          isSigned: true,
+                          signer: { toString: () => 'relayer' },
+                          hash: { toString: () => '0xincomingbackfillsubmit' },
+                          method: {
+                            section: 'bridgeChannelInbound',
+                            method: 'submit',
+                            args: [
+                              { Sub: 'Liberland' },
+                              {
+                                source: { Liberland: LIBERLAND_ACCOUNT },
+                                dest: { Sora: 'alice' },
+                                assetId: XOR,
+                              },
+                            ],
+                            meta: {
+                              args: [{ name: 'networkId' }, { name: 'message' }],
+                            },
+                          },
+                        },
+                      ]
+                    : [],
+              },
+            };
+          },
+        },
+        state: {
+          getMetadata: async () => ({
+            asLatest: {
+              pallets: [{ name: { toString: () => 'bridgeChannelInbound' } }],
+            },
+          }),
+        },
+      },
+      at: async (hash: string) => ({
+        query: {
+          system: {
+            events: async () =>
+              hash === `hash-${bridgeBlock}`
+                ? [
+                    eventRecord('bridgeProxy', 'RequestStatusUpdate', {
+                      requestHash: '0xincomingbackfillrequest',
+                      status: 'Done',
+                    }),
+                    eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: (4n * SCALE).toString() }),
+                  ]
+                : [],
+          },
+          timestamp: {
+            now: async () => ({ toString: () => '1700000003000' }),
+          },
+        },
+      }),
+      query: {
+        system: {
+          events: {
+            at: async (hash: string) =>
+              hash === `hash-${bridgeBlock}`
+                ? [
+                    eventRecord('bridgeProxy', 'RequestStatusUpdate', {
+                      requestHash: '0xincomingbackfillrequest',
+                      status: 'Done',
+                    }),
+                    eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: (4n * SCALE).toString() }),
+                  ]
+                : [],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000003000' }),
+          },
+        },
+      },
+    };
+    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
+
+    await indexer.backfillBridgeProxyHistory(bridgeBlock);
+
+    const original = await repository.get('historyElements', '0xincomingbackfillsubmit');
+    const history = await repository.get('historyElements', '0xincomingbackfillrequest-mint');
+    const aliceActivity = await repository.get('accountTransactions', '0xincomingbackfillrequest-mint-alice');
+    const externalActivity = await repository.get('accountTransactions', `0xincomingbackfillrequest-mint-${LIBERLAND_ACCOUNT}`);
+
+    expect(original).toBeNull();
+    expect(history?.data).toMatchObject({
+      module: 'bridgeProxy',
+      method: 'mint',
+      address: 'relayer',
+      dataFrom: 'alice',
+      dataTo: LIBERLAND_ACCOUNT,
+      data: {
+        assetId: XOR,
+        amount: '4',
+        amountUSD: '8',
+        networkId: 'Liberland',
+        externalNetwork: 'Liberland',
+        externalNetworkType: 'Sub',
+        recipient: 'alice',
+        sender: LIBERLAND_ACCOUNT,
+        requestHash: '0xincomingbackfillrequest',
+        status: 'Done',
+      },
+    });
+    expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: '0xincomingbackfillrequest-mint' });
+    expect(externalActivity).toBeNull();
+  });
+
   it('subscribes to finalized heads before running startup maintenance backfills', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
@@ -3230,6 +3731,7 @@ describe('ChainIndexer price derivation', () => {
       refreshIndexingState: () => Promise<void>;
       refreshDerivedState: (blockHeight: number, timestamp: number, includeSnapshots: boolean) => Promise<void>;
       backfillXorBurns: (finalizedBlock: number) => Promise<void>;
+      backfillBridgeProxyHistory: (finalizedBlock: number) => Promise<void>;
       backfill: () => Promise<boolean>;
       backfillAccountTransactions: () => Promise<boolean>;
       backfillNetworkAggregateSnapshots: () => Promise<boolean>;
@@ -3257,6 +3759,9 @@ describe('ChainIndexer price derivation', () => {
     };
     indexer.backfillXorBurns = async () => {
       order.push('xor-burn-backfill');
+    };
+    indexer.backfillBridgeProxyHistory = async () => {
+      order.push('bridge-history-backfill');
     };
     indexer.backfill = async () => {
       order.push('normal-backfill-start');
@@ -3302,6 +3807,7 @@ describe('ChainIndexer price derivation', () => {
         'repair-network-counters',
         'network-aggregate-backfill',
         'xor-burn-backfill',
+        'bridge-history-backfill',
       ]);
     });
     apiCreate.mockRestore();
@@ -3681,7 +4187,7 @@ describe('ChainIndexer price derivation', () => {
       fee: 0n,
     });
     const documents = await indexer.createAccountDocuments(['alice'], 'history-3', 10, 1000, pendingPointData, {
-      module: 'referenda',
+      module: 'democracy',
       method: 'vote',
       data: { amount: '7', amountUSD: '14' },
       fee: 0n,
@@ -3815,6 +4321,56 @@ describe('ChainIndexer price derivation', () => {
         },
       },
     ]);
+  });
+
+  it('preserves accumulated referral rewards when storage refreshes referral relationships', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      createEventDocuments: (
+        events: unknown[],
+        blockHeight: number,
+        timestamp: number,
+        signer: string
+      ) => Array<{ collection: string; id: string; data: Record<string, unknown> }>;
+      createReferralDocuments: (referrers: unknown[], blockHeight: number, timestamp: number) => unknown[];
+      prepareReferrerRewardDocuments: (documents: unknown[]) => Promise<any[]>;
+    };
+
+    await repository.upsert({
+      collection: 'referrerRewards',
+      id: 'dave-charlie',
+      blockHeight: 11,
+      timestamp: 1_700_000_000,
+      data: {
+        id: 'dave-charlie',
+        referral: 'charlie',
+        referrer: 'dave',
+        updated: 1_700_000_000,
+        amount: '100',
+      },
+    });
+
+    const rewardDocuments = indexer.createEventDocuments(
+      [eventRecord('xorFee', 'ReferrerRewarded', { referral: 'charlie', referrer: 'dave', amount: '23' })],
+      12,
+      1_700_000_010,
+      'fallback-signer'
+    );
+    const storageDocuments = indexer.createReferralDocuments(
+      [[{ args: ['charlie'] }, { toJSON: () => 'dave' }]],
+      12,
+      1_700_000_010
+    );
+
+    await repository.upsertMany(await indexer.prepareReferrerRewardDocuments([...rewardDocuments, ...storageDocuments]));
+
+    await expect(repository.get('referrerRewards', 'dave-charlie')).resolves.toMatchObject({
+      data: {
+        amount: '123',
+        referral: 'charlie',
+        referrer: 'dave',
+      },
+    });
   });
 
   it('preserves vault creation blocks while refreshing storage-derived vaults', async () => {
@@ -4186,6 +4742,61 @@ describe('ChainIndexer price derivation', () => {
     expect(defaultSnapshot?.id).toBe(`orderBook-${orderBookId}-DEFAULT-1700000100`);
     expect(defaultSnapshot?.data.timestamp).toBe(timestamp);
     expect(daySnapshot?.id).toBe(`orderBook-${orderBookId}-DAY-1699920000`);
+  });
+
+  it('projects Polkamarkt runtime storage into production market documents', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createPolkamarktMarketDocuments: (
+        conditions: unknown[],
+        markets: unknown[],
+        pools: unknown[],
+        volumes: unknown[],
+        totals: unknown[],
+        resolutions: unknown[],
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        blockHeight: number,
+        timestamp: number
+      ) => Array<{ collection: string; id: string; data: Record<string, unknown> }>;
+    };
+    const bytes = (value: string) => [...Buffer.from(value)];
+    const assets = new Map([[KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 0n }]]);
+
+    const documents = indexer.createPolkamarktMarketDocuments(
+      [[{ args: [7] }, { question: bytes('Will KUSD stay at peg?'), oracle: bytes('SORA Democracy'), resolutionSource: bytes('sora:governance:democracy:referendum:124') }]],
+      [[{ args: [3] }, { creator: 'alice', conditionId: 7, closeBlock: 123_456, collateralAsset: KUSD, seedLiquidity: (1_000n * SCALE).toString(), status: 'Open' }]],
+      [[{ args: [3] }, { collateral: (1_200n * SCALE).toString(), yes: (40n * SCALE).toString(), no: (60n * SCALE).toString() }]],
+      [[{ args: [3] }, (250n * SCALE).toString()]],
+      [],
+      [],
+      assets,
+      77,
+      1_700_000_349
+    );
+
+    expect(documents).toHaveLength(1);
+    expect(documents[0]).toMatchObject({
+      collection: 'markets',
+      id: '3',
+      data: {
+        id: '3',
+        marketId: 3,
+        conditionId: 7,
+        title: 'Will KUSD stay at peg?',
+        category: 'Other',
+        oracle: 'SORA Democracy',
+        resolutionSource: 'sora:governance:democracy:referendum:124',
+        closeBlock: 123_456,
+        status: 'Open',
+        liquidityUSD: '1200',
+        volumeUSD: '250',
+        probability: 60,
+        priceYes: 0.6,
+        governancePallet: 'democracy',
+        governanceBody: 'Democracy',
+        governanceKind: 'Referendum',
+        governanceReferendumIndex: 124,
+      },
+    });
   });
 
   it('does not emit price chart snapshots when snapshots are disabled', async () => {

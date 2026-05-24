@@ -10,6 +10,9 @@ export type AppConfig = {
   snapshotIntervalBlocks: number;
 };
 
+const DEFAULT_CHAIN_STATE_REFRESH_INTERVAL_BLOCKS = 25;
+const DEFAULT_CHAIN_SNAPSHOT_INTERVAL_BLOCKS = 25;
+
 const readNumber = (name: string, fallback: number): number => {
   const value = process.env[name];
   if (!value) return fallback;
@@ -34,7 +37,10 @@ export function readConfig(): AppConfig {
     soraWsEndpoint: process.env.SORA_WS_ENDPOINT ?? 'wss://mof2.sora.org',
     chainStartBlock: readNumber('CHAIN_START_BLOCK', 0),
     chainBatchSize: readNumber('CHAIN_BATCH_SIZE', 25),
-    stateRefreshIntervalBlocks: readNumber('CHAIN_STATE_REFRESH_INTERVAL_BLOCKS', 250),
-    snapshotIntervalBlocks: readNumber('CHAIN_SNAPSHOT_INTERVAL_BLOCKS', 250),
+    stateRefreshIntervalBlocks: readNumber(
+      'CHAIN_STATE_REFRESH_INTERVAL_BLOCKS',
+      DEFAULT_CHAIN_STATE_REFRESH_INTERVAL_BLOCKS
+    ),
+    snapshotIntervalBlocks: readNumber('CHAIN_SNAPSHOT_INTERVAL_BLOCKS', DEFAULT_CHAIN_SNAPSHOT_INTERVAL_BLOCKS),
   };
 }

@@ -26,6 +26,10 @@ type ConnectionArgs = {
   filter?: Record<string, unknown> | null;
 };
 
+type AccountActivityConnectionArgs = ConnectionArgs & {
+  where?: Record<string, unknown> | null;
+};
+
 type Edge = {
   cursor: string;
   node: Record<string, unknown>;
@@ -216,6 +220,8 @@ const activePoolFilter = {
 const cachedConnectionCollections = new Set<IndexerCollection>([
   'assets',
   'assetSnapshots',
+  'markets',
+  'marketOrderbooks',
   'networkSnapshots',
   'poolXYKs',
   'poolSnapshots',
@@ -525,6 +531,264 @@ const createDocumentResolver =
     });
   };
 
+const marketOrderbookResolver = async (
+  _parent: unknown,
+  args: { marketId: number },
+  context: Context
+): Promise<Record<string, unknown> | null> => {
+  const marketId = Number(args.marketId);
+  if (!Number.isSafeInteger(marketId) || marketId < 0) return null;
+
+  return (await context.repository.get(collection('marketOrderbooks'), String(marketId)))?.data ?? null;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+
+const readString = (value: unknown): string | null => {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  const text = String(value).trim();
+  return text.length ? text : null;
+};
+
+const readNumber = (value: unknown): number | null => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const readEqualFilterValue = (value: unknown): string | null => {
+  const direct = readString(value);
+  if (direct) return direct;
+
+  if (!isRecord(value)) return null;
+
+  return readString(value.equalTo) ?? readString(value.eq) ?? readString(value._eq) ?? null;
+};
+
+const readAccountFromFilter = (filter: unknown): string | null => {
+  if (!isRecord(filter)) return null;
+
+  for (const [key, value] of Object.entries(filter)) {
+    if ((key === 'and' || key === 'or') && Array.isArray(value)) {
+      const nested = value.map(readAccountFromFilter).find((account): account is string => Boolean(account));
+      if (nested) return nested;
+      continue;
+    }
+
+    if (key === 'account_eq' || key === 'accountId_eq' || key === 'account_id_eq') {
+      const account = readString(value);
+      if (account) return account;
+    }
+
+    if (key === 'account' || key === 'accountId' || key === 'account_id') {
+      const account = readEqualFilterValue(value);
+      if (account) return account;
+    }
+  }
+
+  return null;
+};
+
+const readAccountFromArgs = (args: AccountActivityConnectionArgs): string | null =>
+  readAccountFromFilter(args.where) ?? readAccountFromFilter(args.filter);
+
+const accountHistoryFilter = (account: string): Record<string, unknown> => ({
+  or: [
+    { address: { equalTo: account } },
+    { dataFrom: { equalTo: account } },
+    { dataTo: { equalTo: account } },
+  ],
+});
+
+const queryDocuments = async (
+  repository: IndexerRepository,
+  collectionName: IndexerCollection,
+  args: AccountActivityConnectionArgs,
+  filter: Record<string, unknown>,
+  orderBy: unknown = ['TIMESTAMP_DESC']
+) => {
+  const queryArgs: RepositoryQueryArgs = {
+    first: args.first,
+    last: args.last,
+    offset: args.offset,
+    after: args.after,
+    orderBy,
+    filter,
+    includeTotalCount: true,
+  };
+
+  if (repository.query) return repository.query(collectionName, queryArgs);
+
+  const documents = await repository.list(collectionName);
+  const filtered = sortDocuments(
+    documents.filter((document) => matchesFilter(document.data, filter)),
+    orderBy
+  );
+  const totalCount = filtered.length;
+  const { end, pageStart } = paginationWindow(args, totalCount);
+
+  return {
+    items: filtered.slice(pageStart, end),
+    totalCount,
+    pageStart,
+    hasNextPage: end < totalCount,
+    hasPreviousPage: pageStart > 0,
+  };
+};
+
+const connectionFromNodes = (
+  nodes: Record<string, unknown>[],
+  result: { totalCount: number | null; pageStart?: number; hasNextPage?: boolean; hasPreviousPage?: boolean },
+  args: ConnectionArgs
+) => {
+  const fallbackTotalCount =
+    result.totalCount ?? (result.pageStart ?? 0) + nodes.length + (result.hasNextPage ? 1 : 0);
+  const { pageStart: fallbackPageStart } = paginationWindow(args, fallbackTotalCount);
+  const pageStart = result.pageStart ?? fallbackPageStart;
+  const edges: Edge[] = nodes.map((node, index) => ({
+    cursor: String(pageStart + index),
+    node,
+  }));
+
+  return {
+    edges,
+    totalCount: fallbackTotalCount,
+    pageInfo: edges.length
+      ? {
+          hasNextPage: result.hasNextPage ?? false,
+          hasPreviousPage: result.hasPreviousPage ?? pageStart > 0,
+          startCursor: edges[0]?.cursor ?? null,
+          endCursor: edges[edges.length - 1]?.cursor ?? null,
+        }
+      : emptyPageInfo,
+  };
+};
+
+const firstValue = (records: Array<Record<string, unknown>>, keys: string[]): unknown => {
+  for (const record of records) {
+    for (const key of keys) {
+      if (record[key] !== undefined && record[key] !== null) return record[key];
+    }
+  }
+
+  return undefined;
+};
+
+const normalizeSide = (value: unknown): string | null => {
+  const method = readString(value)?.toLowerCase();
+  if (!method) return null;
+  if (method.includes('claim')) return 'claim';
+  if (method.includes('sell')) return 'sell';
+  if (method.includes('buy')) return 'buy';
+  return method;
+};
+
+const timestampIso = (value: unknown): string | null => {
+  const timestamp = readNumber(value);
+  if (timestamp === null || timestamp <= 0) return readString(value);
+
+  const milliseconds = timestamp > 1_000_000_000_000 ? timestamp : timestamp * 1000;
+  return new Date(milliseconds).toISOString();
+};
+
+const toAccountTradeNode = (
+  historyDocument: IndexerDocument | null | undefined,
+  account: string,
+  accountTransaction?: IndexerDocument
+): Record<string, unknown> => {
+  const source = historyDocument?.data ?? accountTransaction?.data ?? {};
+  const payload = isRecord(source.data) ? source.data : {};
+  const calls = Array.isArray(source.calls) ? source.calls.filter(isRecord) : [];
+  const firstCall = calls[0] ?? {};
+  const firstCallData = isRecord(firstCall.data) ? firstCall.data : {};
+  const records = [source, payload, firstCall, firstCallData];
+  const marketId = readNumber(firstValue(records, ['marketId', 'market_id', 'conditionId', 'condition_id']));
+  const timestamp = firstValue(records, ['timestamp']) ?? historyDocument?.timestamp ?? accountTransaction?.timestamp;
+  const blockNumber = readNumber(
+    firstValue(records, ['blockNumber', 'block', 'blockHeight']) ??
+      historyDocument?.blockHeight ??
+      accountTransaction?.blockHeight
+  );
+  const id =
+    readString(accountTransaction?.data.id) ??
+    readString(source.id) ??
+    readString(accountTransaction?.id) ??
+    readString(historyDocument?.id) ??
+    `${account}-${String(timestamp ?? 'activity')}`;
+
+  return {
+    id,
+    account,
+    marketId,
+    side: normalizeSide(firstValue(records, ['side', 'action', 'method'])),
+    outcome: readString(firstValue(records, ['outcome', 'direction'])),
+    collateralUsd: readString(firstValue(records, ['collateralUsd', 'collateralUSD', 'collateralAmountUsd', 'amountUsd'])),
+    collateralAmountUsd: readString(firstValue(records, ['collateralAmountUsd', 'collateralUsd', 'amountUsd'])),
+    shares: readString(firstValue(records, ['shares', 'sharesAmount', 'shareAmount'])),
+    sharesAmount: readString(firstValue(records, ['sharesAmount', 'shares', 'shareAmount'])),
+    price: readString(firstValue(records, ['price', 'executionPrice', 'avgPrice'])),
+    executionPrice: readString(firstValue(records, ['executionPrice', 'price', 'avgPrice'])),
+    feeUsd: readString(firstValue(records, ['feeUsd', 'feeUSD', 'feeAmountUsd'])),
+    feeAmountUsd: readString(firstValue(records, ['feeAmountUsd', 'feeUsd', 'feeUSD'])),
+    realizedPnlUsd: readString(firstValue(records, ['realizedPnlUsd', 'realizedPnlUSD', 'pnlUsd'])),
+    timestamp: timestampIso(timestamp),
+    blockNumber,
+    blockHash: readString(source.blockHash),
+    extrinsicHash: readString(source.id) ?? readString(historyDocument?.id),
+    market: marketId === null ? null : { id: String(marketId), marketId },
+  };
+};
+
+const accountPositionsResolver = async (
+  _parent: unknown,
+  args: AccountActivityConnectionArgs
+) => buildConnection([], args);
+
+const accountTradesResolver = async (
+  _parent: unknown,
+  args: AccountActivityConnectionArgs,
+  context: Context
+) => {
+  const account = readAccountFromArgs(args);
+  if (!account) return buildConnection([], args);
+
+  const accountTransactionResult = await queryDocuments(
+    context.repository,
+    collection('accountTransactions'),
+    args,
+    { accountId: { equalTo: account } },
+    args.orderBy ?? ['TIMESTAMP_DESC']
+  );
+
+  if (accountTransactionResult.items.length || (accountTransactionResult.totalCount ?? 0) > 0) {
+    const historyIds = accountTransactionResult.items
+      .map((document) => readString(document.data.historyElementId))
+      .filter((id): id is string => Boolean(id));
+    const historyDocuments = await context.repository.getMany(collection('historyElements'), historyIds);
+    const nodes = accountTransactionResult.items.map((document) => {
+      const historyElementId = readString(document.data.historyElementId);
+      return toAccountTradeNode(historyElementId ? historyDocuments.get(historyElementId) : null, account, document);
+    });
+
+    return connectionFromNodes(nodes, accountTransactionResult, args);
+  }
+
+  const historyResult = await queryDocuments(
+    context.repository,
+    collection('historyElements'),
+    args,
+    accountHistoryFilter(account),
+    args.orderBy ?? ['TIMESTAMP_DESC']
+  );
+
+  return connectionFromNodes(
+    historyResult.items.map((document) => toAccountTradeNode(document, account)),
+    historyResult,
+    args
+  );
+};
+
 type MutationPayload = {
   id: string;
   mutation_type: 'INSERT' | 'UPDATE';
@@ -660,6 +924,10 @@ export function createSchema(): GraphQLSchema {
         assets: connectionResolver(collection('assets')),
         assetSnapshots: connectionResolver(collection('assetSnapshots')),
         accountLiquiditySnapshots: connectionResolver(collection('accountLiquiditySnapshots')),
+        market: documentResolver(collection('markets')),
+        markets: connectionResolver(collection('markets')),
+        marketOrderbook: marketOrderbookResolver,
+        marketOrderbooks: connectionResolver(collection('marketOrderbooks')),
         networkSnapshots: connectionResolver(collection('networkSnapshots')),
         poolXYKs: connectionResolver(collection('poolXYKs')),
         poolSnapshots: connectionResolver(collection('poolSnapshots')),
@@ -677,6 +945,8 @@ export function createSchema(): GraphQLSchema {
         updatesStream: documentResolver(collection('updatesStreams')),
         accountMeta: documentResolver(collection('accountMeta')),
         accountPointSystems: connectionResolver(collection('accountPointSystems')),
+        accountPositions: accountPositionsResolver,
+        accountTrades: accountTradesResolver,
         exploreStats: cachedExploreStatsResolver,
         networkAccountActivity: cachedNetworkAccountActivityResolver,
       },

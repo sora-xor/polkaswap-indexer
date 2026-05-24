@@ -8,6 +8,8 @@ export type IndexerCollection =
   | 'assetSnapshots'
   | 'historyCalls'
   | 'historyElements'
+  | 'markets'
+  | 'marketOrderbooks'
   | 'networkSnapshots'
   | 'orderBooks'
   | 'orderBookOrders'
