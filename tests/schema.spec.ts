@@ -142,6 +142,19 @@ describe('Polkaswap indexer schema', () => {
     });
   });
 
+  it('serves mobile app config for SORA iOS', async () => {
+    const schema = createSchema();
+    const mobileConfigField = schema.getQueryType()?.getFields().mobileConfig;
+
+    expect(mobileConfigField?.resolve?.({}, {}, { repository: new MemoryRepository() }, {} as never)).toEqual({
+      blockExplorerUrl: 'https://sorametrics.org/sorav2?tab=extrinsics&q={transaction}',
+      substrateTypesUrl:
+        'https://raw.githubusercontent.com/sora-xor/sora2-substrate-js-library/metadata14ios/packages/types/src/metadata/prod/types_scalecodec_mobile.json',
+      soracard: false,
+      nodes: [{ name: 'Sora', address: 'wss://mof2.sora.org' }],
+    });
+  });
+
   it('derives Explore stats from active market documents and the latest day network snapshot', async () => {
     const repository = new MemoryRepository();
     await repository.upsertMany([
@@ -295,7 +308,7 @@ describe('Polkaswap indexer schema', () => {
       volumeDayUSD: '10.5',
       updatedAtTimestamp: 100,
     });
-    expect(networkSnapshots).toEqual({
+    expect(networkSnapshots).toMatchObject({
       edges: [
         {
           cursor: '0',
@@ -687,7 +700,7 @@ describe('Polkaswap indexer schema', () => {
       {} as never
     );
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       totalCount: 1,
       edges: [
         {
@@ -800,7 +813,7 @@ describe('Polkaswap indexer schema', () => {
       {} as never
     );
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       totalCount: 2,
       edges: [
         {
@@ -851,7 +864,7 @@ describe('Polkaswap indexer schema', () => {
       {} as never
     );
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       totalCount: 4,
       edges: [
         {
@@ -904,7 +917,7 @@ describe('Polkaswap indexer schema', () => {
       {} as never
     );
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       edges: [],
       totalCount: 0,
       pageInfo: {
@@ -1118,6 +1131,128 @@ describe('Polkaswap indexer schema', () => {
     expect(accountMeta).toMatchObject({
       createdAtBlock: 1,
       xorFees: { amount: '0', amountUSD: '0' },
+    });
+  });
+
+  it('accepts the Fearless iOS SORA history filter shape', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert({
+      collection: 'historyElements',
+      id: 'history-transfer',
+      data: {
+        id: 'history-transfer',
+        timestamp: 20,
+        method: 'transfer',
+        address: 'alice',
+        dataTo: 'bob',
+        execution: { success: true },
+      },
+    });
+    await repository.upsert({
+      collection: 'historyElements',
+      id: 'history-swap',
+      data: {
+        id: 'history-swap',
+        timestamp: 10,
+        method: 'swap',
+        address: 'alice',
+        dataTo: 'bob',
+        execution: { success: true },
+      },
+    });
+
+    const schema = createSchema();
+    const historyField = schema.getQueryType()?.getFields().historyElements;
+    const history = await historyField?.resolve?.(
+      {},
+      {
+        first: 100,
+        orderBy: ['TIMESTAMP_DESC'],
+        filter: {
+          or: [
+            { address: 'alice', method: { notIn: ['swap', 'rewarded'] } },
+            { dataTo: 'alice', method: { notIn: ['swap', 'rewarded'] } },
+          ],
+        },
+      },
+      { repository },
+      {} as never
+    );
+
+    expect(history).toMatchObject({
+      totalCount: 1,
+      nodes: [{ id: 'history-transfer', execution: { success: true } }],
+      edges: [{ node: { id: 'history-transfer', execution: { success: true } } }],
+    });
+  });
+
+  it('does not let adversarial filter paths match inherited Object properties', async () => {
+    Object.defineProperty(Object.prototype, 'polkaswapIndexerPolluted', {
+      configurable: true,
+      value: 'owned',
+    });
+
+    try {
+      const repository = new MemoryRepository();
+      await repository.upsert({
+        collection: 'assets',
+        id: 'asset-a',
+        data: { id: 'asset-a', symbol: 'XOR', liquidity: '10' },
+      });
+
+      const schema = createSchema();
+      const assetsField = schema.getQueryType()?.getFields().assets;
+      const assets = await assetsField?.resolve?.(
+        {},
+        {
+          first: 10,
+          filter: {
+            '__proto__.polkaswapIndexerPolluted': { equalTo: 'owned' },
+          },
+        },
+        { repository },
+        {} as never
+      );
+
+      expect(assets).toMatchObject({
+        totalCount: 0,
+        nodes: [],
+        edges: [],
+      });
+    } finally {
+      delete (Object.prototype as { polkaswapIndexerPolluted?: unknown }).polkaswapIndexerPolluted;
+    }
+  });
+
+  it('serves SubQuery-style nodes and mobile metadata for referrer rewards', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert({
+      collection: 'referrerRewards',
+      id: 'alice-bob',
+      blockHeight: 42,
+      timestamp: 1234,
+      data: {
+        id: 'alice-bob',
+        referral: 'bob',
+        referrer: 'alice',
+        updated: 1234,
+        amount: '0',
+      },
+    });
+
+    const schema = createSchema();
+    const rewardsField = schema.getQueryType()?.getFields().referrerRewards;
+    const rewards = await rewardsField?.resolve?.(
+      {},
+      { first: 10, filter: { referrer: { equalTo: 'alice' } } },
+      { repository },
+      {} as never
+    );
+
+    expect(rewards).toMatchObject({
+      totalCount: 1,
+      nodes: [{ id: 'alice-bob', blockHeight: '42', timestamp: 1234 }],
+      edges: [{ node: { id: 'alice-bob', blockHeight: '42', timestamp: 1234 } }],
     });
   });
 

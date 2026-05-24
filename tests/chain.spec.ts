@@ -4316,6 +4316,8 @@ describe('ChainIndexer price derivation', () => {
           id: 'dave-charlie',
           referral: 'charlie',
           referrer: 'dave',
+          blockHeight: '12',
+          timestamp: 1_700_000_000,
           updated: 1_700_000_000,
           amount: '0',
         },

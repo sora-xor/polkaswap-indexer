@@ -5574,6 +5574,8 @@ export class ChainIndexer {
           id: `${referrer}-${referral}`,
           referral,
           referrer,
+          blockHeight: String(blockHeight),
+          timestamp,
           updated: timestamp,
           amount: '0',
         },

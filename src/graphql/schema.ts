@@ -51,6 +51,18 @@ export const typeDefs = /* GraphQL */ `
     service: String!
   }
 
+  type MobileChainNode {
+    name: String!
+    address: String!
+  }
+
+  type MobileConfig {
+    blockExplorerUrl: String!
+    substrateTypesUrl: String
+    soracard: Boolean!
+    nodes: [MobileChainNode!]!
+  }
+
   type PageInfo {
     hasNextPage: Boolean!
     hasPreviousPage: Boolean!
@@ -121,6 +133,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type AccountPointSystemConnection {
+    nodes: [AccountPointSystem!]!
     edges: [AccountPointSystemEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -145,6 +158,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type AssetConnection {
+    nodes: [Asset!]!
     edges: [AssetEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -168,6 +182,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type AssetSnapshotConnection {
+    nodes: [AssetSnapshot!]!
     edges: [AssetSnapshotEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -194,6 +209,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type PoolXYKConnection {
+    nodes: [PoolXYK!]!
     edges: [PoolXYKEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -223,6 +239,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type PoolSnapshotConnection {
+    nodes: [PoolSnapshot!]!
     edges: [PoolSnapshotEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -243,6 +260,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type AccountLiquiditySnapshotConnection {
+    nodes: [AccountLiquiditySnapshot!]!
     edges: [AccountLiquiditySnapshotEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -273,6 +291,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type NetworkSnapshotConnection {
+    nodes: [NetworkSnapshot!]!
     edges: [NetworkSnapshotEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -446,6 +465,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type OrderBookConnection {
+    nodes: [OrderBook!]!
     edges: [OrderBookEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -475,6 +495,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type OrderBookOrderConnection {
+    nodes: [OrderBookOrder!]!
     edges: [OrderBookOrderEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -498,6 +519,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type OrderBookSnapshotConnection {
+    nodes: [OrderBookSnapshot!]!
     edges: [OrderBookSnapshotEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -538,6 +560,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type HistoryElementConnection {
+    nodes: [HistoryElement!]!
     edges: [HistoryElementEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -560,6 +583,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type XorBurnConnection {
+    nodes: [XorBurn!]!
     edges: [XorBurnEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -569,6 +593,8 @@ export const typeDefs = /* GraphQL */ `
     id: String!
     referral: String
     referrer: String
+    blockHeight: String
+    timestamp: Int
     updated: Int
     amount: String
   }
@@ -579,6 +605,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type ReferrerRewardConnection {
+    nodes: [ReferrerReward!]!
     edges: [ReferrerRewardEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -594,6 +621,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type StakingStakerConnection {
+    nodes: [StakingStaker!]!
     edges: [StakingStakerEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -621,6 +649,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type StakingValidatorConnection {
+    nodes: [StakingValidator!]!
     edges: [StakingValidatorEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -644,6 +673,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type VaultConnection {
+    nodes: [Vault!]!
     edges: [VaultEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -664,6 +694,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type VaultEventConnection {
+    nodes: [VaultEvent!]!
     edges: [VaultEventEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
@@ -708,6 +739,7 @@ export const typeDefs = /* GraphQL */ `
 
   type Query {
     _health: Health!
+    mobileConfig: MobileConfig!
     account(id: String!): JSON
     assets(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AssetFilter): AssetConnection!
     assetSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AssetSnapshotFilter): AssetSnapshotConnection!

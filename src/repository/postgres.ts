@@ -24,6 +24,8 @@ const afterToOffset = (after: RepositoryQueryArgs['after']): number => {
 };
 
 const isSafeJsonField = (field: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(field);
+const isFilterObject = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
 
 const sqlJsonField = (field: string): string => {
   if (field === 'id') return 'id';
@@ -105,6 +107,11 @@ const toDatabasePayload = (documents: IndexerDocument[]): string =>
   );
 
 const isNullishFilterValue = (value: unknown): boolean => value === null || value === undefined || value === 'null';
+const stringArrayFilterValues = (value: unknown): string[] | null => {
+  if (!Array.isArray(value)) return null;
+
+  return value.filter((item) => !isNullishFilterValue(item)).map(String);
+};
 
 const scalarCondition = (
   field: string,
@@ -135,14 +142,25 @@ const scalarCondition = (
         return `${expression} <> $${values.length}`;
       case 'in':
         {
-          const expectedValues = (Array.isArray(expected) ? expected : [])
-            .filter((item) => !isNullishFilterValue(item))
-            .map(String);
+          const expectedValues = stringArrayFilterValues(expected);
+          if (expectedValues === null) return 'false';
           if (expectedValues.length === 0) return 'true';
           values.push(expectedValues);
         }
         if (nativeNumericExpression) return `${nativeNumericExpression} = any($${values.length}::bigint[])`;
         return `${expression} = any($${values.length}::text[])`;
+      case 'notIn':
+      case 'not_in':
+        {
+          const expectedValues = stringArrayFilterValues(expected);
+          if (expectedValues === null) return 'false';
+          if (expectedValues.length === 0) return 'true';
+          values.push(expectedValues);
+        }
+        if (nativeNumericExpression) {
+          return `(${nativeNumericExpression} is null or not (${nativeNumericExpression} = any($${values.length}::bigint[])))`;
+        }
+        return `(${expression} is null or not (${expression} = any($${values.length}::text[])))`;
       case 'greaterThan':
       case 'gt':
         values.push(String(expected));
@@ -182,7 +200,7 @@ const scalarCondition = (
         const objectIndex = values.length;
         return `(${sqlJsonValue(field)} @> $${arrayIndex}::jsonb or data @> $${objectIndex}::jsonb)`;
       default:
-        return 'true';
+        return 'false';
     }
   });
 
@@ -194,16 +212,20 @@ const filterCondition = (filter: Record<string, unknown> | null | undefined, val
 
   const clauses = Object.entries(filter).map(([field, condition]) => {
     if (field === 'and') {
-      const items = Array.isArray(condition) ? condition : [];
+      if (!Array.isArray(condition)) return 'false';
+      const items = condition.filter(isFilterObject);
+      if (items.length !== condition.length) return 'false';
       return `(${items.map((item) => filterCondition(item as Record<string, unknown>, values)).join(' and ') || 'true'})`;
     }
 
     if (field === 'or') {
-      const items = Array.isArray(condition) ? condition : [];
+      if (!Array.isArray(condition)) return 'false';
+      const items = condition.filter(isFilterObject);
+      if (items.length !== condition.length) return 'false';
       return `(${items.map((item) => filterCondition(item as Record<string, unknown>, values)).join(' or ') || 'false'})`;
     }
 
-    if (condition && typeof condition === 'object' && !Array.isArray(condition)) {
+    if (condition && isFilterObject(condition)) {
       return `(${scalarCondition(field, condition as Record<string, unknown>, values)})`;
     }
 

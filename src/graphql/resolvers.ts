@@ -195,6 +195,7 @@ const buildConnection = (items: Record<string, unknown>[], args: ConnectionArgs)
   }));
 
   return {
+    nodes: pageItems,
     edges,
     totalCount,
     pageInfo: edges.length
@@ -207,6 +208,30 @@ const buildConnection = (items: Record<string, unknown>[], args: ConnectionArgs)
       : emptyPageInfo,
   };
 };
+
+const toConnectionNode = (collectionName: IndexerCollection, document: IndexerDocument): Record<string, unknown> => {
+  if (collectionName !== 'referrerRewards') return document.data;
+
+  return {
+    ...document.data,
+    blockHeight:
+      document.data.blockHeight === undefined && document.blockHeight !== undefined && document.blockHeight !== null
+        ? String(document.blockHeight)
+        : document.data.blockHeight,
+    timestamp:
+      document.data.timestamp === undefined && document.timestamp !== undefined && document.timestamp !== null
+        ? document.timestamp
+        : document.data.timestamp,
+  };
+};
+
+const mobileConfigResolver = () => ({
+  blockExplorerUrl: 'https://sorametrics.org/sorav2?tab=extrinsics&q={transaction}',
+  substrateTypesUrl:
+    'https://raw.githubusercontent.com/sora-xor/sora2-substrate-js-library/metadata14ios/packages/types/src/metadata/prod/types_scalecodec_mobile.json',
+  soracard: false,
+  nodes: [{ name: 'Sora', address: 'wss://mof2.sora.org' }],
+});
 
 const activeAssetFilter = {
   or: [{ liquidity: { greaterThan: '0' } }, { liquidityBooks: { greaterThan: '0' } }],
@@ -486,12 +511,14 @@ const createConnectionResolver =
           result.totalCount ?? (result.pageStart ?? 0) + result.items.length + (result.hasNextPage ? 1 : 0);
         const { end, pageStart: fallbackPageStart } = paginationWindow(args, fallbackTotalCount);
         const pageStart = result.pageStart ?? fallbackPageStart;
+        const nodes = result.items.map((document) => toConnectionNode(collectionName, document));
         const edges: Edge[] = result.items.map((document, index) => ({
           cursor: String(pageStart + index),
-          node: document.data,
+          node: toConnectionNode(collectionName, document),
         }));
 
         return {
+          nodes,
           edges,
           totalCount: result.totalCount ?? fallbackTotalCount,
           pageInfo: edges.length
@@ -920,6 +947,7 @@ export function createSchema(): GraphQLSchema {
       ...FilterScalars,
       Query: {
         _health: healthResolver,
+        mobileConfig: mobileConfigResolver,
         account: documentResolver(collection('accounts')),
         assets: connectionResolver(collection('assets')),
         assetSnapshots: connectionResolver(collection('assetSnapshots')),
