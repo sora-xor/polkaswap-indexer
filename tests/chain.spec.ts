@@ -4,6 +4,8 @@ import { ApiPromise } from '@polkadot/api';
 import { ChainIndexer } from '../src/worker/chain.js';
 import { MemoryRepository } from '../src/repository/memory.js';
 
+import type { IndexerDocument } from '../src/repository/types.js';
+
 const SCALE = 10n ** 18n;
 const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000';
 const VAL = '0x0200040000000000000000000000000000000000000000000000000000000000';
@@ -5665,6 +5667,73 @@ describe('ChainIndexer price derivation', () => {
         marketValueUsd: '90',
       },
     });
+  });
+
+  it('deletes stale Polkamarkt account positions after zero or removed storage entries', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'accountPositions',
+        id: '3-bob',
+        blockHeight: 70,
+        timestamp: 1_700_000_000,
+        data: { id: '3-bob', account: 'bob', marketId: 3, yesShares: '1' },
+      },
+      {
+        collection: 'accountPositions',
+        id: '3-zero',
+        blockHeight: 70,
+        timestamp: 1_700_000_000,
+        data: { id: '3-zero', account: 'zero', marketId: 3, yesShares: '9' },
+      },
+      {
+        collection: 'accountPositions',
+        id: '4-absent',
+        blockHeight: 70,
+        timestamp: 1_700_000_000,
+        data: { id: '4-absent', account: 'absent', marketId: 4, yesShares: '7' },
+      },
+    ]);
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      createPolkamarktPositionDocuments: (
+        positions: unknown[],
+        liquidityPositions: unknown[],
+        markets: unknown[],
+        pools: unknown[],
+        totals: unknown[],
+        resolutions: unknown[],
+        liquidityTotals: unknown[],
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        blockHeight: number,
+        timestamp: number
+      ) => IndexerDocument[];
+      deleteStaleAccountPositionDocuments: (activeDocuments: IndexerDocument[]) => Promise<void>;
+    };
+    const assets = new Map([[KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 0n }]]);
+    const activeDocuments = indexer.createPolkamarktPositionDocuments(
+      [
+        [{ args: [3, 'bob'] }, { yesShares: (5n * SCALE).toString(), noShares: 0, netCollateralPaid: (2n * SCALE).toString() }],
+        [{ args: [3, 'zero'] }, { yesShares: 0, noShares: 0, netCollateralPaid: 0 }],
+      ],
+      [[{ args: [3, 'zero'] }, { shares: 0, collateralContributed: 0 }]],
+      [[{ args: [3] }, { creator: 'alice', conditionId: 8, closeBlock: 222, collateralAsset: KUSD, seedLiquidity: (1_000n * SCALE).toString(), status: 'Open' }]],
+      [[{ args: [3] }, { collateral: (1_000n * SCALE).toString() }]],
+      [[{ args: [3] }, { totalYesShares: 0, totalNoShares: 0, totalNetCollateralPaid: 0 }]],
+      [],
+      [],
+      assets,
+      88,
+      1_700_000_555
+    );
+
+    expect(activeDocuments.map((document) => document.id)).toEqual(['3-bob']);
+
+    await repository.upsertMany(activeDocuments);
+    await indexer.deleteStaleAccountPositionDocuments(activeDocuments);
+
+    expect((await repository.get('accountPositions', '3-bob'))?.data.yesShares).toBe('5');
+    await expect(repository.get('accountPositions', '3-zero')).resolves.toBeNull();
+    await expect(repository.get('accountPositions', '4-absent')).resolves.toBeNull();
   });
 
   it('does not emit price chart snapshots when snapshots are disabled', async () => {

@@ -1070,6 +1070,9 @@ const findEvent = (events: EventRecord[], section: string, method: string): Reco
 const findEvents = (events: EventRecord[], section: string, method: string): Array<Record<string, unknown>> =>
   events.filter((item) => item.event.section === section && item.event.method === method).map((item) => eventData(item.event));
 
+const hasStorageEntries = (storage: unknown): boolean =>
+  typeof (storage as { entries?: unknown } | undefined)?.entries === 'function';
+
 const createAmountData = (assetId: string, amount: unknown, prices: Map<string, bigint>, assets: Map<string, AssetInfo>) => {
   const info = assets.get(assetId);
   const raw = codecToBigInt(amount);
@@ -3780,6 +3783,7 @@ export class ChainIndexer {
   private async refreshDerivedState(blockHeight: number, timestamp: number, includeSnapshots: boolean): Promise<void> {
     if (!this.api) throw new Error('Cannot refresh derived state before the chain API is initialized');
 
+    const canSynchronizeAccountPositions = this.canSynchronizePolkamarktAccountPositions();
     const auxiliaryStoragePromise = Promise.all([
       this.fetchStorageEntries((this.api.query as any).poolXYK.poolProviders, 'poolXYK.poolProviders'),
       this.fetchStorageEntries((this.api.query as any).staking.nominators, 'staking.nominators'),
@@ -3990,6 +3994,9 @@ export class ChainIndexer {
     ];
 
     await this.repository.upsertMany(marketDocuments);
+    if (canSynchronizeAccountPositions) {
+      await this.deleteStaleAccountPositionDocuments(polkamarktPositionDocuments);
+    }
 
     const [poolProviders, nominators, referrers, cdpEntries] = await auxiliaryStoragePromise;
     const [vaultDocuments, stakingValidatorDocuments] = await Promise.all([
@@ -4006,6 +4013,26 @@ export class ChainIndexer {
     ];
 
     await this.repository.upsertMany(await this.prepareReferrerRewardDocuments(auxiliaryDocuments));
+  }
+
+  private canSynchronizePolkamarktAccountPositions(): boolean {
+    const polkamarkt = (this.api?.query as { polkamarkt?: Record<string, unknown> } | undefined)?.polkamarkt;
+
+    return (
+      hasStorageEntries(polkamarkt?.markets) &&
+      hasStorageEntries(polkamarkt?.marketPositions) &&
+      hasStorageEntries(polkamarkt?.liquidityPositions)
+    );
+  }
+
+  private async deleteStaleAccountPositionDocuments(activeDocuments: IndexerDocument[]): Promise<void> {
+    const activeIds = new Set(activeDocuments.map((document) => document.id));
+    const currentDocuments = await this.repository.list(collection('accountPositions'));
+    const staleIds = currentDocuments.map((document) => document.id).filter((id) => !activeIds.has(id));
+
+    for (let start = 0; start < staleIds.length; start += 1_000) {
+      await this.repository.deleteMany(collection('accountPositions'), staleIds.slice(start, start + 1_000));
+    }
   }
 
   private derivePrices(

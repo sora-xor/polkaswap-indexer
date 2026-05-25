@@ -620,6 +620,56 @@ const readAccountFromFilter = (filter: unknown): string | null => {
 const readAccountFromArgs = (args: AccountActivityConnectionArgs): string | null =>
   readAccountFromFilter(args.where) ?? readAccountFromFilter(args.filter);
 
+const addFilterField = (filter: Record<string, unknown>, field: string, condition: unknown): void => {
+  const existing = filter[field];
+  if (existing === undefined) {
+    filter[field] = condition;
+    return;
+  }
+
+  delete filter[field];
+  const existingAnd = filter.and;
+  const andFilters = Array.isArray(existingAnd) ? existingAnd : existingAnd === undefined ? [] : [existingAnd];
+  filter.and = [...andFilters, { [field]: existing }, { [field]: condition }];
+};
+
+const normalizeAccountPositionFilter = (filter: unknown): Record<string, unknown> | null => {
+  if (!isRecord(filter)) return null;
+
+  const normalized: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(filter)) {
+    if ((key === 'and' || key === 'or') && Array.isArray(value)) {
+      normalized[key] = value.map((entry) => normalizeAccountPositionFilter(entry) ?? entry);
+      continue;
+    }
+
+    if (key === 'account_eq' || key === 'accountId_eq' || key === 'account_id_eq') {
+      addFilterField(normalized, 'account', { equalTo: value });
+      continue;
+    }
+
+    if (key === 'accountId' || key === 'account_id') {
+      addFilterField(normalized, 'account', value);
+      continue;
+    }
+
+    addFilterField(normalized, key, value);
+  }
+
+  return normalized;
+};
+
+const accountPositionFilterFromArgs = (args: AccountActivityConnectionArgs): Record<string, unknown> => {
+  const filters = [normalizeAccountPositionFilter(args.where), normalizeAccountPositionFilter(args.filter)].filter(
+    (filter): filter is Record<string, unknown> => Boolean(filter && Object.keys(filter).length)
+  );
+
+  if (filters.length === 0) return {};
+  if (filters.length === 1) return filters[0]!;
+  return { and: filters };
+};
+
 const accountHistoryFilter = (account: string): Record<string, unknown> => ({
   or: [
     { address: { equalTo: account } },
@@ -780,13 +830,11 @@ const accountPositionsResolver = async (
   args: AccountActivityConnectionArgs,
   context: Context
 ) => {
-  const account = readAccountFromArgs(args);
-  const filter = account ? { account: { equalTo: account } } : {};
   const result = await queryDocuments(
     context.repository,
     collection('accountPositions'),
     args,
-    filter,
+    accountPositionFilterFromArgs(args),
     args.orderBy ?? ['UPDATED_AT_DESC']
   );
 

@@ -740,6 +740,80 @@ describe('Polkaswap indexer schema', () => {
     });
   });
 
+  it('merges Polkamarkt account position account aliases with caller filters', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'accountPositions',
+        id: '7-alice',
+        blockHeight: 12,
+        timestamp: 200,
+        data: {
+          id: '7-alice',
+          account: 'alice',
+          marketId: 7,
+          status: 'Open',
+          updatedAt: '1970-01-01T00:03:20.000Z',
+        },
+      },
+      {
+        collection: 'accountPositions',
+        id: '8-alice',
+        blockHeight: 13,
+        timestamp: 220,
+        data: {
+          id: '8-alice',
+          account: 'alice',
+          marketId: 8,
+          status: 'Open',
+          updatedAt: '1970-01-01T00:03:40.000Z',
+        },
+      },
+      {
+        collection: 'accountPositions',
+        id: '7-alice-closed',
+        blockHeight: 14,
+        timestamp: 240,
+        data: {
+          id: '7-alice-closed',
+          account: 'alice',
+          marketId: 7,
+          status: 'Closed',
+          updatedAt: '1970-01-01T00:04:00.000Z',
+        },
+      },
+      {
+        collection: 'accountPositions',
+        id: '7-bob',
+        blockHeight: 15,
+        timestamp: 260,
+        data: {
+          id: '7-bob',
+          account: 'bob',
+          marketId: 7,
+          status: 'Open',
+          updatedAt: '1970-01-01T00:04:20.000Z',
+        },
+      },
+    ]);
+    const positionsField = createSchema().getQueryType()?.getFields().accountPositions;
+
+    const positions = (await positionsField?.resolve?.(
+      {},
+      {
+        where: { account_eq: 'alice', marketId: { equalTo: 7 } },
+        filter: { status: { equalTo: 'Open' } },
+        first: 10,
+        orderBy: ['UPDATED_AT_DESC'],
+      },
+      { repository },
+      {} as never
+    )) as { edges: Array<{ node: Record<string, unknown> }>; totalCount: number };
+
+    expect(positions.totalCount).toBe(1);
+    expect(positions.edges.map((edge) => edge.node.id)).toEqual(['7-alice']);
+  });
+
   it('exposes Polkamarkt flip activity fields', async () => {
     const repository = new MemoryRepository();
     await repository.upsertMany([
