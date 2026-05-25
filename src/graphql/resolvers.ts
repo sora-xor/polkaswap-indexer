@@ -705,6 +705,7 @@ const firstValue = (records: Array<Record<string, unknown>>, keys: string[]): un
 const normalizeSide = (value: unknown): string | null => {
   const method = readString(value)?.toLowerCase();
   if (!method) return null;
+  if (method.includes('flip')) return 'flip';
   if (method.includes('claim')) return 'claim';
   if (method.includes('sell')) return 'sell';
   if (method.includes('buy')) return 'buy';
@@ -750,14 +751,21 @@ const toAccountTradeNode = (
     marketId,
     side: normalizeSide(firstValue(records, ['side', 'action', 'method'])),
     outcome: readString(firstValue(records, ['outcome', 'direction'])),
+    fromOutcome: readString(firstValue(records, ['fromOutcome', 'from_outcome'])),
+    toOutcome: readString(firstValue(records, ['toOutcome', 'to_outcome'])),
     collateralUsd: readString(firstValue(records, ['collateralUsd', 'collateralUSD', 'collateralAmountUsd', 'amountUsd'])),
     collateralAmountUsd: readString(firstValue(records, ['collateralAmountUsd', 'collateralUsd', 'amountUsd'])),
+    collateralReinvestedUsd: readString(firstValue(records, ['collateralReinvestedUsd', 'collateralReinvestedUSD'])),
     shares: readString(firstValue(records, ['shares', 'sharesAmount', 'shareAmount'])),
     sharesAmount: readString(firstValue(records, ['sharesAmount', 'shares', 'shareAmount'])),
+    sharesIn: readString(firstValue(records, ['sharesIn', 'shares_in'])),
+    sharesOut: readString(firstValue(records, ['sharesOut', 'shares_out'])),
     price: readString(firstValue(records, ['price', 'executionPrice', 'avgPrice'])),
     executionPrice: readString(firstValue(records, ['executionPrice', 'price', 'avgPrice'])),
     feeUsd: readString(firstValue(records, ['feeUsd', 'feeUSD', 'feeAmountUsd'])),
     feeAmountUsd: readString(firstValue(records, ['feeAmountUsd', 'feeUsd', 'feeUSD'])),
+    sellFeeUsd: readString(firstValue(records, ['sellFeeUsd', 'sellFeeUSD'])),
+    buyFeeUsd: readString(firstValue(records, ['buyFeeUsd', 'buyFeeUSD'])),
     realizedPnlUsd: readString(firstValue(records, ['realizedPnlUsd', 'realizedPnlUSD', 'pnlUsd'])),
     timestamp: timestampIso(timestamp),
     blockNumber,
@@ -769,8 +777,25 @@ const toAccountTradeNode = (
 
 const accountPositionsResolver = async (
   _parent: unknown,
-  args: AccountActivityConnectionArgs
-) => buildConnection([], args);
+  args: AccountActivityConnectionArgs,
+  context: Context
+) => {
+  const account = readAccountFromArgs(args);
+  const filter = account ? { account: { equalTo: account } } : {};
+  const result = await queryDocuments(
+    context.repository,
+    collection('accountPositions'),
+    args,
+    filter,
+    args.orderBy ?? ['UPDATED_AT_DESC']
+  );
+
+  return connectionFromNodes(
+    result.items.map((document) => document.data),
+    result,
+    args
+  );
+};
 
 const accountTradesResolver = async (
   _parent: unknown,

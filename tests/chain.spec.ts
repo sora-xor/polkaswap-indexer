@@ -1040,6 +1040,657 @@ describe('ChainIndexer price derivation', () => {
     });
   });
 
+  it('indexes Polkamarkt atomic flips as one account activity with combined fees', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+    const sharesIn = (12n * SCALE).toString();
+    const collateralReinvested = (5n * SCALE).toString();
+    const sharesOut = (10n * SCALE).toString();
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 44 },
+                hash: { toString: () => '0xpolkamarkt-flip-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xpolkamarkt-flip' },
+                  method: {
+                    section: 'polkamarkt',
+                    method: 'flip_position',
+                    args: [7, 'Yes', sharesIn, 0, 0],
+                    meta: {
+                      args: [
+                        { name: 'marketId' },
+                        { name: 'fromOutcome' },
+                        { name: 'sharesIn' },
+                        { name: 'minCollateralOut' },
+                        { name: 'minSharesOut' },
+                      ],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord(
+                'polkamarkt',
+                'TradeExecuted',
+                {
+                  marketId: 7,
+                  trader: 'alice',
+                  side: 'Sell',
+                  outcome: 'Yes',
+                  collateralAmount: collateralReinvested,
+                  shareAmount: sharesIn,
+                  feeAmount: (1n * 10n ** 16n).toString(),
+                },
+                0
+              ),
+              eventRecord(
+                'polkamarkt',
+                'TradeExecuted',
+                {
+                  marketId: 7,
+                  trader: 'alice',
+                  side: 'Buy',
+                  outcome: 'No',
+                  collateralAmount: collateralReinvested,
+                  shareAmount: sharesOut,
+                  feeAmount: (2n * 10n ** 16n).toString(),
+                },
+                0
+              ),
+              eventRecord(
+                'polkamarkt',
+                'PositionFlipped',
+                {
+                  marketId: 7,
+                  trader: 'alice',
+                  fromOutcome: 'YES',
+                  toOutcome: 'NO',
+                  sharesIn,
+                  collateralReinvested,
+                  sharesOut,
+                },
+                0
+              ),
+              eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 0),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000000000' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xpolkamarkt-flip-block');
+
+    const history = await repository.get('historyElements', '0xpolkamarkt-flip');
+    const accountActivity = await repository.get('accountTransactions', '0xpolkamarkt-flip-alice');
+    const snapshot = await repository.get('networkSnapshots', 'block-44');
+
+    expect(history?.data).toMatchObject({
+      module: 'polkamarkt',
+      method: 'flip_position',
+      dataFrom: 'alice',
+      data: {
+        marketId: 7,
+        side: 'flip',
+        fromOutcome: 'YES',
+        toOutcome: 'NO',
+        collateralReinvestedUsd: '5',
+        sharesIn: '12',
+        sharesOut: '10',
+        sellFeeUsd: '0.01',
+        buyFeeUsd: '0.02',
+        feeUsd: '0.03',
+        price: '0.5',
+      },
+    });
+    expect(accountActivity?.data).toMatchObject({
+      accountId: 'alice',
+      historyElementId: '0xpolkamarkt-flip',
+      blockHeight: 44,
+    });
+    expect(snapshot?.data.transactions).toBe(1);
+    expect(snapshot?.data.volumeUSD).toBe('5');
+  });
+
+  it('does not fabricate flip activity when PositionFlipped is absent', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 45 },
+                hash: { toString: () => '0xpolkamarkt-missing-flip-event-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'mallory' },
+                  hash: { toString: () => '0xpolkamarkt-missing-flip-event' },
+                  method: {
+                    section: 'polkamarkt',
+                    method: 'flip_position',
+                    args: [7, 'Yes', (12n * SCALE).toString(), 0, 0],
+                    meta: {
+                      args: [
+                        { name: 'marketId' },
+                        { name: 'fromOutcome' },
+                        { name: 'sharesIn' },
+                        { name: 'minCollateralOut' },
+                        { name: 'minSharesOut' },
+                      ],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 0),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000001000' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xpolkamarkt-missing-flip-event-block');
+
+    const history = await repository.get('historyElements', '0xpolkamarkt-missing-flip-event');
+    expect(history?.data.data).toMatchObject({
+      marketId: 7,
+      fromOutcome: 'Yes',
+      sharesIn: (12n * SCALE).toString(),
+    });
+    expect(history?.data.data).not.toMatchObject({ side: 'flip' });
+    expect(history?.data.data).not.toHaveProperty('collateralReinvestedUsd');
+  });
+
+  it('does not attach PositionFlipped events from another extrinsic', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 46 },
+                hash: { toString: () => '0xpolkamarkt-wrong-phase-flip-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'mallory' },
+                  hash: { toString: () => '0xpolkamarkt-wrong-phase-flip' },
+                  method: {
+                    section: 'polkamarkt',
+                    method: 'flip_position',
+                    args: [7, 'Yes', (12n * SCALE).toString(), 0, 0],
+                    meta: {
+                      args: [
+                        { name: 'marketId' },
+                        { name: 'fromOutcome' },
+                        { name: 'sharesIn' },
+                        { name: 'minCollateralOut' },
+                        { name: 'minSharesOut' },
+                      ],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord(
+                'polkamarkt',
+                'PositionFlipped',
+                {
+                  marketId: 7,
+                  trader: 'mallory',
+                  fromOutcome: 'YES',
+                  toOutcome: 'NO',
+                  sharesIn: (12n * SCALE).toString(),
+                  collateralReinvested: (5n * SCALE).toString(),
+                  sharesOut: (10n * SCALE).toString(),
+                },
+                1
+              ),
+              eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 0),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000001500' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xpolkamarkt-wrong-phase-flip-block');
+
+    const history = await repository.get('historyElements', '0xpolkamarkt-wrong-phase-flip');
+    expect(history?.data.data).toMatchObject({
+      marketId: 7,
+      fromOutcome: 'Yes',
+      sharesIn: (12n * SCALE).toString(),
+    });
+    expect(history?.data.data).not.toMatchObject({ side: 'flip' });
+    expect(history?.data.data).not.toHaveProperty('collateralReinvestedUsd');
+  });
+
+  it('aggregates Polkamarkt batch claims without inventing payouts for skipped markets', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 46 },
+                hash: { toString: () => '0xpolkamarkt-claims-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xpolkamarkt-claims' },
+                  method: {
+                    section: 'polkamarkt',
+                    method: 'claim_markets',
+                    args: [[1, 2, 3]],
+                    meta: { args: [{ name: 'marketIds' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('polkamarkt', 'MarketClaimed', { marketId: 1, trader: 'alice', payout: (2n * SCALE).toString() }, 0),
+              eventRecord('polkamarkt', 'MarketClaimed', { marketId: 3, trader: 'alice', payout: (3n * SCALE).toString() }, 0),
+              eventRecord('polkamarkt', 'MarketClaimsBatched', { trader: 'alice', requested: 3, claimed: 2 }, 0),
+              eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 0),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000002000' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xpolkamarkt-claims-block');
+
+    const history = await repository.get('historyElements', '0xpolkamarkt-claims');
+    expect(history?.data).toMatchObject({
+      module: 'polkamarkt',
+      method: 'claim_markets',
+      dataFrom: 'alice',
+      data: {
+        marketId: 1,
+        side: 'claim',
+        claimedMarkets: 2,
+        requestedMarkets: 3,
+        collateralUsd: '5',
+        collateralAmountUsd: '5',
+      },
+    });
+  });
+
+  it('indexes zero-payout Polkamarkt batch claims without inventing collateral', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 47 },
+                hash: { toString: () => '0xpolkamarkt-zero-claim-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xpolkamarkt-zero-claim' },
+                  method: {
+                    section: 'polkamarkt',
+                    method: 'claim_markets',
+                    args: [[1, 1, 1]],
+                    meta: { args: [{ name: 'marketIds' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('polkamarkt', 'MarketClaimed', { marketId: 1, trader: 'alice', payout: '0' }, 0),
+              eventRecord('polkamarkt', 'MarketClaimsBatched', { trader: 'alice', requested: 3, claimed: 1 }, 0),
+              eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 0),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000002250' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xpolkamarkt-zero-claim-block');
+
+    const history = await repository.get('historyElements', '0xpolkamarkt-zero-claim');
+    const snapshot = await repository.get('networkSnapshots', 'block-47');
+    expect(history?.data).toMatchObject({
+      module: 'polkamarkt',
+      method: 'claim_markets',
+      dataFrom: 'alice',
+      data: {
+        marketId: 1,
+        side: 'claim',
+        claimedMarkets: 1,
+        requestedMarkets: 3,
+        collateralUsd: '0',
+        collateralAmountUsd: '0',
+      },
+    });
+    expect(snapshot?.data.volumeUSD).toBe('0');
+  });
+
+  it('does not synthesize batch claim activity from a bare batch summary event', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 47 },
+                hash: { toString: () => '0xpolkamarkt-bare-claims-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'mallory' },
+                  hash: { toString: () => '0xpolkamarkt-bare-claims' },
+                  method: {
+                    section: 'polkamarkt',
+                    method: 'claim_markets',
+                    args: [[1, 2]],
+                    meta: { args: [{ name: 'marketIds' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('polkamarkt', 'MarketClaimsBatched', { trader: 'mallory', requested: 2, claimed: 0 }, 0),
+              eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 0),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000002500' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xpolkamarkt-bare-claims-block');
+
+    const history = await repository.get('historyElements', '0xpolkamarkt-bare-claims');
+    expect(history?.data.data).toMatchObject({ marketIds: [1, 2] });
+    expect(history?.data.data).not.toMatchObject({ side: 'claim' });
+    expect(history?.data.data).not.toHaveProperty('claimedMarkets');
+    expect(history?.data.data).not.toHaveProperty('collateralUsd');
+  });
+
+  it('does not attribute batch claim payouts when claim and batch traders disagree', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 49 },
+                hash: { toString: () => '0xpolkamarkt-mismatched-claims-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xpolkamarkt-mismatched-claims' },
+                  method: {
+                    section: 'polkamarkt',
+                    method: 'claim_markets',
+                    args: [[1, 2]],
+                    meta: { args: [{ name: 'marketIds' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord('polkamarkt', 'MarketClaimed', { marketId: 1, trader: 'bob', payout: (2n * SCALE).toString() }, 0),
+              eventRecord('polkamarkt', 'MarketClaimsBatched', { trader: 'alice', requested: 2, claimed: 1 }, 0),
+              eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 0),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000002600' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xpolkamarkt-mismatched-claims-block');
+
+    const history = await repository.get('historyElements', '0xpolkamarkt-mismatched-claims');
+    const bobActivity = await repository.get('accountTransactions', '0xpolkamarkt-mismatched-claims-bob');
+    expect(history?.data.data).toMatchObject({ marketIds: [1, 2] });
+    expect(history?.data.data).not.toMatchObject({ side: 'claim' });
+    expect(history?.data.data).not.toHaveProperty('claimedMarkets');
+    expect(history?.data.data).not.toHaveProperty('collateralUsd');
+    expect(bobActivity).toBeNull();
+  });
+
+  it('does not trust Polkamarkt pallet events attached to failed extrinsics', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 48 },
+                hash: { toString: () => '0xpolkamarkt-failed-flip-block' },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xpolkamarkt-failed-flip' },
+                  method: {
+                    section: 'polkamarkt',
+                    method: 'flip_position',
+                    args: [7, 'Yes', (12n * SCALE).toString(), 0, 0],
+                    meta: {
+                      args: [
+                        { name: 'marketId' },
+                        { name: 'fromOutcome' },
+                        { name: 'sharesIn' },
+                        { name: 'minCollateralOut' },
+                        { name: 'minSharesOut' },
+                      ],
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async () => [
+              eventRecord(
+                'polkamarkt',
+                'TradeExecuted',
+                {
+                  marketId: 7,
+                  trader: 'alice',
+                  side: 'Sell',
+                  outcome: 'Yes',
+                  collateralAmount: (5n * SCALE).toString(),
+                  shareAmount: (12n * SCALE).toString(),
+                  feeAmount: (1n * 10n ** 16n).toString(),
+                },
+                0
+              ),
+              eventRecord(
+                'polkamarkt',
+                'PositionFlipped',
+                {
+                  marketId: 7,
+                  trader: 'alice',
+                  fromOutcome: 'YES',
+                  toOutcome: 'NO',
+                  sharesIn: (12n * SCALE).toString(),
+                  collateralReinvested: (5n * SCALE).toString(),
+                  sharesOut: (10n * SCALE).toString(),
+                },
+                0
+              ),
+              eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 0),
+              eventRecord('system', 'ExtrinsicFailed', {}, 0),
+            ],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000002750' }),
+          },
+        },
+      },
+    };
+
+    await indexer.indexBlockByHash('0xpolkamarkt-failed-flip-block');
+
+    const history = await repository.get('historyElements', '0xpolkamarkt-failed-flip');
+    const snapshot = await repository.get('networkSnapshots', 'block-48');
+    expect(history?.data.execution).toMatchObject({ success: false });
+    expect(history?.data.data).toMatchObject({
+      marketId: 7,
+      fromOutcome: 'Yes',
+      sharesIn: (12n * SCALE).toString(),
+    });
+    expect(history?.data.data).not.toMatchObject({ side: 'flip' });
+    expect(history?.data.data).not.toHaveProperty('collateralReinvestedUsd');
+    expect(snapshot?.data.transactions).toBe(1);
+    expect(snapshot?.data.volumeUSD).toBe('0');
+  });
+
   it('counts only signed fee-paying extrinsics as block network transactions', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
@@ -4750,11 +5401,28 @@ describe('ChainIndexer price derivation', () => {
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
       createPolkamarktMarketDocuments: (
         conditions: unknown[],
+        conditionDetails: unknown[],
         markets: unknown[],
         pools: unknown[],
         volumes: unknown[],
         totals: unknown[],
         resolutions: unknown[],
+        resolutionEvidence: unknown[],
+        cancellationEvidence: unknown[],
+        liquidityTotals: unknown[],
+        creatorFees: unknown[],
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        blockHeight: number,
+        timestamp: number
+      ) => Array<{ collection: string; id: string; data: Record<string, unknown> }>;
+      createPolkamarktPositionDocuments: (
+        positions: unknown[],
+        liquidityPositions: unknown[],
+        markets: unknown[],
+        pools: unknown[],
+        totals: unknown[],
+        resolutions: unknown[],
+        liquidityTotals: unknown[],
         assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
         blockHeight: number,
         timestamp: number
@@ -4765,11 +5433,16 @@ describe('ChainIndexer price derivation', () => {
 
     const documents = indexer.createPolkamarktMarketDocuments(
       [[{ args: [7] }, { question: bytes('Will KUSD stay at peg?'), oracle: bytes('SORA Democracy'), resolutionSource: bytes('sora:governance:democracy:referendum:124') }]],
+      [[{ args: [7] }, { category: bytes('Crypto'), tags: bytes('KUSD,peg'), metadataUri: bytes('ipfs://metadata'), metadataHash: new Array(32).fill(1), rulesUri: bytes('ipfs://rules') }]],
       [[{ args: [3] }, { creator: 'alice', conditionId: 7, closeBlock: 123_456, collateralAsset: KUSD, seedLiquidity: (1_000n * SCALE).toString(), status: 'Open' }]],
       [[{ args: [3] }, { collateral: (1_200n * SCALE).toString(), yes: (40n * SCALE).toString(), no: (60n * SCALE).toString() }]],
       [[{ args: [3] }, (250n * SCALE).toString()]],
       [],
       [],
+      [[{ args: [3] }, { uri: bytes('ipfs://resolution'), hash: new Array(32).fill(2), atBlock: 99 }]],
+      [],
+      [[{ args: [3] }, { totalShares: (1_000n * SCALE).toString(), totalCollateralContributed: (1_000n * SCALE).toString() }]],
+      [[{ args: [3] }, (5n * SCALE).toString()]],
       assets,
       77,
       1_700_000_349
@@ -4784,19 +5457,212 @@ describe('ChainIndexer price derivation', () => {
         marketId: 3,
         conditionId: 7,
         title: 'Will KUSD stay at peg?',
-        category: 'Other',
+        category: 'Crypto',
+        tags: 'KUSD,peg',
+        metadataUri: 'ipfs://metadata',
+        metadataHash: `0x${'01'.repeat(32)}`,
+        rulesUri: 'ipfs://rules',
         oracle: 'SORA Democracy',
         resolutionSource: 'sora:governance:democracy:referendum:124',
         closeBlock: 123_456,
         status: 'Open',
+        creatorFees: '5',
         liquidityUSD: '1200',
+        liquidityShares: '1000',
+        liquidityCollateralContributed: '1000',
         volumeUSD: '250',
         probability: 60,
         priceYes: 0.6,
+        resolutionEvidenceUri: 'ipfs://resolution',
+        resolutionEvidenceHash: `0x${'02'.repeat(32)}`,
+        resolutionEvidenceBlock: 99,
         governancePallet: 'democracy',
         governanceBody: 'Democracy',
         governanceKind: 'Referendum',
         governanceReferendumIndex: 124,
+      },
+    });
+
+    const positions = indexer.createPolkamarktPositionDocuments(
+      [[{ args: [3, 'bob'] }, { yesShares: (12n * SCALE).toString(), noShares: 0, netCollateralPaid: (6n * SCALE).toString() }]],
+      [[{ args: [3, 'bob'] }, { shares: (25n * SCALE).toString(), collateralContributed: (25n * SCALE).toString() }]],
+      [[{ args: [3] }, { creator: 'alice', conditionId: 7, closeBlock: 123_456, collateralAsset: KUSD, seedLiquidity: (1_000n * SCALE).toString(), status: 'Resolved' }]],
+      [[{ args: [3] }, { collateral: (1_200n * SCALE).toString() }]],
+      [[{ args: [3] }, { totalYesShares: (12n * SCALE).toString(), totalNoShares: 0, totalNetCollateralPaid: (6n * SCALE).toString() }]],
+      [[{ args: [3] }, 'Yes']],
+      [[{ args: [3] }, { totalShares: (100n * SCALE).toString(), totalCollateralContributed: (100n * SCALE).toString() }]],
+      assets,
+      77,
+      1_700_000_349
+    );
+
+    expect(positions).toHaveLength(1);
+    expect(positions[0]).toMatchObject({
+      collection: 'accountPositions',
+      id: '3-bob',
+      data: {
+        account: 'bob',
+        marketId: 3,
+        outcome: 'Yes',
+        shares: '12',
+        yesShares: '12',
+        noShares: '0',
+        netCollateralPaid: '6',
+        lpShares: '25',
+        lpCollateralContributed: '25',
+        claimablePayoutUsd: '12',
+        lpClaimablePayoutUsd: '297',
+        isCreator: false,
+        status: 'Resolved',
+        market: { id: '3', marketId: 3 },
+      },
+    });
+  });
+
+  it('hardens Polkamarkt market projection against malformed storage and partial upgrades', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createPolkamarktMarketDocuments: (
+        conditions: unknown[],
+        conditionDetails: unknown[],
+        markets: unknown[],
+        pools: unknown[],
+        volumes: unknown[],
+        totals: unknown[],
+        resolutions: unknown[],
+        resolutionEvidence: unknown[],
+        cancellationEvidence: unknown[],
+        liquidityTotals: unknown[],
+        creatorFees: unknown[],
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        blockHeight: number,
+        timestamp: number
+      ) => Array<{ collection: string; id: string; data: Record<string, unknown> }>;
+    };
+    const bytes = (value: string) => [...Buffer.from(value)];
+    const invalidUtf8 = [0xff, 0xfe, 0xfd];
+    const assets = new Map([[KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 0n }]]);
+
+    const documents = indexer.createPolkamarktMarketDocuments(
+      [
+        [{ args: [7] }, { question: invalidUtf8, oracle: bytes('bad oracle'), resolutionSource: bytes('bad source') }],
+        [{ args: [8] }, { question: bytes('Will malformed metadata be ignored?'), oracle: bytes('SORA Council'), resolutionSource: bytes('sora:governance:council:motion:not-a-number') }],
+      ],
+      [[{ args: [8] }, { category: invalidUtf8, tags: bytes('safe,metadata'), metadataUri: invalidUtf8, metadataHash: [1, 256], rulesUri: bytes('ipfs://rules') }]],
+      [
+        [{ args: ['not-a-number'] }, { creator: 'mallory', conditionId: 8, closeBlock: 111, collateralAsset: KUSD, seedLiquidity: (1_000n * SCALE).toString(), status: 'Open' }],
+        [{ args: [3] }, { creator: 'alice', conditionId: 7, closeBlock: 111, collateralAsset: KUSD, seedLiquidity: (1_000n * SCALE).toString(), status: 'Open' }],
+        [{ args: [4] }, { creator: 'alice', conditionId: 8, closeBlock: 222, collateralAsset: KUSD, seedLiquidity: (1_000n * SCALE).toString(), status: { open: null } }],
+      ],
+      [],
+      [[{ args: [4] }, 'not-a-balance']],
+      [],
+      [[{ args: [4] }, { no: null }]],
+      [[{ args: [4] }, { uri: invalidUtf8, hash: '0xzz', atBlock: 'bad-block' }]],
+      [[{ args: [4] }, { uri: invalidUtf8, hash: [2, -1], atBlock: 0 }]],
+      [],
+      [[{ args: [4] }, 'bad-fee']],
+      assets,
+      88,
+      1_700_000_555
+    );
+
+    expect(documents).toHaveLength(1);
+    expect(documents[0]).toMatchObject({
+      collection: 'markets',
+      id: '4',
+      data: {
+        marketId: 4,
+        conditionId: 8,
+        title: 'Will malformed metadata be ignored?',
+        category: 'Other',
+        tags: 'safe,metadata',
+        metadataUri: null,
+        metadataHash: null,
+        rulesUri: 'ipfs://rules',
+        status: 'Open',
+        seedLiquidity: '1000',
+        liquidityUSD: '1000',
+        liquidityShares: '0',
+        volumeUSD: '0',
+        creatorFees: '0',
+        resolutionOutcome: 'No',
+        resolutionEvidenceUri: null,
+        resolutionEvidenceHash: null,
+        resolutionEvidenceBlock: null,
+        cancellationEvidenceUri: null,
+        cancellationEvidenceHash: null,
+        cancellationEvidenceBlock: null,
+      },
+    });
+    expect(documents[0].data.governancePallet).toBeUndefined();
+    expect(documents[0].data.governanceKind).toBeUndefined();
+  });
+
+  it('hardens Polkamarkt position projection against orphaned, zero, and malformed entries', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createPolkamarktPositionDocuments: (
+        positions: unknown[],
+        liquidityPositions: unknown[],
+        markets: unknown[],
+        pools: unknown[],
+        totals: unknown[],
+        resolutions: unknown[],
+        liquidityTotals: unknown[],
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        blockHeight: number,
+        timestamp: number
+      ) => Array<{ collection: string; id: string; data: Record<string, unknown> }>;
+    };
+    const assets = new Map([[KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 0n }]]);
+
+    const documents = indexer.createPolkamarktPositionDocuments(
+      [
+        [{ args: ['bad-market', 'mallory'] }, { yesShares: (1n * SCALE).toString(), noShares: 0, netCollateralPaid: 0 }],
+        [{ args: [3, ''] }, { yesShares: (1n * SCALE).toString(), noShares: 0, netCollateralPaid: 0 }],
+        [{ args: [99, 'orphan'] }, { yesShares: (1n * SCALE).toString(), noShares: 0, netCollateralPaid: 0 }],
+        [{ args: [3, 'zero'] }, { yesShares: 0, noShares: 0, netCollateralPaid: 0 }],
+        [{ args: [3, 'bob'] }, { yesShares: (5n * SCALE).toString(), noShares: 0, netCollateralPaid: (2n * SCALE).toString() }],
+      ],
+      [
+        [{ args: [99, 'orphan-lp'] }, { shares: (10n * SCALE).toString(), collateralContributed: (10n * SCALE).toString() }],
+        [{ args: [3, 'zero-lp'] }, { shares: 0, collateralContributed: 0 }],
+        [{ args: [3, 'lp-only'] }, { shares: (10n * SCALE).toString(), collateralContributed: (10n * SCALE).toString() }],
+      ],
+      [[{ args: [3] }, { creator: 'alice', conditionId: 8, closeBlock: 222, collateralAsset: KUSD, seedLiquidity: (1_000n * SCALE).toString(), status: 'Cancelled' }]],
+      [[{ args: [3] }, { collateral: (1_000n * SCALE).toString() }]],
+      [[{ args: [3] }, { totalYesShares: 0, totalNoShares: 0, totalNetCollateralPaid: (100n * SCALE).toString() }]],
+      [],
+      [[{ args: [3] }, { totalShares: (100n * SCALE).toString(), totalCollateralContributed: (100n * SCALE).toString() }]],
+      assets,
+      88,
+      1_700_000_555
+    );
+
+    expect(documents.map((document) => document.id).sort()).toEqual(['3-bob', '3-lp-only']);
+    expect(documents.find((document) => document.id === '3-bob')).toMatchObject({
+      data: {
+        account: 'bob',
+        marketId: 3,
+        yesShares: '5',
+        noShares: '0',
+        netCollateralPaid: '2',
+        claimablePayoutUsd: '2',
+        lpShares: '0',
+        lpClaimablePayoutUsd: '0',
+        marketValueUsd: '2',
+      },
+    });
+    expect(documents.find((document) => document.id === '3-lp-only')).toMatchObject({
+      data: {
+        account: 'lp-only',
+        marketId: 3,
+        outcome: null,
+        shares: '0',
+        lpShares: '10',
+        lpCollateralContributed: '10',
+        claimablePayoutUsd: '0',
+        lpClaimablePayoutUsd: '90',
+        marketValueUsd: '90',
       },
     });
   });

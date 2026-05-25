@@ -1067,6 +1067,9 @@ const findEvent = (events: EventRecord[], section: string, method: string): Reco
   return match ? eventData(match.event) : null;
 };
 
+const findEvents = (events: EventRecord[], section: string, method: string): Array<Record<string, unknown>> =>
+  events.filter((item) => item.event.section === section && item.event.method === method).map((item) => eventData(item.event));
+
 const createAmountData = (assetId: string, amount: unknown, prices: Map<string, bigint>, assets: Map<string, AssetInfo>) => {
   const info = assets.get(assetId);
   const raw = codecToBigInt(amount);
@@ -1076,6 +1079,153 @@ const createAmountData = (assetId: string, amount: unknown, prices: Map<string, 
     amountUSD: codecUsd(assetId, raw, prices, info?.decimals ?? DECIMALS),
     assetId,
   };
+};
+
+const createPolkamarktHistoryData = (
+  method: string,
+  args: Record<string, unknown>,
+  events: EventRecord[],
+  signer: string
+): { data: unknown; from: string; to: string; assets: string[] } | null => {
+  const token = method.replace(/_/g, '').toLowerCase();
+  const trade = findEvent(events, 'polkamarkt', 'TradeExecuted');
+  const trades = findEvents(events, 'polkamarkt', 'TradeExecuted');
+  const flip = findEvent(events, 'polkamarkt', 'PositionFlipped');
+
+  if ((token === 'buy' || token === 'sell') && trade) {
+    const marketId = Number(trade.marketId ?? trade.arg0 ?? args.marketId ?? args.arg0 ?? 0);
+    const trader = firstString(trade, ['trader', 'account', 'arg1']) || signer;
+    const collateralAmount = firstPresentValue(trade, ['collateralAmount', 'arg4']) ?? args.collateralIn ?? args.arg2 ?? 0;
+    const shareAmount = firstPresentValue(trade, ['shareAmount', 'shares', 'arg5']) ?? args.sharesIn ?? args.arg2 ?? 0;
+    const feeAmount = firstPresentValue(trade, ['feeAmount', 'fee', 'arg6']) ?? 0;
+    const collateralRaw = codecToBigInt(collateralAmount);
+    const sharesRaw = codecToBigInt(shareAmount);
+
+    return {
+      data: {
+        marketId,
+        side: firstString(trade, ['side', 'arg2']) || token,
+        outcome: firstString(trade, ['outcome', 'arg3']) || firstString(args, ['outcome', 'arg1']),
+        collateralUsd: codecToDecimalString(collateralAmount, DECIMALS),
+        collateralAmountUsd: codecToDecimalString(collateralAmount, DECIMALS),
+        shares: codecToDecimalString(shareAmount, DECIMALS),
+        sharesAmount: codecToDecimalString(shareAmount, DECIMALS),
+        price: decimalToString(scaledDiv(collateralRaw, sharesRaw), DECIMALS, 8),
+        executionPrice: decimalToString(scaledDiv(collateralRaw, sharesRaw), DECIMALS, 8),
+        feeUsd: codecToDecimalString(feeAmount, DECIMALS),
+        feeAmountUsd: codecToDecimalString(feeAmount, DECIMALS),
+      },
+      from: trader,
+      to: '',
+      assets: [],
+    };
+  }
+
+  if (token === 'flipposition' && flip) {
+    const marketId = Number(flip.marketId ?? flip.arg0 ?? args.marketId ?? args.arg0 ?? 0);
+    const trader = firstString(flip, ['trader', 'account', 'arg1']) || signer;
+    const sharesIn = firstPresentValue(flip, ['sharesIn', 'shares_in', 'arg4']) ?? args.sharesIn ?? args.arg2 ?? 0;
+    const collateralReinvested = firstPresentValue(flip, ['collateralReinvested', 'collateral_reinvested', 'arg5']) ?? 0;
+    const sharesOut = firstPresentValue(flip, ['sharesOut', 'shares_out', 'arg6']) ?? 0;
+    const sellTrade = trades.find((item) => String(item.side ?? item.arg2 ?? '').toLowerCase().includes('sell')) ?? {};
+    const buyTrade = trades.find((item) => String(item.side ?? item.arg2 ?? '').toLowerCase().includes('buy')) ?? {};
+    const sellFee = firstPresentValue(sellTrade, ['feeAmount', 'fee', 'arg6']) ?? 0;
+    const buyFee = firstPresentValue(buyTrade, ['feeAmount', 'fee', 'arg6']) ?? 0;
+    const collateralRaw = codecToBigInt(collateralReinvested);
+    const sharesOutRaw = codecToBigInt(sharesOut);
+
+    return {
+      data: {
+        marketId,
+        side: 'flip',
+        fromOutcome: firstString(flip, ['fromOutcome', 'from_outcome', 'arg2']) || firstString(args, ['fromOutcome', 'from_outcome', 'arg1']),
+        toOutcome: firstString(flip, ['toOutcome', 'to_outcome', 'arg3']),
+        sharesIn: codecToDecimalString(sharesIn, DECIMALS),
+        shares: codecToDecimalString(sharesOut, DECIMALS),
+        sharesAmount: codecToDecimalString(sharesOut, DECIMALS),
+        sharesOut: codecToDecimalString(sharesOut, DECIMALS),
+        collateralUsd: codecToDecimalString(collateralReinvested, DECIMALS),
+        collateralAmountUsd: codecToDecimalString(collateralReinvested, DECIMALS),
+        collateralReinvestedUsd: codecToDecimalString(collateralReinvested, DECIMALS),
+        sellFeeUsd: codecToDecimalString(sellFee, DECIMALS),
+        buyFeeUsd: codecToDecimalString(buyFee, DECIMALS),
+        feeUsd: codecToDecimalString(codecToBigInt(sellFee) + codecToBigInt(buyFee), DECIMALS),
+        feeAmountUsd: codecToDecimalString(codecToBigInt(sellFee) + codecToBigInt(buyFee), DECIMALS),
+        price: decimalToString(scaledDiv(collateralRaw, sharesOutRaw), DECIMALS, 8),
+        executionPrice: decimalToString(scaledDiv(collateralRaw, sharesOutRaw), DECIMALS, 8),
+      },
+      from: trader,
+      to: '',
+      assets: [],
+    };
+  }
+
+  if (token === 'claimmarket') {
+    const claim = findEvent(events, 'polkamarkt', 'MarketClaimed');
+    if (!claim) return null;
+    const trader = firstString(claim, ['trader', 'account', 'arg1']) || signer;
+    const payout = firstPresentValue(claim, ['payout', 'amount', 'arg2']) ?? 0;
+
+    return {
+      data: {
+        marketId: Number(claim.marketId ?? claim.arg0 ?? args.marketId ?? args.arg0 ?? 0),
+        side: 'claim',
+        collateralUsd: codecToDecimalString(payout, DECIMALS),
+        collateralAmountUsd: codecToDecimalString(payout, DECIMALS),
+      },
+      from: trader,
+      to: '',
+      assets: [],
+    };
+  }
+
+  if (token === 'claimmarkets') {
+    const claims = findEvents(events, 'polkamarkt', 'MarketClaimed');
+    const batch = findEvent(events, 'polkamarkt', 'MarketClaimsBatched');
+    if (!claims.length) return null;
+    const batchTrader = firstString(batch ?? {}, ['trader', 'account', 'arg0', 'arg1']);
+    const claimTraders = claims.map((claim) => firstString(claim, ['trader', 'account', 'arg1'])).filter(Boolean);
+    const uniqueTraders = new Set([batchTrader, ...claimTraders].filter(Boolean));
+    if (uniqueTraders.size > 1) return null;
+    const trader = batchTrader || claimTraders[0] || signer;
+    const payout = claims.reduce((sum, claim) => sum + codecToBigInt(firstPresentValue(claim, ['payout', 'amount', 'arg2']) ?? 0), 0n);
+
+    return {
+      data: {
+        marketId: Number(claims[0]?.marketId ?? claims[0]?.arg0 ?? 0) || null,
+        side: 'claim',
+        claimedMarkets: claims.length,
+        requestedMarkets: Number(batch?.requested ?? batch?.arg1 ?? 0) || claims.length,
+        collateralUsd: codecToDecimalString(payout, DECIMALS),
+        collateralAmountUsd: codecToDecimalString(payout, DECIMALS),
+      },
+      from: trader,
+      to: '',
+      assets: [],
+    };
+  }
+
+  if (token === 'claimcreatorfees' || token === 'claimcreatorliquidity') {
+    const claim =
+      findEvent(events, 'polkamarkt', token === 'claimcreatorfees' ? 'CreatorFeesClaimed' : 'CreatorLiquidityClaimed');
+    if (!claim) return null;
+    const creator = firstString(claim, ['creator', 'account', 'arg1']) || signer;
+    const amount = firstPresentValue(claim, ['amount', 'arg2']) ?? 0;
+
+    return {
+      data: {
+        marketId: Number(claim.marketId ?? claim.arg0 ?? args.marketId ?? args.arg0 ?? 0),
+        side: token === 'claimcreatorfees' ? 'claim_creator_fees' : 'claim_creator_liquidity',
+        collateralUsd: codecToDecimalString(amount, DECIMALS),
+        collateralAmountUsd: codecToDecimalString(amount, DECIMALS),
+      },
+      from: creator,
+      to: '',
+      assets: [],
+    };
+  }
+
+  return null;
 };
 
 const bridgeRequestUpdate = (events: EventRecord[]): { requestHash: string; status: string } => {
@@ -1242,6 +1392,11 @@ const createHistoryData = (
     const registered = findEvent(events, 'assets', 'AssetRegistered');
     const assetId = firstString(registered ?? args, ['assetId', 'arg0']);
     return { data: { assetId }, from: signer, to: '', assets: assetId ? [assetId] : [] };
+  }
+
+  if (module === 'polkamarkt') {
+    const polkamarkt = createPolkamarktHistoryData(method, args, events, signer);
+    if (polkamarkt) return polkamarkt;
   }
 
   if (module === 'poolXYK' && (method === 'depositLiquidity' || method === 'withdrawLiquidity')) {
@@ -2716,6 +2871,7 @@ export class ChainIndexer {
     for (const [index, extrinsic] of signedBlock.block.extrinsics.entries()) {
       const eventsForExtrinsic = eventsByExtrinsic.get(index) ?? [];
       const failed = eventsForExtrinsic.find(({ event }) => event.section === 'system' && event.method === 'ExtrinsicFailed');
+      const historyEvents = failed && extrinsic.method.section === 'polkamarkt' ? [] : eventsForExtrinsic;
       const args = codecArgs(extrinsic.method as any);
       const calls = getUtilityCalls(extrinsic as any);
       const callNames = calls.map((call) => `${call.module}.${call.method}`);
@@ -2724,7 +2880,7 @@ export class ChainIndexer {
         extrinsic.method.section,
         extrinsic.method.method,
         args,
-        eventsForExtrinsic,
+        historyEvents,
         address,
         this.prices,
         this.assetInfos
@@ -3043,7 +3199,14 @@ export class ChainIndexer {
     let max = 0n;
 
     for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
-      if (key.endsWith('AmountUSD') || key === 'amountUSD' || key === 'volumeUSD') {
+      const normalizedKey = key.toLowerCase();
+      if (
+        normalizedKey.endsWith('amountusd') ||
+        normalizedKey === 'amountusd' ||
+        normalizedKey === 'volumeusd' ||
+        normalizedKey === 'collateralusd' ||
+        normalizedKey === 'collateralreinvestedusd'
+      ) {
         const amount = decimalStringToScaled(value);
         if (amount > max) max = amount;
       }
@@ -3634,11 +3797,18 @@ export class ChainIndexer {
       orderBookAsks,
       orderBookLimitOrders,
       polkamarktConditions,
+      polkamarktConditionDetails,
       polkamarktMarkets,
       polkamarktPools,
       polkamarktVolumes,
       polkamarktTotals,
       polkamarktResolutions,
+      polkamarktResolutionEvidence,
+      polkamarktCancellationEvidence,
+      polkamarktPositions,
+      polkamarktLiquidityPositions,
+      polkamarktLiquidityTotals,
+      polkamarktCreatorFees,
       farmingPoolFarmers,
       nativeXorIssuance,
     ] = await Promise.all([
@@ -3652,11 +3822,18 @@ export class ChainIndexer {
       this.fetchStorageEntries((this.api.query as any).orderBook.asks, 'orderBook.asks'),
       this.fetchStorageEntries((this.api.query as any).orderBook.limitOrders, 'orderBook.limitOrders'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.conditions, 'polkamarkt.conditions'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.conditionDetails, 'polkamarkt.conditionDetails'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.markets, 'polkamarkt.markets'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketPools, 'polkamarkt.marketPools'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketVolume, 'polkamarkt.marketVolume'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketPositionTotals, 'polkamarkt.marketPositionTotals'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketResolution, 'polkamarkt.marketResolution'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketResolutionEvidence, 'polkamarkt.marketResolutionEvidence'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketCancellationEvidence, 'polkamarkt.marketCancellationEvidence'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketPositions, 'polkamarkt.marketPositions'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.liquidityPositions, 'polkamarkt.liquidityPositions'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.liquidityPositionTotals, 'polkamarkt.liquidityPositionTotals'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketCreatorFees, 'polkamarkt.marketCreatorFees'),
       this.fetchStorageEntries((this.api.query as any).farming.poolFarmers, 'farming.poolFarmers'),
       this.fetchNativeXorIssuance(),
     ]);
@@ -3776,11 +3953,28 @@ export class ChainIndexer {
     ]);
     const polkamarktMarketDocuments = this.createPolkamarktMarketDocuments(
       polkamarktConditions,
+      polkamarktConditionDetails,
       polkamarktMarkets,
       polkamarktPools,
       polkamarktVolumes,
       polkamarktTotals,
       polkamarktResolutions,
+      polkamarktResolutionEvidence,
+      polkamarktCancellationEvidence,
+      polkamarktLiquidityTotals,
+      polkamarktCreatorFees,
+      assets,
+      effectiveBlockHeight,
+      timestamp
+    );
+    const polkamarktPositionDocuments = this.createPolkamarktPositionDocuments(
+      polkamarktPositions,
+      polkamarktLiquidityPositions,
+      polkamarktMarkets,
+      polkamarktPools,
+      polkamarktTotals,
+      polkamarktResolutions,
+      polkamarktLiquidityTotals,
       assets,
       effectiveBlockHeight,
       timestamp
@@ -3790,6 +3984,7 @@ export class ChainIndexer {
       ...poolDocuments,
       ...orderBookDocuments,
       ...polkamarktMarketDocuments,
+      ...polkamarktPositionDocuments,
       ...this.createNetworkSnapshotDocuments(analytics, effectiveBlockHeight, timestamp, includeSnapshots),
       ...this.createUpdateStreams(poolStates, assets, prices, apyByPool, effectiveBlockHeight, timestamp),
     ];
@@ -4502,18 +4697,20 @@ export class ChainIndexer {
 
   private decodeMetadataText(value: unknown): string {
     const normalized = normalizeValue(value);
+    const clean = (text: string) => (text.includes('\uFFFD') ? '' : text.trim());
 
     if (typeof normalized === 'string') {
       if (/^0x[0-9a-fA-F]*$/.test(normalized) && normalized.length > 2) {
-        return Buffer.from(normalized.slice(2), 'hex').toString('utf8').trim();
+        return clean(Buffer.from(normalized.slice(2), 'hex').toString('utf8'));
       }
 
-      return normalized.trim();
+      return clean(normalized);
     }
 
     if (Array.isArray(normalized)) {
-      const bytes = normalized.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item >= 0 && item <= 255);
-      if (bytes.length) return Buffer.from(bytes).toString('utf8').trim();
+      const bytes = normalized.map((item) => Number(item));
+      if (bytes.some((item) => !Number.isInteger(item) || item < 0 || item > 255)) return '';
+      if (bytes.length) return clean(Buffer.from(bytes).toString('utf8'));
     }
 
     if (isRecord(normalized)) {
@@ -4524,6 +4721,33 @@ export class ChainIndexer {
     }
 
     return '';
+  }
+
+  private decodeBytesHex(value: unknown): string | null {
+    const normalized = normalizeValue(value);
+    if (normalized === null || normalized === undefined || normalized === '') return null;
+
+    if (typeof normalized === 'string') {
+      if (normalized.startsWith('0x')) {
+        return /^0x(?:[0-9a-fA-F]{2})+$/.test(normalized) ? normalized.toLowerCase() : null;
+      }
+      return `0x${Buffer.from(normalized, 'utf8').toString('hex')}`;
+    }
+
+    if (Array.isArray(normalized)) {
+      const bytes = normalized.map((item) => Number(item));
+      if (bytes.some((item) => !Number.isInteger(item) || item < 0 || item > 255)) return null;
+      return bytes.length ? `0x${Buffer.from(bytes).toString('hex')}` : null;
+    }
+
+    if (isRecord(normalized)) {
+      for (const key of ['value', 'inner', 'raw']) {
+        const decoded = this.decodeBytesHex(normalized[key]);
+        if (decoded) return decoded;
+      }
+    }
+
+    return null;
   }
 
   private variantName(value: unknown): string {
@@ -4627,25 +4851,41 @@ export class ChainIndexer {
 
   private createPolkamarktMarketDocuments(
     conditions: Array<[StorageEntryKey, unknown]>,
+    conditionDetails: Array<[StorageEntryKey, unknown]>,
     markets: Array<[StorageEntryKey, unknown]>,
     pools: Array<[StorageEntryKey, unknown]>,
     volumes: Array<[StorageEntryKey, unknown]>,
     totals: Array<[StorageEntryKey, unknown]>,
     resolutions: Array<[StorageEntryKey, unknown]>,
+    resolutionEvidence: Array<[StorageEntryKey, unknown]>,
+    cancellationEvidence: Array<[StorageEntryKey, unknown]>,
+    liquidityTotals: Array<[StorageEntryKey, unknown]>,
+    creatorFees: Array<[StorageEntryKey, unknown]>,
     assets: Map<string, AssetInfo>,
     blockHeight: number,
     timestamp: number
   ): IndexerDocument[] {
     const conditionsById = new Map<number, Record<string, unknown>>();
+    const conditionDetailsById = new Map<number, Record<string, unknown>>();
     const poolsByMarket = new Map<number, Record<string, unknown>>();
     const volumesByMarket = new Map<number, bigint>();
     const totalsByMarket = new Map<number, Record<string, unknown>>();
     const resolutionsByMarket = new Map<number, string>();
+    const resolutionEvidenceByMarket = new Map<number, Record<string, unknown>>();
+    const cancellationEvidenceByMarket = new Map<number, Record<string, unknown>>();
+    const liquidityTotalsByMarket = new Map<number, Record<string, unknown>>();
+    const creatorFeesByMarket = new Map<number, bigint>();
 
     for (const [key, value] of conditions) {
       const id = this.storageKeyNumber(key);
       if (id === null) continue;
       conditionsById.set(id, this.normalizedRecord(value));
+    }
+
+    for (const [key, value] of conditionDetails) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      conditionDetailsById.set(id, this.normalizedRecord(value));
     }
 
     for (const [key, value] of pools) {
@@ -4672,6 +4912,30 @@ export class ChainIndexer {
       resolutionsByMarket.set(id, this.variantName(value));
     }
 
+    for (const [key, value] of resolutionEvidence) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      resolutionEvidenceByMarket.set(id, this.normalizedRecord(value));
+    }
+
+    for (const [key, value] of cancellationEvidence) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      cancellationEvidenceByMarket.set(id, this.normalizedRecord(value));
+    }
+
+    for (const [key, value] of liquidityTotals) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      liquidityTotalsByMarket.set(id, this.normalizedRecord(value));
+    }
+
+    for (const [key, value] of creatorFees) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      creatorFeesByMarket.set(id, this.safeCodecToBigInt(value));
+    }
+
     return markets.flatMap(([key, value]) => {
       const marketId = this.storageKeyNumber(key);
       if (marketId === null) return [];
@@ -4679,18 +4943,23 @@ export class ChainIndexer {
       const market = this.normalizedRecord(value);
       const conditionId = Number(market.conditionId ?? market.condition ?? -1);
       const condition = conditionsById.get(conditionId);
+      const details = conditionDetailsById.get(conditionId) ?? {};
       const title = this.decodeMetadataText(condition?.question);
       if (!title) return [];
 
       const pool = poolsByMarket.get(marketId) ?? {};
       const totalsForMarket = totalsByMarket.get(marketId) ?? {};
+      const lpTotalsForMarket = liquidityTotalsByMarket.get(marketId) ?? {};
       const collateralAsset = assetIdToString(market.collateralAsset);
       const decimals = assets.get(collateralAsset)?.decimals ?? DECIMALS;
       const seedLiquidity = this.safeCodecToBigInt(market.seedLiquidity);
       const collateral = this.safeCodecToBigInt(pool.collateral ?? seedLiquidity);
       const yesShares = this.safeCodecToBigInt(pool.yes ?? totalsForMarket.totalYesShares ?? seedLiquidity);
       const noShares = this.safeCodecToBigInt(pool.no ?? totalsForMarket.totalNoShares ?? seedLiquidity);
+      const lpShares = this.safeCodecToBigInt(lpTotalsForMarket.totalShares);
+      const lpCollateralContributed = this.safeCodecToBigInt(lpTotalsForMarket.totalCollateralContributed);
       const volume = volumesByMarket.get(marketId) ?? 0n;
+      const creatorFeesForMarket = creatorFeesByMarket.get(marketId) ?? 0n;
       const probability =
         yesShares + noShares > 0n
           ? Number((noShares * 10_000n) / (yesShares + noShares)) / 100
@@ -4699,6 +4968,12 @@ export class ChainIndexer {
       const volumeUSD = decimalToString(volume, decimals, 8);
       const oracle = this.decodeMetadataText(condition?.oracle);
       const resolutionSource = this.decodeMetadataText(condition?.resolutionSource);
+      const category = this.decodeMetadataText(details.category) || 'Other';
+      const tags = this.decodeMetadataText(details.tags);
+      const metadataUri = this.decodeMetadataText(details.metadataUri);
+      const rulesUri = this.decodeMetadataText(details.rulesUri);
+      const resolutionEvidenceForMarket = resolutionEvidenceByMarket.get(marketId) ?? {};
+      const cancellationEvidenceForMarket = cancellationEvidenceByMarket.get(marketId) ?? {};
       const governance = resolutionSource ? this.parseSoraGovernanceReference(resolutionSource) : {};
 
       return [
@@ -4712,7 +4987,11 @@ export class ChainIndexer {
             marketId,
             conditionId,
             title,
-            category: 'Other',
+            category,
+            tags: tags || null,
+            metadataUri: metadataUri || null,
+            metadataHash: this.decodeBytesHex(details.metadataHash),
+            rulesUri: rulesUri || null,
             oracle,
             resolutionSource,
             closeBlock: Number(market.closeBlock ?? 0),
@@ -4720,6 +4999,7 @@ export class ChainIndexer {
             creator: String(market.creator ?? ''),
             collateralAsset,
             seedLiquidity: decimalToString(seedLiquidity, decimals, 8),
+            creatorFees: decimalToString(creatorFeesForMarket, decimals, 8),
             liquidityUSD,
             volumeUSD,
             probability,
@@ -4727,10 +5007,185 @@ export class ChainIndexer {
             collateral: decimalToString(collateral, decimals, 8),
             yesShares: decimalToString(yesShares, decimals, 8),
             noShares: decimalToString(noShares, decimals, 8),
+            liquidityShares: decimalToString(lpShares, decimals, 8),
+            liquidityCollateralContributed: decimalToString(lpCollateralContributed, decimals, 8),
             resolutionOutcome: resolutionsByMarket.get(marketId) ?? null,
+            resolutionEvidenceUri: this.decodeMetadataText(resolutionEvidenceForMarket.uri) || null,
+            resolutionEvidenceHash: this.decodeBytesHex(resolutionEvidenceForMarket.hash),
+            resolutionEvidenceBlock: Number(resolutionEvidenceForMarket.atBlock ?? 0) || null,
+            cancellationEvidenceUri: this.decodeMetadataText(cancellationEvidenceForMarket.uri) || null,
+            cancellationEvidenceHash: this.decodeBytesHex(cancellationEvidenceForMarket.hash),
+            cancellationEvidenceBlock: Number(cancellationEvidenceForMarket.atBlock ?? 0) || null,
             ...governance,
             updatedAtBlock: blockHeight,
             timestamp,
+          },
+        },
+      ];
+    });
+  }
+
+  private createPolkamarktPositionDocuments(
+    positions: Array<[StorageEntryKey, unknown]>,
+    liquidityPositions: Array<[StorageEntryKey, unknown]>,
+    markets: Array<[StorageEntryKey, unknown]>,
+    pools: Array<[StorageEntryKey, unknown]>,
+    totals: Array<[StorageEntryKey, unknown]>,
+    resolutions: Array<[StorageEntryKey, unknown]>,
+    liquidityTotals: Array<[StorageEntryKey, unknown]>,
+    assets: Map<string, AssetInfo>,
+    blockHeight: number,
+    timestamp: number
+  ): IndexerDocument[] {
+    const marketsById = new Map<number, Record<string, unknown>>();
+    const poolsByMarket = new Map<number, Record<string, unknown>>();
+    const totalsByMarket = new Map<number, Record<string, unknown>>();
+    const resolutionsByMarket = new Map<number, string>();
+    const liquidityTotalsByMarket = new Map<number, Record<string, unknown>>();
+    const positionsByKey = new Map<string, Record<string, unknown>>();
+    const liquidityPositionsByKey = new Map<string, Record<string, unknown>>();
+    const accountMarketKeys = new Map<string, { marketId: number; account: string }>();
+
+    for (const [key, value] of markets) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      marketsById.set(id, this.normalizedRecord(value));
+    }
+
+    for (const [key, value] of pools) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      poolsByMarket.set(id, this.normalizedRecord(value));
+    }
+
+    for (const [key, value] of totals) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      totalsByMarket.set(id, this.normalizedRecord(value));
+    }
+
+    for (const [key, value] of resolutions) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      resolutionsByMarket.set(id, this.variantName(value));
+    }
+
+    for (const [key, value] of liquidityTotals) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      liquidityTotalsByMarket.set(id, this.normalizedRecord(value));
+    }
+
+    for (const [key, value] of positions) {
+      const marketIdRaw = normalizeValue(key.args?.[0]);
+      const marketId = Number(marketIdRaw);
+      const account = String(normalizeValue(key.args?.[1]) ?? '');
+      if (!Number.isSafeInteger(marketId) || !account) continue;
+      const id = `${marketId}-${account}`;
+      positionsByKey.set(id, this.normalizedRecord(value));
+      accountMarketKeys.set(id, { marketId, account });
+    }
+
+    for (const [key, value] of liquidityPositions) {
+      const marketIdRaw = normalizeValue(key.args?.[0]);
+      const marketId = Number(marketIdRaw);
+      const account = String(normalizeValue(key.args?.[1]) ?? '');
+      if (!Number.isSafeInteger(marketId) || !account) continue;
+      const id = `${marketId}-${account}`;
+      liquidityPositionsByKey.set(id, this.normalizedRecord(value));
+      accountMarketKeys.set(id, { marketId, account });
+    }
+
+    return [...accountMarketKeys.entries()].flatMap(([id, entry]) => {
+      const { marketId, account } = entry;
+      const market = marketsById.get(marketId);
+      if (!market) return [];
+      const pool = poolsByMarket.get(marketId) ?? {};
+      const totalsForMarket = totalsByMarket.get(marketId) ?? {};
+      const lpTotalsForMarket = liquidityTotalsByMarket.get(marketId) ?? {};
+      const marketPosition = positionsByKey.get(id) ?? {};
+      const liquidityPosition = liquidityPositionsByKey.get(id) ?? {};
+      const collateralAsset = assetIdToString(market.collateralAsset);
+      const decimals = assets.get(collateralAsset)?.decimals ?? DECIMALS;
+      const yesShares = this.safeCodecToBigInt(marketPosition.yesShares ?? marketPosition.yes_shares);
+      const noShares = this.safeCodecToBigInt(marketPosition.noShares ?? marketPosition.no_shares);
+      const netCollateralPaid = this.safeCodecToBigInt(marketPosition.netCollateralPaid ?? marketPosition.net_collateral_paid);
+      const lpShares = this.safeCodecToBigInt(liquidityPosition.shares);
+      const lpCollateralContributed = this.safeCodecToBigInt(
+        liquidityPosition.collateralContributed ?? liquidityPosition.collateral_contributed
+      );
+      if (
+        yesShares === 0n &&
+        noShares === 0n &&
+        netCollateralPaid === 0n &&
+        lpShares === 0n &&
+        lpCollateralContributed === 0n
+      ) {
+        return [];
+      }
+      const status = this.variantName(market.status);
+      const resolutionOutcome = resolutionsByMarket.get(marketId) ?? null;
+      const normalizedStatus = status.toLowerCase();
+      const normalizedResolution = resolutionOutcome?.toLowerCase();
+      const claimablePayout =
+        normalizedStatus === 'resolved'
+          ? normalizedResolution === 'yes'
+            ? yesShares
+            : normalizedResolution === 'no'
+              ? noShares
+              : 0n
+          : normalizedStatus === 'cancelled'
+            ? netCollateralPaid
+            : 0n;
+      const collateral = this.safeCodecToBigInt(pool.collateral ?? market.seedLiquidity);
+      const lockedPayout =
+        normalizedStatus === 'resolved'
+          ? normalizedResolution === 'yes'
+            ? this.safeCodecToBigInt(totalsForMarket.totalYesShares)
+            : normalizedResolution === 'no'
+              ? this.safeCodecToBigInt(totalsForMarket.totalNoShares)
+              : 0n
+          : normalizedStatus === 'cancelled'
+            ? this.safeCodecToBigInt(totalsForMarket.totalNetCollateralPaid)
+            : 0n;
+      const totalLiquidityClaimable =
+        normalizedStatus === 'resolved' || normalizedStatus === 'cancelled'
+          ? collateral > lockedPayout
+            ? collateral - lockedPayout
+            : 0n
+          : 0n;
+      const lpTotalShares = this.safeCodecToBigInt(lpTotalsForMarket.totalShares);
+      const lpClaimablePayout = lpTotalShares > 0n ? (totalLiquidityClaimable * lpShares) / lpTotalShares : 0n;
+      const dominantOutcome = yesShares >= noShares ? 'Yes' : 'No';
+      const dominantShares = yesShares >= noShares ? yesShares : noShares;
+
+      return [
+        {
+          collection: collection('accountPositions'),
+          id,
+          blockHeight,
+          timestamp,
+          data: {
+            id,
+            account,
+            marketId,
+            outcome: dominantShares > 0n ? dominantOutcome : null,
+            shares: decimalToString(dominantShares, decimals, 8),
+            yesShares: decimalToString(yesShares, decimals, 8),
+            noShares: decimalToString(noShares, decimals, 8),
+            netCollateralPaid: decimalToString(netCollateralPaid, decimals, 8),
+            lpShares: decimalToString(lpShares, decimals, 8),
+            lpCollateralContributed: decimalToString(lpCollateralContributed, decimals, 8),
+            costBasisUsd: decimalToString(netCollateralPaid, decimals, 8),
+            marketValueUsd: decimalToString(claimablePayout + lpClaimablePayout, decimals, 8),
+            realizedPnlUsd: '0',
+            unrealizedPnlUsd: '0',
+            claimablePayoutUsd: decimalToString(claimablePayout, decimals, 8),
+            lpClaimablePayoutUsd: decimalToString(lpClaimablePayout, decimals, 8),
+            isCreator: String(market.creator ?? '') === account,
+            status,
+            updatedAt: new Date(timestamp * 1000).toISOString(),
+            market: { id: String(marketId), marketId },
           },
         },
       ];

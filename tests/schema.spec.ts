@@ -86,7 +86,18 @@ describe('Polkaswap indexer schema', () => {
           id: '3',
           marketId: 3,
           title: 'Will KUSD stay at peg?',
+          metadataUri: 'ipfs://metadata',
+          metadataHash: `0x${'01'.repeat(32)}`,
+          rulesUri: 'ipfs://rules',
+          liquidityShares: '1000',
+          liquidityCollateralContributed: '1000',
           volumeUSD: '250',
+          resolutionEvidenceUri: 'ipfs://resolution',
+          resolutionEvidenceHash: `0x${'02'.repeat(32)}`,
+          resolutionEvidenceBlock: 99,
+          cancellationEvidenceUri: null,
+          cancellationEvidenceHash: null,
+          cancellationEvidenceBlock: null,
           governancePallet: 'democracy',
           governanceBody: 'Democracy',
           governanceKind: 'Referendum',
@@ -124,7 +135,18 @@ describe('Polkaswap indexer schema', () => {
             id: '3',
             marketId: 3,
             title: 'Will KUSD stay at peg?',
+            metadataUri: 'ipfs://metadata',
+            metadataHash: `0x${'01'.repeat(32)}`,
+            rulesUri: 'ipfs://rules',
+            liquidityShares: '1000',
+            liquidityCollateralContributed: '1000',
             volumeUSD: '250',
+            resolutionEvidenceUri: 'ipfs://resolution',
+            resolutionEvidenceHash: `0x${'02'.repeat(32)}`,
+            resolutionEvidenceBlock: 99,
+            cancellationEvidenceUri: null,
+            cancellationEvidenceHash: null,
+            cancellationEvidenceBlock: null,
             governancePallet: 'democracy',
             governanceBody: 'Democracy',
             governanceKind: 'Referendum',
@@ -634,6 +656,30 @@ describe('Polkaswap indexer schema', () => {
           },
         },
       },
+      {
+        collection: 'accountPositions',
+        id: '7-alice',
+        blockHeight: 12,
+        timestamp: 200,
+        data: {
+          id: '7-alice',
+          account: 'alice',
+          marketId: 7,
+          outcome: 'Yes',
+          shares: '10',
+          yesShares: '10',
+          noShares: '0',
+          netCollateralPaid: '5',
+          lpShares: '2',
+          lpCollateralContributed: '2',
+          claimablePayoutUsd: '0',
+          lpClaimablePayoutUsd: '0',
+          isCreator: false,
+          status: 'Open',
+          updatedAt: '1970-01-01T00:03:20.000Z',
+          market: { id: '7', marketId: 7 },
+        },
+      },
     ]);
     const schema = createSchema();
     const queryFields = schema.getQueryType()?.getFields();
@@ -656,7 +702,26 @@ describe('Polkaswap indexer schema', () => {
       {} as never
     )) as { edges: Array<{ node: Record<string, unknown> }>; totalCount: number };
 
-    expect(positions).toMatchObject({ edges: [], totalCount: 0 });
+    expect(positions).toMatchObject({
+      totalCount: 1,
+      edges: [
+        {
+          node: {
+            id: '7-alice',
+            account: 'alice',
+            marketId: 7,
+            yesShares: '10',
+            noShares: '0',
+            netCollateralPaid: '5',
+            lpShares: '2',
+            lpCollateralContributed: '2',
+            lpClaimablePayoutUsd: '0',
+            isCreator: false,
+            market: { id: '7', marketId: 7 },
+          },
+        },
+      ],
+    });
     expect(trades.totalCount).toBe(1);
     expect(trades.edges[0]?.node).toMatchObject({
       id: 'history-a-alice',
@@ -672,6 +737,73 @@ describe('Polkaswap indexer schema', () => {
       blockHash: '0xabc',
       extrinsicHash: 'history-a',
       market: { id: '7', marketId: 7 },
+    });
+  });
+
+  it('exposes Polkamarkt flip activity fields', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'accountTransactions',
+        id: 'history-flip-alice',
+        blockHeight: 13,
+        timestamp: 220,
+        data: {
+          id: 'history-flip-alice',
+          accountId: 'alice',
+          historyElementId: 'history-flip',
+          blockHeight: 13,
+          timestamp: 220,
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: 'history-flip',
+        blockHeight: 13,
+        timestamp: 220,
+        data: {
+          id: 'history-flip',
+          timestamp: 220,
+          blockHash: '0xdef',
+          blockHeight: 13,
+          module: 'polkamarkt',
+          method: 'flip_position',
+          address: 'alice',
+          data: {
+            marketId: 7,
+            side: 'flip',
+            fromOutcome: 'YES',
+            toOutcome: 'NO',
+            collateralReinvestedUsd: '5',
+            sharesIn: '12',
+            sharesOut: '10',
+            sellFeeUsd: '0.01',
+            buyFeeUsd: '0.02',
+          },
+        },
+      },
+    ]);
+    const schema = createSchema();
+    const tradesField = schema.getQueryType()?.getFields().accountTrades;
+
+    const trades = (await tradesField?.resolve?.(
+      {},
+      { where: { account_eq: 'alice' }, first: 10, orderBy: ['TIMESTAMP_DESC'] },
+      { repository },
+      {} as never
+    )) as { edges: Array<{ node: Record<string, unknown> }>; totalCount: number };
+
+    expect(trades.totalCount).toBe(1);
+    expect(trades.edges[0]?.node).toMatchObject({
+      id: 'history-flip-alice',
+      side: 'flip',
+      fromOutcome: 'YES',
+      toOutcome: 'NO',
+      collateralReinvestedUsd: '5',
+      sharesIn: '12',
+      sharesOut: '10',
+      sellFeeUsd: '0.01',
+      buyFeeUsd: '0.02',
     });
   });
 

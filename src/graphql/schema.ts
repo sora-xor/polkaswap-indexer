@@ -320,11 +320,18 @@ export const typeDefs = /* GraphQL */ `
     marketId: Int
     outcome: String
     shares: String
+    yesShares: String
+    noShares: String
+    netCollateralPaid: String
+    lpShares: String
+    lpCollateralContributed: String
     costBasisUsd: String
     marketValueUsd: String
     realizedPnlUsd: String
     unrealizedPnlUsd: String
     claimablePayoutUsd: String
+    lpClaimablePayoutUsd: String
+    isCreator: Boolean
     status: String
     updatedAt: String
     market: Market
@@ -347,14 +354,21 @@ export const typeDefs = /* GraphQL */ `
     marketId: Int
     side: String
     outcome: String
+    fromOutcome: String
+    toOutcome: String
     collateralUsd: String
     collateralAmountUsd: String
+    collateralReinvestedUsd: String
     shares: String
     sharesAmount: String
+    sharesIn: String
+    sharesOut: String
     price: String
     executionPrice: String
     feeUsd: String
     feeAmountUsd: String
+    sellFeeUsd: String
+    buyFeeUsd: String
     realizedPnlUsd: String
     timestamp: String
     blockNumber: Int
@@ -380,7 +394,11 @@ export const typeDefs = /* GraphQL */ `
     conditionId: Int
     title: String
     category: String
+    tags: String
     description: String
+    metadataUri: String
+    metadataHash: String
+    rulesUri: String
     oracle: String
     resolutionSource: String
     closeBlock: Int
@@ -388,6 +406,7 @@ export const typeDefs = /* GraphQL */ `
     creator: String
     collateralAsset: String
     seedLiquidity: String
+    creatorFees: String
     liquidityUSD: String
     volumeUSD: String
     probability: Float
@@ -395,7 +414,15 @@ export const typeDefs = /* GraphQL */ `
     collateral: String
     yesShares: String
     noShares: String
+    liquidityShares: String
+    liquidityCollateralContributed: String
     resolutionOutcome: String
+    resolutionEvidenceUri: String
+    resolutionEvidenceHash: String
+    resolutionEvidenceBlock: Int
+    cancellationEvidenceUri: String
+    cancellationEvidenceHash: String
+    cancellationEvidenceBlock: Int
     governancePallet: String
     governanceBody: String
     governanceKind: String

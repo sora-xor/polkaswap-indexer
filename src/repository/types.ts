@@ -2,6 +2,8 @@ export type IndexerCollection =
   | 'accounts'
   | 'accountMeta'
   | 'accountPointSystems'
+  | 'accountPositions'
+  | 'accountTrades'
   | 'accountTransactions'
   | 'accountLiquiditySnapshots'
   | 'assets'
