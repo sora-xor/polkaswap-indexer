@@ -10,7 +10,7 @@ export const typeDefs = /* GraphQL */ `
   scalar AssetSnapshotFilter
   scalar HistoryElementFilter
   scalar MarketFilter
-  scalar MarketOrderbookFilter
+  scalar MarketSnapshotFilter
   scalar NetworkSnapshotFilter
   scalar OrderBookFilter
   scalar OrderBookOrderFilter
@@ -323,14 +323,11 @@ export const typeDefs = /* GraphQL */ `
     yesShares: String
     noShares: String
     netCollateralPaid: String
-    lpShares: String
-    lpCollateralContributed: String
     costBasisUsd: String
     marketValueUsd: String
     realizedPnlUsd: String
     unrealizedPnlUsd: String
     claimablePayoutUsd: String
-    lpClaimablePayoutUsd: String
     isCreator: Boolean
     status: String
     updatedAt: String
@@ -358,7 +355,6 @@ export const typeDefs = /* GraphQL */ `
     toOutcome: String
     collateralUsd: String
     collateralAmountUsd: String
-    collateralReinvestedUsd: String
     shares: String
     sharesAmount: String
     sharesIn: String
@@ -367,8 +363,6 @@ export const typeDefs = /* GraphQL */ `
     executionPrice: String
     feeUsd: String
     feeAmountUsd: String
-    sellFeeUsd: String
-    buyFeeUsd: String
     realizedPnlUsd: String
     timestamp: String
     blockNumber: Int
@@ -403,19 +397,26 @@ export const typeDefs = /* GraphQL */ `
     resolutionSource: String
     closeBlock: Int
     status: String
+    mechanism: String
     creator: String
     collateralAsset: String
-    seedLiquidity: String
     creatorFees: String
     liquidityUSD: String
     volumeUSD: String
     probability: Float
     priceYes: Float
+    priceNo: Float
+    virtualDepth: String
+    dpmCollateral: String
+    realYesShares: String
+    realNoShares: String
+    marginalYesPriceBps: Int
+    marginalNoPriceBps: Int
+    impliedYesProbabilityBps: Int
+    impliedNoProbabilityBps: Int
     collateral: String
     yesShares: String
     noShares: String
-    liquidityShares: String
-    liquidityCollateralContributed: String
     resolutionOutcome: String
     resolutionEvidenceUri: String
     resolutionEvidenceHash: String
@@ -446,27 +447,38 @@ export const typeDefs = /* GraphQL */ `
     totalCount: Int!
   }
 
-  type MarketOrderLevel {
-    price: Float!
-    quantity: Float!
-  }
-
-  type MarketOrderbook {
+  type MarketSnapshot {
     id: String!
     marketId: Int
-    bids: [MarketOrderLevel!]!
-    asks: [MarketOrderLevel!]!
-    updatedAtBlock: Int
     timestamp: Int
+    blockHeight: Int
+    type: SnapshotType
+    probability: Float
+    priceYes: Float
+    priceNo: Float
+    virtualDepth: String
+    dpmCollateral: String
+    realYesShares: String
+    realNoShares: String
+    marginalYesPriceBps: Int
+    marginalNoPriceBps: Int
+    impliedYesProbabilityBps: Int
+    impliedNoProbabilityBps: Int
+    collateral: String
+    yesShares: String
+    noShares: String
+    liquidityUSD: String
+    volumeUSD: String
+    status: String
   }
 
-  type MarketOrderbookEdge {
+  type MarketSnapshotEdge {
     cursor: Cursor
-    node: MarketOrderbook!
+    node: MarketSnapshot!
   }
 
-  type MarketOrderbookConnection {
-    edges: [MarketOrderbookEdge!]!
+  type MarketSnapshotConnection {
+    edges: [MarketSnapshotEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
   }
@@ -773,8 +785,7 @@ export const typeDefs = /* GraphQL */ `
     accountLiquiditySnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountLiquiditySnapshotFilter): AccountLiquiditySnapshotConnection!
     market(id: String!): Market
     markets(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: MarketFilter): MarketConnection!
-    marketOrderbook(marketId: Int!): MarketOrderbook
-    marketOrderbooks(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: MarketOrderbookFilter): MarketOrderbookConnection!
+    marketSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: MarketSnapshotFilter): MarketSnapshotConnection!
     networkSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: NetworkSnapshotFilter): NetworkSnapshotConnection!
     poolXYKs(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: PoolXYKFilter): PoolXYKConnection!
     poolSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: PoolSnapshotFilter): PoolSnapshotConnection!

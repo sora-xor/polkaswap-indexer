@@ -17,11 +17,55 @@ const numericJsonExpression = (field: string): string => {
   return `(case when jsonb_typeof(data->'${field}') in ('number', 'string') and nullif(data->>'${field}', '') ~ '${NUMERIC_TEXT_PATTERN}' then (data->>'${field}')::numeric else 0 end)`;
 };
 
+const numericIndexCollections = {
+  updatedAtBlock: ['historyElements', 'markets', 'orderBooks', 'orderBookOrders', 'vaults', 'vaultEvents', 'accountPositions'],
+  createdAtBlock: ['accountMeta', 'markets', 'orderBookOrders', 'vaults', 'vaultEvents'],
+  createdAtTimestamp: ['accountMeta', 'accountLiquiditySnapshots'],
+  priceChangeDay: ['assets', 'orderBooks'],
+  liquidity: ['assets'],
+  liquidityBooks: ['assets'],
+  liquidityUSD: ['assets', 'markets', 'marketSnapshots', 'networkSnapshots', 'orderBooks', 'orderBookSnapshots', 'poolXYKs', 'poolSnapshots'],
+  priceUSD: ['assets', 'poolXYKs'],
+  poolTokenPriceUSD: ['poolXYKs', 'poolSnapshots'],
+  priceChangeWeek: ['assets'],
+  volumeDayUSD: ['assets', 'orderBooks'],
+  volumeWeekUSD: ['assets'],
+  volumeUSD: ['markets', 'marketSnapshots', 'networkSnapshots', 'orderBookSnapshots', 'poolSnapshots'],
+  baseAssetReserves: ['orderBooks', 'poolXYKs', 'poolSnapshots'],
+  targetAssetReserves: ['poolXYKs', 'poolSnapshots'],
+  amount: ['orderBookOrders', 'referrerRewards', 'xorBurns'],
+  apy: ['stakingValidators'],
+  commission: ['stakingValidators'],
+  rewardPoints: ['stakingValidators'],
+} satisfies Record<string, string[]>;
+
+const collectionPredicate = (collections: string[]): string => {
+  if (!collections.length) {
+    throw new Error('Numeric index must be scoped to at least one collection');
+  }
+
+  const quotedCollections = collections.map((collection) => `'${collection.replace(/'/g, "''")}'`).join(', ');
+
+  return `collection in (${quotedCollections})`;
+};
+
 export async function migrate(databaseUrl = readConfig().databaseUrl): Promise<void> {
   const pool = new Pool({ connectionString: databaseUrl });
   const client = await pool.connect();
-  const createNumericIndex = (name: string, field: string) =>
-    client.query(`create index if not exists ${name} on indexer_documents(collection, ${numericJsonExpression(field)}, id);`);
+  const createNumericIndex = async (name: string, field: keyof typeof numericIndexCollections) => {
+    const predicate = collectionPredicate(numericIndexCollections[field]);
+    const existingIndex = await client.query<{ indexdef: string }>('select pg_get_indexdef($1::regclass) as indexdef', [
+      name,
+    ]).catch(() => null);
+
+    if (existingIndex && !existingIndex.rows[0]?.indexdef.includes(' WHERE ')) {
+      await client.query(`drop index ${name};`);
+    }
+
+    await client.query(
+      `create index if not exists ${name} on indexer_documents(collection, ${numericJsonExpression(field)}, id) where ${predicate};`
+    );
+  };
 
   try {
     await client.query('select pg_advisory_lock($1);', [MIGRATION_LOCK_KEY]);

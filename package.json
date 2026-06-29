@@ -20,8 +20,10 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@babel/runtime": "^7.28.4",
     "@graphql-tools/schema": "^10.0.30",
     "@polkadot/api": "16.5.4",
+    "@sora-substrate/type-definitions": "1.46.3",
     "graphql": "^16.13.1",
     "graphql-ws": "6.0.7",
     "graphql-yoga": "^5.16.2",

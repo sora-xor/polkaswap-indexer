@@ -11,7 +11,7 @@ export type IndexerCollection =
   | 'historyCalls'
   | 'historyElements'
   | 'markets'
-  | 'marketOrderbooks'
+  | 'marketSnapshots'
   | 'networkSnapshots'
   | 'orderBooks'
   | 'orderBookOrders'

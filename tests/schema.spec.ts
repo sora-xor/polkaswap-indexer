@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { GraphQLResolveInfo } from 'graphql';
+import type { GraphQLObjectType, GraphQLResolveInfo } from 'graphql';
 
 import { createSchema } from '../src/graphql/resolvers.js';
 import { MemoryRepository } from '../src/repository/memory.js';
@@ -75,7 +75,7 @@ describe('Polkaswap indexer schema', () => {
     });
   });
 
-  it('exposes Polkamarkt market and market orderbook data', async () => {
+  it('exposes Polkamarkt market and snapshot data', async () => {
     const repository = new MemoryRepository();
     await repository.upsertMany([
       {
@@ -85,13 +85,25 @@ describe('Polkaswap indexer schema', () => {
         data: {
           id: '3',
           marketId: 3,
+          conditionId: 0,
           title: 'Will KUSD stay at peg?',
           metadataUri: 'ipfs://metadata',
           metadataHash: `0x${'01'.repeat(32)}`,
           rulesUri: 'ipfs://rules',
-          liquidityShares: '1000',
-          liquidityCollateralContributed: '1000',
+          creatorFees: '0',
           volumeUSD: '250',
+          probability: 50.66,
+          priceYes: 0.5066,
+          priceNo: 0.4933,
+          mechanism: 'DynamicPariMutuel',
+          virtualDepth: '100',
+          dpmCollateral: '1200',
+          realYesShares: '52',
+          realNoShares: '48',
+          marginalYesPriceBps: 7164,
+          marginalNoPriceBps: 6976,
+          impliedYesProbabilityBps: 5066,
+          impliedNoProbabilityBps: 4933,
           resolutionEvidenceUri: 'ipfs://resolution',
           resolutionEvidenceHash: `0x${'02'.repeat(32)}`,
           resolutionEvidenceBlock: 99,
@@ -105,20 +117,95 @@ describe('Polkaswap indexer schema', () => {
         },
       },
       {
-        collection: 'marketOrderbooks',
-        id: '3',
-        timestamp: 200,
+        collection: 'marketSnapshots',
+        id: 'market-3-DEFAULT-180',
+        timestamp: 180,
         data: {
-          id: '3',
+          id: 'market-3-DEFAULT-180',
           marketId: 3,
-          bids: [{ price: 0.59, quantity: 100 }],
-          asks: [{ price: 0.61, quantity: 80 }],
+          timestamp: 180,
+          blockHeight: 90,
+          type: 'DEFAULT',
+          probability: 47.66,
+          priceYes: 0.4766,
+          priceNo: 0.5233,
+          virtualDepth: '100',
+          dpmCollateral: '1000',
+          realYesShares: '43',
+          realNoShares: '57',
+          marginalYesPriceBps: 6733,
+          marginalNoPriceBps: 7393,
+          impliedYesProbabilityBps: 4766,
+          impliedNoProbabilityBps: 5233,
+          yesShares: '43',
+          noShares: '57',
+          liquidityUSD: '1000',
+          volumeUSD: '200',
+          status: 'Open',
+        },
+      },
+      {
+        collection: 'marketSnapshots',
+        id: 'market-3-DEFAULT-240',
+        timestamp: 240,
+        data: {
+          id: 'market-3-DEFAULT-240',
+          marketId: 3,
+          timestamp: 240,
+          blockHeight: 120,
+          type: 'DEFAULT',
+          probability: 46,
+          priceYes: 0.46,
+          priceNo: 0.54,
+          virtualDepth: '100',
+          dpmCollateral: '1200',
+          realYesShares: '38',
+          realNoShares: '62',
+          marginalYesPriceBps: 6484,
+          marginalNoPriceBps: 7612,
+          impliedYesProbabilityBps: 4600,
+          impliedNoProbabilityBps: 5400,
+          yesShares: '38',
+          noShares: '62',
+          liquidityUSD: '1200',
+          volumeUSD: '250',
+          status: 'Open',
         },
       },
     ]);
     const schema = createSchema();
+    const marketFields = (schema.getType('Market') as { getFields?: () => Record<string, unknown> } | undefined)?.getFields?.() ?? {};
+    const marketSnapshotFields =
+      (schema.getType('MarketSnapshot') as { getFields?: () => Record<string, unknown> } | undefined)?.getFields?.() ?? {};
+
+    expect(Object.keys(marketFields)).toEqual(
+      expect.arrayContaining([
+        'mechanism',
+        'priceNo',
+        'virtualDepth',
+        'dpmCollateral',
+        'realYesShares',
+        'realNoShares',
+        'marginalYesPriceBps',
+        'marginalNoPriceBps',
+        'impliedYesProbabilityBps',
+        'impliedNoProbabilityBps',
+      ])
+    );
+    expect(Object.keys(marketSnapshotFields)).toEqual(
+      expect.arrayContaining([
+        'virtualDepth',
+        'dpmCollateral',
+        'realYesShares',
+        'realNoShares',
+        'marginalYesPriceBps',
+        'marginalNoPriceBps',
+        'impliedYesProbabilityBps',
+        'impliedNoProbabilityBps',
+      ])
+    );
     const marketsField = schema.getQueryType()?.getFields().markets;
-    const marketOrderbookField = schema.getQueryType()?.getFields().marketOrderbook;
+    const marketSnapshotsField = schema.getQueryType()?.getFields().marketSnapshots;
 
     const markets = await marketsField?.resolve?.(
       {},
@@ -126,7 +213,16 @@ describe('Polkaswap indexer schema', () => {
       { repository },
       {} as GraphQLResolveInfo
     );
-    const orderbook = await marketOrderbookField?.resolve?.({}, { marketId: 3 }, { repository }, {} as never);
+    const snapshots = await marketSnapshotsField?.resolve?.(
+      {},
+      {
+        first: 10,
+        orderBy: ['TIMESTAMP_ASC'],
+        filter: { marketId: { equalTo: 3 }, type: { equalTo: 'DEFAULT' } },
+      },
+      { repository },
+      {} as GraphQLResolveInfo
+    );
 
     expect(markets).toMatchObject({
       edges: [
@@ -134,13 +230,25 @@ describe('Polkaswap indexer schema', () => {
           node: {
             id: '3',
             marketId: 3,
+            conditionId: 0,
             title: 'Will KUSD stay at peg?',
             metadataUri: 'ipfs://metadata',
             metadataHash: `0x${'01'.repeat(32)}`,
             rulesUri: 'ipfs://rules',
-            liquidityShares: '1000',
-            liquidityCollateralContributed: '1000',
+            creatorFees: '0',
             volumeUSD: '250',
+            probability: 50.66,
+            priceYes: 0.5066,
+            priceNo: 0.4933,
+            mechanism: 'DynamicPariMutuel',
+            virtualDepth: '100',
+            dpmCollateral: '1200',
+            realYesShares: '52',
+            realNoShares: '48',
+            marginalYesPriceBps: 7164,
+            marginalNoPriceBps: 6976,
+            impliedYesProbabilityBps: 5066,
+            impliedNoProbabilityBps: 4933,
             resolutionEvidenceUri: 'ipfs://resolution',
             resolutionEvidenceHash: `0x${'02'.repeat(32)}`,
             resolutionEvidenceBlock: 99,
@@ -156,11 +264,44 @@ describe('Polkaswap indexer schema', () => {
       ],
       totalCount: 1,
     });
-    expect(orderbook).toMatchObject({
-      id: '3',
-      marketId: 3,
-      bids: [{ price: 0.59, quantity: 100 }],
-      asks: [{ price: 0.61, quantity: 80 }],
+    expect(snapshots).toMatchObject({
+      edges: [
+        {
+          node: {
+            id: 'market-3-DEFAULT-180',
+            marketId: 3,
+            probability: 47.66,
+            priceYes: 0.4766,
+            priceNo: 0.5233,
+            virtualDepth: '100',
+            dpmCollateral: '1000',
+            realYesShares: '43',
+            realNoShares: '57',
+            marginalYesPriceBps: 6733,
+            marginalNoPriceBps: 7393,
+            impliedYesProbabilityBps: 4766,
+            impliedNoProbabilityBps: 5233,
+          },
+        },
+        {
+          node: {
+            id: 'market-3-DEFAULT-240',
+            marketId: 3,
+            probability: 46,
+            priceYes: 0.46,
+            priceNo: 0.54,
+            virtualDepth: '100',
+            dpmCollateral: '1200',
+            realYesShares: '38',
+            realNoShares: '62',
+            marginalYesPriceBps: 6484,
+            marginalNoPriceBps: 7612,
+            impliedYesProbabilityBps: 4600,
+            impliedNoProbabilityBps: 5400,
+          },
+        },
+      ],
+      totalCount: 2,
     });
   });
 
@@ -670,10 +811,7 @@ describe('Polkaswap indexer schema', () => {
           yesShares: '10',
           noShares: '0',
           netCollateralPaid: '5',
-          lpShares: '2',
-          lpCollateralContributed: '2',
           claimablePayoutUsd: '0',
-          lpClaimablePayoutUsd: '0',
           isCreator: false,
           status: 'Open',
           updatedAt: '1970-01-01T00:03:20.000Z',
@@ -685,9 +823,13 @@ describe('Polkaswap indexer schema', () => {
     const queryFields = schema.getQueryType()?.getFields();
     const positionsField = queryFields?.accountPositions;
     const tradesField = queryFields?.accountTrades;
+    const accountTradeFields = (schema.getType('AccountTrade') as GraphQLObjectType | undefined)?.getFields() ?? {};
 
     expect(positionsField?.args.map((arg) => arg.name)).toContain('where');
     expect(tradesField?.args.map((arg) => arg.name)).toContain('where');
+    expect(Object.keys(accountTradeFields)).toEqual(
+      expect.arrayContaining(['fromOutcome', 'toOutcome', 'sharesIn', 'sharesOut'])
+    );
 
     const positions = await positionsField?.resolve?.(
       {},
@@ -713,9 +855,6 @@ describe('Polkaswap indexer schema', () => {
             yesShares: '10',
             noShares: '0',
             netCollateralPaid: '5',
-            lpShares: '2',
-            lpCollateralContributed: '2',
-            lpClaimablePayoutUsd: '0',
             isCreator: false,
             market: { id: '7', marketId: 7 },
           },
@@ -729,8 +868,10 @@ describe('Polkaswap indexer schema', () => {
       marketId: 7,
       side: 'buy',
       outcome: 'YES',
+      toOutcome: 'YES',
       collateralUsd: '5',
       shares: '10',
+      sharesIn: '10',
       price: '0.5',
       timestamp: '1970-01-01T00:03:20.000Z',
       blockNumber: 12,
@@ -812,73 +953,6 @@ describe('Polkaswap indexer schema', () => {
 
     expect(positions.totalCount).toBe(1);
     expect(positions.edges.map((edge) => edge.node.id)).toEqual(['7-alice']);
-  });
-
-  it('exposes Polkamarkt flip activity fields', async () => {
-    const repository = new MemoryRepository();
-    await repository.upsertMany([
-      {
-        collection: 'accountTransactions',
-        id: 'history-flip-alice',
-        blockHeight: 13,
-        timestamp: 220,
-        data: {
-          id: 'history-flip-alice',
-          accountId: 'alice',
-          historyElementId: 'history-flip',
-          blockHeight: 13,
-          timestamp: 220,
-        },
-      },
-      {
-        collection: 'historyElements',
-        id: 'history-flip',
-        blockHeight: 13,
-        timestamp: 220,
-        data: {
-          id: 'history-flip',
-          timestamp: 220,
-          blockHash: '0xdef',
-          blockHeight: 13,
-          module: 'polkamarkt',
-          method: 'flip_position',
-          address: 'alice',
-          data: {
-            marketId: 7,
-            side: 'flip',
-            fromOutcome: 'YES',
-            toOutcome: 'NO',
-            collateralReinvestedUsd: '5',
-            sharesIn: '12',
-            sharesOut: '10',
-            sellFeeUsd: '0.01',
-            buyFeeUsd: '0.02',
-          },
-        },
-      },
-    ]);
-    const schema = createSchema();
-    const tradesField = schema.getQueryType()?.getFields().accountTrades;
-
-    const trades = (await tradesField?.resolve?.(
-      {},
-      { where: { account_eq: 'alice' }, first: 10, orderBy: ['TIMESTAMP_DESC'] },
-      { repository },
-      {} as never
-    )) as { edges: Array<{ node: Record<string, unknown> }>; totalCount: number };
-
-    expect(trades.totalCount).toBe(1);
-    expect(trades.edges[0]?.node).toMatchObject({
-      id: 'history-flip-alice',
-      side: 'flip',
-      fromOutcome: 'YES',
-      toOutcome: 'NO',
-      collateralReinvestedUsd: '5',
-      sharesIn: '12',
-      sharesOut: '10',
-      sellFeeUsd: '0.01',
-      buyFeeUsd: '0.02',
-    });
   });
 
   it('serves SubQuery-compatible asset connections', async () => {

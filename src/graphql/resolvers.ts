@@ -246,7 +246,7 @@ const cachedConnectionCollections = new Set<IndexerCollection>([
   'assets',
   'assetSnapshots',
   'markets',
-  'marketOrderbooks',
+  'marketSnapshots',
   'networkSnapshots',
   'poolXYKs',
   'poolSnapshots',
@@ -558,17 +558,6 @@ const createDocumentResolver =
     });
   };
 
-const marketOrderbookResolver = async (
-  _parent: unknown,
-  args: { marketId: number },
-  context: Context
-): Promise<Record<string, unknown> | null> => {
-  const marketId = Number(args.marketId);
-  if (!Number.isSafeInteger(marketId) || marketId < 0) return null;
-
-  return (await context.repository.get(collection('marketOrderbooks'), String(marketId)))?.data ?? null;
-};
-
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 
@@ -757,6 +746,7 @@ const normalizeSide = (value: unknown): string | null => {
   if (!method) return null;
   if (method.includes('flip')) return 'flip';
   if (method.includes('claim')) return 'claim';
+  if (method.includes('order')) return 'order';
   if (method.includes('sell')) return 'sell';
   if (method.includes('buy')) return 'buy';
   return method;
@@ -801,21 +791,18 @@ const toAccountTradeNode = (
     marketId,
     side: normalizeSide(firstValue(records, ['side', 'action', 'method'])),
     outcome: readString(firstValue(records, ['outcome', 'direction'])),
-    fromOutcome: readString(firstValue(records, ['fromOutcome', 'from_outcome'])),
-    toOutcome: readString(firstValue(records, ['toOutcome', 'to_outcome'])),
+    fromOutcome: readString(firstValue(records, ['fromOutcome', 'from_outcome', 'outcomeIn', 'outcome_in'])),
+    toOutcome: readString(firstValue(records, ['toOutcome', 'to_outcome', 'outcomeOut', 'outcome_out', 'outcome', 'direction'])),
     collateralUsd: readString(firstValue(records, ['collateralUsd', 'collateralUSD', 'collateralAmountUsd', 'amountUsd'])),
     collateralAmountUsd: readString(firstValue(records, ['collateralAmountUsd', 'collateralUsd', 'amountUsd'])),
-    collateralReinvestedUsd: readString(firstValue(records, ['collateralReinvestedUsd', 'collateralReinvestedUSD'])),
     shares: readString(firstValue(records, ['shares', 'sharesAmount', 'shareAmount'])),
     sharesAmount: readString(firstValue(records, ['sharesAmount', 'shares', 'shareAmount'])),
-    sharesIn: readString(firstValue(records, ['sharesIn', 'shares_in'])),
-    sharesOut: readString(firstValue(records, ['sharesOut', 'shares_out'])),
+    sharesIn: readString(firstValue(records, ['sharesIn', 'shares_in', 'sharesAmountIn', 'sharesAmount', 'shares', 'shareAmount'])),
+    sharesOut: readString(firstValue(records, ['sharesOut', 'shares_out', 'sharesAmountOut'])),
     price: readString(firstValue(records, ['price', 'executionPrice', 'avgPrice'])),
     executionPrice: readString(firstValue(records, ['executionPrice', 'price', 'avgPrice'])),
     feeUsd: readString(firstValue(records, ['feeUsd', 'feeUSD', 'feeAmountUsd'])),
     feeAmountUsd: readString(firstValue(records, ['feeAmountUsd', 'feeUsd', 'feeUSD'])),
-    sellFeeUsd: readString(firstValue(records, ['sellFeeUsd', 'sellFeeUSD'])),
-    buyFeeUsd: readString(firstValue(records, ['buyFeeUsd', 'buyFeeUSD'])),
     realizedPnlUsd: readString(firstValue(records, ['realizedPnlUsd', 'realizedPnlUSD', 'pnlUsd'])),
     timestamp: timestampIso(timestamp),
     blockNumber,
@@ -1027,8 +1014,7 @@ export function createSchema(): GraphQLSchema {
         accountLiquiditySnapshots: connectionResolver(collection('accountLiquiditySnapshots')),
         market: documentResolver(collection('markets')),
         markets: connectionResolver(collection('markets')),
-        marketOrderbook: marketOrderbookResolver,
-        marketOrderbooks: connectionResolver(collection('marketOrderbooks')),
+        marketSnapshots: connectionResolver(collection('marketSnapshots')),
         networkSnapshots: connectionResolver(collection('networkSnapshots')),
         poolXYKs: connectionResolver(collection('poolXYKs')),
         poolSnapshots: connectionResolver(collection('poolSnapshots')),

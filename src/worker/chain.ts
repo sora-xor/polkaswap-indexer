@@ -1,4 +1,5 @@
 import { ApiPromise, WsProvider } from '@polkadot/api';
+import { types as soraTypes } from '@sora-substrate/type-definitions';
 
 import {
   ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID,
@@ -202,10 +203,21 @@ type IndexBlockOptions = {
   refreshDerivedState?: boolean;
 };
 
+type FetchedBlock = {
+  signedBlock: any;
+  events: EventRecord[];
+  timestamp: number;
+};
+
 type DerivedStateRefreshRequest = {
   blockHeight: number;
   timestamp: number;
   includeSnapshots: boolean;
+};
+
+type PriceStreamRefreshRequest = {
+  blockHeight: number;
+  timestamp: number;
 };
 
 type StorageEntryKey = {
@@ -250,22 +262,86 @@ const BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID = 'bridgeProxyHistoryBackfill-v1';
 const NETWORK_AGGREGATE_BACKFILL_STATE_ID = 'networkAggregateSnapshotsBackfill';
 const NETWORK_TRANSACTION_COUNTER_REPAIR_STATE_ID = 'networkTransactionCounterRepair-v1';
 const ASSET_PRICE_OUTLIER_CLEANUP_STATE_ID = 'assetSnapshotPriceOutlierCleanup-v1';
+const XOR_SUPPLY_REPAIR_STATE_ID = 'xorSupplyRepair-v1';
 const DECIMALS = 18;
 const SCALE = 10n ** 18n;
+const DPM_VIRTUAL_SHARES = 100n * SCALE;
 const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000';
 const VAL = '0x0200040000000000000000000000000000000000000000000000000000000000';
-const XOR_SUPPLY_REDENOMINATION_FACTOR = 1_000_000n;
 const SORA_NEXUS_XOR_BURN_REMARK_TYPE = 'soraNexusXorClaim';
 const LIBERLAND_NETWORK_ID = 'Liberland';
 const SORA_XOR_BURN_START_BLOCK = 25_043_003;
-const XOR_BURN_BACKFILL_BATCH_SIZE = 250;
+const readPositiveIntegerEnv = (name: string, fallback: number): number => {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+};
+const XOR_BURN_BACKFILL_BATCH_SIZE = readPositiveIntegerEnv('CHAIN_XOR_BURN_BACKFILL_BATCH_SIZE', 500);
+const XOR_BURN_BACKFILL_RPC_CONCURRENCY = readPositiveIntegerEnv('CHAIN_XOR_BURN_BACKFILL_RPC_CONCURRENCY', 16);
+const XOR_BURN_BACKFILL_RETRY_DELAY_MS = readPositiveIntegerEnv('CHAIN_XOR_BURN_BACKFILL_RETRY_DELAY_MS', 30_000);
+const XOR_BURN_BACKFILL_RPC_RETRIES = readPositiveIntegerEnv('CHAIN_XOR_BURN_BACKFILL_RPC_RETRIES', 3);
+const XOR_BURN_BACKFILL_RPC_RETRY_DELAY_MS = readPositiveIntegerEnv('CHAIN_XOR_BURN_BACKFILL_RPC_RETRY_DELAY_MS', 2_000);
 const BRIDGE_PROXY_HISTORY_BACKFILL_BATCH_SIZE = 500;
 const BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY = 16;
+const XOR_SUPPLY_REPAIR_RPC_CONCURRENCY = 8;
 const ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE = 1_000;
 const FINALIZED_HEAD_RETRY_DELAY_MS = 5_000;
 const FINALIZED_HEAD_POLL_INTERVAL_MS = 1_000;
 const DERIVED_STATE_REFRESH_RETRY_DELAY_MS = 15_000;
 const CHAIN_RPC_TIMEOUT_MS = 15_000;
+const BACKFILL_PREFETCH_CONCURRENCY = Math.max(
+  1,
+  Math.floor(Number(process.env.CHAIN_BACKFILL_PREFETCH_CONCURRENCY ?? 1))
+);
+const FINALIZED_CATCHUP_PREFETCH_CONCURRENCY = Math.max(
+  1,
+  Math.floor(Number(process.env.CHAIN_FINALIZED_CATCHUP_PREFETCH_CONCURRENCY ?? BACKFILL_PREFETCH_CONCURRENCY))
+);
+const PRICE_STREAM_REFRESH_INTERVAL_BLOCKS = Math.max(
+  0,
+  Math.floor(Number(process.env.CHAIN_PRICE_STREAM_REFRESH_INTERVAL_BLOCKS ?? 0))
+);
+const USE_LEGACY_SORA_BLOCK_TYPES = ['1', 'true', 'yes'].includes(
+  String(process.env.CHAIN_LEGACY_SORA_BLOCK_TYPES ?? '').toLowerCase()
+);
+const ARCHIVE_SORA_WS_ENDPOINT = process.env.SORA_ARCHIVE_WS_ENDPOINT?.trim() ?? '';
+const soraSpec1Types = {
+  ...soraTypes,
+  DispatchErrorModuleV0: { index: 'u8', error: 'u8' },
+  DispatchError: {
+    _enum: {
+      Other: 'Null',
+      CannotLookup: 'Null',
+      BadOrigin: 'Null',
+      Module: 'DispatchErrorModuleV0',
+      ConsumerRemaining: 'Null',
+      NoProviders: 'Null',
+      TooManyConsumers: 'Null',
+      Token: 'TokenError',
+      Arithmetic: 'ArithmeticError',
+    },
+  },
+  Weight: 'u64',
+  DispatchInfo: { weight: 'u64', class: 'DispatchClass', paysFee: 'Pays' },
+  PostDispatchInfo: { actualWeight: 'Option<u64>', paysFee: 'Pays' },
+  // Spec 1 BridgeMultisig metadata exposes the bridge timepoint under the generic Timepoint name.
+  Timepoint: 'BridgeTimepoint',
+};
+const soraArchiveTypesBundle = {
+  spec: {
+    sora: {
+      types: [
+        { minmax: [0, 1], types: soraSpec1Types },
+        { minmax: [2, null], types: soraTypes },
+      ],
+    },
+    'sora-substrate': {
+      types: [
+        { minmax: [0, 1], types: soraSpec1Types },
+        { minmax: [2, null], types: soraTypes },
+      ],
+    },
+  },
+};
 const PSWAP = '0x0200050000000000000000000000000000000000000000000000000000000000';
 const DAI = '0x0200060000000000000000000000000000000000000000000000000000000000';
 const XSTUSD = '0x0200080000000000000000000000000000000000000000000000000000000000';
@@ -374,6 +450,38 @@ const withTimeout = async <T>(promise: Promise<T>, label: string, timeoutMs = CH
   } finally {
     if (timeout) clearTimeout(timeout);
   }
+};
+
+const isPrunedHistoricalStateErrorValue = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('State already discarded') || message.includes('unknown Block');
+};
+
+const delay = (delayMs: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, delayMs));
+
+const withRpcRetry = async <T>(
+  createRequest: () => Promise<T>,
+  label: string,
+  attempts = XOR_BURN_BACKFILL_RPC_RETRIES
+): Promise<T> => {
+  let lastError: unknown;
+  const maxAttempts = Math.max(1, attempts);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await withTimeout(createRequest(), label);
+    } catch (error) {
+      if (isPrunedHistoricalStateErrorValue(error)) throw error;
+
+      lastError = error;
+      if (attempt >= maxAttempts) break;
+
+      console.warn(`${label} failed on attempt ${attempt}/${maxAttempts}; retrying`);
+      await delay(XOR_BURN_BACKFILL_RPC_RETRY_DELAY_MS * attempt);
+    }
+  }
+
+  throw lastError;
 };
 
 const toJson = (value: unknown): unknown => {
@@ -497,6 +605,65 @@ const codecToDecimalString = (value: unknown, decimals = DECIMALS): string =>
 
 const scaledMul = (left: bigint, right: bigint): bigint => (left * right) / SCALE;
 const scaledDiv = (left: bigint, right: bigint): bigint => (right === 0n ? 0n : (left * SCALE) / right);
+
+const integerSqrt = (value: bigint): bigint => {
+  if (value < 0n) throw new Error('Cannot square-root a negative bigint');
+  if (value < 2n) return value;
+
+  let previous = value;
+  let current = (value >> 1n) + 1n;
+
+  while (current < previous) {
+    previous = current;
+    current = (current + value / current) >> 1n;
+  }
+
+  return previous;
+};
+
+const ratioBps = (numerator: bigint, denominator: bigint): number =>
+  denominator <= 0n ? 0 : Number((numerator * 10_000n) / denominator);
+
+const normalizedMechanism = (value: string): string => value.replace(/[_\s-]/g, '').toLowerCase();
+
+const emptyIndexedMarketState = (yesShares: bigint, noShares: bigint) => ({
+  realYesShares: yesShares < 0n ? 0n : yesShares,
+  realNoShares: noShares < 0n ? 0n : noShares,
+  virtualDepth: 0n,
+  marginalYesPriceBps: 0,
+  marginalNoPriceBps: 0,
+  impliedYesProbabilityBps: 0,
+  impliedNoProbabilityBps: 0,
+  probability: null as number | null,
+  priceYes: null as number | null,
+  priceNo: null as number | null,
+});
+
+const dpmIndexedState = (yesShares: bigint, noShares: bigint) => {
+  const realYesShares = yesShares < 0n ? 0n : yesShares;
+  const realNoShares = noShares < 0n ? 0n : noShares;
+  const qYes = DPM_VIRTUAL_SHARES + realYesShares;
+  const qNo = DPM_VIRTUAL_SHARES + realNoShares;
+  const totalQ = qYes + qNo;
+  const cost = integerSqrt(qYes * qYes + qNo * qNo);
+  const impliedYesProbabilityBps = ratioBps(qYes, totalQ);
+  const impliedNoProbabilityBps = ratioBps(qNo, totalQ);
+  const marginalYesPriceBps = ratioBps(qYes, cost);
+  const marginalNoPriceBps = ratioBps(qNo, cost);
+
+  return {
+    realYesShares,
+    realNoShares,
+    virtualDepth: DPM_VIRTUAL_SHARES,
+    marginalYesPriceBps,
+    marginalNoPriceBps,
+    impliedYesProbabilityBps,
+    impliedNoProbabilityBps,
+    probability: impliedYesProbabilityBps / 100,
+    priceYes: impliedYesProbabilityBps / 10_000,
+    priceNo: impliedNoProbabilityBps / 10_000,
+  };
+};
 
 /** Mirrors Substrate `Imbalance::ration`: first share is floored, second share keeps the remainder. */
 const splitByRatio = (amount: bigint, first: number, second: number): [bigint, bigint] => {
@@ -1092,8 +1259,6 @@ const createPolkamarktHistoryData = (
 ): { data: unknown; from: string; to: string; assets: string[] } | null => {
   const token = method.replace(/_/g, '').toLowerCase();
   const trade = findEvent(events, 'polkamarkt', 'TradeExecuted');
-  const trades = findEvents(events, 'polkamarkt', 'TradeExecuted');
-  const flip = findEvent(events, 'polkamarkt', 'PositionFlipped');
 
   if ((token === 'buy' || token === 'sell') && trade) {
     const marketId = Number(trade.marketId ?? trade.arg0 ?? args.marketId ?? args.arg0 ?? 0);
@@ -1117,45 +1282,6 @@ const createPolkamarktHistoryData = (
         executionPrice: decimalToString(scaledDiv(collateralRaw, sharesRaw), DECIMALS, 8),
         feeUsd: codecToDecimalString(feeAmount, DECIMALS),
         feeAmountUsd: codecToDecimalString(feeAmount, DECIMALS),
-      },
-      from: trader,
-      to: '',
-      assets: [],
-    };
-  }
-
-  if (token === 'flipposition' && flip) {
-    const marketId = Number(flip.marketId ?? flip.arg0 ?? args.marketId ?? args.arg0 ?? 0);
-    const trader = firstString(flip, ['trader', 'account', 'arg1']) || signer;
-    const sharesIn = firstPresentValue(flip, ['sharesIn', 'shares_in', 'arg4']) ?? args.sharesIn ?? args.arg2 ?? 0;
-    const collateralReinvested = firstPresentValue(flip, ['collateralReinvested', 'collateral_reinvested', 'arg5']) ?? 0;
-    const sharesOut = firstPresentValue(flip, ['sharesOut', 'shares_out', 'arg6']) ?? 0;
-    const sellTrade = trades.find((item) => String(item.side ?? item.arg2 ?? '').toLowerCase().includes('sell')) ?? {};
-    const buyTrade = trades.find((item) => String(item.side ?? item.arg2 ?? '').toLowerCase().includes('buy')) ?? {};
-    const sellFee = firstPresentValue(sellTrade, ['feeAmount', 'fee', 'arg6']) ?? 0;
-    const buyFee = firstPresentValue(buyTrade, ['feeAmount', 'fee', 'arg6']) ?? 0;
-    const collateralRaw = codecToBigInt(collateralReinvested);
-    const sharesOutRaw = codecToBigInt(sharesOut);
-
-    return {
-      data: {
-        marketId,
-        side: 'flip',
-        fromOutcome: firstString(flip, ['fromOutcome', 'from_outcome', 'arg2']) || firstString(args, ['fromOutcome', 'from_outcome', 'arg1']),
-        toOutcome: firstString(flip, ['toOutcome', 'to_outcome', 'arg3']),
-        sharesIn: codecToDecimalString(sharesIn, DECIMALS),
-        shares: codecToDecimalString(sharesOut, DECIMALS),
-        sharesAmount: codecToDecimalString(sharesOut, DECIMALS),
-        sharesOut: codecToDecimalString(sharesOut, DECIMALS),
-        collateralUsd: codecToDecimalString(collateralReinvested, DECIMALS),
-        collateralAmountUsd: codecToDecimalString(collateralReinvested, DECIMALS),
-        collateralReinvestedUsd: codecToDecimalString(collateralReinvested, DECIMALS),
-        sellFeeUsd: codecToDecimalString(sellFee, DECIMALS),
-        buyFeeUsd: codecToDecimalString(buyFee, DECIMALS),
-        feeUsd: codecToDecimalString(codecToBigInt(sellFee) + codecToBigInt(buyFee), DECIMALS),
-        feeAmountUsd: codecToDecimalString(codecToBigInt(sellFee) + codecToBigInt(buyFee), DECIMALS),
-        price: decimalToString(scaledDiv(collateralRaw, sharesOutRaw), DECIMALS, 8),
-        executionPrice: decimalToString(scaledDiv(collateralRaw, sharesOutRaw), DECIMALS, 8),
       },
       from: trader,
       to: '',
@@ -1208,9 +1334,8 @@ const createPolkamarktHistoryData = (
     };
   }
 
-  if (token === 'claimcreatorfees' || token === 'claimcreatorliquidity') {
-    const claim =
-      findEvent(events, 'polkamarkt', token === 'claimcreatorfees' ? 'CreatorFeesClaimed' : 'CreatorLiquidityClaimed');
+  if (token === 'claimcreatorfees') {
+    const claim = findEvent(events, 'polkamarkt', 'CreatorFeesClaimed');
     if (!claim) return null;
     const creator = firstString(claim, ['creator', 'account', 'arg1']) || signer;
     const amount = firstPresentValue(claim, ['amount', 'arg2']) ?? 0;
@@ -1218,7 +1343,7 @@ const createPolkamarktHistoryData = (
     return {
       data: {
         marketId: Number(claim.marketId ?? claim.arg0 ?? args.marketId ?? args.arg0 ?? 0),
-        side: token === 'claimcreatorfees' ? 'claim_creator_fees' : 'claim_creator_liquidity',
+        side: 'claim_creator_fees',
         collateralUsd: codecToDecimalString(amount, DECIMALS),
         collateralAmountUsd: codecToDecimalString(amount, DECIMALS),
       },
@@ -1919,8 +2044,23 @@ const emptyAnalytics = (): Analytics => ({
   orderBookActiveReserves: new Map(),
 });
 
+const isPolkamarktTradeContext = (context: BlockExtrinsicContext): boolean => {
+  if (context.failed) return false;
+
+  const method = context.method.toLowerCase();
+  return (
+    (context.module === 'polkamarkt' && (method.includes('buy') || method.includes('sell'))) ||
+    context.callNames.some((callName) => /^polkamarkt\.(buy|sell)/i.test(callName)) ||
+    context.events.some(
+      ({ event }) => event.section === 'polkamarkt' && event.method === 'TradeExecuted'
+    )
+  );
+};
+
 export class ChainIndexer {
   private api: ApiPromise | null = null;
+  private legacyBlockApi: ApiPromise | null = null;
+  private legacyBlockApiPromise: Promise<ApiPromise> | null = null;
   private assetInfos = new Map<string, AssetInfo>();
   private prices = new Map<string, bigint>();
   private networkLiquidityStats = emptyNetworkLiquidityStats();
@@ -1929,10 +2069,21 @@ export class ChainIndexer {
   private finalizedHeadRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private finalizedHeadPollTimer: ReturnType<typeof setInterval> | null = null;
   private finalizedHeadPollRunning = false;
+  private finalizedHeadRpcUpdateRunning = false;
+  private finalizedHeadRpcUpdateQueued = false;
   private derivedStateRefreshRunning = false;
+  private priceStreamRefreshRunning = false;
+  private polkamarktStateRefreshRunning = false;
   private bridgeProxyHistoryRuntimeAvailable = false;
   private derivedStateRefreshRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private priceStreamRefreshRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private polkamarktStateRefreshRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingDerivedStateRefresh: DerivedStateRefreshRequest | null = null;
+  private pendingPriceStreamRefresh: PriceStreamRefreshRequest | null = null;
+  private pendingPolkamarktStateRefresh: DerivedStateRefreshRequest | null = null;
+  private xorBurnBackfillRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private xorBurnBackfillRunning = false;
+  private xorBurnBackfillTargetBlock = 0;
 
   constructor(
     private readonly config: AppConfig,
@@ -1956,6 +2107,7 @@ export class ChainIndexer {
 
   private async runStartupMaintenance(finalizedBlock: number, indexedAny: boolean): Promise<void> {
     await this.cleanupAssetSnapshotPriceOutliers();
+    await this.repairXorSupplyDocuments();
     await this.backfillAccountTransactions();
     await this.repairNetworkTransactionCounters();
     let shouldRefreshDerivedState = indexedAny;
@@ -1967,8 +2119,48 @@ export class ChainIndexer {
       const latestIndexedBlock = await this.getLastIndexedBlock();
       this.requestDerivedStateRefresh(Math.max(finalizedBlock, latestIndexedBlock), Math.floor(Date.now() / 1000), true);
     }
-    await this.backfillXorBurns(finalizedBlock);
+    this.requestXorBurnBackfill(finalizedBlock);
     await this.backfillBridgeProxyHistory(finalizedBlock);
+  }
+
+  private requestXorBurnBackfill(finalizedBlock: number): void {
+    if (!this.api || finalizedBlock < SORA_XOR_BURN_START_BLOCK) return;
+
+    this.xorBurnBackfillTargetBlock = Math.max(this.xorBurnBackfillTargetBlock, finalizedBlock);
+
+    if (this.xorBurnBackfillRunning || this.xorBurnBackfillRetryTimer) return;
+
+    void this.runXorBurnBackfill();
+  }
+
+  private scheduleXorBurnBackfillRetry(delayMs = XOR_BURN_BACKFILL_RETRY_DELAY_MS): void {
+    if (this.xorBurnBackfillRetryTimer) return;
+
+    this.xorBurnBackfillRetryTimer = setTimeout(() => {
+      this.xorBurnBackfillRetryTimer = null;
+      void this.runXorBurnBackfill();
+    }, delayMs);
+    this.xorBurnBackfillRetryTimer.unref?.();
+  }
+
+  private async runXorBurnBackfill(): Promise<void> {
+    if (!this.api || this.xorBurnBackfillRunning) return;
+
+    this.xorBurnBackfillRunning = true;
+    const targetBlock = this.xorBurnBackfillTargetBlock;
+
+    try {
+      await this.backfillXorBurns(targetBlock);
+
+      if (this.xorBurnBackfillTargetBlock > targetBlock) {
+        this.scheduleXorBurnBackfillRetry(0);
+      }
+    } catch (error) {
+      console.error('XOR burn backfill failed', error);
+      this.scheduleXorBurnBackfillRetry();
+    } finally {
+      this.xorBurnBackfillRunning = false;
+    }
   }
 
   private async getLastIndexedBlock(): Promise<number> {
@@ -2021,6 +2213,17 @@ export class ChainIndexer {
         data: JSON.stringify({ lastIndexedBlock: block }),
       },
     };
+  }
+
+  private isPrunedHistoricalStateError(error: unknown): boolean {
+    return isPrunedHistoricalStateErrorValue(error);
+  }
+
+  private skipPrunedHistoricalBackfill(label: string, block: number, error: unknown): boolean {
+    if (!this.isPrunedHistoricalStateError(error)) return false;
+
+    console.warn(`${label} skipped at SORA block ${block}: node has pruned historical state`);
+    return true;
   }
 
   private bridgeProxyHistoryBackfillStartBlock(): number {
@@ -2100,6 +2303,32 @@ export class ChainIndexer {
     };
   }
 
+  private createXorSupplyRepairStateDocument(
+    processedDocuments: number,
+    writtenDocuments: number,
+    skippedDocuments: number,
+    latestBlock: number,
+    latestTimestamp: number
+  ): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: XOR_SUPPLY_REPAIR_STATE_ID,
+      blockHeight: latestBlock || null,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: XOR_SUPPLY_REPAIR_STATE_ID,
+        block: latestBlock,
+        data: JSON.stringify({
+          processedDocuments,
+          writtenDocuments,
+          skippedDocuments,
+          lastIndexedBlock: latestBlock,
+          lastTimestamp: latestTimestamp,
+        }),
+      },
+    };
+  }
+
   private createAccountTransactionsBackfillStateDocument(
     processedDocuments: number,
     writtenDocuments: number,
@@ -2167,6 +2396,110 @@ export class ChainIndexer {
     await this.repository.upsert(this.createAssetPriceOutlierCleanupStateDocument(ids.length));
     if (ids.length) console.info(`Deleted ${ids.length} zero-volume asset snapshot price outliers`);
     return ids.length > 0;
+  }
+
+  /**
+   * Rewrites legacy XOR supply rows so GraphQL exposes the same codec-scale
+   * contract as live `balances.totalIssuance` and every other asset supply.
+   */
+  private async repairXorSupplyDocuments(): Promise<boolean> {
+    const state = await this.repository.get(collection('updatesStreams'), XOR_SUPPLY_REPAIR_STATE_ID);
+    if (state) return false;
+
+    const supplyByBlock = new Map<number, Promise<string>>();
+    let processedDocuments = 0;
+    let writtenDocuments = 0;
+    let skippedDocuments = 0;
+    let skippedPrunedDocuments = 0;
+    let latestBlock = 0;
+    let latestTimestamp = 0;
+
+    const getSupplyAtBlock = (blockHeight: number): Promise<string> => {
+      let supply = supplyByBlock.get(blockHeight);
+      if (!supply) {
+        supply = this.fetchNativeXorIssuanceAtBlock(blockHeight).then((value) => value.toString());
+        supplyByBlock.set(blockHeight, supply);
+      }
+
+      return supply;
+    };
+
+    const repairDocument = async (document: IndexerDocument): Promise<IndexerDocument | null> => {
+      processedDocuments += 1;
+
+      const blockHeight = Number(document.blockHeight ?? document.data.blockHeight);
+      const timestamp = Number(document.timestamp ?? document.data.timestamp);
+      if (Number.isFinite(blockHeight)) latestBlock = Math.max(latestBlock, Math.trunc(blockHeight));
+      if (Number.isFinite(timestamp)) latestTimestamp = Math.max(latestTimestamp, Math.trunc(timestamp));
+
+      if (!Number.isFinite(blockHeight) || blockHeight <= 0) {
+        skippedDocuments += 1;
+        return null;
+      }
+
+      let supply: string;
+      try {
+        supply = await getSupplyAtBlock(Math.trunc(blockHeight));
+      } catch (error) {
+        if (!this.isPrunedHistoricalStateError(error)) throw error;
+
+        skippedDocuments += 1;
+        skippedPrunedDocuments += 1;
+        return null;
+      }
+
+      if (String(document.data.supply ?? '') === supply) return null;
+
+      return {
+        ...document,
+        data: {
+          ...document.data,
+          supply,
+        },
+      };
+    };
+
+    const flush = async (documents: IndexerDocument[]): Promise<void> => {
+      if (!documents.length) return;
+
+      const repaired = (
+        await mapWithConcurrency(documents, XOR_SUPPLY_REPAIR_RPC_CONCURRENCY, (document) => repairDocument(document))
+      ).filter((document): document is IndexerDocument => Boolean(document));
+
+      if (repaired.length) {
+        await this.repository.upsertMany(repaired);
+        writtenDocuments += repaired.length;
+      }
+
+      await this.drainFinalizedHeads();
+    };
+
+    const currentAsset = await this.repository.get(collection('assets'), XOR);
+    if (currentAsset) await flush([currentAsset]);
+
+    for await (const page of this.queryPages(collection('assetSnapshots'), {
+      filter: { assetId: { equalTo: XOR } },
+      orderBy: ['BLOCK_HEIGHT_ASC'],
+    })) {
+      await flush(page);
+    }
+
+    await this.repository.upsert(
+      this.createXorSupplyRepairStateDocument(
+        processedDocuments,
+        writtenDocuments,
+        skippedDocuments,
+        latestBlock,
+        latestTimestamp
+      )
+    );
+
+    if (skippedPrunedDocuments) {
+      console.warn(`Skipped ${skippedPrunedDocuments} XOR supply rows because the node has pruned historical state`);
+    }
+    if (writtenDocuments) console.info(`Repaired ${writtenDocuments} XOR supply rows from native balances issuance`);
+
+    return writtenDocuments > 0;
   }
 
   /**
@@ -2409,20 +2742,30 @@ export class ChainIndexer {
 
     if (startBlock > finalizedBlock) return;
 
+    try {
+      const blockApi = await this.getBlockDataApi();
+      const startHash = await withRpcRetry(() => blockApi.rpc.chain.getBlockHash(startBlock), `chain.getBlockHash(${startBlock})`);
+      await withRpcRetry(() => (blockApi.query as any).system.events.at(startHash), `system.events.at(${startBlock})`);
+    } catch (error) {
+      if (this.skipPrunedHistoricalBackfill('XOR burn backfill', startBlock, error)) return;
+      throw error;
+    }
+
     for (let block = startBlock; block <= finalizedBlock; block += XOR_BURN_BACKFILL_BATCH_SIZE) {
       await this.drainFinalizedHeads();
 
+      const blockApi = await this.getBlockDataApi();
       const batchEnd = Math.min(block + XOR_BURN_BACKFILL_BATCH_SIZE - 1, finalizedBlock);
       const blocks = Array.from({ length: batchEnd - block + 1 }, (_item, index) => block + index);
-      const blockHashes = await Promise.all(
-        blocks.map((blockHeight) =>
-          withTimeout(this.api!.rpc.chain.getBlockHash(blockHeight), `chain.getBlockHash(${blockHeight})`)
-        )
+      const blockHashes = await mapWithConcurrency(
+        blocks,
+        XOR_BURN_BACKFILL_RPC_CONCURRENCY,
+        (blockHeight) => withRpcRetry(() => blockApi.rpc.chain.getBlockHash(blockHeight), `chain.getBlockHash(${blockHeight})`)
       );
-      const eventsByBlock = (await Promise.all(
-        blockHashes.map((hash, index) =>
-          withTimeout((this.api!.query as any).system.events.at(hash), `system.events.at(${blocks[index]})`)
-        )
+      const eventsByBlock = (await mapWithConcurrency(
+        blockHashes,
+        XOR_BURN_BACKFILL_RPC_CONCURRENCY,
+        (hash, index) => withRpcRetry(() => (blockApi.query as any).system.events.at(hash), `system.events.at(${blocks[index]})`)
       )) as EventRecord[][];
       const burnBlockIndexes = eventsByBlock.flatMap((events, index) =>
         events.some((event) => getXorBurnEvent(event, this.assetInfos)) ? [index] : []
@@ -2430,10 +2773,14 @@ export class ChainIndexer {
       const signedBlocksByIndex = new Map<number, unknown>();
 
       if (burnBlockIndexes.length) {
-        const signedBlocks = await Promise.all(
-          burnBlockIndexes.map((index) =>
-            withTimeout(this.api!.rpc.chain.getBlock(blockHashes[index]), `chain.getBlock(${blocks[index]})`)
-          )
+        const signedBlocks = await mapWithConcurrency(
+          burnBlockIndexes,
+          XOR_BURN_BACKFILL_RPC_CONCURRENCY,
+          (index) =>
+            withRpcRetry(
+              () => this.fetchSignedBlock(blockHashes[index].toString(), blockApi),
+              `chain.getBlock(${blocks[index]})`
+            )
         );
         burnBlockIndexes.forEach((index, resultIndex) => {
           signedBlocksByIndex.set(index, signedBlocks[resultIndex]);
@@ -2461,22 +2808,33 @@ export class ChainIndexer {
 
     if (startBlock > finalizedBlock) return;
 
+    try {
+      const blockApi = await this.getBlockDataApi();
+      const startHash = await withTimeout(blockApi.rpc.chain.getBlockHash(startBlock), `chain.getBlockHash(${startBlock})`);
+      await this.hasBridgeProxyHistoryRuntime(startHash.toString(), startBlock, blockApi);
+    } catch (error) {
+      if (this.skipPrunedHistoricalBackfill('bridgeProxy history backfill', startBlock, error)) return;
+      throw error;
+    }
+
     for (let block = startBlock; block <= finalizedBlock; block += BRIDGE_PROXY_HISTORY_BACKFILL_BATCH_SIZE) {
       await this.drainFinalizedHeads();
 
+      const blockApi = await this.getBlockDataApi();
       const batchEnd = Math.min(block + BRIDGE_PROXY_HISTORY_BACKFILL_BATCH_SIZE - 1, finalizedBlock);
       const blocks = Array.from({ length: batchEnd - block + 1 }, (_item, index) => block + index);
       const blockHashes = await mapWithConcurrency(
         blocks,
         BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
-        (blockHeight) => withTimeout(this.api!.rpc.chain.getBlockHash(blockHeight), `chain.getBlockHash(${blockHeight})`)
+        (blockHeight) => withTimeout(blockApi.rpc.chain.getBlockHash(blockHeight), `chain.getBlockHash(${blockHeight})`)
       );
       let scanBlockIndexes = blocks.map((_blockHeight, index) => index);
 
       if (!this.bridgeProxyHistoryRuntimeAvailable) {
         const batchEndHasBridgeRuntime = await this.hasBridgeProxyHistoryRuntime(
           blockHashes[blockHashes.length - 1]?.toString() ?? '',
-          batchEnd
+          batchEnd,
+          blockApi
         );
 
         if (!batchEndHasBridgeRuntime) {
@@ -2488,7 +2846,7 @@ export class ChainIndexer {
         const runtimeAvailability = await mapWithConcurrency(
           blockHashes,
           BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
-          (hash, index) => this.hasBridgeProxyHistoryRuntime(hash.toString(), blocks[index])
+          (hash, index) => this.hasBridgeProxyHistoryRuntime(hash.toString(), blocks[index], blockApi)
         );
         scanBlockIndexes = runtimeAvailability.flatMap((available, index) => (available ? [index] : []));
         this.bridgeProxyHistoryRuntimeAvailable = scanBlockIndexes.length > 0;
@@ -2497,7 +2855,11 @@ export class ChainIndexer {
       const signedBlocks = (await mapWithConcurrency(
         scanBlockIndexes,
         BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
-        (index) => withTimeout(this.api!.rpc.chain.getBlock(blockHashes[index]), `chain.getBlock(${blocks[index]})`)
+        (index) =>
+          withTimeout(
+            this.fetchSignedBlock(blockHashes[index].toString(), blockApi),
+            `chain.getBlock(${blocks[index]})`
+          )
       )) as SignedBlockLike[];
       const bridgeBlockIndexes = signedBlocks.flatMap((signedBlock, resultIndex) =>
         this.hasBridgeProxyHistoryExtrinsics(signedBlock) ? [scanBlockIndexes[resultIndex]] : []
@@ -2518,8 +2880,8 @@ export class ChainIndexer {
             if (!hash) throw new Error(`Missing block hash for bridgeProxy history backfill block ${blocks[index]}`);
 
             const [events, timestamp] = await Promise.all([
-              this.fetchHistoricalSystemEvents(hash, blocks[index]),
-              this.fetchHistoricalBlockTimestamp(hash, blocks[index]),
+              this.fetchHistoricalSystemEvents(hash, blocks[index], blockApi),
+              this.fetchHistoricalBlockTimestamp(hash, blocks[index], blockApi),
             ]);
 
             return {
@@ -2548,16 +2910,17 @@ export class ChainIndexer {
     }
   }
 
-  private async hasBridgeProxyHistoryRuntime(hash: string, blockHeight: number): Promise<boolean> {
+  private async hasBridgeProxyHistoryRuntime(hash: string, blockHeight: number, api = this.api): Promise<boolean> {
     if (!this.api) throw new Error('Cannot inspect historical metadata before the chain API is initialized');
+    if (!api) throw new Error('Cannot inspect historical metadata before the chain API is initialized');
     if (!hash) throw new Error(`Missing block hash for historical metadata at SORA block ${blockHeight}`);
 
-    const getMetadata = (this.api.rpc as unknown as { state?: { getMetadata?: (hash: string) => Promise<unknown> } }).state?.getMetadata;
+    const getMetadata = (api.rpc as unknown as { state?: { getMetadata?: (hash: string) => Promise<unknown> } }).state?.getMetadata;
     if (typeof getMetadata !== 'function') {
       throw new Error('state.getMetadata is required to find the bridgeProxy history start');
     }
 
-    const metadata = await withTimeout(getMetadata.call((this.api.rpc as any).state, hash), `state.getMetadata(${blockHeight})`);
+    const metadata = await withTimeout(getMetadata.call((api.rpc as any).state, hash), `state.getMetadata(${blockHeight})`);
     const pallets = (metadata as { asLatest?: { pallets?: Iterable<{ name?: { toString?: () => string } }> } }).asLatest?.pallets;
 
     if (pallets) {
@@ -2663,19 +3026,37 @@ export class ChainIndexer {
   private async backfill(): Promise<boolean> {
     if (!this.api) return false;
 
-    const finalizedHash = await withTimeout(this.api.rpc.chain.getFinalizedHead(), 'chain.getFinalizedHead()');
-    const finalizedHeader = await withTimeout(this.api.rpc.chain.getHeader(finalizedHash), `chain.getHeader(${finalizedHash.toString()})`);
-    const finalizedBlock = finalizedHeader.number.toNumber();
+    const finalizedBlock = await this.getIndexableFinalizedBlock();
     const lastIndexed = await this.getLastIndexedBlock();
     const startBlock = Math.max(this.config.chainStartBlock, lastIndexed + 1);
     let indexedAny = false;
 
-    for (let block = startBlock; block <= finalizedBlock; block += 1) {
-      await this.indexBlockByNumber(block, { refreshDerivedState: false });
-      indexedAny = true;
+    if (BACKFILL_PREFETCH_CONCURRENCY === 1) {
+      for (let block = startBlock; block <= finalizedBlock; block += 1) {
+        await this.indexBlockByNumber(block, { refreshDerivedState: false });
+        indexedAny = true;
 
-      if (block % this.config.chainBatchSize === 0) {
-        console.info(`Indexed SORA block ${block}/${finalizedBlock}`);
+        if (block % this.config.chainBatchSize === 0) {
+          console.info(`Indexed SORA block ${block}/${finalizedBlock}`);
+        }
+      }
+    } else {
+      for (let batchStart = startBlock; batchStart <= finalizedBlock; batchStart += BACKFILL_PREFETCH_CONCURRENCY) {
+        const batchEnd = Math.min(batchStart + BACKFILL_PREFETCH_CONCURRENCY - 1, finalizedBlock);
+        const blocks = Array.from({ length: batchEnd - batchStart + 1 }, (_item, index) => batchStart + index);
+        const fetchedBlocks = await mapWithConcurrency(blocks, BACKFILL_PREFETCH_CONCURRENCY, (block) =>
+          this.fetchBlockByNumber(block)
+        );
+
+        for (const fetchedBlock of fetchedBlocks) {
+          const block = fetchedBlock.signedBlock.block.header.number.toNumber();
+          await this.indexFetchedBlock(fetchedBlock, { refreshDerivedState: false });
+          indexedAny = true;
+
+          if (block % this.config.chainBatchSize === 0) {
+            console.info(`Indexed SORA block ${block}/${finalizedBlock}`);
+          }
+        }
       }
     }
 
@@ -2766,21 +3147,46 @@ export class ChainIndexer {
     if (!this.api) return;
 
     await this.api.rpc.chain.subscribeFinalizedHeads((header) => {
+      if (ARCHIVE_SORA_WS_ENDPOINT) {
+        this.requestPendingFinalizedBlockUpdate('Failed to update finalized head from subscription');
+        return;
+      }
+
       this.pendingFinalizedBlock = Math.max(this.pendingFinalizedBlock, header.number.toNumber());
       void this.drainFinalizedHeads();
     });
 
     this.startFinalizedHeadPolling();
-    await this.updatePendingFinalizedBlockFromRpc();
+    await this.updatePendingFinalizedBlockFromRpc().catch((error: unknown) => {
+      console.error('Failed to initialize finalized head polling', error);
+    });
   }
 
   private async updatePendingFinalizedBlockFromRpc(): Promise<void> {
     if (!this.api) return;
+    if (this.finalizedHeadRpcUpdateRunning) {
+      this.finalizedHeadRpcUpdateQueued = true;
+      return;
+    }
 
-    const finalizedHash = await withTimeout(this.api.rpc.chain.getFinalizedHead(), 'chain.getFinalizedHead()');
-    const finalizedHeader = await withTimeout(this.api.rpc.chain.getHeader(finalizedHash), `chain.getHeader(${finalizedHash.toString()})`);
-    this.pendingFinalizedBlock = Math.max(this.pendingFinalizedBlock, finalizedHeader.number.toNumber());
-    await this.drainFinalizedHeads();
+    this.finalizedHeadRpcUpdateRunning = true;
+
+    try {
+      do {
+        this.finalizedHeadRpcUpdateQueued = false;
+        this.pendingFinalizedBlock = Math.max(this.pendingFinalizedBlock, await this.getIndexableFinalizedBlock());
+        this.requestXorBurnBackfill(this.pendingFinalizedBlock);
+        await this.drainFinalizedHeads();
+      } while (this.finalizedHeadRpcUpdateQueued);
+    } finally {
+      this.finalizedHeadRpcUpdateRunning = false;
+    }
+  }
+
+  private requestPendingFinalizedBlockUpdate(errorMessage: string): void {
+    void this.updatePendingFinalizedBlockFromRpc().catch((error: unknown) => {
+      console.error(errorMessage, error);
+    });
   }
 
   private startFinalizedHeadPolling(): void {
@@ -2819,8 +3225,35 @@ export class ChainIndexer {
 
       while (nextBlock <= this.pendingFinalizedBlock) {
         try {
-          await this.indexBlockByNumber(nextBlock);
-          nextBlock += 1;
+          const batchEnd = Math.min(
+            nextBlock + FINALIZED_CATCHUP_PREFETCH_CONCURRENCY - 1,
+            this.pendingFinalizedBlock
+          );
+
+          if (batchEnd === nextBlock) {
+            await this.indexBlockByNumber(nextBlock);
+            nextBlock += 1;
+            continue;
+          }
+
+          const blocks = Array.from({ length: batchEnd - nextBlock + 1 }, (_item, index) => nextBlock + index);
+          const fetchedBlocks = await mapWithConcurrency(
+            blocks,
+            FINALIZED_CATCHUP_PREFETCH_CONCURRENCY,
+            (block) => this.fetchBlockByNumber(block)
+          );
+
+          for (let index = 0; index < fetchedBlocks.length; index += 1) {
+            const fetchedBlock = fetchedBlocks[index];
+            const expectedBlock = blocks[index];
+            const fetchedBlockHeight = fetchedBlock.signedBlock.block.header.number.toNumber();
+            if (fetchedBlockHeight !== expectedBlock) {
+              throw new Error(`Fetched SORA block ${fetchedBlockHeight} while indexing finalized block ${expectedBlock}`);
+            }
+
+            await this.indexFetchedBlock(fetchedBlock);
+            nextBlock = expectedBlock + 1;
+          }
         } catch (error) {
           console.error(`Failed to index finalized block ${nextBlock}`, error);
           this.scheduleFinalizedHeadRetry();
@@ -2843,19 +3276,128 @@ export class ChainIndexer {
   private async indexBlockByNumber(block: number, options: IndexBlockOptions = {}): Promise<void> {
     if (!this.api) return;
 
-    const hash = await withTimeout(this.api.rpc.chain.getBlockHash(block), `chain.getBlockHash(${block})`);
-    await this.indexBlockByHash(hash.toString(), options);
+    await this.indexFetchedBlock(await this.fetchBlockByNumber(block), options);
   }
 
   private async indexBlockByHash(hash: string, options: IndexBlockOptions = {}): Promise<void> {
     if (!this.api) return;
 
+    await this.indexFetchedBlock(await this.fetchBlockByHash(hash), options);
+  }
+
+  private async fetchBlockByNumber(block: number): Promise<FetchedBlock> {
+    if (!this.api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
+
+    const blockApi = await this.getBlockDataApi();
+    const hash = await withTimeout(blockApi.rpc.chain.getBlockHash(block), `chain.getBlockHash(${block})`);
+    if (!hash || hash.toString() === '0x0000000000000000000000000000000000000000000000000000000000000000') {
+      throw new Error(`No SORA block hash available for block ${block} from the configured block data endpoint`);
+    }
+
+    return this.fetchBlockByHash(hash.toString());
+  }
+
+  private async fetchBlockByHash(hash: string): Promise<FetchedBlock> {
+    if (!this.api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
+
+    const blockApi = await this.getBlockDataApi();
+    const canFetchApiAt = typeof (blockApi as unknown as { at?: unknown }).at === 'function';
+    if (!canFetchApiAt) {
+      const [signedBlock, eventsCodec, timestamp] = await Promise.all([
+        withTimeout(this.fetchSignedBlock(hash, blockApi), `chain.getBlock(${hash})`),
+        withTimeout((blockApi.query as any).system.events.at(hash), `system.events.at(${hash})`),
+        withTimeout(this.fetchBlockTimestamp(hash, blockApi), `timestamp.now.at(${hash})`),
+      ]);
+
+      return {
+        signedBlock,
+        events: eventsCodec as unknown as EventRecord[],
+        timestamp,
+      };
+    }
+
+    const apiAt = await this.fetchApiAtFrom(blockApi, hash, `SORA block ${hash}`);
+    const system = (apiAt.query as { system?: { events?: () => Promise<unknown> } }).system;
+    const timestampNow = (apiAt.query as { timestamp?: { now?: () => Promise<unknown> } }).timestamp?.now;
+    if (typeof system?.events !== 'function') {
+      throw new Error(`system.events is required to decode SORA block ${hash}`);
+    }
+    if (typeof timestampNow !== 'function') {
+      throw new Error(`timestamp.now is required to decode SORA block ${hash}`);
+    }
+
     const [signedBlock, eventsCodec, timestamp] = await Promise.all([
-      withTimeout(this.api.rpc.chain.getBlock(hash), `chain.getBlock(${hash})`),
-      withTimeout((this.api.query as any).system.events.at(hash), `system.events.at(${hash})`),
-      withTimeout(this.fetchBlockTimestamp(hash), `timestamp.now.at(${hash})`),
+      withTimeout(this.fetchSignedBlock(hash, blockApi), `chain.getBlock(${hash})`),
+      withTimeout(system.events.call(system), `system.events(${hash})`),
+      withTimeout(timestampNow(), `timestamp.now(${hash})`).then((codec) => {
+        const timestampMs = Number((codec as CodecLike | undefined)?.toString?.() ?? codec);
+        if (!Number.isFinite(timestampMs)) {
+          throw new Error(`Invalid timestamp.now value for block ${hash}`);
+        }
+
+        return Math.floor(timestampMs / 1000);
+      }),
     ]);
-    const events = eventsCodec as unknown as EventRecord[];
+
+    return {
+      signedBlock,
+      events: eventsCodec as unknown as EventRecord[],
+      timestamp,
+    };
+  }
+
+  private async fetchSignedBlock(hash: string, api = this.api): Promise<unknown> {
+    if (!this.api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
+    if (!api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
+
+    return api.rpc.chain.getBlock(hash);
+  }
+
+  private async getBlockDataApi(): Promise<ApiPromise> {
+    if (!ARCHIVE_SORA_WS_ENDPOINT && !USE_LEGACY_SORA_BLOCK_TYPES) {
+      if (!this.api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
+      return this.api;
+    }
+
+    if (this.legacyBlockApi) return this.legacyBlockApi;
+
+    const endpoint = ARCHIVE_SORA_WS_ENDPOINT || this.config.soraWsEndpoint;
+    const apiOptions = USE_LEGACY_SORA_BLOCK_TYPES ? { typesBundle: soraArchiveTypesBundle as any } : {};
+    this.legacyBlockApiPromise ??= ApiPromise.create({
+      provider: new WsProvider(endpoint),
+      ...apiOptions,
+    }).then((api) => {
+      this.legacyBlockApi = api;
+      return api;
+    });
+
+    return this.legacyBlockApiPromise;
+  }
+
+  private async getIndexableFinalizedBlock(): Promise<number> {
+    if (!this.api) throw new Error('Cannot read finalized SORA block before the chain API is initialized');
+
+    const localFinalizedBlock = await this.getFinalizedBlock(this.api, 'chain');
+    if (!ARCHIVE_SORA_WS_ENDPOINT) return localFinalizedBlock;
+
+    const blockDataApi = await this.getBlockDataApi();
+    const blockDataFinalizedBlock = await this.getFinalizedBlock(blockDataApi, 'block data endpoint');
+    if (blockDataFinalizedBlock < localFinalizedBlock) {
+      console.warn(
+        `Block data endpoint is behind localhost SORA: archive=${blockDataFinalizedBlock}, localhost=${localFinalizedBlock}`
+      );
+    }
+
+    return Math.min(localFinalizedBlock, blockDataFinalizedBlock);
+  }
+
+  private async getFinalizedBlock(api: ApiPromise, label: string): Promise<number> {
+    const finalizedHash = await withTimeout(api.rpc.chain.getFinalizedHead(), `${label}.getFinalizedHead()`);
+    const finalizedHeader = await withTimeout(api.rpc.chain.getHeader(finalizedHash), `${label}.getHeader(${finalizedHash.toString()})`);
+    return finalizedHeader.number.toNumber();
+  }
+
+  private async indexFetchedBlock({ signedBlock, events, timestamp }: FetchedBlock, options: IndexBlockOptions = {}): Promise<void> {
     const eventsByExtrinsic = groupEventsByExtrinsic(events);
     const blockHeight = signedBlock.block.header.number.toNumber();
     const blockHash = signedBlock.block.header.hash.toString();
@@ -2926,6 +3468,7 @@ export class ChainIndexer {
       }
     }
 
+    const shouldRefreshPolkamarktState = extrinsicContexts.some(isPolkamarktTradeContext);
     const existingAccountMeta = await this.repository.getMany(collection('accountMeta'), [...touchedAccounts]);
 
     for (const context of extrinsicContexts) {
@@ -2984,8 +3527,18 @@ export class ChainIndexer {
     documents.push(this.createChainStateDocument(blockHeight));
     await this.repository.upsertMany(await this.prepareReferrerRewardDocuments(documents));
 
+    if ((options.refreshDerivedState ?? true) && shouldRefreshPolkamarktState) {
+      this.requestPolkamarktStateRefresh(blockHeight, timestamp, true);
+    }
     if ((options.refreshDerivedState ?? true) && blockHeight % this.config.stateRefreshIntervalBlocks === 0) {
       this.requestDerivedStateRefresh(blockHeight, timestamp, blockHeight % this.config.snapshotIntervalBlocks === 0);
+    }
+    if (
+      (options.refreshDerivedState ?? true) &&
+      PRICE_STREAM_REFRESH_INTERVAL_BLOCKS > 0 &&
+      blockHeight % PRICE_STREAM_REFRESH_INTERVAL_BLOCKS === 0
+    ) {
+      this.requestPriceStreamRefresh(blockHeight, timestamp);
     }
   }
 
@@ -3010,6 +3563,15 @@ export class ChainIndexer {
       includeSnapshots,
     });
     void this.drainDerivedStateRefreshQueue();
+  }
+
+  private requestPolkamarktStateRefresh(blockHeight: number, timestamp: number, includeSnapshots: boolean): void {
+    this.pendingPolkamarktStateRefresh = this.mergeDerivedStateRefreshRequests(this.pendingPolkamarktStateRefresh, {
+      blockHeight,
+      timestamp,
+      includeSnapshots,
+    });
+    void this.drainPolkamarktStateRefreshQueue();
   }
 
   private scheduleDerivedStateRefreshRetry(): void {
@@ -3050,6 +3612,103 @@ export class ChainIndexer {
     }
   }
 
+  private schedulePolkamarktStateRefreshRetry(): void {
+    if (this.polkamarktStateRefreshRetryTimer) return;
+
+    this.polkamarktStateRefreshRetryTimer = setTimeout(() => {
+      this.polkamarktStateRefreshRetryTimer = null;
+      void this.drainPolkamarktStateRefreshQueue();
+    }, DERIVED_STATE_REFRESH_RETRY_DELAY_MS);
+    this.polkamarktStateRefreshRetryTimer.unref?.();
+  }
+
+  private async drainPolkamarktStateRefreshQueue(): Promise<void> {
+    if (this.polkamarktStateRefreshRunning) return;
+
+    const request = this.pendingPolkamarktStateRefresh;
+    if (!request) return;
+
+    this.pendingPolkamarktStateRefresh = null;
+    this.polkamarktStateRefreshRunning = true;
+
+    try {
+      await this.refreshPolkamarktState(request.blockHeight, request.timestamp, request.includeSnapshots);
+      if (this.polkamarktStateRefreshRetryTimer) {
+        clearTimeout(this.polkamarktStateRefreshRetryTimer);
+        this.polkamarktStateRefreshRetryTimer = null;
+      }
+    } catch (error) {
+      console.error(`Failed to refresh Polkamarkt state at SORA block ${request.blockHeight}`, error);
+      this.pendingPolkamarktStateRefresh = this.mergeDerivedStateRefreshRequests(
+        request,
+        this.pendingPolkamarktStateRefresh
+      );
+      this.schedulePolkamarktStateRefreshRetry();
+    } finally {
+      this.polkamarktStateRefreshRunning = false;
+    }
+
+    if (this.pendingPolkamarktStateRefresh && !this.polkamarktStateRefreshRetryTimer) {
+      void this.drainPolkamarktStateRefreshQueue();
+    }
+  }
+
+  private mergePriceStreamRefreshRequests(
+    left: PriceStreamRefreshRequest | null,
+    right: PriceStreamRefreshRequest | null
+  ): PriceStreamRefreshRequest | null {
+    if (!left) return right;
+    if (!right) return left;
+
+    return left.blockHeight >= right.blockHeight ? left : right;
+  }
+
+  private requestPriceStreamRefresh(blockHeight: number, timestamp: number): void {
+    this.pendingPriceStreamRefresh = this.mergePriceStreamRefreshRequests(this.pendingPriceStreamRefresh, {
+      blockHeight,
+      timestamp,
+    });
+    void this.drainPriceStreamRefreshQueue();
+  }
+
+  private schedulePriceStreamRefreshRetry(): void {
+    if (this.priceStreamRefreshRetryTimer) return;
+
+    this.priceStreamRefreshRetryTimer = setTimeout(() => {
+      this.priceStreamRefreshRetryTimer = null;
+      void this.drainPriceStreamRefreshQueue();
+    }, DERIVED_STATE_REFRESH_RETRY_DELAY_MS);
+    this.priceStreamRefreshRetryTimer.unref?.();
+  }
+
+  private async drainPriceStreamRefreshQueue(): Promise<void> {
+    if (this.priceStreamRefreshRunning) return;
+
+    const request = this.pendingPriceStreamRefresh;
+    if (!request) return;
+
+    this.pendingPriceStreamRefresh = null;
+    this.priceStreamRefreshRunning = true;
+
+    try {
+      await this.refreshPriceStream(request.blockHeight, request.timestamp);
+      if (this.priceStreamRefreshRetryTimer) {
+        clearTimeout(this.priceStreamRefreshRetryTimer);
+        this.priceStreamRefreshRetryTimer = null;
+      }
+    } catch (error) {
+      console.error(`Failed to refresh price stream at SORA block ${request.blockHeight}`, error);
+      this.pendingPriceStreamRefresh = this.mergePriceStreamRefreshRequests(request, this.pendingPriceStreamRefresh);
+      this.schedulePriceStreamRefreshRetry();
+    } finally {
+      this.priceStreamRefreshRunning = false;
+    }
+
+    if (this.pendingPriceStreamRefresh && !this.priceStreamRefreshRetryTimer) {
+      void this.drainPriceStreamRefreshQueue();
+    }
+  }
+
   private extractNetworkFee(events: EventRecord[]): bigint {
     let total = 0n;
 
@@ -3085,8 +3744,7 @@ export class ChainIndexer {
 
   /**
    * Combines ORML token issuance with native Balances issuance, which is where XOR supply is stored.
-   * Native XOR issuance is still exposed in the pre-redenomination scale, while asset snapshots are
-   * consumed as current XOR units by Polkaswap and external supply displays.
+   * All supplies are persisted as codec-scale strings matching the asset precision exposed by chain metadata.
    */
   private createSupplyByAsset(
     tokenIssuances: Array<[StorageEntryKey, unknown]>,
@@ -3098,7 +3756,7 @@ export class ChainIndexer {
       supplyByAsset.set(assetIdToString(key.args[0]), codecToBigInt(value));
     }
 
-    supplyByAsset.set(XOR, codecToBigInt(nativeXorIssuance) / XOR_SUPPLY_REDENOMINATION_FACTOR);
+    supplyByAsset.set(XOR, codecToBigInt(nativeXorIssuance));
     return supplyByAsset;
   }
 
@@ -3111,6 +3769,25 @@ export class ChainIndexer {
     }
 
     return balances.totalIssuance.call(balances);
+  }
+
+  private async fetchNativeXorIssuanceAtBlock(blockHeight: number): Promise<bigint> {
+    if (!this.api) throw new Error('Cannot repair native XOR supply before the chain API is initialized');
+
+    const blockApi = await this.getBlockDataApi();
+    const hash = await withTimeout(blockApi.rpc.chain.getBlockHash(blockHeight), `chain.getBlockHash(${blockHeight})`);
+    const hashText = hash?.toString?.() ?? '';
+    if (!hashText || hashText === '0x0000000000000000000000000000000000000000000000000000000000000000') {
+      throw new Error(`No SORA block hash available for block ${blockHeight} from the configured block data endpoint`);
+    }
+
+    const apiAt = await this.fetchApiAtFrom(blockApi, hashText, `SORA block ${blockHeight}`);
+    const balances = (apiAt.query as { balances?: { totalIssuance?: () => Promise<unknown> } }).balances;
+    if (typeof balances?.totalIssuance !== 'function') {
+      throw new Error(`balances.totalIssuance is required to repair XOR supply at SORA block ${blockHeight}`);
+    }
+
+    return codecToBigInt(await withTimeout(balances.totalIssuance.call(balances), `balances.totalIssuance(${blockHeight})`));
   }
 
   private async fetchStorageEntries(
@@ -3141,19 +3818,25 @@ export class ChainIndexer {
     return entries.apply(storage, args);
   }
 
-  private async fetchApiAt(hash: string, label: string): Promise<{ query: unknown }> {
+  private async fetchApiAt(hash: string, label: string): Promise<{ query: unknown; rpc?: unknown }> {
     if (!this.api) throw new Error(`Cannot fetch historical chain state for ${label} before the chain API is initialized`);
 
-    const at = (this.api as unknown as { at?: (hash: string) => Promise<{ query: unknown }> }).at;
+    return this.fetchApiAtFrom(this.api, hash, label);
+  }
+
+  private async fetchApiAtFrom(api: ApiPromise, hash: string, label: string): Promise<{ query: unknown; rpc?: unknown }> {
+    const at = (api as unknown as { at?: (hash: string) => Promise<{ query: unknown }> }).at;
     if (typeof at !== 'function') {
       throw new Error('api.at is required to decode historical chain state');
     }
 
-    return withTimeout(at.call(this.api, hash), `api.at(${label})`);
+    return withTimeout(at.call(api, hash), `api.at(${label})`);
   }
 
-  private async fetchHistoricalSystemEvents(hash: string, blockHeight: number): Promise<EventRecord[]> {
-    const apiAt = await this.fetchApiAt(hash, `SORA block ${blockHeight}`);
+  private async fetchHistoricalSystemEvents(hash: string, blockHeight: number, api = this.api): Promise<EventRecord[]> {
+    if (!api) throw new Error('Cannot decode historical SORA events before the chain API is initialized');
+
+    const apiAt = await this.fetchApiAtFrom(api, hash, `SORA block ${blockHeight}`);
     const system = (apiAt.query as { system?: { events?: () => Promise<unknown> } }).system;
     if (typeof system?.events !== 'function') {
       throw new Error(`system.events is required to decode historical SORA block ${blockHeight}`);
@@ -3162,8 +3845,10 @@ export class ChainIndexer {
     return (await withTimeout(system.events.call(system), `system.events(${blockHeight})`)) as EventRecord[];
   }
 
-  private async fetchHistoricalBlockTimestamp(hash: string, blockHeight: number): Promise<number> {
-    const apiAt = await this.fetchApiAt(hash, `SORA block ${blockHeight}`);
+  private async fetchHistoricalBlockTimestamp(hash: string, blockHeight: number, api = this.api): Promise<number> {
+    if (!api) throw new Error('Cannot decode historical SORA timestamps before the chain API is initialized');
+
+    const apiAt = await this.fetchApiAtFrom(api, hash, `SORA block ${blockHeight}`);
     const timestampNow = (apiAt.query as { timestamp?: { now?: () => Promise<unknown> } }).timestamp?.now;
     if (typeof timestampNow !== 'function') {
       throw new Error(`timestamp.now is required to index historical SORA block ${blockHeight}`);
@@ -3178,10 +3863,11 @@ export class ChainIndexer {
     return Math.floor(timestampMs / 1000);
   }
 
-  private async fetchBlockTimestamp(hash: string): Promise<number> {
+  private async fetchBlockTimestamp(hash: string, api = this.api): Promise<number> {
     if (!this.api) throw new Error('Cannot index a block before the chain API is initialized');
+    if (!api) throw new Error('Cannot index a block before the chain API is initialized');
 
-    const timestampNow = (this.api.query as any).timestamp?.now;
+    const timestampNow = (api.query as any).timestamp?.now;
     const at = timestampNow?.at;
     if (typeof at !== 'function') {
       throw new Error('timestamp.now.at is required to index block timestamps');
@@ -3780,6 +4466,91 @@ export class ChainIndexer {
     this.networkLiquidityStats = createNetworkLiquidityStats(poolLiquidityUSD, orderBookLiquidityUSD, activePools, activeOrderBooks, assets.size);
   }
 
+  private async refreshPolkamarktState(blockHeight: number, timestamp: number, includeSnapshots: boolean): Promise<void> {
+    if (!this.api) throw new Error('Cannot refresh Polkamarkt state before the chain API is initialized');
+
+    const polkamarkt = (this.api.query as any).polkamarkt;
+    const canSynchronizeAccountPositions = this.canSynchronizePolkamarktAccountPositions();
+    const [
+      assetInfos,
+      tokenIssuances,
+      nativeXorIssuance,
+      polkamarktConditions,
+      polkamarktConditionDetails,
+      polkamarktMarkets,
+      polkamarktDpmCollaterals,
+      polkamarktVolumes,
+      polkamarktTotals,
+      polkamarktResolutions,
+      polkamarktResolutionEvidence,
+      polkamarktCancellationEvidence,
+      polkamarktPositions,
+      polkamarktCreatorFees,
+    ] = await Promise.all([
+      this.fetchStorageEntries((this.api.query as any).assets.assetInfosV2, 'assets.assetInfosV2'),
+      this.fetchStorageEntries((this.api.query as any).tokens.totalIssuance, 'tokens.totalIssuance'),
+      this.fetchNativeXorIssuance(),
+      this.fetchOptionalStorageEntries(polkamarkt?.conditions, 'polkamarkt.conditions'),
+      this.fetchOptionalStorageEntries(polkamarkt?.conditionDetails, 'polkamarkt.conditionDetails'),
+      this.fetchOptionalStorageEntries(polkamarkt?.markets, 'polkamarkt.markets'),
+      this.fetchOptionalStorageEntries(polkamarkt?.marketDpmCollateral, 'polkamarkt.marketDpmCollateral'),
+      this.fetchOptionalStorageEntries(polkamarkt?.marketVolume, 'polkamarkt.marketVolume'),
+      this.fetchOptionalStorageEntries(polkamarkt?.marketPositionTotals, 'polkamarkt.marketPositionTotals'),
+      this.fetchOptionalStorageEntries(polkamarkt?.marketResolution, 'polkamarkt.marketResolution'),
+      this.fetchOptionalStorageEntries(polkamarkt?.marketResolutionEvidence, 'polkamarkt.marketResolutionEvidence'),
+      this.fetchOptionalStorageEntries(polkamarkt?.marketCancellationEvidence, 'polkamarkt.marketCancellationEvidence'),
+      this.fetchOptionalStorageEntries(polkamarkt?.marketPositions, 'polkamarkt.marketPositions'),
+      this.fetchOptionalStorageEntries(polkamarkt?.marketCreatorFees, 'polkamarkt.marketCreatorFees'),
+    ]);
+    const supplyByAsset = this.createSupplyByAsset(tokenIssuances, nativeXorIssuance);
+    const assets = new Map<string, AssetInfo>();
+
+    for (const [key, value] of assetInfos) {
+      const id = assetIdToString(key.args[0]);
+      const human = toHuman(value) as Record<string, unknown>;
+      assets.set(id, {
+        id,
+        symbol: String(human.symbol ?? ''),
+        name: String(human.name ?? ''),
+        decimals: Number(human.precision ?? DECIMALS),
+        supply: supplyByAsset.get(id) ?? 0n,
+      });
+    }
+    this.assetInfos = assets;
+
+    const polkamarktMarketDocuments = this.createPolkamarktMarketDocuments(
+      polkamarktConditions,
+      polkamarktConditionDetails,
+      polkamarktMarkets,
+      polkamarktDpmCollaterals,
+      polkamarktVolumes,
+      polkamarktTotals,
+      polkamarktResolutions,
+      polkamarktResolutionEvidence,
+      polkamarktCancellationEvidence,
+      polkamarktCreatorFees,
+      assets,
+      blockHeight,
+      timestamp,
+      includeSnapshots
+    );
+    const polkamarktPositionDocuments = this.createPolkamarktPositionDocuments(
+      polkamarktPositions,
+      polkamarktMarkets,
+      polkamarktDpmCollaterals,
+      polkamarktTotals,
+      polkamarktResolutions,
+      assets,
+      blockHeight,
+      timestamp
+    );
+
+    await this.repository.upsertMany([...polkamarktMarketDocuments, ...polkamarktPositionDocuments]);
+    if (canSynchronizeAccountPositions) {
+      await this.deleteStaleAccountPositionDocuments(polkamarktPositionDocuments);
+    }
+  }
+
   private async refreshDerivedState(blockHeight: number, timestamp: number, includeSnapshots: boolean): Promise<void> {
     if (!this.api) throw new Error('Cannot refresh derived state before the chain API is initialized');
 
@@ -3803,15 +4574,13 @@ export class ChainIndexer {
       polkamarktConditions,
       polkamarktConditionDetails,
       polkamarktMarkets,
-      polkamarktPools,
+      polkamarktDpmCollaterals,
       polkamarktVolumes,
       polkamarktTotals,
       polkamarktResolutions,
       polkamarktResolutionEvidence,
       polkamarktCancellationEvidence,
       polkamarktPositions,
-      polkamarktLiquidityPositions,
-      polkamarktLiquidityTotals,
       polkamarktCreatorFees,
       farmingPoolFarmers,
       nativeXorIssuance,
@@ -3828,15 +4597,13 @@ export class ChainIndexer {
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.conditions, 'polkamarkt.conditions'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.conditionDetails, 'polkamarkt.conditionDetails'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.markets, 'polkamarkt.markets'),
-      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketPools, 'polkamarkt.marketPools'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketDpmCollateral, 'polkamarkt.marketDpmCollateral'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketVolume, 'polkamarkt.marketVolume'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketPositionTotals, 'polkamarkt.marketPositionTotals'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketResolution, 'polkamarkt.marketResolution'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketResolutionEvidence, 'polkamarkt.marketResolutionEvidence'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketCancellationEvidence, 'polkamarkt.marketCancellationEvidence'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketPositions, 'polkamarkt.marketPositions'),
-      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.liquidityPositions, 'polkamarkt.liquidityPositions'),
-      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.liquidityPositionTotals, 'polkamarkt.liquidityPositionTotals'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketCreatorFees, 'polkamarkt.marketCreatorFees'),
       this.fetchStorageEntries((this.api.query as any).farming.poolFarmers, 'farming.poolFarmers'),
       this.fetchNativeXorIssuance(),
@@ -3959,26 +4726,24 @@ export class ChainIndexer {
       polkamarktConditions,
       polkamarktConditionDetails,
       polkamarktMarkets,
-      polkamarktPools,
+      polkamarktDpmCollaterals,
       polkamarktVolumes,
       polkamarktTotals,
       polkamarktResolutions,
       polkamarktResolutionEvidence,
       polkamarktCancellationEvidence,
-      polkamarktLiquidityTotals,
       polkamarktCreatorFees,
       assets,
       effectiveBlockHeight,
-      timestamp
+      timestamp,
+      includeSnapshots
     );
     const polkamarktPositionDocuments = this.createPolkamarktPositionDocuments(
       polkamarktPositions,
-      polkamarktLiquidityPositions,
       polkamarktMarkets,
-      polkamarktPools,
+      polkamarktDpmCollaterals,
       polkamarktTotals,
       polkamarktResolutions,
-      polkamarktLiquidityTotals,
       assets,
       effectiveBlockHeight,
       timestamp
@@ -4015,13 +4780,50 @@ export class ChainIndexer {
     await this.repository.upsertMany(await this.prepareReferrerRewardDocuments(auxiliaryDocuments));
   }
 
+  private async refreshPriceStream(blockHeight: number, timestamp: number): Promise<void> {
+    if (!this.api) throw new Error('Cannot refresh price stream before the chain API is initialized');
+
+    const [assetInfos, poolReserves] = await Promise.all([
+      this.fetchStorageEntries((this.api.query as any).assets.assetInfosV2, 'assets.assetInfosV2'),
+      this.fetchStorageEntries((this.api.query as any).poolXYK.reserves, 'poolXYK.reserves'),
+    ]);
+    const assets = new Map<string, Pick<AssetInfo, 'id' | 'decimals'>>();
+
+    for (const [key, value] of assetInfos) {
+      const id = assetIdToString(key.args[0]);
+      const human = toHuman(value) as Record<string, unknown>;
+      assets.set(id, {
+        id,
+        decimals: Number(human.precision ?? DECIMALS),
+      });
+    }
+
+    const poolsRaw: Array<{
+      baseAssetId: string;
+      targetAssetId: string;
+      baseAssetReserves: bigint;
+      targetAssetReserves: bigint;
+    }> = (poolReserves as Array<[any, any]>).map(([key, value]) => {
+      const reserves = toJson(value);
+      return {
+        baseAssetId: assetIdToString(key.args[0]),
+        targetAssetId: assetIdToString(key.args[1]),
+        baseAssetReserves: codecToBigInt(Array.isArray(reserves) ? reserves[0] : 0),
+        targetAssetReserves: codecToBigInt(Array.isArray(reserves) ? reserves[1] : 0),
+      };
+    });
+    const prices = this.derivePrices(assets, poolsRaw);
+
+    this.prices = prices;
+    await this.repository.upsert(this.createPriceStreamDocument(assets.keys(), prices, blockHeight, timestamp));
+  }
+
   private canSynchronizePolkamarktAccountPositions(): boolean {
     const polkamarkt = (this.api?.query as { polkamarkt?: Record<string, unknown> } | undefined)?.polkamarkt;
 
     return (
       hasStorageEntries(polkamarkt?.markets) &&
-      hasStorageEntries(polkamarkt?.marketPositions) &&
-      hasStorageEntries(polkamarkt?.liquidityPositions)
+      hasStorageEntries(polkamarkt?.marketPositions)
     );
   }
 
@@ -4036,7 +4838,7 @@ export class ChainIndexer {
   }
 
   private derivePrices(
-    assets: Map<string, AssetInfo>,
+    assets: Map<string, Pick<AssetInfo, 'id' | 'decimals'>>,
     pools: Array<{ baseAssetId: string; targetAssetId: string; baseAssetReserves: bigint; targetAssetReserves: bigint }>
   ): Map<string, bigint> {
     const prices = new Map<string, bigint>();
@@ -4876,31 +5678,39 @@ export class ChainIndexer {
     return {};
   }
 
+  private createPolkamarktMarketDescription(oracle: string | null, resolutionSource: string | null): string | null {
+    const sentences = [
+      oracle ? `Resolved by ${oracle.replace(/[.\s]+$/, '')}` : null,
+      resolutionSource ? `Resolution source: ${resolutionSource.replace(/[.\s]+$/, '')}` : null,
+    ].filter((sentence): sentence is string => Boolean(sentence));
+
+    return sentences.length ? `${sentences.join('. ')}.` : null;
+  }
+
   private createPolkamarktMarketDocuments(
     conditions: Array<[StorageEntryKey, unknown]>,
     conditionDetails: Array<[StorageEntryKey, unknown]>,
     markets: Array<[StorageEntryKey, unknown]>,
-    pools: Array<[StorageEntryKey, unknown]>,
+    dpmCollaterals: Array<[StorageEntryKey, unknown]>,
     volumes: Array<[StorageEntryKey, unknown]>,
     totals: Array<[StorageEntryKey, unknown]>,
     resolutions: Array<[StorageEntryKey, unknown]>,
     resolutionEvidence: Array<[StorageEntryKey, unknown]>,
     cancellationEvidence: Array<[StorageEntryKey, unknown]>,
-    liquidityTotals: Array<[StorageEntryKey, unknown]>,
     creatorFees: Array<[StorageEntryKey, unknown]>,
     assets: Map<string, AssetInfo>,
     blockHeight: number,
-    timestamp: number
+    timestamp: number,
+    includeSnapshots = false
   ): IndexerDocument[] {
     const conditionsById = new Map<number, Record<string, unknown>>();
     const conditionDetailsById = new Map<number, Record<string, unknown>>();
-    const poolsByMarket = new Map<number, Record<string, unknown>>();
+    const dpmCollateralByMarket = new Map<number, bigint>();
     const volumesByMarket = new Map<number, bigint>();
     const totalsByMarket = new Map<number, Record<string, unknown>>();
     const resolutionsByMarket = new Map<number, string>();
     const resolutionEvidenceByMarket = new Map<number, Record<string, unknown>>();
     const cancellationEvidenceByMarket = new Map<number, Record<string, unknown>>();
-    const liquidityTotalsByMarket = new Map<number, Record<string, unknown>>();
     const creatorFeesByMarket = new Map<number, bigint>();
 
     for (const [key, value] of conditions) {
@@ -4915,10 +5725,10 @@ export class ChainIndexer {
       conditionDetailsById.set(id, this.normalizedRecord(value));
     }
 
-    for (const [key, value] of pools) {
+    for (const [key, value] of dpmCollaterals) {
       const id = this.storageKeyNumber(key);
       if (id === null) continue;
-      poolsByMarket.set(id, this.normalizedRecord(value));
+      dpmCollateralByMarket.set(id, this.safeCodecToBigInt(value));
     }
 
     for (const [key, value] of volumes) {
@@ -4951,12 +5761,6 @@ export class ChainIndexer {
       cancellationEvidenceByMarket.set(id, this.normalizedRecord(value));
     }
 
-    for (const [key, value] of liquidityTotals) {
-      const id = this.storageKeyNumber(key);
-      if (id === null) continue;
-      liquidityTotalsByMarket.set(id, this.normalizedRecord(value));
-    }
-
     for (const [key, value] of creatorFees) {
       const id = this.storageKeyNumber(key);
       if (id === null) continue;
@@ -4974,24 +5778,22 @@ export class ChainIndexer {
       const title = this.decodeMetadataText(condition?.question);
       if (!title) return [];
 
-      const pool = poolsByMarket.get(marketId) ?? {};
       const totalsForMarket = totalsByMarket.get(marketId) ?? {};
-      const lpTotalsForMarket = liquidityTotalsByMarket.get(marketId) ?? {};
       const collateralAsset = assetIdToString(market.collateralAsset);
       const decimals = assets.get(collateralAsset)?.decimals ?? DECIMALS;
-      const seedLiquidity = this.safeCodecToBigInt(market.seedLiquidity);
-      const collateral = this.safeCodecToBigInt(pool.collateral ?? seedLiquidity);
-      const yesShares = this.safeCodecToBigInt(pool.yes ?? totalsForMarket.totalYesShares ?? seedLiquidity);
-      const noShares = this.safeCodecToBigInt(pool.no ?? totalsForMarket.totalNoShares ?? seedLiquidity);
-      const lpShares = this.safeCodecToBigInt(lpTotalsForMarket.totalShares);
-      const lpCollateralContributed = this.safeCodecToBigInt(lpTotalsForMarket.totalCollateralContributed);
+      const collateral = dpmCollateralByMarket.get(marketId) ?? 0n;
+      const yesShares = this.safeCodecToBigInt(totalsForMarket.totalYesShares);
+      const noShares = this.safeCodecToBigInt(totalsForMarket.totalNoShares);
       const volume = volumesByMarket.get(marketId) ?? 0n;
       const creatorFeesForMarket = creatorFeesByMarket.get(marketId) ?? 0n;
-      const probability =
-        yesShares + noShares > 0n
-          ? Number((noShares * 10_000n) / (yesShares + noShares)) / 100
-          : null;
-      const liquidityUSD = decimalToString(collateral, decimals, 8);
+      const mechanism = this.variantName(market.mechanism) || 'DynamicPariMutuel';
+      const isDynamicPariMutuel = normalizedMechanism(mechanism) === 'dynamicparimutuel';
+      const dpmCollateral = isDynamicPariMutuel ? collateral : 0n;
+      const dpmState =
+        isDynamicPariMutuel
+          ? dpmIndexedState(yesShares, noShares)
+          : emptyIndexedMarketState(yesShares, noShares);
+      const liquidityUSD = decimalToString(dpmCollateral, decimals, 8);
       const volumeUSD = decimalToString(volume, decimals, 8);
       const oracle = this.decodeMetadataText(condition?.oracle);
       const resolutionSource = this.decodeMetadataText(condition?.resolutionSource);
@@ -5002,75 +5804,117 @@ export class ChainIndexer {
       const resolutionEvidenceForMarket = resolutionEvidenceByMarket.get(marketId) ?? {};
       const cancellationEvidenceForMarket = cancellationEvidenceByMarket.get(marketId) ?? {};
       const governance = resolutionSource ? this.parseSoraGovernanceReference(resolutionSource) : {};
-
-      return [
-        {
-          collection: collection('markets'),
+      const description = this.createPolkamarktMarketDescription(oracle, resolutionSource);
+      const marketDocument: IndexerDocument = {
+        collection: collection('markets'),
+        id: String(marketId),
+        blockHeight,
+        timestamp,
+        data: {
           id: String(marketId),
-          blockHeight,
+          marketId,
+          conditionId,
+          title,
+          category,
+          tags: tags || null,
+          description,
+          metadataUri: metadataUri || null,
+          metadataHash: this.decodeBytesHex(details.metadataHash),
+          rulesUri: rulesUri || null,
+          oracle,
+          resolutionSource,
+          closeBlock: Number(market.closeBlock ?? 0),
+          status: this.variantName(market.status),
+          mechanism,
+          creator: String(market.creator ?? ''),
+          collateralAsset,
+          creatorFees: decimalToString(creatorFeesForMarket, decimals, 8),
+          liquidityUSD,
+          volumeUSD,
+          probability: dpmState.probability,
+          priceYes: dpmState.priceYes,
+          priceNo: dpmState.priceNo,
+          virtualDepth: decimalToString(dpmState.virtualDepth, decimals, 8),
+          dpmCollateral: decimalToString(dpmCollateral, decimals, 8),
+          realYesShares: decimalToString(dpmState.realYesShares, decimals, 8),
+          realNoShares: decimalToString(dpmState.realNoShares, decimals, 8),
+          marginalYesPriceBps: dpmState.marginalYesPriceBps,
+          marginalNoPriceBps: dpmState.marginalNoPriceBps,
+          impliedYesProbabilityBps: dpmState.impliedYesProbabilityBps,
+          impliedNoProbabilityBps: dpmState.impliedNoProbabilityBps,
+          collateral: decimalToString(dpmCollateral, decimals, 8),
+          yesShares: decimalToString(dpmState.realYesShares, decimals, 8),
+          noShares: decimalToString(dpmState.realNoShares, decimals, 8),
+          resolutionOutcome: resolutionsByMarket.get(marketId) ?? null,
+          resolutionEvidenceUri: this.decodeMetadataText(resolutionEvidenceForMarket.uri) || null,
+          resolutionEvidenceHash: this.decodeBytesHex(resolutionEvidenceForMarket.hash),
+          resolutionEvidenceBlock: Number(resolutionEvidenceForMarket.atBlock ?? 0) || null,
+          cancellationEvidenceUri: this.decodeMetadataText(cancellationEvidenceForMarket.uri) || null,
+          cancellationEvidenceHash: this.decodeBytesHex(cancellationEvidenceForMarket.hash),
+          cancellationEvidenceBlock: Number(cancellationEvidenceForMarket.atBlock ?? 0) || null,
+          ...governance,
+          updatedAtBlock: blockHeight,
           timestamp,
-          data: {
-            id: String(marketId),
-            marketId,
-            conditionId,
-            title,
-            category,
-            tags: tags || null,
-            metadataUri: metadataUri || null,
-            metadataHash: this.decodeBytesHex(details.metadataHash),
-            rulesUri: rulesUri || null,
-            oracle,
-            resolutionSource,
-            closeBlock: Number(market.closeBlock ?? 0),
-            status: this.variantName(market.status),
-            creator: String(market.creator ?? ''),
-            collateralAsset,
-            seedLiquidity: decimalToString(seedLiquidity, decimals, 8),
-            creatorFees: decimalToString(creatorFeesForMarket, decimals, 8),
-            liquidityUSD,
-            volumeUSD,
-            probability,
-            priceYes: probability === null ? null : probability / 100,
-            collateral: decimalToString(collateral, decimals, 8),
-            yesShares: decimalToString(yesShares, decimals, 8),
-            noShares: decimalToString(noShares, decimals, 8),
-            liquidityShares: decimalToString(lpShares, decimals, 8),
-            liquidityCollateralContributed: decimalToString(lpCollateralContributed, decimals, 8),
-            resolutionOutcome: resolutionsByMarket.get(marketId) ?? null,
-            resolutionEvidenceUri: this.decodeMetadataText(resolutionEvidenceForMarket.uri) || null,
-            resolutionEvidenceHash: this.decodeBytesHex(resolutionEvidenceForMarket.hash),
-            resolutionEvidenceBlock: Number(resolutionEvidenceForMarket.atBlock ?? 0) || null,
-            cancellationEvidenceUri: this.decodeMetadataText(cancellationEvidenceForMarket.uri) || null,
-            cancellationEvidenceHash: this.decodeBytesHex(cancellationEvidenceForMarket.hash),
-            cancellationEvidenceBlock: Number(cancellationEvidenceForMarket.atBlock ?? 0) || null,
-            ...governance,
-            updatedAtBlock: blockHeight,
-            timestamp,
-          },
         },
-      ];
+      };
+
+      const marketSnapshotDocuments: IndexerDocument[] =
+        includeSnapshots && dpmState.probability !== null
+          ? SNAPSHOT_TYPES.map((type) => {
+              const id = snapshotId('market', String(marketId), type, timestamp, blockHeight);
+
+              return {
+                collection: collection('marketSnapshots'),
+                id,
+                blockHeight,
+                timestamp,
+                data: {
+                  id,
+                  marketId,
+                  timestamp,
+                  blockHeight,
+                  type,
+                  probability: dpmState.probability,
+                  priceYes: dpmState.priceYes,
+                  priceNo: dpmState.priceNo,
+                  virtualDepth: decimalToString(dpmState.virtualDepth, decimals, 8),
+                  dpmCollateral: decimalToString(dpmCollateral, decimals, 8),
+                  realYesShares: decimalToString(dpmState.realYesShares, decimals, 8),
+                  realNoShares: decimalToString(dpmState.realNoShares, decimals, 8),
+                  marginalYesPriceBps: dpmState.marginalYesPriceBps,
+                  marginalNoPriceBps: dpmState.marginalNoPriceBps,
+                  impliedYesProbabilityBps: dpmState.impliedYesProbabilityBps,
+                  impliedNoProbabilityBps: dpmState.impliedNoProbabilityBps,
+                  collateral: decimalToString(dpmCollateral, decimals, 8),
+                  yesShares: decimalToString(dpmState.realYesShares, decimals, 8),
+                  noShares: decimalToString(dpmState.realNoShares, decimals, 8),
+                  liquidityUSD,
+                  volumeUSD,
+                  status: this.variantName(market.status),
+                },
+              };
+            })
+          : [];
+
+      return [marketDocument, ...marketSnapshotDocuments];
     });
   }
 
   private createPolkamarktPositionDocuments(
     positions: Array<[StorageEntryKey, unknown]>,
-    liquidityPositions: Array<[StorageEntryKey, unknown]>,
     markets: Array<[StorageEntryKey, unknown]>,
-    pools: Array<[StorageEntryKey, unknown]>,
+    dpmCollaterals: Array<[StorageEntryKey, unknown]>,
     totals: Array<[StorageEntryKey, unknown]>,
     resolutions: Array<[StorageEntryKey, unknown]>,
-    liquidityTotals: Array<[StorageEntryKey, unknown]>,
     assets: Map<string, AssetInfo>,
     blockHeight: number,
     timestamp: number
   ): IndexerDocument[] {
     const marketsById = new Map<number, Record<string, unknown>>();
-    const poolsByMarket = new Map<number, Record<string, unknown>>();
+    const dpmCollateralByMarket = new Map<number, bigint>();
     const totalsByMarket = new Map<number, Record<string, unknown>>();
     const resolutionsByMarket = new Map<number, string>();
-    const liquidityTotalsByMarket = new Map<number, Record<string, unknown>>();
     const positionsByKey = new Map<string, Record<string, unknown>>();
-    const liquidityPositionsByKey = new Map<string, Record<string, unknown>>();
     const accountMarketKeys = new Map<string, { marketId: number; account: string }>();
 
     for (const [key, value] of markets) {
@@ -5079,10 +5923,10 @@ export class ChainIndexer {
       marketsById.set(id, this.normalizedRecord(value));
     }
 
-    for (const [key, value] of pools) {
+    for (const [key, value] of dpmCollaterals) {
       const id = this.storageKeyNumber(key);
       if (id === null) continue;
-      poolsByMarket.set(id, this.normalizedRecord(value));
+      dpmCollateralByMarket.set(id, this.safeCodecToBigInt(value));
     }
 
     for (const [key, value] of totals) {
@@ -5097,12 +5941,6 @@ export class ChainIndexer {
       resolutionsByMarket.set(id, this.variantName(value));
     }
 
-    for (const [key, value] of liquidityTotals) {
-      const id = this.storageKeyNumber(key);
-      if (id === null) continue;
-      liquidityTotalsByMarket.set(id, this.normalizedRecord(value));
-    }
-
     for (const [key, value] of positions) {
       const marketIdRaw = normalizeValue(key.args?.[0]);
       const marketId = Number(marketIdRaw);
@@ -5113,76 +5951,39 @@ export class ChainIndexer {
       accountMarketKeys.set(id, { marketId, account });
     }
 
-    for (const [key, value] of liquidityPositions) {
-      const marketIdRaw = normalizeValue(key.args?.[0]);
-      const marketId = Number(marketIdRaw);
-      const account = String(normalizeValue(key.args?.[1]) ?? '');
-      if (!Number.isSafeInteger(marketId) || !account) continue;
-      const id = `${marketId}-${account}`;
-      liquidityPositionsByKey.set(id, this.normalizedRecord(value));
-      accountMarketKeys.set(id, { marketId, account });
-    }
-
     return [...accountMarketKeys.entries()].flatMap(([id, entry]) => {
       const { marketId, account } = entry;
       const market = marketsById.get(marketId);
       if (!market) return [];
-      const pool = poolsByMarket.get(marketId) ?? {};
       const totalsForMarket = totalsByMarket.get(marketId) ?? {};
-      const lpTotalsForMarket = liquidityTotalsByMarket.get(marketId) ?? {};
       const marketPosition = positionsByKey.get(id) ?? {};
-      const liquidityPosition = liquidityPositionsByKey.get(id) ?? {};
       const collateralAsset = assetIdToString(market.collateralAsset);
       const decimals = assets.get(collateralAsset)?.decimals ?? DECIMALS;
       const yesShares = this.safeCodecToBigInt(marketPosition.yesShares ?? marketPosition.yes_shares);
       const noShares = this.safeCodecToBigInt(marketPosition.noShares ?? marketPosition.no_shares);
       const netCollateralPaid = this.safeCodecToBigInt(marketPosition.netCollateralPaid ?? marketPosition.net_collateral_paid);
-      const lpShares = this.safeCodecToBigInt(liquidityPosition.shares);
-      const lpCollateralContributed = this.safeCodecToBigInt(
-        liquidityPosition.collateralContributed ?? liquidityPosition.collateral_contributed
-      );
-      if (
-        yesShares === 0n &&
-        noShares === 0n &&
-        netCollateralPaid === 0n &&
-        lpShares === 0n &&
-        lpCollateralContributed === 0n
-      ) {
-        return [];
-      }
+      if (yesShares === 0n && noShares === 0n && netCollateralPaid === 0n) return [];
       const status = this.variantName(market.status);
       const resolutionOutcome = resolutionsByMarket.get(marketId) ?? null;
       const normalizedStatus = status.toLowerCase();
       const normalizedResolution = resolutionOutcome?.toLowerCase();
+      const collateral = dpmCollateralByMarket.get(marketId) ?? 0n;
+      const winningShares =
+        normalizedResolution === 'yes' ? yesShares : normalizedResolution === 'no' ? noShares : 0n;
+      const totalWinningShares =
+        normalizedResolution === 'yes'
+          ? this.safeCodecToBigInt(totalsForMarket.totalYesShares)
+          : normalizedResolution === 'no'
+            ? this.safeCodecToBigInt(totalsForMarket.totalNoShares)
+            : 0n;
       const claimablePayout =
         normalizedStatus === 'resolved'
-          ? normalizedResolution === 'yes'
-            ? yesShares
-            : normalizedResolution === 'no'
-              ? noShares
-              : 0n
+          ? totalWinningShares > 0n
+            ? (collateral * winningShares) / totalWinningShares
+            : 0n
           : normalizedStatus === 'cancelled'
             ? netCollateralPaid
             : 0n;
-      const collateral = this.safeCodecToBigInt(pool.collateral ?? market.seedLiquidity);
-      const lockedPayout =
-        normalizedStatus === 'resolved'
-          ? normalizedResolution === 'yes'
-            ? this.safeCodecToBigInt(totalsForMarket.totalYesShares)
-            : normalizedResolution === 'no'
-              ? this.safeCodecToBigInt(totalsForMarket.totalNoShares)
-              : 0n
-          : normalizedStatus === 'cancelled'
-            ? this.safeCodecToBigInt(totalsForMarket.totalNetCollateralPaid)
-            : 0n;
-      const totalLiquidityClaimable =
-        normalizedStatus === 'resolved' || normalizedStatus === 'cancelled'
-          ? collateral > lockedPayout
-            ? collateral - lockedPayout
-            : 0n
-          : 0n;
-      const lpTotalShares = this.safeCodecToBigInt(lpTotalsForMarket.totalShares);
-      const lpClaimablePayout = lpTotalShares > 0n ? (totalLiquidityClaimable * lpShares) / lpTotalShares : 0n;
       const dominantOutcome = yesShares >= noShares ? 'Yes' : 'No';
       const dominantShares = yesShares >= noShares ? yesShares : noShares;
 
@@ -5201,14 +6002,11 @@ export class ChainIndexer {
             yesShares: decimalToString(yesShares, decimals, 8),
             noShares: decimalToString(noShares, decimals, 8),
             netCollateralPaid: decimalToString(netCollateralPaid, decimals, 8),
-            lpShares: decimalToString(lpShares, decimals, 8),
-            lpCollateralContributed: decimalToString(lpCollateralContributed, decimals, 8),
             costBasisUsd: decimalToString(netCollateralPaid, decimals, 8),
-            marketValueUsd: decimalToString(claimablePayout + lpClaimablePayout, decimals, 8),
+            marketValueUsd: decimalToString(claimablePayout, decimals, 8),
             realizedPnlUsd: '0',
             unrealizedPnlUsd: '0',
             claimablePayoutUsd: decimalToString(claimablePayout, decimals, 8),
-            lpClaimablePayoutUsd: decimalToString(lpClaimablePayout, decimals, 8),
             isCreator: String(market.creator ?? '') === account,
             status,
             updatedAt: new Date(timestamp * 1000).toISOString(),
@@ -5936,13 +6734,11 @@ export class ChainIndexer {
     if (currentEra === null) throw new Error('staking.currentEra returned an invalid era');
 
     const rewardEra = this.latestRewardEra(rewardEntries);
-    if (!rewardEra) throw new Error('staking.erasValidatorReward has no completed reward era');
-
-    const apyEra = rewardEra.era;
+    const apyEra = rewardEra?.era ?? null;
     const [rewardPoints, currentExposures, apyExposureEntries, identities] = await Promise.all([
-      this.getEraRewardPoints(rewardEra.era),
+      rewardEra ? this.getEraRewardPoints(rewardEra.era) : Promise.resolve(null),
       this.getEraExposures(currentEra),
-      apyEra === currentEra ? Promise.resolve(null) : this.getEraExposures(apyEra),
+      rewardEra && apyEra !== currentEra ? this.getEraExposures(rewardEra.era) : Promise.resolve(null),
       mapWithConcurrency(validators, VALIDATOR_IDENTITY_CONCURRENCY, async (validator) => [
         validator.address,
         await this.readValidatorIdentity(validator.address),
@@ -5950,7 +6746,7 @@ export class ChainIndexer {
     ]);
     if (!currentExposures.size) throw new Error(`staking.erasStakers(${currentEra}) returned no validator exposures`);
 
-    const apyExposures = apyExposureEntries ?? currentExposures;
+    const apyExposures = rewardEra ? (apyExposureEntries ?? currentExposures) : null;
     const identityByAddress = new Map(identities);
     const maxNominatorRewarded = this.getMaxNominatorRewardedPerValidator();
     const activeValidators = validators.filter((validator) => currentExposures.has(validator.address));
@@ -5960,24 +6756,24 @@ export class ChainIndexer {
 
     return activeValidators.map((validator) => {
       const exposure = currentExposures.get(validator.address);
-      const apyExposure = apyExposures.get(validator.address);
+      const apyExposure = apyExposures?.get(validator.address) ?? null;
       const identity = identityByAddress.get(validator.address) ?? null;
-      const validatorRewardPoints = rewardPoints.individual.get(validator.address) ?? 0;
+      const validatorRewardPoints = rewardPoints?.individual.get(validator.address) ?? null;
 
       if (!exposure) {
         throw new Error(`staking.erasStakers(${currentEra}) is missing exposure for validator ${validator.address}`);
       }
-      if (!apyExposure && validatorRewardPoints > 0) {
+      if (!apyExposure && validatorRewardPoints && validatorRewardPoints > 0) {
         throw new Error(
           `staking.erasStakers(${apyEra}) has reward points but is missing APY exposure for validator ${validator.address}`
         );
       }
 
-      const apy = apyExposure
+      const apy = rewardEra && rewardPoints && apyExposure
         ? this.calculateValidatorApy(
             apyExposure.total,
             rewardEra.reward,
-            validatorRewardPoints,
+            validatorRewardPoints ?? 0,
             rewardPoints.total,
             validator.commission,
             prices,
@@ -6139,6 +6935,23 @@ export class ChainIndexer {
     });
   }
 
+  private createPriceStreamDocument(
+    assetIds: Iterable<string>,
+    prices: Map<string, bigint>,
+    blockHeight: number,
+    timestamp: number
+  ): IndexerDocument {
+    const priceData = Object.fromEntries([...assetIds].map((id) => [id, scaledToString(prices.get(id) ?? 0n, 8)]));
+
+    return {
+      collection: collection('updatesStreams'),
+      id: 'price',
+      blockHeight,
+      timestamp,
+      data: { id: 'price', block: blockHeight, data: JSON.stringify(priceData) },
+    };
+  }
+
   private createUpdateStreams(
     pools: PoolState[],
     assets: Map<string, AssetInfo>,
@@ -6147,7 +6960,6 @@ export class ChainIndexer {
     blockHeight: number,
     timestamp: number
   ): IndexerDocument[] {
-    const priceData = Object.fromEntries([...assets.values()].map((asset) => [asset.id, scaledToString(prices.get(asset.id) ?? 0n, 8)]));
     const apyData = Object.fromEntries(pools.map((pool) => [pool.id, apyByPool.get(pool.id) ?? '0']));
     const assetRegistrationData = Object.fromEntries(
       [...assets.values()].map((asset) => [
@@ -6162,13 +6974,9 @@ export class ChainIndexer {
     );
 
     return [
-      {
-        collection: collection('updatesStreams'),
-        id: 'price',
-        blockHeight,
-        timestamp,
-        data: { id: 'price', block: blockHeight, data: JSON.stringify(priceData) },
-      },
+      ...(PRICE_STREAM_REFRESH_INTERVAL_BLOCKS > 0
+        ? []
+        : [this.createPriceStreamDocument(assets.keys(), prices, blockHeight, timestamp)]),
       {
         collection: collection('updatesStreams'),
         id: 'apy',

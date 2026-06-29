@@ -5,6 +5,13 @@ __metadata:
   version: 8
   cacheKey: 10c0
 
+"@babel/runtime@npm:^7.28.4":
+  version: 7.29.7
+  resolution: "@babel/runtime@npm:7.29.7"
+  checksum: 10c0/ca11572f7146b21e0bde6a9ed4bb6a89eafbee5f0944c7eb54d0d8a2dac962c33638a1d611e14faa71dfbb92b4b5f9236232208568a6b7d5c6f3f39ddb91771e
+  languageName: node
+  linkType: hard
+
 "@emnapi/core@npm:1.10.0":
   version: 1.10.0
   resolution: "@emnapi/core@npm:1.10.0"
@@ -404,6 +411,15 @@ __metadata:
   version: 1.8.0
   resolution: "@noble/hashes@npm:1.8.0"
   checksum: 10c0/06a0b52c81a6fa7f04d67762e08b2c476a00285858150caeaaff4037356dd5e119f45b2a530f638b77a5eeca013168ec1b655db41bae3236cb2e9d511484fc77
+  languageName: node
+  linkType: hard
+
+"@open-web3/orml-type-definitions@npm:1.1.4":
+  version: 1.1.4
+  resolution: "@open-web3/orml-type-definitions@npm:1.1.4"
+  dependencies:
+    lodash.merge: "npm:^4.6.2"
+  checksum: 10c0/20b51bf806cdc3c8ec9c4e98b475d752ef16f1d2eb723e06f374fcb5989e0dc1327b37ce34276ef6f23660e08d18e790d9f3acee0a608864517f93af07fc903c
   languageName: node
   linkType: hard
 
@@ -1029,6 +1045,15 @@ __metadata:
     "@noble/curves": "npm:~1.9.2"
     "@noble/hashes": "npm:~1.8.0"
   checksum: 10c0/7836a7ea9e50c3c36c19f14408b52fc57d255e5b82a19e1ccb05bc3e369b20ee64d00683930b7171a1a728b4ed8f8fbb8f28194f1d51eb380991e0be2f44daef
+  languageName: node
+  linkType: hard
+
+"@sora-substrate/type-definitions@npm:1.46.3":
+  version: 1.46.3
+  resolution: "@sora-substrate/type-definitions@npm:1.46.3"
+  dependencies:
+    "@open-web3/orml-type-definitions": "npm:1.1.4"
+  checksum: 10c0/1d323387bd756e4a731afaac5e5abb614375f085384cdef3d2e48a99b2c0b885e1d963721735d3e6a008f23238b45c527021196d14bc01d629ea8966ccdf91ab
   languageName: node
   linkType: hard
 
@@ -1772,6 +1797,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"lodash.merge@npm:^4.6.2":
+  version: 4.6.2
+  resolution: "lodash.merge@npm:4.6.2"
+  checksum: 10c0/402fa16a1edd7538de5b5903a90228aa48eb5533986ba7fa26606a49db2572bf414ff73a2c9f5d5fd36b31c46a5d5c7e1527749c07cbcf965ccff5fbdf32c506
+  languageName: node
+  linkType: hard
+
 "lru-cache@npm:^10.0.0":
   version: 10.4.3
   resolution: "lru-cache@npm:10.4.3"
@@ -2000,8 +2032,10 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "polkaswap-indexer@workspace:."
   dependencies:
+    "@babel/runtime": "npm:^7.28.4"
     "@graphql-tools/schema": "npm:^10.0.30"
     "@polkadot/api": "npm:16.5.4"
+    "@sora-substrate/type-definitions": "npm:1.46.3"
     "@types/node": "npm:^24.12.0"
     "@types/pg": "npm:^8.15.6"
     "@types/ws": "npm:^8.18.1"

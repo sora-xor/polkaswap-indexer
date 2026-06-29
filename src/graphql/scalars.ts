@@ -59,7 +59,7 @@ export const FilterScalars = {
   AssetSnapshotFilter: opaqueScalar('AssetSnapshotFilter', 'Asset snapshot filter object.'),
   HistoryElementFilter: opaqueScalar('HistoryElementFilter', 'History element filter object.'),
   MarketFilter: opaqueScalar('MarketFilter', 'Polkamarkt market filter object.'),
-  MarketOrderbookFilter: opaqueScalar('MarketOrderbookFilter', 'Polkamarkt market orderbook filter object.'),
+  MarketSnapshotFilter: opaqueScalar('MarketSnapshotFilter', 'Polkamarkt market snapshot filter object.'),
   NetworkSnapshotFilter: opaqueScalar('NetworkSnapshotFilter', 'Network snapshot filter object.'),
   OrderBookFilter: opaqueScalar('OrderBookFilter', 'Order book filter object.'),
   OrderBookOrderFilter: opaqueScalar('OrderBookOrderFilter', 'Order book order filter object.'),
