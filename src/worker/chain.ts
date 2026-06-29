@@ -288,13 +288,10 @@ const FINALIZED_HEAD_RETRY_DELAY_MS = 5_000;
 const FINALIZED_HEAD_POLL_INTERVAL_MS = 1_000;
 const DERIVED_STATE_REFRESH_RETRY_DELAY_MS = 15_000;
 const CHAIN_RPC_TIMEOUT_MS = 15_000;
-const BACKFILL_PREFETCH_CONCURRENCY = Math.max(
-  1,
-  Math.floor(Number(process.env.CHAIN_BACKFILL_PREFETCH_CONCURRENCY ?? 1))
-);
-const FINALIZED_CATCHUP_PREFETCH_CONCURRENCY = Math.max(
-  1,
-  Math.floor(Number(process.env.CHAIN_FINALIZED_CATCHUP_PREFETCH_CONCURRENCY ?? BACKFILL_PREFETCH_CONCURRENCY))
+const BACKFILL_PREFETCH_CONCURRENCY = readPositiveIntegerEnv('CHAIN_BACKFILL_PREFETCH_CONCURRENCY', 1);
+const FINALIZED_CATCHUP_PREFETCH_CONCURRENCY = readPositiveIntegerEnv(
+  'CHAIN_FINALIZED_CATCHUP_PREFETCH_CONCURRENCY',
+  BACKFILL_PREFETCH_CONCURRENCY
 );
 const PRICE_STREAM_REFRESH_INTERVAL_BLOCKS = Math.max(
   0,
@@ -2484,18 +2481,18 @@ export class ChainIndexer {
       await flush(page);
     }
 
-    await this.repository.upsert(
-      this.createXorSupplyRepairStateDocument(
-        processedDocuments,
-        writtenDocuments,
-        skippedDocuments,
-        latestBlock,
-        latestTimestamp
-      )
-    );
-
     if (skippedPrunedDocuments) {
       console.warn(`Skipped ${skippedPrunedDocuments} XOR supply rows because the node has pruned historical state`);
+    } else {
+      await this.repository.upsert(
+        this.createXorSupplyRepairStateDocument(
+          processedDocuments,
+          writtenDocuments,
+          skippedDocuments,
+          latestBlock,
+          latestTimestamp
+        )
+      );
     }
     if (writtenDocuments) console.info(`Repaired ${writtenDocuments} XOR supply rows from native balances issuance`);
 

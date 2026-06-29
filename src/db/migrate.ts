@@ -20,7 +20,6 @@ const numericJsonExpression = (field: string): string => {
 const numericIndexCollections = {
   updatedAtBlock: ['historyElements', 'markets', 'orderBooks', 'orderBookOrders', 'vaults', 'vaultEvents', 'accountPositions'],
   createdAtBlock: ['accountMeta', 'markets', 'orderBookOrders', 'vaults', 'vaultEvents'],
-  createdAtTimestamp: ['accountMeta', 'accountLiquiditySnapshots'],
   priceChangeDay: ['assets', 'orderBooks'],
   liquidity: ['assets'],
   liquidityBooks: ['assets'],
@@ -139,7 +138,6 @@ export async function migrate(databaseUrl = readConfig().databaseUrl): Promise<v
     );
     await createNumericIndex('indexer_documents_collection_updated_at_block_idx', 'updatedAtBlock');
     await createNumericIndex('indexer_documents_collection_created_at_block_idx', 'createdAtBlock');
-    await createNumericIndex('indexer_documents_collection_created_at_timestamp_idx', 'createdAtTimestamp');
     await createNumericIndex('indexer_documents_collection_price_change_day_idx', 'priceChangeDay');
     await createNumericIndex('indexer_documents_collection_liquidity_idx', 'liquidity');
     await createNumericIndex('indexer_documents_collection_liquidity_books_idx', 'liquidityBooks');

@@ -207,6 +207,19 @@ describe('GraphQL filter compatibility', () => {
     expect(result.map((item) => item.id)).toEqual(['high', 'middle', 'low']);
   });
 
+  it('sorts DPM string metrics numerically', () => {
+    const result = sortDocuments(
+      [
+        { id: 'low', dpmCollateral: '900' },
+        { id: 'high', dpmCollateral: '10000' },
+        { id: 'middle', dpmCollateral: '1200' },
+      ],
+      ['DPM_COLLATERAL_DESC']
+    );
+
+    expect(result.map((item) => item.id)).toEqual(['high', 'middle', 'low']);
+  });
+
   it('defaults to id ordering without mutating the input array', () => {
     const items = [{ id: 'b' }, { id: 'a' }, { id: 'c' }];
     const result = sortDocuments(items, undefined);

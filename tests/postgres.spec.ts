@@ -250,6 +250,31 @@ describe('PostgresRepository', () => {
     expect(result.items).toEqual([row]);
   });
 
+  it('orders DPM market metrics numerically against the stored JSON key', async () => {
+    const row = {
+      collection: 'markets',
+      id: 'market-a',
+      data: { id: 'market-a', marginalYesPriceBps: 10000 },
+    } satisfies IndexerDocument;
+    mocks.pool.query.mockResolvedValueOnce({ rows: [row] });
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    const result = await repository.query('markets', {
+      first: 1,
+      orderBy: ['MARGINAL_YES_PRICE_BPS_DESC'],
+      includeTotalCount: false,
+    });
+
+    expect(mocks.pool.query).toHaveBeenCalledTimes(1);
+    expect(String(mocks.pool.query.mock.calls[0]?.[0])).toContain(
+      "jsonb_typeof(data->'marginalYesPriceBps') in ('number', 'string')"
+    );
+    expect(String(mocks.pool.query.mock.calls[0]?.[0])).toContain(
+      "then (data->>'marginalYesPriceBps')::numeric else 0 end) desc, id desc"
+    );
+    expect(result.items).toEqual([row]);
+  });
+
   it('builds SQL for stats page network snapshot filters', async () => {
     const row = {
       collection: 'networkSnapshots',

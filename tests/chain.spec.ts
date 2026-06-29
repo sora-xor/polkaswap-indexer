@@ -493,6 +493,80 @@ describe('ChainIndexer price derivation', () => {
     });
   });
 
+  it('leaves XOR supply repair retryable when historical state is pruned', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      drainFinalizedHeads: () => Promise<void>;
+      fetchNativeXorIssuanceAtBlock: (blockHeight: number) => Promise<bigint>;
+      repairXorSupplyDocuments: () => Promise<boolean>;
+    };
+    const supplyAtBlock10 = 1_000n * SCALE;
+    const supplyAtBlock11 = 1_100n * SCALE;
+    const fetchNativeXorIssuanceAtBlock = vi.fn(async (blockHeight: number) => {
+      if (blockHeight === 10) return supplyAtBlock10;
+      if (blockHeight === 11) throw new Error('State already discarded');
+      throw new Error(`unexpected block ${blockHeight}`);
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
+    indexer.fetchNativeXorIssuanceAtBlock = fetchNativeXorIssuanceAtBlock;
+
+    try {
+      await repository.upsertMany([
+        {
+          collection: 'assets',
+          id: XOR,
+          blockHeight: 10,
+          timestamp: 1_000,
+          data: { id: XOR, supply: 'legacy-asset' },
+        },
+        {
+          collection: 'assetSnapshots',
+          id: 'xor-day-11',
+          blockHeight: 11,
+          timestamp: 1_100,
+          data: { id: 'xor-day-11', assetId: XOR, type: 'DAY', timestamp: 1_100, supply: 'legacy-snapshot' },
+        },
+      ]);
+
+      await expect(indexer.repairXorSupplyDocuments()).resolves.toBe(true);
+
+      await expect(repository.get('assets', XOR)).resolves.toMatchObject({
+        data: { supply: supplyAtBlock10.toString() },
+      });
+      await expect(repository.get('assetSnapshots', 'xor-day-11')).resolves.toMatchObject({
+        data: { supply: 'legacy-snapshot' },
+      });
+      await expect(repository.get('updatesStreams', 'xorSupplyRepair-v1')).resolves.toBeNull();
+      expect(warn).toHaveBeenCalledWith(
+        'Skipped 1 XOR supply rows because the node has pruned historical state'
+      );
+
+      fetchNativeXorIssuanceAtBlock.mockImplementation(async (blockHeight: number) => {
+        if (blockHeight === 10) return supplyAtBlock10;
+        if (blockHeight === 11) return supplyAtBlock11;
+        throw new Error(`unexpected block ${blockHeight}`);
+      });
+
+      await expect(indexer.repairXorSupplyDocuments()).resolves.toBe(true);
+
+      await expect(repository.get('assetSnapshots', 'xor-day-11')).resolves.toMatchObject({
+        data: { supply: supplyAtBlock11.toString() },
+      });
+      const state = await repository.get('updatesStreams', 'xorSupplyRepair-v1');
+      expect(JSON.parse(String(state?.data.data))).toMatchObject({
+        processedDocuments: 2,
+        writtenDocuments: 1,
+        skippedDocuments: 0,
+        lastIndexedBlock: 11,
+        lastTimestamp: 1_100,
+      });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('requires native balances issuance when refreshing XOR supply', async () => {
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
       api: unknown;
