@@ -970,10 +970,23 @@ const pollingSubscription = (collectionName: IndexerCollection) => ({
     watchSubscription(collectionName, args, context),
 });
 
+const POLKASWAP_SERVICE_ID = 'pi.soramitsu.io';
+const POLKASWAP_PUBLIC_BASE_URL = 'https://pi.soramitsu.io/graphql';
+
 const healthResolver = async (_parent: unknown, _args: unknown, context: Context) => {
   const ok = context.repository.healthCheck ? await context.repository.healthCheck().catch(() => false) : true;
 
-  return { ok, service: 'polkaswap-indexer' };
+  return {
+    ok,
+    service: 'polkaswap-indexer',
+    serviceId: POLKASWAP_SERVICE_ID,
+    schemaVersion: 1,
+    ecosystem: 'sora2',
+    chainId: 'sora:mainnet',
+    network: 'mainnet',
+    publicBaseUrl: POLKASWAP_PUBLIC_BASE_URL,
+    readOnly: true,
+  };
 };
 
 export function createSchema(): GraphQLSchema {

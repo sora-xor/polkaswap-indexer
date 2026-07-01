@@ -58,6 +58,13 @@ describe('Polkaswap indexer schema', () => {
     await expect(healthField?.resolve?.({}, {}, { repository: new MemoryRepository() }, {} as never)).resolves.toEqual({
       ok: true,
       service: 'polkaswap-indexer',
+      serviceId: 'pi.soramitsu.io',
+      schemaVersion: 1,
+      ecosystem: 'sora2',
+      chainId: 'sora:mainnet',
+      network: 'mainnet',
+      publicBaseUrl: 'https://pi.soramitsu.io/graphql',
+      readOnly: true,
     });
   });
 
@@ -72,6 +79,13 @@ describe('Polkaswap indexer schema', () => {
     await expect(healthField?.resolve?.({}, {}, { repository }, {} as never)).resolves.toEqual({
       ok: false,
       service: 'polkaswap-indexer',
+      serviceId: 'pi.soramitsu.io',
+      schemaVersion: 1,
+      ecosystem: 'sora2',
+      chainId: 'sora:mainnet',
+      network: 'mainnet',
+      publicBaseUrl: 'https://pi.soramitsu.io/graphql',
+      readOnly: true,
     });
   });
 

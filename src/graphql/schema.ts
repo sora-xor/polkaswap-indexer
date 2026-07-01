@@ -49,6 +49,13 @@ export const typeDefs = /* GraphQL */ `
   type Health {
     ok: Boolean!
     service: String!
+    serviceId: String!
+    schemaVersion: Int!
+    ecosystem: String!
+    chainId: String!
+    network: String!
+    publicBaseUrl: String!
+    readOnly: Boolean!
   }
 
   type MobileChainNode {

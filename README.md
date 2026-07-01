@@ -86,3 +86,16 @@ Use `CHAIN_STATE_REFRESH_INTERVAL_BLOCKS` to control how often storage-derived
 collections are refreshed during block processing, and
 `CHAIN_SNAPSHOT_INTERVAL_BLOCKS` to control chart snapshot density. Both default
 to `25` so stats aggregates stay close to finalized block progress.
+
+Before enabling production routing, run the smoke check against the public
+GraphQL endpoint:
+
+```sh
+POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production
+```
+
+The smoke query requires `_health` to identify this service as
+`serviceId=pi.soramitsu.io`, `ecosystem=sora2`, `chainId=sora:mainnet`,
+`network=mainnet`, `schemaVersion=1`, `readOnly=true`, and
+`publicBaseUrl=https://pi.soramitsu.io/graphql`. It intentionally fails if the
+route points at the TON or Solana indexer contracts.
