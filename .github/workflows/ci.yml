@@ -35,6 +35,13 @@ jobs:
       - name: Audit production dependencies
         run: yarn npm audit --environment production
 
+      - name: Run deployment evidence audit tests
+        run: |
+          yarn test:deployment-evidence-template
+          yarn generate:deployment-evidence-template --output build/reports/production-deployment-evidence-template.json
+          yarn test:deployment-evidence-audit
+          yarn audit:deployment-evidence
+
       - name: Run production smoke contract tests
         run: yarn test:production-smoke
 
