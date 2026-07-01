@@ -38,7 +38,11 @@
     "storage:cleanup:postgres-rocksdb-capture": "tsx src/scripts/cleanup-postgres-rocksdb-capture.ts",
     "storage:cleanup:postgres-rocksdb-capture:dist": "node dist/src/scripts/cleanup-postgres-rocksdb-capture.js",
     "seed:swap-chart": "tsx src/dev/seedSwapChartData.ts",
+    "audit:deployment-evidence": "bash scripts/audit-deployment-evidence.sh",
+    "generate:deployment-evidence-template": "bash scripts/generate-deployment-evidence-template.sh",
     "smoke:production": "tsx src/scripts/production-smoke.ts",
+    "test:deployment-evidence-audit": "bash scripts/test-deployment-evidence-audit.sh",
+    "test:deployment-evidence-template": "bash scripts/test-deployment-evidence-template.sh",
     "test:production-smoke": "vitest run tests/production-smoke.spec.ts",
     "test": "vitest run"
   },

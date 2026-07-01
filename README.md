@@ -471,3 +471,19 @@ The smoke query requires `_health` to identify this service as
 route points at the TON or Solana indexer contracts. Production smoke always
 requires an available, ready, running, startup-complete worker with internally
 consistent finalized, indexed, lag, heartbeat, and commit-time details.
+
+Production release evidence is tracked in
+`scripts/production-deployment-evidence.json`. The committed manifest must stay
+blocked until the deployed image digest, git commit, deployment id, operator,
+PI health response, and live smoke timestamp have been recorded.
+
+Prepare the operator template and run the ready gate before enabling release
+routing:
+
+```sh
+yarn test:deployment-evidence-template
+yarn generate:deployment-evidence-template --output build/reports/production-deployment-evidence-template.json
+yarn test:deployment-evidence-audit
+yarn audit:deployment-evidence --require-ready
+POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production
+```

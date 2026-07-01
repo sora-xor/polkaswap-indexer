@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "scope": "polkaswap-indexer-production-deployment-readiness",
+  "serviceId": "pi.soramitsu.io",
+  "baseUrl": "https://pi.soramitsu.io/graphql",
+  "status": "blocked",
+  "releaseEnabled": false,
+  "lastReviewed": "2026-07-01",
+  "blockers": [
+    "production-deployment-evidence-missing",
+    "live-production-smoke-failing"
+  ],
+  "smokeCommand": "POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production",
+  "dockerBuildCommand": "docker build -t polkaswap-indexer:release .",
+  "readyVerificationCommands": [
+    "yarn test:deployment-evidence-template",
+    "yarn generate:deployment-evidence-template --output build/reports/production-deployment-evidence-template.json",
+    "yarn test:deployment-evidence-audit",
+    "yarn audit:deployment-evidence --require-ready",
+    "docker build -t polkaswap-indexer:release .",
+    "POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production"
+  ],
+  "requiredEvidenceFields": [
+    "commit",
+    "imageDigest",
+    "deploymentId",
+    "baseUrl",
+    "smokeCommand",
+    "deployedAt",
+    "smokePassedAt",
+    "healthInfo",
+    "operator"
+  ],
+  "deploymentEvidence": []
+}
