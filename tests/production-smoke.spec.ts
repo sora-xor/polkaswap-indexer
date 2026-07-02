@@ -156,6 +156,17 @@ describe('Polkaswap production smoke', () => {
     );
   });
 
+  it('rejects deployed health objects missing identity fields with a deployment hint', async () => {
+    const fetchImpl = fetchWithHealth({
+      ok: true,
+      service: 'polkaswap-indexer',
+    });
+
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
+      /health serviceId must be pi\.soramitsu\.io; received <missing>.*Deploy the current polkaswap-indexer image to pi\.soramitsu\.io\/graphql/
+    );
+  });
+
   it('rejects non-JSON production responses with a body preview', async () => {
     const fetchImpl = vi.fn(
       async () =>
