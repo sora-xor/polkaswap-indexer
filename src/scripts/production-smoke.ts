@@ -97,6 +97,26 @@ function objectKeys(value: unknown): string {
   return Object.keys(value as Record<string, unknown>).sort().join(',') || '<empty object>';
 }
 
+function graphqlErrorMessages(errors: unknown): string[] {
+  if (!Array.isArray(errors)) return [];
+
+  return errors
+    .map((error) => {
+      if (!error || typeof error !== 'object' || !('message' in error)) return '';
+      const message = (error as { message?: unknown }).message;
+      return typeof message === 'string' ? message : '';
+    })
+    .filter((message) => message.length > 0);
+}
+
+function missingHealthIdentityFields(errors: unknown): string[] {
+  const messages = graphqlErrorMessages(errors);
+  const requiredFields = ['serviceId', 'schemaVersion', 'ecosystem', 'chainId', 'network', 'publicBaseUrl', 'readOnly'];
+  return requiredFields.filter((field) =>
+    messages.some((message) => message.includes(`Cannot query field "${field}" on type "Health"`))
+  );
+}
+
 async function fetchGraphQl(fetchImpl: FetchLike, graphqlUrl: URL): Promise<GraphQlResponse> {
   const response = await fetchImpl(graphqlUrl, {
     method: 'POST',
@@ -206,6 +226,12 @@ export async function runProductionSmoke(
   const payload = await fetchGraphQl(fetchImpl, graphqlUrl);
 
   if (payload.errors !== undefined) {
+    const missingIdentityFields = missingHealthIdentityFields(payload.errors);
+    if (missingIdentityFields.length > 0) {
+      throw new Error(
+        `PI production GraphQL schema is missing _health identity fields (${missingIdentityFields.join(', ')}). Deploy the current polkaswap-indexer image to pi.soramitsu.io/graphql so _health exposes serviceId=pi.soramitsu.io, schemaVersion=1, ecosystem=sora2, chainId=sora:mainnet, network=mainnet, publicBaseUrl=https://pi.soramitsu.io/graphql, and readOnly=true.`
+      );
+    }
     throw new Error(`Polkaswap GraphQL endpoint returned errors: ${JSON.stringify(payload.errors).slice(0, 300)}`);
   }
   if (!payload.data?._health || typeof payload.data._health !== 'object') {

@@ -137,6 +137,25 @@ describe('Polkaswap production smoke', () => {
     );
   });
 
+  it('rejects old production health schemas missing identity fields', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({
+        errors: [
+          {
+            message: 'Cannot query field "serviceId" on type "Health". Did you mean "service"?',
+          },
+          {
+            message: 'Cannot query field "schemaVersion" on type "Health".',
+          },
+        ],
+      })
+    );
+
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
+      'PI production GraphQL schema is missing _health identity fields (serviceId, schemaVersion)'
+    );
+  });
+
   it('rejects non-JSON production responses with a body preview', async () => {
     const fetchImpl = vi.fn(
       async () =>
