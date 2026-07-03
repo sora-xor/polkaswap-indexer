@@ -24,6 +24,8 @@ type FetchLike = (input: URL, init?: RequestInit) => Promise<Response>;
 
 const DEFAULT_GRAPHQL_URL = 'https://pi.soramitsu.io/graphql';
 const BODY_PREVIEW_LIMIT = 300;
+const PI_GRAPHQL_DEPLOYMENT_HINT =
+  'Production routing must serve the polkaswap-indexer GraphQL API at https://pi.soramitsu.io/graphql. Deploy the current polkaswap-indexer image to pi.soramitsu.io/graphql.';
 const PI_HEALTH_DEPLOYMENT_HINT =
   'Deploy the current polkaswap-indexer image to pi.soramitsu.io/graphql so _health exposes ok=true, service=polkaswap-indexer, serviceId=pi.soramitsu.io, schemaVersion=1, ecosystem=sora2, chainId=sora:mainnet, network=mainnet, publicBaseUrl=https://pi.soramitsu.io/graphql, and readOnly=true.';
 
@@ -117,21 +119,21 @@ async function fetchGraphQl(fetchImpl: FetchLike, graphqlUrl: URL): Promise<Grap
   const rawBody = await response.text();
   if (!response.ok) {
     throw new Error(
-      `Polkaswap GraphQL endpoint returned HTTP ${response.status}. Body preview: ${bodyPreview(rawBody)}. Route pi.soramitsu.io to the polkaswap-indexer GraphQL API.`
+      `Polkaswap GraphQL endpoint returned HTTP ${response.status}. Body preview: ${bodyPreview(rawBody)}. ${PI_GRAPHQL_DEPLOYMENT_HINT}`
     );
   }
 
   const contentType = response.headers.get('content-type') ?? '';
   if (!/application\/json/i.test(contentType)) {
     throw new Error(
-      `Polkaswap GraphQL endpoint did not return JSON. Content-Type: ${contentType || '<missing>'}. Body preview: ${bodyPreview(rawBody)}.`
+      `Polkaswap GraphQL endpoint did not return JSON. Content-Type: ${contentType || '<missing>'}. Body preview: ${bodyPreview(rawBody)}. ${PI_GRAPHQL_DEPLOYMENT_HINT}`
     );
   }
 
   try {
     return JSON.parse(rawBody) as GraphQlResponse;
   } catch {
-    throw new Error(`Polkaswap GraphQL endpoint returned invalid JSON. Body preview: ${bodyPreview(rawBody)}.`);
+    throw new Error(`Polkaswap GraphQL endpoint returned invalid JSON. Body preview: ${bodyPreview(rawBody)}. ${PI_GRAPHQL_DEPLOYMENT_HINT}`);
   }
 }
 
@@ -176,10 +178,12 @@ export async function runProductionSmoke(
         `PI production GraphQL schema is missing _health identity fields (${missingIdentityFields.join(', ')}). ${PI_HEALTH_DEPLOYMENT_HINT}`
       );
     }
-    throw new Error(`Polkaswap GraphQL endpoint returned errors: ${JSON.stringify(payload.errors).slice(0, 300)}`);
+    throw new Error(`Polkaswap GraphQL endpoint returned errors: ${bodyPreview(JSON.stringify(payload.errors))}. ${PI_GRAPHQL_DEPLOYMENT_HINT}`);
   }
   if (!payload.data?._health || typeof payload.data._health !== 'object') {
-    throw new Error('Polkaswap GraphQL endpoint did not return data._health');
+    throw new Error(
+      `Polkaswap GraphQL endpoint did not return data._health; received data keys ${objectKeys(payload.data)}. ${PI_GRAPHQL_DEPLOYMENT_HINT}`
+    );
   }
 
   assertHealthContract(payload.data._health);
