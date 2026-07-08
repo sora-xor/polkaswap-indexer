@@ -1,30 +1,33 @@
-export type IndexerCollection =
-  | 'accounts'
-  | 'accountMeta'
-  | 'accountPointSystems'
-  | 'accountPositions'
-  | 'accountTrades'
-  | 'accountTransactions'
-  | 'accountLiquiditySnapshots'
-  | 'assets'
-  | 'assetSnapshots'
-  | 'historyCalls'
-  | 'historyElements'
-  | 'markets'
-  | 'marketSnapshots'
-  | 'networkSnapshots'
-  | 'orderBooks'
-  | 'orderBookOrders'
-  | 'orderBookSnapshots'
-  | 'poolXYKs'
-  | 'poolSnapshots'
-  | 'referrerRewards'
-  | 'stakingStakers'
-  | 'stakingValidators'
-  | 'updatesStreams'
-  | 'vaults'
-  | 'vaultEvents'
-  | 'xorBurns';
+export const INDEXER_COLLECTIONS = [
+  'accounts',
+  'accountMeta',
+  'accountPointSystems',
+  'accountPositions',
+  'accountTrades',
+  'accountTransactions',
+  'accountLiquiditySnapshots',
+  'assets',
+  'assetSnapshots',
+  'historyCalls',
+  'historyElements',
+  'markets',
+  'marketSnapshots',
+  'networkSnapshots',
+  'orderBooks',
+  'orderBookOrders',
+  'orderBookSnapshots',
+  'poolXYKs',
+  'poolSnapshots',
+  'referrerRewards',
+  'stakingStakers',
+  'stakingValidators',
+  'updatesStreams',
+  'vaults',
+  'vaultEvents',
+  'xorBurns',
+] as const;
+
+export type IndexerCollection = (typeof INDEXER_COLLECTIONS)[number];
 
 export type IndexerDocument = {
   collection: IndexerCollection;

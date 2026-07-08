@@ -8,7 +8,7 @@ import { readConfig, type AppConfig } from './config.js';
 import { migrate } from './db/migrate.js';
 import { createSchema } from './graphql/resolvers.js';
 import { metrics } from './metrics.js';
-import { PostgresRepository } from './repository/postgres.js';
+import { createRepository, shouldRunPostgresMigration } from './repository/factory.js';
 
 import type { IndexerRepository } from './repository/types.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -88,9 +88,9 @@ const closeHttpServer = (server: ReturnType<typeof createServer>): Promise<void>
  */
 export async function startServer(
   config: AppConfig = readConfig(),
-  repository: IndexerRepository = new PostgresRepository(config.databaseUrl)
+  repository: IndexerRepository = createRepository(config)
 ): Promise<ServerHandle> {
-  await migrate(config.databaseUrl);
+  if (process.env.SKIP_POSTGRES_MIGRATION !== 'true' && shouldRunPostgresMigration(config)) await migrate(config.databaseUrl);
 
   const schema = createSchema();
   const yoga = createYoga({

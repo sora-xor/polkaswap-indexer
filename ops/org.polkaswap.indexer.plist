@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.polkaswap.indexer</string>
+  <key>UserName</key>
+  <string>administrator</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/administrator/apps/polkaswap-indexer/run-combined.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/administrator/apps/polkaswap-indexer</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/administrator/apps/polkaswap-indexer/logs/combined-launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/administrator/apps/polkaswap-indexer/logs/combined-launchd.err.log</string>
+</dict>
+</plist>

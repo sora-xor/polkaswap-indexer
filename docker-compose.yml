@@ -35,5 +35,26 @@ services:
       CHAIN_SNAPSHOT_INTERVAL_BLOCKS: 25
     command: ["node", "dist/src/worker/index.js"]
 
+  combined-rocksdb:
+    build: .
+    profiles:
+      - rocksdb
+    environment:
+      STORAGE_ENGINE: rocksdb
+      ROCKSDB_PATH: /data/polkaswap-indexer.rocksdb
+      HOST: 0.0.0.0
+      PORT: 4350
+      GRAPHQL_PATH: /graphql
+      SORA_WS_ENDPOINT: wss://mof2.sora.org
+      CHAIN_BATCH_SIZE: 25
+      CHAIN_STATE_REFRESH_INTERVAL_BLOCKS: 25
+      CHAIN_SNAPSHOT_INTERVAL_BLOCKS: 25
+    ports:
+      - "4350:4350"
+    volumes:
+      - rocksdb-data:/data
+    command: ["node", "dist/src/combined.js"]
+
 volumes:
   postgres-data:
+  rocksdb-data:
