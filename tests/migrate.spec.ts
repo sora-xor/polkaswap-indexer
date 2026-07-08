@@ -49,4 +49,22 @@ describe('migrate', () => {
 
     expect(createIndexSql).toBeUndefined();
   });
+
+  it('creates the Polkamarkt market snapshot lookup index', async () => {
+    mocks.client.query.mockImplementation(async (sql: string) => {
+      if (sql.includes('pg_get_indexdef')) throw new Error('index does not exist');
+      return { rows: [] };
+    });
+
+    await migrate(DATABASE_URL);
+
+    const createIndexSql = mocks.client.query.mock.calls
+      .map(([sql]) => String(sql))
+      .find((sql) => sql.includes('indexer_documents_market_snapshots_market_type_block_idx'));
+
+    expect(createIndexSql).toContain("(data->>'marketId')");
+    expect(createIndexSql).toContain("(data->>'type')");
+    expect(createIndexSql).toContain('block_height desc');
+    expect(createIndexSql).toContain("where collection = 'marketSnapshots'");
+  });
 });

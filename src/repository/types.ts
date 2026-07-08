@@ -65,6 +65,7 @@ export type RepositoryQueryResult = {
 export type RepositoryMetricsSnapshot = Record<string, number>;
 
 export interface IndexerRepository {
+  prepare?(): Promise<void>;
   list(collection: IndexerCollection): Promise<IndexerDocument[]>;
   query?(collection: IndexerCollection, args: RepositoryQueryArgs): Promise<RepositoryQueryResult>;
   watch?(collection: IndexerCollection, ids?: string[]): AsyncGenerator<IndexerDocument, void, unknown>;

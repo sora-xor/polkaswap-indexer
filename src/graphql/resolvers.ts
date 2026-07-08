@@ -489,6 +489,197 @@ const exploreStatsResolver = async (_parent: unknown, _args: unknown, context: C
   };
 };
 
+const signalNumber = (value: unknown): number => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const signalString = (value: unknown): string | null => {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  const text = String(value).trim();
+  return text ? text : null;
+};
+
+const signalStatus = (value: unknown): string => String(value ?? '').trim().toLowerCase();
+
+const signalOutcome = (value: unknown): 'YES' | 'NO' | null => {
+  const normalized = String(value ?? '').trim().toUpperCase();
+  return normalized === 'YES' || normalized === 'NO' ? normalized : null;
+};
+
+const signalInteger = (value: unknown): number | null => {
+  const parsed = typeof value === 'number' ? value : Number.parseInt(String(value ?? '').replace(/,/g, ''), 10);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+};
+
+const signalTimestampLabel = (value: unknown): string => {
+  const timestamp = signalNumber(value);
+  if (!timestamp) return signalString(value) ?? 'Snapshot';
+  const millis = timestamp > 1_000_000_000_000 ? timestamp : timestamp * 1_000;
+
+  return new Intl.DateTimeFormat('en-US', {
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'UTC',
+  }).format(new Date(millis));
+};
+
+const coerceSignalProbability = (value: unknown): number | null => {
+  const parsed = readNumber(value);
+  if (parsed === null) return null;
+  const percentage = parsed <= 1 ? parsed * 100 : parsed;
+
+  return Math.max(0, Math.min(100, percentage));
+};
+
+const scorePolkamarktSignalMarket = async (
+  repository: IndexerRepository,
+  market: IndexerDocument
+): Promise<Record<string, unknown> | null> => {
+  const marketId = signalInteger(market.data.marketId ?? market.id);
+  const closeBlock = signalInteger(market.data.closeBlock);
+  const title = signalString(market.data.title);
+  const outcome = signalOutcome(market.data.resolutionOutcome);
+
+  if (marketId === null || closeBlock === null || !title || !outcome) return null;
+
+  const snapshot = await queryFirst(repository, collection('marketSnapshots'), {
+    orderBy: ['BLOCK_HEIGHT_DESC'],
+    filter: {
+      marketId: { equalTo: marketId },
+      type: { equalTo: 'DEFAULT' },
+      blockHeight: { lessThanOrEqualTo: closeBlock },
+    },
+  });
+  const yesProbability = coerceSignalProbability(snapshot?.data.probability ?? snapshot?.data.priceYes);
+  if (yesProbability === null || yesProbability === 50) return null;
+
+  const predictedOutcome = yesProbability > 50 ? 'YES' : 'NO';
+  const confidencePercent = outcome === 'YES' ? yesProbability : 100 - yesProbability;
+
+  return {
+    marketId,
+    title,
+    outcome,
+    predictedOutcome,
+    confidencePercent,
+    yesProbability,
+    correct: predictedOutcome === outcome,
+    label: snapshot ? signalTimestampLabel(snapshot.data.timestamp ?? snapshot.timestamp) : `Market ${marketId}`,
+  };
+};
+
+const buildPolkamarktSignalAccuracy = async (
+  repository: IndexerRepository,
+  markets: IndexerDocument[]
+): Promise<{ summary: Record<string, unknown> | null; series: Array<Record<string, unknown>> }> => {
+  const resolvedMarkets = markets.filter((market) => {
+    return signalStatus(market.data.status) === 'resolved' && Boolean(signalOutcome(market.data.resolutionOutcome));
+  });
+
+  if (!resolvedMarkets.length) return { summary: null, series: [] };
+
+  const results = await Promise.all(resolvedMarkets.map((market) => scorePolkamarktSignalMarket(repository, market)));
+  const scoredResults = results.filter((result): result is Record<string, unknown> => Boolean(result));
+
+  if (!scoredResults.length) {
+    return {
+      summary: {
+        scoredMarkets: 0,
+        resolvedMarkets: resolvedMarkets.length,
+        correctMarkets: 0,
+        accuracyPercent: 0,
+        averageConfidencePercent: 0,
+      },
+      series: [],
+    };
+  }
+
+  let correctMarkets = 0;
+  let confidenceTotal = 0;
+  const series = scoredResults.map((result, index) => {
+    if (result.correct === true) correctMarkets += 1;
+    confidenceTotal += signalNumber(result.confidencePercent);
+
+    return {
+      label: String(result.label ?? `Market ${result.marketId ?? index + 1}`),
+      value: (correctMarkets / (index + 1)) * 100,
+      correctMarkets,
+      scoredMarkets: index + 1,
+    };
+  });
+
+  return {
+    summary: {
+      scoredMarkets: scoredResults.length,
+      resolvedMarkets: resolvedMarkets.length,
+      correctMarkets,
+      accuracyPercent: (correctMarkets / scoredResults.length) * 100,
+      averageConfidencePercent: confidenceTotal / scoredResults.length,
+      latest: scoredResults.at(-1) ?? null,
+    },
+    series,
+  };
+};
+
+const addSignalAccount = (accounts: Set<string>, value: unknown): void => {
+  const account = signalString(value);
+  if (account) accounts.add(account);
+};
+
+const polkamarktSignalsResolver = async (_parent: unknown, _args: unknown, context: Context) => {
+  const [marketResult, activityResult, snapshotResult] = await Promise.all([
+    queryDocuments(context.repository, collection('markets'), { first: 1_000 }, {}, ['VOLUME_USD_DESC']),
+    queryDocuments(
+      context.repository,
+      collection('historyElements'),
+      { first: 1_000 },
+      { module: { equalTo: 'polkamarkt' } },
+      ['TIMESTAMP_DESC']
+    ),
+    queryDocuments(context.repository, collection('networkSnapshots'), { first: 8 }, {}, ['TIMESTAMP_DESC']),
+  ]);
+  const markets = marketResult.items;
+  const snapshots = snapshotResult.items
+    .map((document) => ({
+      timestamp: toTimestamp(document),
+      accounts: signalNumber(document.data.accounts),
+      liquidityUsd: signalNumber(document.data.liquidityUSD),
+      volumeUsd: signalNumber(document.data.volumeUSD),
+    }))
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const latestSnapshot = snapshots.at(-1);
+  const statuses = markets.map((market) => signalStatus(market.data.status)).filter(Boolean);
+  const openMarketCount = statuses.length ? statuses.filter((status) => status === 'open').length : null;
+  const accounts = new Set<string>();
+
+  for (const market of markets) addSignalAccount(accounts, market.data.creator);
+  for (const event of activityResult.items) {
+    addSignalAccount(accounts, event.data.address);
+    addSignalAccount(accounts, event.data.dataFrom);
+  }
+
+  const accuracy = await buildPolkamarktSignalAccuracy(context.repository, markets);
+
+  return {
+    totalVolumeUsd: markets.length
+      ? markets.reduce((total, market) => total + signalNumber(market.data.volumeUSD), 0)
+      : latestSnapshot?.volumeUsd ?? 0,
+    activeMarkets: openMarketCount ?? marketResult.totalCount ?? markets.length,
+    activeAccounts: accounts.size || latestSnapshot?.accounts || 0,
+    liquidityUsd: markets.length
+      ? markets.reduce((total, market) => total + signalNumber(market.data.liquidityUSD), 0)
+      : latestSnapshot?.liquidityUsd ?? 0,
+    liquiditySeries: snapshots.map((snapshot) => ({
+      label: signalTimestampLabel(snapshot.timestamp),
+      value: snapshot.liquidityUsd,
+    })),
+    answerBreakdown: [],
+    accuracySummary: accuracy.summary,
+    accuracySeries: accuracy.series,
+  };
+};
+
 const shouldCacheConnection = (collectionName: IndexerCollection, args: ConnectionArgs): boolean => {
   if (!cachedConnectionCollections.has(collectionName)) return false;
 
@@ -1002,6 +1193,12 @@ export function createSchema(): GraphQLSchema {
     context: Context
   ): Promise<Awaited<ReturnType<typeof exploreStatsResolver>>> =>
     cache.getOrSet('exploreStats', 'exploreStats', () => exploreStatsResolver(parent, args, context));
+  const cachedPolkamarktSignalsResolver = (
+    parent: unknown,
+    args: unknown,
+    context: Context
+  ): Promise<Awaited<ReturnType<typeof polkamarktSignalsResolver>>> =>
+    cache.getOrSet('polkamarktSignals', 'polkamarktSignals', () => polkamarktSignalsResolver(parent, args, context));
   const cachedNetworkAccountActivityResolver = (
     parent: unknown,
     args: NetworkAccountActivityArgs,
@@ -1048,6 +1245,7 @@ export function createSchema(): GraphQLSchema {
         accountPositions: accountPositionsResolver,
         accountTrades: accountTradesResolver,
         exploreStats: cachedExploreStatsResolver,
+        polkamarktSignals: cachedPolkamarktSignalsResolver,
         networkAccountActivity: cachedNetworkAccountActivityResolver,
       },
       HistoryElement: {

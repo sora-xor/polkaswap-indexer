@@ -393,6 +393,113 @@ describe('Polkaswap indexer schema', () => {
     });
   });
 
+  it('serves compact Polkamarkt signals from indexed documents', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'markets',
+        id: '1',
+        blockHeight: 10,
+        timestamp: 100,
+        data: {
+          id: '1',
+          marketId: 1,
+          title: 'Open market',
+          creator: 'alice',
+          status: 'Open',
+          liquidityUSD: '100',
+          volumeUSD: '10',
+        },
+      },
+      {
+        collection: 'markets',
+        id: '2',
+        blockHeight: 20,
+        timestamp: 200,
+        data: {
+          id: '2',
+          marketId: 2,
+          title: 'Resolved market',
+          creator: 'bob',
+          status: 'Resolved',
+          resolutionOutcome: 'Yes',
+          closeBlock: 50,
+          liquidityUSD: '0',
+          volumeUSD: '20',
+        },
+      },
+      {
+        collection: 'marketSnapshots',
+        id: 'snapshot-2-default',
+        blockHeight: 45,
+        timestamp: 150,
+        data: {
+          id: 'snapshot-2-default',
+          marketId: 2,
+          type: 'DEFAULT',
+          blockHeight: 45,
+          timestamp: 150,
+          probability: 75,
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: 'history-a',
+        timestamp: 210,
+        data: {
+          id: 'history-a',
+          module: 'polkamarkt',
+          address: 'charlie',
+          dataFrom: 'alice',
+        },
+      },
+      {
+        collection: 'networkSnapshots',
+        id: 'network-old',
+        timestamp: 100,
+        data: { id: 'network-old', type: 'DAY', timestamp: 100, accounts: 1, liquidityUSD: '50', volumeUSD: '5' },
+      },
+      {
+        collection: 'networkSnapshots',
+        id: 'network-new',
+        timestamp: 200,
+        data: { id: 'network-new', type: 'DAY', timestamp: 200, accounts: 3, liquidityUSD: '100', volumeUSD: '30' },
+      },
+    ]);
+
+    const signalsField = createSchema().getQueryType()?.getFields().polkamarktSignals;
+    const signals = await signalsField?.resolve?.({}, {}, { repository }, {} as never);
+
+    expect(signals).toMatchObject({
+      totalVolumeUsd: 30,
+      activeMarkets: 1,
+      activeAccounts: 3,
+      liquidityUsd: 100,
+      answerBreakdown: [],
+      liquiditySeries: [
+        { value: 50 },
+        { value: 100 },
+      ],
+      accuracySummary: {
+        scoredMarkets: 1,
+        resolvedMarkets: 1,
+        correctMarkets: 1,
+        accuracyPercent: 100,
+        averageConfidencePercent: 75,
+        latest: {
+          marketId: 2,
+          title: 'Resolved market',
+          outcome: 'YES',
+          predictedOutcome: 'YES',
+          confidencePercent: 75,
+          yesProbability: 75,
+          correct: true,
+        },
+      },
+      accuracySeries: [{ value: 100, correctMarkets: 1, scoredMarkets: 1 }],
+    });
+  });
+
   it('serves the stats page GraphQL data from network snapshots', async () => {
     const repository = new MemoryRepository();
     await repository.upsertMany([

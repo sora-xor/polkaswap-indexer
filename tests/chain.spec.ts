@@ -5599,6 +5599,8 @@ describe('ChainIndexer price derivation', () => {
         dpmCollaterals: unknown[],
         totals: unknown[],
         resolutions: unknown[],
+        dpmCostBasis: unknown[],
+        dpmCostBasisTotals: unknown[],
         assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
         blockHeight: number,
         timestamp: number
@@ -5820,6 +5822,8 @@ describe('ChainIndexer price derivation', () => {
       [[{ args: [3] }, (1_200n * SCALE).toString()]],
       [[{ args: [3] }, { totalYesShares: (12n * SCALE).toString(), totalNoShares: 0, totalNetCollateralPaid: (6n * SCALE).toString() }]],
       [[{ args: [3] }, 'Yes']],
+      [[{ args: [3, 'bob'] }, { yes: (6n * SCALE).toString(), no: 0 }]],
+      [[{ args: [3] }, { yes: (6n * SCALE).toString(), no: 0 }]],
       assets,
       77,
       1_700_000_349
@@ -5837,8 +5841,13 @@ describe('ChainIndexer price derivation', () => {
         yesShares: '12',
         noShares: '0',
         netCollateralPaid: '6',
+        costBasisUsd: '6',
+        yesCostBasisUsd: '6',
+        noCostBasisUsd: '0',
         claimablePayoutUsd: '1200',
         marketValueUsd: '1200',
+        realizedPnlUsd: null,
+        unrealizedPnlUsd: '1194',
         isCreator: false,
         status: 'Resolved',
         market: { id: '3', marketId: 3 },
@@ -5929,6 +5938,8 @@ describe('ChainIndexer price derivation', () => {
         dpmCollaterals: unknown[],
         totals: unknown[],
         resolutions: unknown[],
+        dpmCostBasis: unknown[],
+        dpmCostBasisTotals: unknown[],
         assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
         blockHeight: number,
         timestamp: number
@@ -5948,6 +5959,8 @@ describe('ChainIndexer price derivation', () => {
       [[{ args: [3] }, (1_000n * SCALE).toString()]],
       [[{ args: [3] }, { totalYesShares: 0, totalNoShares: 0, totalNetCollateralPaid: (100n * SCALE).toString() }]],
       [],
+      [[{ args: [3, 'bob'] }, { yes: (2n * SCALE).toString(), no: 0 }]],
+      [[{ args: [3] }, { yes: (100n * SCALE).toString(), no: 0 }]],
       assets,
       88,
       1_700_000_555
@@ -5961,10 +5974,193 @@ describe('ChainIndexer price derivation', () => {
         yesShares: '5',
         noShares: '0',
         netCollateralPaid: '2',
-        claimablePayoutUsd: '2',
-        marketValueUsd: '2',
+        yesCostBasisUsd: '2',
+        noCostBasisUsd: '0',
+        claimablePayoutUsd: '20',
+        marketValueUsd: '20',
+        unrealizedPnlUsd: '18',
       },
     });
+  });
+
+  it('leaves unresolved Polkamarkt positions without fake mark-to-market PnL', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createPolkamarktPositionDocuments: (
+        positions: unknown[],
+        markets: unknown[],
+        dpmCollaterals: unknown[],
+        totals: unknown[],
+        resolutions: unknown[],
+        dpmCostBasis: unknown[],
+        dpmCostBasisTotals: unknown[],
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        blockHeight: number,
+        timestamp: number
+      ) => Array<{ collection: string; id: string; data: Record<string, unknown> }>;
+    };
+    const assets = new Map([[KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 0n }]]);
+
+    const documents = indexer.createPolkamarktPositionDocuments(
+      [[{ args: [3, 'bob'] }, { yesShares: (5n * SCALE).toString(), noShares: 0, netCollateralPaid: (2n * SCALE).toString() }]],
+      [[{ args: [3] }, { creator: 'alice', conditionId: 8, closeBlock: 222, collateralAsset: KUSD, status: 'Open' }]],
+      [[{ args: [3] }, (1_000n * SCALE).toString()]],
+      [[{ args: [3] }, { totalYesShares: (5n * SCALE).toString(), totalNoShares: 0, totalNetCollateralPaid: (2n * SCALE).toString() }]],
+      [],
+      [[{ args: [3, 'bob'] }, { yes: (2n * SCALE).toString(), no: 0 }]],
+      [[{ args: [3] }, { yes: (2n * SCALE).toString(), no: 0 }]],
+      assets,
+      88,
+      1_700_000_555
+    );
+
+    expect(documents[0]?.data).toMatchObject({
+      costBasisUsd: '2',
+      yesCostBasisUsd: '2',
+      noCostBasisUsd: '0',
+      marketValueUsd: null,
+      realizedPnlUsd: null,
+      unrealizedPnlUsd: null,
+      claimablePayoutUsd: '0',
+    });
+  });
+
+  it('enriches Polkamarkt sell and claim rows with realized PnL when prior basis is indexed', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'accountPositions',
+        id: '7-alice',
+        blockHeight: 10,
+        timestamp: 100,
+        data: {
+          id: '7-alice',
+          account: 'alice',
+          marketId: 7,
+          yesShares: '10',
+          noShares: '0',
+          costBasisUsd: '6',
+          yesCostBasisUsd: '6',
+          noCostBasisUsd: '0',
+        },
+      },
+      {
+        collection: 'accountPositions',
+        id: '8-alice',
+        blockHeight: 10,
+        timestamp: 100,
+        data: {
+          id: '8-alice',
+          account: 'alice',
+          marketId: 8,
+          yesShares: '1',
+          noShares: '0',
+          costBasisUsd: '2',
+          yesCostBasisUsd: '2',
+          noCostBasisUsd: '0',
+        },
+      },
+    ]);
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      enrichPolkamarktRealizedPnl: (contexts: any[]) => Promise<void>;
+    };
+    const sellContext = {
+      id: 'sell',
+      module: 'polkamarkt',
+      method: 'sell',
+      address: 'alice',
+      failed: false,
+      history: {
+        data: { marketId: 7, side: 'sell', outcome: 'YES', collateralUsd: '4', shares: '5' },
+        from: 'alice',
+        to: '',
+        assets: [],
+      },
+      calls: [],
+      callNames: [],
+      events: [],
+      accounts: ['alice'],
+      fee: 0n,
+    };
+    const claimContext = {
+      id: 'claim',
+      module: 'polkamarkt',
+      method: 'claim_market',
+      address: 'alice',
+      failed: false,
+      history: {
+        data: { marketId: 8, side: 'claim', collateralUsd: '5' },
+        from: 'alice',
+        to: '',
+        assets: [],
+      },
+      calls: [],
+      callNames: [],
+      events: [
+        eventRecord('polkamarkt', 'MarketClaimed', { marketId: 8, trader: 'alice', payout: (5n * SCALE).toString() }, 0),
+      ],
+      accounts: ['alice'],
+      fee: 0n,
+    };
+
+    await indexer.enrichPolkamarktRealizedPnl([sellContext, claimContext]);
+
+    expect((sellContext.history.data as Record<string, unknown>).realizedPnlUsd).toBe('1');
+    expect((claimContext.history.data as Record<string, unknown>).realizedPnlUsd).toBe('3');
+  });
+
+  it('only enriches batch claim realized PnL when every claimed market has prior basis', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert({
+      collection: 'accountPositions',
+      id: '7-alice',
+      blockHeight: 10,
+      timestamp: 100,
+      data: {
+        id: '7-alice',
+        account: 'alice',
+        marketId: 7,
+        costBasisUsd: '2',
+      },
+    });
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      enrichPolkamarktRealizedPnl: (contexts: any[]) => Promise<void>;
+    };
+    const completeBatch = {
+      id: 'complete-batch',
+      module: 'polkamarkt',
+      method: 'claim_markets',
+      address: 'alice',
+      failed: false,
+      history: { data: { side: 'claim', collateralUsd: '5' }, from: 'alice', to: '', assets: [] },
+      calls: [],
+      callNames: [],
+      events: [
+        eventRecord('polkamarkt', 'MarketClaimed', { marketId: 7, trader: 'alice', payout: (5n * SCALE).toString() }, 0),
+      ],
+      accounts: ['alice'],
+      fee: 0n,
+    };
+    const incompleteBatch = {
+      id: 'incomplete-batch',
+      module: 'polkamarkt',
+      method: 'claim_markets',
+      address: 'alice',
+      failed: false,
+      history: { data: { side: 'claim', collateralUsd: '6' }, from: 'alice', to: '', assets: [] },
+      calls: [],
+      callNames: [],
+      events: [
+        eventRecord('polkamarkt', 'MarketClaimed', { marketId: 7, trader: 'alice', payout: (5n * SCALE).toString() }, 0),
+        eventRecord('polkamarkt', 'MarketClaimed', { marketId: 9, trader: 'alice', payout: (1n * SCALE).toString() }, 0),
+      ],
+      accounts: ['alice'],
+      fee: 0n,
+    };
+
+    await indexer.enrichPolkamarktRealizedPnl([completeBatch, incompleteBatch]);
+
+    expect((completeBatch.history.data as Record<string, unknown>).realizedPnlUsd).toBe('3');
+    expect((incompleteBatch.history.data as Record<string, unknown>).realizedPnlUsd).toBeUndefined();
   });
 
   it('deletes stale Polkamarkt account positions after zero or removed storage entries', async () => {
@@ -5999,6 +6195,8 @@ describe('ChainIndexer price derivation', () => {
         dpmCollaterals: unknown[],
         totals: unknown[],
         resolutions: unknown[],
+        dpmCostBasis: unknown[],
+        dpmCostBasisTotals: unknown[],
         assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
         blockHeight: number,
         timestamp: number
@@ -6014,6 +6212,8 @@ describe('ChainIndexer price derivation', () => {
       [[{ args: [3] }, { creator: 'alice', conditionId: 8, closeBlock: 222, collateralAsset: KUSD, status: 'Open' }]],
       [[{ args: [3] }, (1_000n * SCALE).toString()]],
       [[{ args: [3] }, { totalYesShares: 0, totalNoShares: 0, totalNetCollateralPaid: 0 }]],
+      [],
+      [],
       [],
       assets,
       88,

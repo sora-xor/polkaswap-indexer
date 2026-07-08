@@ -91,6 +91,7 @@ export async function startServer(
   repository: IndexerRepository = createRepository(config)
 ): Promise<ServerHandle> {
   if (process.env.SKIP_POSTGRES_MIGRATION !== 'true' && shouldRunPostgresMigration(config)) await migrate(config.databaseUrl);
+  await repository.prepare?.();
 
   const schema = createSchema();
   const yoga = createYoga({

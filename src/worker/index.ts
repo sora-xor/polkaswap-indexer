@@ -7,6 +7,7 @@ const config = readConfig();
 const repository = createRepository(config);
 
 if (shouldRunPostgresMigration(config)) await migrate(config.databaseUrl);
+await repository.prepare?.();
 
 const indexer = new ChainIndexer(config, repository);
 

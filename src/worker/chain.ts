@@ -3394,6 +3394,121 @@ export class ChainIndexer {
     return finalizedHeader.number.toNumber();
   }
 
+  private decimalStringToScaledOrNull(value: unknown): bigint | null {
+    if (value === null || value === undefined || value === '') return null;
+
+    try {
+      return decimalStringToScaled(value);
+    } catch {
+      return null;
+    }
+  }
+
+  private readPositionCostBasis(position: IndexerDocument | null | undefined): bigint | null {
+    if (!position) return null;
+
+    return this.decimalStringToScaledOrNull(position.data.costBasisUsd ?? position.data.netCollateralPaid);
+  }
+
+  private readSideCostBasis(position: IndexerDocument, outcome: string): { shares: bigint; costBasis: bigint } | null {
+    const normalizedOutcome = outcome.toLowerCase();
+    const yesShares = this.decimalStringToScaledOrNull(position.data.yesShares) ?? 0n;
+    const noShares = this.decimalStringToScaledOrNull(position.data.noShares) ?? 0n;
+    const shares = normalizedOutcome === 'yes' ? yesShares : normalizedOutcome === 'no' ? noShares : 0n;
+    const explicitCostBasis =
+      normalizedOutcome === 'yes'
+        ? this.decimalStringToScaledOrNull(position.data.yesCostBasisUsd)
+        : normalizedOutcome === 'no'
+          ? this.decimalStringToScaledOrNull(position.data.noCostBasisUsd)
+          : null;
+
+    if (shares <= 0n) return null;
+    if (explicitCostBasis !== null) return { shares, costBasis: explicitCostBasis };
+
+    const totalCostBasis = this.readPositionCostBasis(position);
+    if (totalCostBasis === null) return null;
+    if ((normalizedOutcome === 'yes' && noShares === 0n) || (normalizedOutcome === 'no' && yesShares === 0n)) {
+      return { shares, costBasis: totalCostBasis };
+    }
+
+    return null;
+  }
+
+  private async enrichSellRealizedPnl(context: BlockExtrinsicContext, data: Record<string, unknown>): Promise<string | null> {
+    const marketId = Number(data.marketId ?? data.market_id ?? 0);
+    const account = context.history.from || context.address;
+    const outcome = firstString(data, ['outcome', 'toOutcome', 'to_outcome']);
+    const sharesSold = this.decimalStringToScaledOrNull(data.shares ?? data.sharesAmount ?? data.shareAmount);
+    const collateralOut = this.decimalStringToScaledOrNull(data.collateralUsd ?? data.collateralAmountUsd);
+    if (!Number.isSafeInteger(marketId) || !account || !outcome || sharesSold === null || collateralOut === null) return null;
+
+    const position = await this.repository.get(collection('accountPositions'), `${marketId}-${account}`);
+    if (!position) return null;
+
+    const sideCostBasis = this.readSideCostBasis(position, outcome);
+    if (!sideCostBasis || sideCostBasis.shares <= 0n) return null;
+
+    const basisReduction =
+      sharesSold >= sideCostBasis.shares
+        ? sideCostBasis.costBasis
+        : (sideCostBasis.costBasis * sharesSold) / sideCostBasis.shares;
+
+    return decimalToString(collateralOut - basisReduction, DECIMALS, 8);
+  }
+
+  private async enrichClaimRealizedPnl(context: BlockExtrinsicContext): Promise<string | null> {
+    const claims = findEvents(context.events, 'polkamarkt', 'MarketClaimed');
+    const account = context.history.from || context.address;
+    if (!claims.length || !account) return null;
+
+    let payoutTotal = 0n;
+    let basisTotal = 0n;
+
+    for (const claim of claims) {
+      const trader = firstString(claim, ['trader', 'account', 'arg1']) || account;
+      if (trader !== account) return null;
+
+      const marketId = Number(claim.marketId ?? claim.arg0 ?? 0);
+      if (!Number.isSafeInteger(marketId)) return null;
+
+      const position = await this.repository.get(collection('accountPositions'), `${marketId}-${trader}`);
+      const costBasis = this.readPositionCostBasis(position);
+      if (costBasis === null) return null;
+
+      payoutTotal += this.safeCodecToBigInt(firstPresentValue(claim, ['payout', 'amount', 'arg2']) ?? 0);
+      basisTotal += costBasis;
+    }
+
+    return decimalToString(payoutTotal - basisTotal, DECIMALS, 8);
+  }
+
+  private async enrichPolkamarktRealizedPnl(contexts: BlockExtrinsicContext[]): Promise<void> {
+    await Promise.all(
+      contexts.map(async (context) => {
+        if (context.failed || context.module !== 'polkamarkt' || !isRecord(context.history.data)) return;
+
+        const data = context.history.data;
+        const side = String(data.side ?? '').toLowerCase();
+        const realizedPnlUsd =
+          side === 'sell'
+            ? await this.enrichSellRealizedPnl(context, data)
+            : side === 'claim'
+              ? await this.enrichClaimRealizedPnl(context)
+              : null;
+
+        if (realizedPnlUsd === null) return;
+
+        context.history = {
+          ...context.history,
+          data: {
+            ...data,
+            realizedPnlUsd,
+          },
+        };
+      })
+    );
+  }
+
   private async indexFetchedBlock({ signedBlock, events, timestamp }: FetchedBlock, options: IndexBlockOptions = {}): Promise<void> {
     const eventsByExtrinsic = groupEventsByExtrinsic(events);
     const blockHeight = signedBlock.block.header.number.toNumber();
@@ -3466,6 +3581,7 @@ export class ChainIndexer {
     }
 
     const shouldRefreshPolkamarktState = extrinsicContexts.some(isPolkamarktTradeContext);
+    await this.enrichPolkamarktRealizedPnl(extrinsicContexts);
     const existingAccountMeta = await this.repository.getMany(collection('accountMeta'), [...touchedAccounts]);
 
     for (const context of extrinsicContexts) {
@@ -4482,6 +4598,8 @@ export class ChainIndexer {
       polkamarktResolutionEvidence,
       polkamarktCancellationEvidence,
       polkamarktPositions,
+      polkamarktDpmCostBasis,
+      polkamarktDpmCostBasisTotals,
       polkamarktCreatorFees,
     ] = await Promise.all([
       this.fetchStorageEntries((this.api.query as any).assets.assetInfosV2, 'assets.assetInfosV2'),
@@ -4497,6 +4615,8 @@ export class ChainIndexer {
       this.fetchOptionalStorageEntries(polkamarkt?.marketResolutionEvidence, 'polkamarkt.marketResolutionEvidence'),
       this.fetchOptionalStorageEntries(polkamarkt?.marketCancellationEvidence, 'polkamarkt.marketCancellationEvidence'),
       this.fetchOptionalStorageEntries(polkamarkt?.marketPositions, 'polkamarkt.marketPositions'),
+      this.fetchOptionalStorageEntries(polkamarkt?.dpmCostBasis, 'polkamarkt.dpmCostBasis'),
+      this.fetchOptionalStorageEntries(polkamarkt?.dpmCostBasisTotals, 'polkamarkt.dpmCostBasisTotals'),
       this.fetchOptionalStorageEntries(polkamarkt?.marketCreatorFees, 'polkamarkt.marketCreatorFees'),
     ]);
     const supplyByAsset = this.createSupplyByAsset(tokenIssuances, nativeXorIssuance);
@@ -4537,6 +4657,8 @@ export class ChainIndexer {
       polkamarktDpmCollaterals,
       polkamarktTotals,
       polkamarktResolutions,
+      polkamarktDpmCostBasis,
+      polkamarktDpmCostBasisTotals,
       assets,
       blockHeight,
       timestamp
@@ -4578,6 +4700,8 @@ export class ChainIndexer {
       polkamarktResolutionEvidence,
       polkamarktCancellationEvidence,
       polkamarktPositions,
+      polkamarktDpmCostBasis,
+      polkamarktDpmCostBasisTotals,
       polkamarktCreatorFees,
       farmingPoolFarmers,
       nativeXorIssuance,
@@ -4601,6 +4725,8 @@ export class ChainIndexer {
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketResolutionEvidence, 'polkamarkt.marketResolutionEvidence'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketCancellationEvidence, 'polkamarkt.marketCancellationEvidence'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketPositions, 'polkamarkt.marketPositions'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.dpmCostBasis, 'polkamarkt.dpmCostBasis'),
+      this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.dpmCostBasisTotals, 'polkamarkt.dpmCostBasisTotals'),
       this.fetchOptionalStorageEntries((this.api.query as any).polkamarkt?.marketCreatorFees, 'polkamarkt.marketCreatorFees'),
       this.fetchStorageEntries((this.api.query as any).farming.poolFarmers, 'farming.poolFarmers'),
       this.fetchNativeXorIssuance(),
@@ -4741,6 +4867,8 @@ export class ChainIndexer {
       polkamarktDpmCollaterals,
       polkamarktTotals,
       polkamarktResolutions,
+      polkamarktDpmCostBasis,
+      polkamarktDpmCostBasisTotals,
       assets,
       effectiveBlockHeight,
       timestamp
@@ -5903,6 +6031,8 @@ export class ChainIndexer {
     dpmCollaterals: Array<[StorageEntryKey, unknown]>,
     totals: Array<[StorageEntryKey, unknown]>,
     resolutions: Array<[StorageEntryKey, unknown]>,
+    dpmCostBasis: Array<[StorageEntryKey, unknown]>,
+    dpmCostBasisTotals: Array<[StorageEntryKey, unknown]>,
     assets: Map<string, AssetInfo>,
     blockHeight: number,
     timestamp: number
@@ -5911,6 +6041,8 @@ export class ChainIndexer {
     const dpmCollateralByMarket = new Map<number, bigint>();
     const totalsByMarket = new Map<number, Record<string, unknown>>();
     const resolutionsByMarket = new Map<number, string>();
+    const costBasisByKey = new Map<string, Record<string, unknown>>();
+    const costBasisTotalsByMarket = new Map<number, Record<string, unknown>>();
     const positionsByKey = new Map<string, Record<string, unknown>>();
     const accountMarketKeys = new Map<string, { marketId: number; account: string }>();
 
@@ -5938,6 +6070,20 @@ export class ChainIndexer {
       resolutionsByMarket.set(id, this.variantName(value));
     }
 
+    for (const [key, value] of dpmCostBasis) {
+      const marketIdRaw = normalizeValue(key.args?.[0]);
+      const marketId = Number(marketIdRaw);
+      const account = String(normalizeValue(key.args?.[1]) ?? '');
+      if (!Number.isSafeInteger(marketId) || !account) continue;
+      costBasisByKey.set(`${marketId}-${account}`, this.normalizedRecord(value));
+    }
+
+    for (const [key, value] of dpmCostBasisTotals) {
+      const id = this.storageKeyNumber(key);
+      if (id === null) continue;
+      costBasisTotalsByMarket.set(id, this.normalizedRecord(value));
+    }
+
     for (const [key, value] of positions) {
       const marketIdRaw = normalizeValue(key.args?.[0]);
       const marketId = Number(marketIdRaw);
@@ -5960,6 +6106,14 @@ export class ChainIndexer {
       const noShares = this.safeCodecToBigInt(marketPosition.noShares ?? marketPosition.no_shares);
       const netCollateralPaid = this.safeCodecToBigInt(marketPosition.netCollateralPaid ?? marketPosition.net_collateral_paid);
       if (yesShares === 0n && noShares === 0n && netCollateralPaid === 0n) return [];
+      const accountCostBasis = costBasisByKey.get(id) ?? {};
+      const marketCostBasisTotals = costBasisTotalsByMarket.get(marketId) ?? {};
+      const hasCostBasisStorage = dpmCostBasis.length > 0 || dpmCostBasisTotals.length > 0;
+      const yesCostBasis = this.safeCodecToBigInt(accountCostBasis.yes);
+      const noCostBasis = this.safeCodecToBigInt(accountCostBasis.no);
+      const accountCostBasisTotal = yesCostBasis + noCostBasis;
+      const totalCostBasis =
+        this.safeCodecToBigInt(marketCostBasisTotals.yes) + this.safeCodecToBigInt(marketCostBasisTotals.no);
       const status = this.variantName(market.status);
       const resolutionOutcome = resolutionsByMarket.get(marketId) ?? null;
       const normalizedStatus = status.toLowerCase();
@@ -5979,8 +6133,14 @@ export class ChainIndexer {
             ? (collateral * winningShares) / totalWinningShares
             : 0n
           : normalizedStatus === 'cancelled'
-            ? netCollateralPaid
+            ? hasCostBasisStorage
+              ? accountCostBasisTotal > 0n && totalCostBasis > 0n
+                ? (collateral * accountCostBasisTotal) / totalCostBasis
+                : 0n
+              : netCollateralPaid
             : 0n;
+      const finalized = normalizedStatus === 'resolved' || normalizedStatus === 'cancelled';
+      const settlementPnl = finalized ? claimablePayout - netCollateralPaid : null;
       const dominantOutcome = yesShares >= noShares ? 'Yes' : 'No';
       const dominantShares = yesShares >= noShares ? yesShares : noShares;
 
@@ -6000,9 +6160,11 @@ export class ChainIndexer {
             noShares: decimalToString(noShares, decimals, 8),
             netCollateralPaid: decimalToString(netCollateralPaid, decimals, 8),
             costBasisUsd: decimalToString(netCollateralPaid, decimals, 8),
-            marketValueUsd: decimalToString(claimablePayout, decimals, 8),
-            realizedPnlUsd: '0',
-            unrealizedPnlUsd: '0',
+            yesCostBasisUsd: hasCostBasisStorage ? decimalToString(yesCostBasis, decimals, 8) : null,
+            noCostBasisUsd: hasCostBasisStorage ? decimalToString(noCostBasis, decimals, 8) : null,
+            marketValueUsd: finalized ? decimalToString(claimablePayout, decimals, 8) : null,
+            realizedPnlUsd: null,
+            unrealizedPnlUsd: settlementPnl === null ? null : decimalToString(settlementPnl, decimals, 8),
             claimablePayoutUsd: decimalToString(claimablePayout, decimals, 8),
             isCreator: String(market.creator ?? '') === account,
             status,

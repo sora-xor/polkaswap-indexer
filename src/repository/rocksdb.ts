@@ -39,8 +39,11 @@ type WatchSubscriber = {
 
 const HIGH_KEY = Buffer.from([0xff]);
 const UPSERT_BATCH_SIZE = 1_000;
+const PREPARE_INDEX_BATCH_SIZE = 1_000;
 const WATCH_IDLE_WAKE_INTERVAL_MS = 30_000;
 const DEFAULT_WATCH_QUEUE_MAX = 1_000;
+const SECONDARY_INDEX_METADATA_KEY = 'rocksdbSecondaryIndexVersion';
+const CURRENT_SECONDARY_INDEX_VERSION = 2;
 const NUMERIC_INTEGER_WIDTH = 80;
 const NUMERIC_FRACTION_WIDTH = 40;
 const NUMERIC_NEGATIVE_DIGIT_MAP: Record<string, string> = {
@@ -252,6 +255,13 @@ const documentIndexKeys = (document: IndexerDocument): RocksKey[] => {
 
     keys.push(['i', 'eq', document.collection, field, value, document.id]);
     if (timestamp !== null) keys.push(['i', 'eqTs', document.collection, field, value, timestamp, document.id]);
+    if (blockHeight !== null) keys.push(['i', 'eqBh', document.collection, field, value, blockHeight, document.id]);
+  }
+
+  const marketId = indexValue(document.data.marketId);
+  const snapshotType = indexValue(document.data.type);
+  if (document.collection === 'marketSnapshots' && blockHeight !== null && marketId !== null && snapshotType !== null) {
+    keys.push(['i', 'marketSnapshotBh', marketId, snapshotType, blockHeight, document.id]);
   }
 
   for (const field of indexedNumericFieldsForCollection(document.collection)) {
@@ -382,6 +392,52 @@ const sourceForEqualityTimestampRange = (
   };
 };
 
+const sourceForEqualityBlockHeightRange = (
+  collection: IndexerCollection,
+  equality: { field: string; value: string | number | boolean },
+  direction: 'asc' | 'desc',
+  seek: RepositoryQueryArgs['seek']
+): QuerySource => {
+  const prefix: RocksKey = ['i', 'eqBh', collection, equality.field, equality.value];
+  const options = rangeForPrefix(prefix, { values: false, reverse: direction === 'desc' });
+
+  if (seek?.field === 'blockHeight' && direction === 'asc') {
+    options.start = [...prefix, seek.value, seek.id];
+    options.exclusiveStart = true;
+  } else if (seek?.field === 'blockHeight' && direction === 'desc') {
+    options.start = [...prefix, seek.value, seek.id];
+  }
+
+  return {
+    ranges: [{ keyKind: 'index', options }],
+    preservesOrder: true,
+    reason: 'eqBh',
+  };
+};
+
+const sourceForMarketSnapshotBlockHeightRange = (
+  marketId: string | number | boolean,
+  snapshotType: string | number | boolean,
+  direction: 'asc' | 'desc',
+  seek: RepositoryQueryArgs['seek']
+): QuerySource => {
+  const prefix: RocksKey = ['i', 'marketSnapshotBh', marketId, snapshotType];
+  const options = rangeForPrefix(prefix, { values: false, reverse: direction === 'desc' });
+
+  if (seek?.field === 'blockHeight' && direction === 'asc') {
+    options.start = [...prefix, seek.value, seek.id];
+    options.exclusiveStart = true;
+  } else if (seek?.field === 'blockHeight' && direction === 'desc') {
+    options.start = [...prefix, seek.value, seek.id];
+  }
+
+  return {
+    ranges: [{ keyKind: 'index', options }],
+    preservesOrder: true,
+    reason: 'marketSnapshotBh',
+  };
+};
+
 const isAfterSeek = (document: IndexerDocument, seek: NonNullable<RepositoryQueryArgs['seek']>): boolean => {
   const value = readDocumentNumber(document, seek.field) ?? 0;
   const direction = seek.direction ?? 'asc';
@@ -414,6 +470,42 @@ export class RocksRepository implements IndexerRepository {
       verificationTable: true,
     });
     this.watchQueueMax = readPositiveInt('ROCKSDB_WATCH_QUEUE_MAX', DEFAULT_WATCH_QUEUE_MAX);
+  }
+
+  async prepare(): Promise<void> {
+    const version = this.getMetadata<number>(SECONDARY_INDEX_METADATA_KEY) ?? 1;
+    if (version >= CURRENT_SECONDARY_INDEX_VERSION) return;
+
+    await this.recordOperation('prepare', 'all', () => this.runWrite(async () => {
+      let batch: IndexerDocument[] = [];
+      let preparedDocuments = 0;
+
+      const flush = async () => {
+        if (!batch.length) return;
+        const documents = batch;
+        batch = [];
+
+        await this.db.transaction(async (transaction) => {
+          for (const document of documents) {
+            for (const indexKey of documentIndexKeys(document)) {
+              await transaction.put(indexKey, 1);
+            }
+          }
+        });
+        preparedDocuments += documents.length;
+      };
+
+      for (const entry of this.db.getRange(rangeForPrefix(['d']))) {
+        const document = entry?.value as IndexerDocument | undefined;
+        if (!document) continue;
+        batch.push(document);
+        if (batch.length >= PREPARE_INDEX_BATCH_SIZE) await flush();
+      }
+
+      await flush();
+      await this.setMetadata(SECONDARY_INDEX_METADATA_KEY, CURRENT_SECONDARY_INDEX_VERSION);
+      metrics.increment('indexer_rocksdb_secondary_index_prepare_documents_total', { version: CURRENT_SECONDARY_INDEX_VERSION }, preparedDocuments);
+    }));
   }
 
   async list(collection: IndexerCollection): Promise<IndexerDocument[]> {
@@ -676,7 +768,18 @@ export class RocksRepository implements IndexerRepository {
       return sourceForOrderedRange(collection, 'ts', 'timestamp', direction, args.seek);
     }
 
-    if (field === 'blockHeight') return sourceForOrderedRange(collection, 'bh', 'blockHeight', direction, args.seek);
+    if (field === 'blockHeight') {
+      const marketIdEquality = equalities.find((entry) => entry.field === 'marketId');
+      const typeEquality = equalities.find((entry) => entry.field === 'type');
+      if (collection === 'marketSnapshots' && marketIdEquality && typeEquality) {
+        return sourceForMarketSnapshotBlockHeightRange(marketIdEquality.value, typeEquality.value, direction, args.seek);
+      }
+
+      const blockHeightEquality = equality && EQUALITY_INDEX_FIELDS.has(equality.field) ? equality : null;
+      if (blockHeightEquality) return sourceForEqualityBlockHeightRange(collection, blockHeightEquality, direction, args.seek);
+
+      return sourceForOrderedRange(collection, 'bh', 'blockHeight', direction, args.seek);
+    }
 
     if (field === 'id') {
       if (equality?.field === 'id') {

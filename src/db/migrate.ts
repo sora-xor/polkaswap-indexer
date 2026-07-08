@@ -136,6 +136,9 @@ export async function migrate(databaseUrl = readConfig().databaseUrl): Promise<v
     await client.query(
       'create index if not exists indexer_documents_collection_status_idx on indexer_documents(collection, (data->>\'status\'));'
     );
+    await client.query(
+      'create index if not exists indexer_documents_market_snapshots_market_type_block_idx on indexer_documents((data->>\'marketId\'), (data->>\'type\'), block_height desc, id desc) where collection = \'marketSnapshots\';'
+    );
     await createNumericIndex('indexer_documents_collection_updated_at_block_idx', 'updatedAtBlock');
     await createNumericIndex('indexer_documents_collection_created_at_block_idx', 'createdAtBlock');
     await createNumericIndex('indexer_documents_collection_price_change_day_idx', 'priceChangeDay');

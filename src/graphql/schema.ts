@@ -321,6 +321,55 @@ export const typeDefs = /* GraphQL */ `
     updatedAtTimestamp: Int
   }
 
+  type PolkamarktSignalPoint {
+    label: String!
+    value: Float!
+  }
+
+  type PolkamarktSignalAnswerBreakdown {
+    answer: String!
+    volumeUsd: Float!
+    markets: Int!
+  }
+
+  type PolkamarktSignalAccuracyMarket {
+    marketId: Int!
+    title: String!
+    outcome: String!
+    predictedOutcome: String!
+    confidencePercent: Float!
+    yesProbability: Float!
+    correct: Boolean!
+    label: String!
+  }
+
+  type PolkamarktSignalAccuracySummary {
+    scoredMarkets: Int!
+    resolvedMarkets: Int!
+    correctMarkets: Int!
+    accuracyPercent: Float!
+    averageConfidencePercent: Float!
+    latest: PolkamarktSignalAccuracyMarket
+  }
+
+  type PolkamarktSignalAccuracyPoint {
+    label: String!
+    value: Float!
+    correctMarkets: Int!
+    scoredMarkets: Int!
+  }
+
+  type PolkamarktSignals {
+    totalVolumeUsd: Float!
+    activeMarkets: Int!
+    activeAccounts: Int!
+    liquidityUsd: Float!
+    liquiditySeries: [PolkamarktSignalPoint!]!
+    answerBreakdown: [PolkamarktSignalAnswerBreakdown!]!
+    accuracySummary: PolkamarktSignalAccuracySummary
+    accuracySeries: [PolkamarktSignalAccuracyPoint!]!
+  }
+
   type AccountPosition {
     id: String!
     account: String
@@ -331,6 +380,8 @@ export const typeDefs = /* GraphQL */ `
     noShares: String
     netCollateralPaid: String
     costBasisUsd: String
+    yesCostBasisUsd: String
+    noCostBasisUsd: String
     marketValueUsd: String
     realizedPnlUsd: String
     unrealizedPnlUsd: String
@@ -813,6 +864,7 @@ export const typeDefs = /* GraphQL */ `
     accountPositions(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountPositionFilter, where: AccountPositionFilter): AccountPositionConnection!
     accountTrades(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountTradeFilter, where: AccountTradeFilter): AccountTradeConnection!
     exploreStats: ExploreStats!
+    polkamarktSignals: PolkamarktSignals!
     networkAccountActivity(from: Int!, to: Int!): NetworkAccountActivity!
   }
 

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { RocksRepository } from '../src/repository/rocksdb.js';
+import { metrics } from '../src/metrics.js';
 
 import type { AppConfig } from '../src/config.js';
 import type { IndexerDocument } from '../src/repository/types.js';
@@ -91,6 +92,47 @@ describe('RocksRepository', () => {
 
     expect(secondPage.items.map((document) => document.id)).toEqual(['xor-30']);
     expect(secondPage.hasNextPage).toBe(false);
+  });
+
+  it('uses the market snapshot block-height index for final pre-close lookups', async () => {
+    await repository.upsertMany([
+      {
+        collection: 'marketSnapshots',
+        id: 'market-7-default-80',
+        blockHeight: 80,
+        timestamp: 80,
+        data: { id: 'market-7-default-80', marketId: 7, type: 'DEFAULT', blockHeight: 80, timestamp: 80 },
+      },
+      {
+        collection: 'marketSnapshots',
+        id: 'market-7-day-90',
+        blockHeight: 90,
+        timestamp: 90,
+        data: { id: 'market-7-day-90', marketId: 7, type: 'DAY', blockHeight: 90, timestamp: 90 },
+      },
+      {
+        collection: 'marketSnapshots',
+        id: 'market-8-default-95',
+        blockHeight: 95,
+        timestamp: 95,
+        data: { id: 'market-8-default-95', marketId: 8, type: 'DEFAULT', blockHeight: 95, timestamp: 95 },
+      },
+    ]);
+
+    metrics.reset();
+    const result = await repository.query('marketSnapshots', {
+      first: 1,
+      orderBy: ['BLOCK_HEIGHT_DESC'],
+      filter: {
+        marketId: { equalTo: 7 },
+        type: { equalTo: 'DEFAULT' },
+        blockHeight: { lessThanOrEqualTo: 100 },
+      },
+      includeTotalCount: false,
+    });
+
+    expect(result.items.map((document) => document.id)).toEqual(['market-7-default-80']);
+    expect(metrics.render()).toContain('source="marketSnapshotBh"');
   });
 
   it('removes stale secondary index entries on update and delete', async () => {

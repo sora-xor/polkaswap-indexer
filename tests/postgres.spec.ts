@@ -311,6 +311,38 @@ describe('PostgresRepository', () => {
     });
   });
 
+  it('builds SQL for Polkamarkt final pre-close market snapshot lookups', async () => {
+    const row = {
+      collection: 'marketSnapshots',
+      id: 'market-7-default-80',
+      blockHeight: 80,
+      timestamp: 80,
+      data: { id: 'market-7-default-80', marketId: 7, type: 'DEFAULT', blockHeight: 80, probability: 75 },
+    } satisfies IndexerDocument;
+    mocks.pool.query.mockResolvedValueOnce({ rows: [row] });
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    const result = await repository.query('marketSnapshots', {
+      first: 1,
+      orderBy: ['BLOCK_HEIGHT_DESC'],
+      filter: {
+        marketId: { equalTo: 7 },
+        type: { equalTo: 'DEFAULT' },
+        blockHeight: { lessThanOrEqualTo: 100 },
+      },
+      includeTotalCount: false,
+    });
+
+    expect(mocks.pool.query).toHaveBeenCalledTimes(1);
+    const [sql, values] = mocks.pool.query.mock.calls[0] ?? [];
+    expect(String(sql)).toContain("data->>'marketId' = $2");
+    expect(String(sql)).toContain("data->>'type' = $3");
+    expect(String(sql)).toContain('block_height <= $4::bigint');
+    expect(String(sql)).toContain('order by block_height desc, id desc');
+    expect(values).toEqual(['marketSnapshots', '7', 'DEFAULT', '100', 2, 0]);
+    expect(result.items).toEqual([row]);
+  });
+
   it('ignores nullish optional comparison filter values before SQL casts', async () => {
     const row = {
       collection: 'assetSnapshots',
