@@ -54,7 +54,45 @@ describe('Polkaswap production smoke', () => {
     const fetchImpl = vi.fn(async () => jsonResponse({ errors: [{ message: 'resolver failed' }] }));
 
     await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
-      'GraphQL endpoint returned errors'
+      /GraphQL endpoint returned errors: .*resolver failed.*Production routing must serve the polkaswap-indexer GraphQL API/
+    );
+  });
+
+  it('rejects successful responses missing data._health with a routing hint', async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ data: { status: 'ok' } }));
+
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
+      /did not return data\._health; received data keys status.*Production routing must serve the polkaswap-indexer GraphQL API/
+    );
+  });
+
+  it('rejects old production health schemas missing identity fields', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({
+        errors: [
+          {
+            message: 'Cannot query field "serviceId" on type "Health". Did you mean "service"?',
+          },
+          {
+            message: 'Cannot query field "schemaVersion" on type "Health".',
+          },
+        ],
+      })
+    );
+
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
+      'PI production GraphQL schema is missing _health identity fields (serviceId, schemaVersion)'
+    );
+  });
+
+  it('rejects deployed health objects missing identity fields with a deployment hint', async () => {
+    const fetchImpl = fetchWithHealth({
+      ok: true,
+      service: 'polkaswap-indexer',
+    });
+
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
+      /health serviceId must be pi\.soramitsu\.io; received <missing>.*Deploy the current polkaswap-indexer image to pi\.soramitsu\.io\/graphql/
     );
   });
 
@@ -68,7 +106,35 @@ describe('Polkaswap production smoke', () => {
     );
 
     await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
-      'did not return JSON'
+      /did not return JSON.*Body preview: <html>not graphql<\/html>.*Production routing must serve the polkaswap-indexer GraphQL API/
+    );
+  });
+
+  it('rejects invalid JSON production responses with a body preview and routing hint', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response('{"data":', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+    );
+
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
+      /returned invalid JSON\. Body preview: \{"data":.*Production routing must serve the polkaswap-indexer GraphQL API/
+    );
+  });
+
+  it('rejects HTTP failures with a body preview and routing hint', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response('deploy in progress', {
+          status: 503,
+          headers: { 'content-type': 'text/plain; charset=utf-8' },
+        })
+    );
+
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
+      /returned HTTP 503\. Body preview: deploy in progress.*Production routing must serve the polkaswap-indexer GraphQL API/
     );
   });
 
