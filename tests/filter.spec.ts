@@ -124,6 +124,17 @@ describe('GraphQL filter compatibility', () => {
     ).toBe(false);
   });
 
+  it('treats empty and null-only membership sets consistently', () => {
+    for (const item of [{ cohort: 'x' }, {}]) {
+      expect(matchesFilter(item, { cohort: { in: [] } })).toBe(false);
+      expect(matchesFilter(item, { cohort: { in: [null, 'null'] } })).toBe(false);
+      expect(matchesFilter(item, { cohort: { notIn: [] } })).toBe(true);
+      expect(matchesFilter(item, { cohort: { not_in: [null, 'null'] } })).toBe(true);
+    }
+    expect(matchesFilter({ cohort: 'x' }, { cohort: { in: [null, 'x'] } })).toBe(true);
+    expect(matchesFilter({}, { cohort: { in: [null, 'x'] } })).toBe(false);
+  });
+
   it('matches nested path and substring filters', () => {
     expect(
       matchesFilter(
@@ -139,9 +150,28 @@ describe('GraphQL filter compatibility', () => {
     ).toBe(true);
   });
 
-  it('treats non-numeric comparison values as zero', () => {
-    expect(matchesFilter({ liquidity: 'not-a-number' }, { liquidity: { greaterThanOrEqualTo: 0 } })).toBe(true);
+  it('fails numeric comparisons closed for invalid decimal values', () => {
+    expect(matchesFilter({ liquidity: 'not-a-number' }, { liquidity: { greaterThanOrEqualTo: 0 } })).toBe(false);
     expect(matchesFilter({ liquidity: 'not-a-number' }, { liquidity: { greaterThan: 0 } })).toBe(false);
+    expect(matchesFilter({ liquidity: '1' }, { liquidity: { greaterThan: '1e0' } })).toBe(false);
+    expect(matchesFilter({ liquidity: '1' }, { liquidity: { greaterThanOrEqualTo: ' 1' } })).toBe(false);
+  });
+
+  it('compares arbitrary-precision decimals exactly', () => {
+    expect(
+      matchesFilter({ amount: '9007199254740993' }, { amount: { greaterThan: '9007199254740992' } })
+    ).toBe(true);
+    expect(matchesFilter({ amount: '9'.repeat(80) }, { amount: { lessThan: `1${'0'.repeat(80)}` } })).toBe(true);
+    expect(matchesFilter({ amount: `0.${'0'.repeat(79)}1` }, { amount: { greaterThan: '0' } })).toBe(true);
+    expect(matchesFilter({ amount: '-10.01' }, { amount: { lessThan: '-10.001' } })).toBe(true);
+    expect(matchesFilter({ amount: '00012.3400' }, { amount: { gte: '12.34', lte: '12.34000' } })).toBe(true);
+  });
+
+  it('canonicalizes numeric equality and set membership across number and string representations', () => {
+    expect(matchesFilter({ marketId: 1 }, { marketId: { equalTo: '1.0' } })).toBe(true);
+    expect(matchesFilter({ marketId: '001.00' }, { marketId: { equalTo: 1 } })).toBe(true);
+    expect(matchesFilter({ marketId: 2 }, { marketId: { in: ['1', '2.0'] } })).toBe(true);
+    expect(matchesFilter({ marketId: '2.00' }, { marketId: { notIn: [1, '2'] } })).toBe(false);
   });
 
   it('rejects unsupported comparison operators', () => {
@@ -228,15 +258,42 @@ describe('GraphQL filter compatibility', () => {
     expect(items.map((item) => item.id)).toEqual(['b', 'a', 'c']);
   });
 
+  it('uses deterministic lexical ordering for mixed-case, punctuation, and Unicode IDs', () => {
+    const ids = ['a', 'A', 'é', 'Ω', '!', 'B', '0', '中'];
+    expect(sortDocuments(ids.map((id) => ({ id })), ['ID_ASC']).map((item) => item.id)).toEqual([
+      '!',
+      '0',
+      'A',
+      'B',
+      'a',
+      'é',
+      'Ω',
+      '中',
+    ]);
+  });
+
   it('sorts nullish values last for ascending order and first for descending order', () => {
     const items = [
       { id: 'missing' },
       { id: 'one', timestamp: 1 },
       { id: 'two', timestamp: 2 },
       { id: 'null', timestamp: null },
+      { id: 'invalid', timestamp: 'not-a-number' },
     ];
 
-    expect(sortDocuments(items, ['TIMESTAMP_ASC']).map((item) => item.id)).toEqual(['one', 'two', 'missing', 'null']);
-    expect(sortDocuments(items, ['TIMESTAMP_DESC']).map((item) => item.id)).toEqual(['missing', 'null', 'two', 'one']);
+    expect(sortDocuments(items, ['TIMESTAMP_ASC']).map((item) => item.id)).toEqual([
+      'one',
+      'two',
+      'invalid',
+      'missing',
+      'null',
+    ]);
+    expect(sortDocuments(items, ['TIMESTAMP_DESC']).map((item) => item.id)).toEqual([
+      'null',
+      'missing',
+      'invalid',
+      'two',
+      'one',
+    ]);
   });
 });

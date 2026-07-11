@@ -10,6 +10,7 @@ type GraphQlResponse = {
 
 type HealthInfo = {
   ok?: unknown;
+  repositoryReady?: unknown;
   service?: unknown;
   serviceId?: unknown;
   schemaVersion?: unknown;
@@ -18,6 +19,17 @@ type HealthInfo = {
   network?: unknown;
   publicBaseUrl?: unknown;
   readOnly?: unknown;
+  workerAvailable?: unknown;
+  workerReady?: unknown;
+  workerReadinessReason?: unknown;
+  workerLifecycle?: unknown;
+  workerStartupComplete?: unknown;
+  workerLatestFinalizedBlock?: unknown;
+  workerLatestIndexedBlock?: unknown;
+  workerLag?: unknown;
+  workerLastSuccessfulIndexTimestamp?: unknown;
+  workerLastError?: unknown;
+  workerLastErrorTimestamp?: unknown;
   lastMasterSeqno?: unknown;
 };
 
@@ -25,11 +37,13 @@ type FetchLike = (input: URL, init?: RequestInit) => Promise<Response>;
 
 const DEFAULT_GRAPHQL_URL = 'https://pi.soramitsu.io/graphql';
 const BODY_PREVIEW_LIMIT = 300;
+const REQUEST_TIMEOUT_MS = 10_000;
 
 const PRODUCTION_SMOKE_QUERY = /* GraphQL */ `
   query PolkaswapProductionSmoke {
     _health {
       ok
+      repositoryReady
       service
       serviceId
       schemaVersion
@@ -38,6 +52,17 @@ const PRODUCTION_SMOKE_QUERY = /* GraphQL */ `
       network
       publicBaseUrl
       readOnly
+      workerAvailable
+      workerReady
+      workerReadinessReason
+      workerLifecycle
+      workerStartupComplete
+      workerLatestFinalizedBlock
+      workerLatestIndexedBlock
+      workerLag
+      workerLastSuccessfulIndexTimestamp
+      workerLastError
+      workerLastErrorTimestamp
     }
   }
 `;
@@ -77,9 +102,13 @@ async function fetchGraphQl(fetchImpl: FetchLike, graphqlUrl: URL): Promise<Grap
     method: 'POST',
     headers: {
       accept: 'application/json',
+      'cache-control': 'no-store',
       'content-type': 'application/json',
     },
     body: JSON.stringify({ query: PRODUCTION_SMOKE_QUERY }),
+    cache: 'no-store',
+    redirect: 'error',
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   const rawBody = await response.text();
   if (!response.ok) {
@@ -116,6 +145,7 @@ function assertHealthContract(health: HealthInfo): void {
   if (health.ok !== true) {
     throw new Error(`PI production health is not ready: expected ok=true, received keys ${objectKeys(health)}.`);
   }
+  assert.equal(health.repositoryReady, true, 'health repositoryReady must be true');
 
   assert.equal(health.service, 'polkaswap-indexer', 'health service must be polkaswap-indexer');
   assert.equal(health.serviceId, 'pi.soramitsu.io', 'health serviceId must be pi.soramitsu.io');
@@ -125,6 +155,47 @@ function assertHealthContract(health: HealthInfo): void {
   assert.equal(health.network, 'mainnet', 'health network must be mainnet');
   assert.equal(health.publicBaseUrl, DEFAULT_GRAPHQL_URL, `health publicBaseUrl must be ${DEFAULT_GRAPHQL_URL}`);
   assert.equal(health.readOnly, true, 'health readOnly must be true');
+
+  assert.equal(health.workerAvailable, true, 'production health must expose a shared worker status');
+  assert.equal(health.workerReady, true, 'available worker must be ready');
+  assert.equal(health.workerReadinessReason, null, 'ready worker must not have a readiness failure reason');
+  assert.equal(health.workerLifecycle, 'running', 'ready worker lifecycle must be running');
+  assert.equal(health.workerStartupComplete, true, 'ready worker startup must be complete');
+
+  for (const [name, value] of [
+    ['workerLatestFinalizedBlock', health.workerLatestFinalizedBlock],
+    ['workerLatestIndexedBlock', health.workerLatestIndexedBlock],
+    ['workerLag', health.workerLag],
+    ['workerLastSuccessfulIndexTimestamp', health.workerLastSuccessfulIndexTimestamp],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || Number(value) < 0) {
+      throw new Error(`health ${name} must be a non-negative safe integer`);
+    }
+  }
+
+  if (Number(health.workerLatestIndexedBlock) > Number(health.workerLatestFinalizedBlock)) {
+    throw new Error('health workerLatestIndexedBlock must not exceed workerLatestFinalizedBlock');
+  }
+  const expectedLag = Number(health.workerLatestFinalizedBlock) - Number(health.workerLatestIndexedBlock);
+  assert.equal(health.workerLag, expectedLag, 'health workerLag must match finalized minus indexed blocks');
+  if (Number(health.workerLastSuccessfulIndexTimestamp) === 0) {
+    throw new Error('health workerLastSuccessfulIndexTimestamp must be positive');
+  }
+  if (
+    health.workerLastError !== null &&
+    (typeof health.workerLastError !== 'string' || health.workerLastError.length > 1_000)
+  ) {
+    throw new Error('health workerLastError must be null or a string');
+  }
+  if (
+    health.workerLastErrorTimestamp !== null &&
+    (!Number.isSafeInteger(health.workerLastErrorTimestamp) || Number(health.workerLastErrorTimestamp) < 0)
+  ) {
+    throw new Error('health workerLastErrorTimestamp must be null or a non-negative safe integer');
+  }
+  if ((health.workerLastError === null) !== (health.workerLastErrorTimestamp === null)) {
+    throw new Error('health worker error and timestamp must either both be present or both be null');
+  }
 }
 
 export async function runProductionSmoke(
@@ -149,7 +220,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const graphqlUrlInput = process.argv[2] || process.env.POLKASWAP_INDEXER_BASE_URL || DEFAULT_GRAPHQL_URL;
 
   runProductionSmoke(graphqlUrlInput).catch((error) => {
-    let endpointForLog = graphqlUrlInput;
+    let endpointForLog = '<invalid endpoint>';
     try {
       endpointForLog = normalizeGraphqlUrl(graphqlUrlInput).toString();
     } catch {

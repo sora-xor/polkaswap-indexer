@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  hasCompletedAccountTransactionsBackfill,
   normalizeIndexedAccountId,
   uniqueIndexedAccountIds,
 } from '../src/account-activity.js';
@@ -38,42 +37,5 @@ describe('account activity helpers', () => {
 
   it('deduplicates only accepted account identifiers', () => {
     expect(uniqueIndexedAccountIds(['alice', ' alice ', '0xrecipient', 'not an account', 'bob'])).toEqual(['alice', 'bob']);
-  });
-
-  it('does not treat corrupt backfill state as complete', () => {
-    expect(hasCompletedAccountTransactionsBackfill(null)).toBe(false);
-    expect(hasCompletedAccountTransactionsBackfill(JSON.stringify([]))).toBe(false);
-    expect(hasCompletedAccountTransactionsBackfill('not-json')).toBe(false);
-    expect(hasCompletedAccountTransactionsBackfill(JSON.stringify({ processedDocuments: 1 }))).toBe(false);
-    expect(
-      hasCompletedAccountTransactionsBackfill(
-        JSON.stringify({ processedDocuments: '1', writtenDocuments: 1, lastIndexedBlock: 2, lastTimestamp: 3 })
-      )
-    ).toBe(false);
-    expect(
-      hasCompletedAccountTransactionsBackfill(
-        JSON.stringify({ processedDocuments: -1, writtenDocuments: 1, lastIndexedBlock: 2, lastTimestamp: 3 })
-      )
-    ).toBe(false);
-    expect(
-      hasCompletedAccountTransactionsBackfill(
-        JSON.stringify({ processedDocuments: 1.5, writtenDocuments: 1, lastIndexedBlock: 2, lastTimestamp: 3 })
-      )
-    ).toBe(false);
-    expect(
-      hasCompletedAccountTransactionsBackfill(
-        JSON.stringify({
-          processedDocuments: Number.MAX_SAFE_INTEGER + 1,
-          writtenDocuments: 1,
-          lastIndexedBlock: 2,
-          lastTimestamp: 3,
-        })
-      )
-    ).toBe(false);
-    expect(
-      hasCompletedAccountTransactionsBackfill(
-        JSON.stringify({ processedDocuments: 1, writtenDocuments: 1, lastIndexedBlock: 2, lastTimestamp: 3 })
-      )
-    ).toBe(true);
   });
 });

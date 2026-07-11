@@ -16,9 +16,18 @@
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>65536</integer>
+  </dict>
+  <key>ExitTimeOut</key>
+  <integer>240</integer>
+  <key>Umask</key>
+  <integer>23</integer>
   <key>StandardOutPath</key>
   <string>/Users/administrator/apps/polkaswap-indexer/logs/combined-launchd.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/administrator/apps/polkaswap-indexer/logs/combined-launchd.err.log</string>
+  <string>/Users/administrator/apps/polkaswap-indexer/logs/combined-launchd.log</string>
 </dict>
 </plist>

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiPromise } from '@polkadot/api';
 import { ChainIndexer } from '../src/worker/chain.js';
 import { MemoryRepository } from '../src/repository/memory.js';
+import { MAX_REPOSITORY_WRITE_CALL_DOCUMENTS } from '../src/repository/validation.js';
 
 import type { IndexerDocument } from '../src/repository/types.js';
 
@@ -46,18 +47,77 @@ const config = {
   host: '0.0.0.0',
   port: 4350,
   graphqlPath: '/graphql',
+  httpListenBacklog: 4_096,
+  httpShutdownTimeoutMs: 30_000,
+  httpKeepAliveTimeoutMs: 75_000,
+  httpHeadersTimeoutMs: 80_000,
+  httpRequestTimeoutMs: 120_000,
+  httpMaxConnections: 10_000,
+  graphqlHttpMaxBodyBytes: 262_144,
+  graphqlHttpMaxInFlight: 100,
+  graphqlMaxDepth: 12,
+  graphqlMaxDocumentNodes: 2_000,
+  graphqlMaxFields: 500,
+  graphqlMaxAliases: 50,
+  graphqlMaxFragmentSpreads: 100,
+  graphqlMaxOperationCost: 100_000,
+  graphqlAllowIntrospection: false,
+  graphqlWsMaxPayloadBytes: 65_536,
+  graphqlWsConnectionInitTimeoutMs: 30_000,
+  graphqlWsMaxConnections: 1_000,
+  graphqlWsMaxOperations: 2_000,
+  graphqlWsMaxOperationsPerConnection: 20,
+  graphqlWsMaxPendingMessagesPerConnection: 64,
+  graphqlCacheMaxEntries: 1_000,
+  graphqlCacheMaxBytes: 67_108_864,
+  graphqlCacheTtlMs: 2_000,
+  graphqlMaxResultBytes: 67_108_864,
+  graphqlExecutionMemoryMaxBytes: 536_870_912,
   storageEngine: 'postgres' as const,
   databaseUrl: '',
+  skipPostgresMigration: false,
+  postgresPoolMax: 20,
+  postgresListenPoolMax: 2,
+  postgresConnectionTimeoutMs: 10_000,
+  postgresQueryTimeoutMs: 120_000,
+  postgresStatementTimeoutMs: 120_000,
+  postgresMigrationQueryTimeoutMs: 0,
+  postgresMigrationStatementTimeoutMs: 0,
+  postgresWatchQueueMax: 1_000,
+  postgresWatchReconnectMinDelayMs: 100,
+  postgresWatchReconnectMaxDelayMs: 10_000,
   rocksdbPath: './data/polkaswap-indexer.rocksdb',
   rocksdbBlockCacheMb: 512,
   rocksdbWriteBufferManagerMb: 256,
   rocksdbParallelism: 4,
   rocksdbEnableStats: false,
+  rocksdbDocumentCacheMax: 10_000,
+  rocksdbDocumentCacheMaxBytes: 268_435_456,
+  rocksdbWatchQueueMax: 1_000,
+  rocksdbQueryMaxScannedRows: 100_000,
+  rocksdbCompactionMinFreeGb: 10,
   soraWsEndpoint: 'wss://mof2.sora.org',
   chainStartBlock: 0,
   chainBatchSize: 25,
   stateRefreshIntervalBlocks: 250,
   snapshotIntervalBlocks: 250,
+  fullReconciliationIntervalBlocks: 250,
+  chainShutdownTimeoutMs: 30_000,
+  chainRpcTimeoutMs: 15_000,
+  chainRpcMaxInFlight: 256,
+  derivedStorageLoadMaxBytes: 268_435_456,
+  derivedStorageCacheMaxBytes: 67_108_864,
+  analyticsInputCacheMaxBytes: 134_217_728,
+  backfillPrefetchConcurrency: 1,
+  finalizedCatchupPrefetchConcurrency: 1,
+  priceStreamRefreshIntervalBlocks: 0,
+  legacySoraBlockTypes: false,
+  archiveSoraWsEndpoint: '',
+  workerReadinessMaxLagBlocks: 25,
+  workerReadinessMaxStalenessSeconds: 120,
+  workerMetricsHost: '127.0.0.1',
+  workerMetricsPort: 9464,
+  workerMetricsMaxInFlight: 10,
 };
 
 const createBlockNetworkSnapshot = (
@@ -115,15 +175,6 @@ const createAssetSnapshot = (
     },
   },
 });
-
-const expectNoBackfilledNetworkStockMetrics = (document: { data: Record<string, unknown> } | null | undefined) => {
-  expect(document?.data).not.toHaveProperty('liquidityUSD');
-  expect(document?.data).not.toHaveProperty('poolLiquidityUSD');
-  expect(document?.data).not.toHaveProperty('orderBookLiquidityUSD');
-  expect(document?.data).not.toHaveProperty('activePools');
-  expect(document?.data).not.toHaveProperty('activeOrderBooks');
-  expect(document?.data).not.toHaveProperty('listedAssets');
-};
 
 describe('ChainIndexer price derivation', () => {
   it('prefers liquid stable pools over dust pools for derived asset prices', () => {
@@ -257,67 +308,7 @@ describe('ChainIndexer price derivation', () => {
     expect(prices.get(XOR)).toBeLessThan(6n * SCALE);
   });
 
-  it('cleans zero-volume asset snapshot price outliers while preserving isolated historical highs', async () => {
-    const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
-      cleanupAssetSnapshotPriceOutliers: () => Promise<boolean>;
-    };
-    const normalPrice = (price: string) => ({ open: price, high: price, low: price, close: price });
-    const documents = [
-      createAssetSnapshot('asset-xor-DEFAULT-legacy-high', 1_619_543_754, normalPrice('362.29477681')),
-      createAssetSnapshot('asset-xor-DEFAULT-bad-1', 1_778_368_470, normalPrice('362.29477681')),
-      createAssetSnapshot('asset-xor-DEFAULT-bad-2', 1_778_457_186, {
-        open: '588.29698412',
-        high: '588.29698412',
-        low: '458.83773967',
-        close: '458.83773967',
-      }),
-      createAssetSnapshot('asset-xor-DEFAULT-bad-3', 1_778_542_932, {
-        open: '458.83773967',
-        high: '458.83773967',
-        low: '5.72015908',
-        close: '5.81993769',
-      }),
-      createAssetSnapshot('asset-xor-DEFAULT-good-1', 1_778_630_016, normalPrice('5.81522438')),
-      createAssetSnapshot('asset-xor-DEFAULT-good-2', 1_778_715_546, normalPrice('5.20150076')),
-      createAssetSnapshot('asset-xor-DEFAULT-good-3', 1_778_802_738, normalPrice('5.41743442')),
-      createAssetSnapshot('asset-xor-DEFAULT-good-4', 1_778_888_436, normalPrice('5.62856663')),
-      createAssetSnapshot('asset-xor-DEFAULT-volume-spike', 1_778_930_000, normalPrice('362.29477681'), '1'),
-    ];
-    await repository.upsertMany(documents);
 
-    await expect(indexer.cleanupAssetSnapshotPriceOutliers()).resolves.toBe(true);
-
-    const remainingIds = new Set((await repository.list('assetSnapshots')).map((document) => document.id));
-    expect(remainingIds.has('asset-xor-DEFAULT-bad-1')).toBe(false);
-    expect(remainingIds.has('asset-xor-DEFAULT-bad-2')).toBe(false);
-    expect(remainingIds.has('asset-xor-DEFAULT-bad-3')).toBe(false);
-    expect(remainingIds.has('asset-xor-DEFAULT-legacy-high')).toBe(true);
-    expect(remainingIds.has('asset-xor-DEFAULT-volume-spike')).toBe(true);
-    expect(await repository.get('updatesStreams', 'assetSnapshotPriceOutlierCleanup-v1')).not.toBeNull();
-  });
-
-  it('does not re-run asset snapshot outlier cleanup once the cleanup state exists', async () => {
-    const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
-      cleanupAssetSnapshotPriceOutliers: () => Promise<boolean>;
-    };
-    await repository.upsert({
-      collection: 'updatesStreams',
-      id: 'assetSnapshotPriceOutlierCleanup-v1',
-      data: { id: 'assetSnapshotPriceOutlierCleanup-v1', data: JSON.stringify({ deletedCount: 0 }) },
-    });
-    await repository.upsert(createAssetSnapshot('asset-xor-DEFAULT-bad-state-kept', 1_778_368_470, {
-      open: '362.29477681',
-      high: '362.29477681',
-      low: '362.29477681',
-      close: '362.29477681',
-    }));
-
-    await expect(indexer.cleanupAssetSnapshotPriceOutliers()).resolves.toBe(false);
-
-    expect(await repository.get('assetSnapshots', 'asset-xor-DEFAULT-bad-state-kept')).not.toBeNull();
-  });
 
   it('prefers deeper target reserves over a shallow pool with more stable-side liquidity', () => {
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
@@ -405,173 +396,7 @@ describe('ChainIndexer price derivation', () => {
     expect(supplyByAsset.get(KUSD)).toBe(123n);
   });
 
-  it('repairs persisted XOR supplies from native balances issuance without touching other fields', async () => {
-    const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
-      drainFinalizedHeads: () => Promise<void>;
-      fetchNativeXorIssuanceAtBlock: (blockHeight: number) => Promise<bigint>;
-      repairXorSupplyDocuments: () => Promise<boolean>;
-    };
-    const supplyAtBlock10 = 1_000n * SCALE;
-    const supplyAtBlock12 = 2_000n * SCALE;
 
-    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
-    indexer.fetchNativeXorIssuanceAtBlock = vi.fn(async (blockHeight: number) => {
-      if (blockHeight === 10) return supplyAtBlock10;
-      if (blockHeight === 12) return supplyAtBlock12;
-      throw new Error(`unexpected block ${blockHeight}`);
-    });
-
-    await repository.upsertMany([
-      {
-        collection: 'assets',
-        id: XOR,
-        blockHeight: 10,
-        timestamp: 1_000,
-        data: { id: XOR, supply: '1', priceUSD: '0.1' },
-      },
-      {
-        collection: 'assets',
-        id: KUSD,
-        blockHeight: 10,
-        timestamp: 1_000,
-        data: { id: KUSD, supply: '2', priceUSD: '1' },
-      },
-      {
-        collection: 'assetSnapshots',
-        id: 'xor-day-10',
-        blockHeight: 10,
-        timestamp: 1_000,
-        data: { id: 'xor-day-10', assetId: XOR, type: 'DAY', timestamp: 1_000, supply: '3', mint: '4', burn: '5' },
-      },
-      {
-        collection: 'assetSnapshots',
-        id: 'xor-day-12',
-        blockHeight: 12,
-        timestamp: 1_200,
-        data: {
-          id: 'xor-day-12',
-          assetId: XOR,
-          type: 'DAY',
-          timestamp: 1_200,
-          supply: supplyAtBlock12.toString(),
-          mint: '6',
-          burn: '7',
-        },
-      },
-      {
-        collection: 'assetSnapshots',
-        id: 'kusd-day-10',
-        blockHeight: 10,
-        timestamp: 1_000,
-        data: { id: 'kusd-day-10', assetId: KUSD, type: 'DAY', timestamp: 1_000, supply: '8', mint: '9', burn: '10' },
-      },
-    ]);
-
-    await expect(indexer.repairXorSupplyDocuments()).resolves.toBe(true);
-
-    expect(indexer.fetchNativeXorIssuanceAtBlock).toHaveBeenCalledTimes(2);
-    expect(indexer.fetchNativeXorIssuanceAtBlock).toHaveBeenCalledWith(10);
-    expect(indexer.fetchNativeXorIssuanceAtBlock).toHaveBeenCalledWith(12);
-    await expect(repository.get('assets', XOR)).resolves.toMatchObject({
-      data: { supply: supplyAtBlock10.toString(), priceUSD: '0.1' },
-    });
-    await expect(repository.get('assets', KUSD)).resolves.toMatchObject({
-      data: { supply: '2' },
-    });
-    await expect(repository.get('assetSnapshots', 'xor-day-10')).resolves.toMatchObject({
-      data: { supply: supplyAtBlock10.toString(), mint: '4', burn: '5' },
-    });
-    await expect(repository.get('assetSnapshots', 'xor-day-12')).resolves.toMatchObject({
-      data: { supply: supplyAtBlock12.toString(), mint: '6', burn: '7' },
-    });
-    await expect(repository.get('assetSnapshots', 'kusd-day-10')).resolves.toMatchObject({
-      data: { supply: '8' },
-    });
-
-    const state = await repository.get('updatesStreams', 'xorSupplyRepair-v1');
-    expect(JSON.parse(String(state?.data.data))).toMatchObject({
-      processedDocuments: 3,
-      writtenDocuments: 2,
-      skippedDocuments: 0,
-      lastIndexedBlock: 12,
-      lastTimestamp: 1_200,
-    });
-  });
-
-  it('leaves XOR supply repair retryable when historical state is pruned', async () => {
-    const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
-      drainFinalizedHeads: () => Promise<void>;
-      fetchNativeXorIssuanceAtBlock: (blockHeight: number) => Promise<bigint>;
-      repairXorSupplyDocuments: () => Promise<boolean>;
-    };
-    const supplyAtBlock10 = 1_000n * SCALE;
-    const supplyAtBlock11 = 1_100n * SCALE;
-    const fetchNativeXorIssuanceAtBlock = vi.fn(async (blockHeight: number) => {
-      if (blockHeight === 10) return supplyAtBlock10;
-      if (blockHeight === 11) throw new Error('State already discarded');
-      throw new Error(`unexpected block ${blockHeight}`);
-    });
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-
-    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
-    indexer.fetchNativeXorIssuanceAtBlock = fetchNativeXorIssuanceAtBlock;
-
-    try {
-      await repository.upsertMany([
-        {
-          collection: 'assets',
-          id: XOR,
-          blockHeight: 10,
-          timestamp: 1_000,
-          data: { id: XOR, supply: 'legacy-asset' },
-        },
-        {
-          collection: 'assetSnapshots',
-          id: 'xor-day-11',
-          blockHeight: 11,
-          timestamp: 1_100,
-          data: { id: 'xor-day-11', assetId: XOR, type: 'DAY', timestamp: 1_100, supply: 'legacy-snapshot' },
-        },
-      ]);
-
-      await expect(indexer.repairXorSupplyDocuments()).resolves.toBe(true);
-
-      await expect(repository.get('assets', XOR)).resolves.toMatchObject({
-        data: { supply: supplyAtBlock10.toString() },
-      });
-      await expect(repository.get('assetSnapshots', 'xor-day-11')).resolves.toMatchObject({
-        data: { supply: 'legacy-snapshot' },
-      });
-      await expect(repository.get('updatesStreams', 'xorSupplyRepair-v1')).resolves.toBeNull();
-      expect(warn).toHaveBeenCalledWith(
-        'Skipped 1 XOR supply rows because the node has pruned historical state'
-      );
-
-      fetchNativeXorIssuanceAtBlock.mockImplementation(async (blockHeight: number) => {
-        if (blockHeight === 10) return supplyAtBlock10;
-        if (blockHeight === 11) return supplyAtBlock11;
-        throw new Error(`unexpected block ${blockHeight}`);
-      });
-
-      await expect(indexer.repairXorSupplyDocuments()).resolves.toBe(true);
-
-      await expect(repository.get('assetSnapshots', 'xor-day-11')).resolves.toMatchObject({
-        data: { supply: supplyAtBlock11.toString() },
-      });
-      const state = await repository.get('updatesStreams', 'xorSupplyRepair-v1');
-      expect(JSON.parse(String(state?.data.data))).toMatchObject({
-        processedDocuments: 2,
-        writtenDocuments: 1,
-        skippedDocuments: 0,
-        lastIndexedBlock: 11,
-        lastTimestamp: 1_100,
-      });
-    } finally {
-      warn.mockRestore();
-    }
-  });
 
   it('requires native balances issuance when refreshing XOR supply', async () => {
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
@@ -610,8 +435,565 @@ describe('ChainIndexer price derivation', () => {
     };
 
     await expect(indexer.fetchStorageEntries({}, 'orderBook.bids')).rejects.toThrow(
-      'orderBook.bids.entries is required to refresh derived state'
+      'orderBook.bids.entriesPaged is required to refresh derived state'
     );
+  });
+
+  it('loads storage entries in bounded pages and advances with the prior page startKey', async () => {
+    const firstPage = Array.from({ length: 256 }, (_item, index) => [
+      { args: [index], toHex: () => `0x${index.toString(16).padStart(4, '0')}` },
+      index,
+    ]) as Array<[{ args: unknown[]; toHex: () => string }, number]>;
+    const finalEntry = [
+      { args: [256], toHex: () => '0x0100' },
+      256,
+    ] as [{ args: unknown[]; toHex: () => string }, number];
+    const entriesPaged = vi.fn(async ({ startKey }: { startKey?: unknown }) =>
+      startKey ? [finalEntry] : firstPage
+    );
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      fetchStorageEntries: (storage: unknown, label: string, ...args: unknown[]) => Promise<unknown[]>;
+    };
+
+    await expect(
+      indexer.fetchStorageEntries({ entriesPaged }, 'poolXYK.reserves', 'scope')
+    ).resolves.toHaveLength(257);
+    expect(entriesPaged).toHaveBeenCalledTimes(2);
+    expect(entriesPaged.mock.calls[0]?.[0]).toEqual({ args: ['scope'], pageSize: 256 });
+    expect(entriesPaged.mock.calls[1]?.[0]).toEqual({
+      args: ['scope'],
+      pageSize: 256,
+      startKey: '0x00ff',
+    });
+  });
+
+  it('fails closed when an entriesPaged backend repeats a page without continuation progress', async () => {
+    const repeatedPage = Array.from({ length: 256 }, (_item, index) => [
+      { args: [index], toHex: () => `0x${index.toString(16).padStart(4, '0')}` },
+      index,
+    ]) as Array<[{ args: unknown[]; toHex: () => string }, number]>;
+    const entriesPaged = vi.fn().mockResolvedValue(repeatedPage);
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      fetchStorageEntries: (storage: unknown, label: string) => Promise<unknown[]>;
+    };
+
+    await expect(indexer.fetchStorageEntries({ entriesPaged }, 'orderBook.limitOrders')).rejects.toThrow(
+      /progress|startKey/
+    );
+    expect(entriesPaged).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects an oversized derived storage entry before retaining it', async () => {
+    const indexer = new ChainIndexer(
+      { ...config, derivedStorageLoadMaxBytes: 256 },
+      new MemoryRepository()
+    ) as unknown as {
+      fetchStorageEntries: (storage: unknown, label: string) => Promise<unknown[]>;
+    };
+    const entriesPaged = vi.fn().mockResolvedValue([
+      [{ args: ['large'] }, { value: 'x'.repeat(1_000) }],
+    ]);
+
+    await expect(indexer.fetchStorageEntries({ entriesPaged }, 'orderBook.limitOrders')).rejects.toThrow(
+      /retained-load limit/
+    );
+    expect(entriesPaged).toHaveBeenCalledTimes(1);
+  });
+
+  it('classifies only storage domains that can be changed by a pallet operation', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      derivedStorageDomainsForPallet: (pallet: string, method?: string) => string[];
+    };
+
+    expect(indexer.derivedStorageDomainsForPallet('poolXYK', 'ReservesChanged')).toEqual(['poolReserves']);
+    expect(indexer.derivedStorageDomainsForPallet('poolXYK', 'Exchange')).toEqual(['poolReserves']);
+    expect(indexer.derivedStorageDomainsForPallet('poolXYK', 'DepositLiquidity')).toEqual([
+      'poolReserves',
+      'poolIssuance',
+      'poolProviders',
+    ]);
+    expect(indexer.derivedStorageDomainsForPallet('liquidityProxy', 'Swap')).toEqual([]);
+    expect(indexer.derivedStorageDomainsForPallet('xorFee', 'FeeWithdrawn')).toEqual([]);
+    expect(indexer.derivedStorageDomainsForPallet('assets', 'Transfer')).toEqual([]);
+    expect(indexer.derivedStorageDomainsForPallet('assets', 'Issued')).toEqual(['assetSupply']);
+    expect(indexer.derivedStorageDomainsForPallet('assets', 'AssetRegistered')).toEqual(['assetMetadata']);
+    expect(indexer.derivedStorageDomainsForPallet('tokens', 'Transfer')).toEqual([]);
+    expect(indexer.derivedStorageDomainsForPallet('tokens', 'Withdrawn')).toEqual(['assetSupply']);
+    expect(indexer.derivedStorageDomainsForPallet('balances', 'Rescinded')).toEqual(['assetSupply']);
+    expect(indexer.derivedStorageDomainsForPallet('system', 'CodeUpdated')).toHaveLength(12);
+  });
+
+  it('reuses clean storage domains and reloads only domains marked dirty', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      loadDerivedStorageDomain: <T>(
+        domain: string,
+        blockHeight: number,
+        forceReconciliation: boolean,
+        loader: () => Promise<T>
+      ) => Promise<T>;
+      markDerivedStorageDomainsDirty: (domains: Iterable<string>) => void;
+      getDerivedStorageCacheMetrics: () => {
+        loads: number;
+        hits: number;
+        cachedDomains: number;
+        dirtyDomains: number;
+      };
+    };
+    const firstOrderBookLoad = vi.fn().mockResolvedValue(['order-1']);
+    const skippedOrderBookLoad = vi.fn().mockResolvedValue(['should-not-load']);
+    const poolLoad = vi.fn().mockResolvedValue(['pool-1']);
+    const refreshedOrderBookLoad = vi.fn().mockResolvedValue(['order-2']);
+
+    expect(await indexer.loadDerivedStorageDomain('orderBooks', 10, false, firstOrderBookLoad)).toEqual(['order-1']);
+    expect(await indexer.loadDerivedStorageDomain('poolReserves', 10, false, poolLoad)).toEqual(['pool-1']);
+    expect(await indexer.loadDerivedStorageDomain('orderBooks', 20, false, skippedOrderBookLoad)).toEqual(['order-1']);
+
+    indexer.markDerivedStorageDomainsDirty(['orderBooks']);
+
+    expect(await indexer.loadDerivedStorageDomain('orderBooks', 25, false, refreshedOrderBookLoad)).toEqual(['order-2']);
+    expect(firstOrderBookLoad).toHaveBeenCalledTimes(1);
+    expect(skippedOrderBookLoad).not.toHaveBeenCalled();
+    expect(poolLoad).toHaveBeenCalledTimes(1);
+    expect(refreshedOrderBookLoad).toHaveBeenCalledTimes(1);
+    expect(indexer.getDerivedStorageCacheMetrics()).toMatchObject({ loads: 3, hits: 1, cachedDomains: 2 });
+  });
+
+  it('keeps metadata and LP issuance cached across reserve- and supply-only mutations', async () => {
+    const assetInfos = vi.fn().mockResolvedValue([]);
+    const tokenIssuance = vi.fn().mockResolvedValue([]);
+    const nativeIssuance = vi.fn().mockResolvedValue('0');
+    const poolProperties = vi.fn().mockResolvedValue([]);
+    const poolReserves = vi.fn().mockResolvedValue([]);
+    const poolIssuance = vi.fn().mockResolvedValue([]);
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      api: unknown;
+      loadAssetStorageDomain: (block: number) => Promise<unknown>;
+      loadPoolStorageDomain: (block: number) => Promise<unknown>;
+      markDerivedStorageDomainsDirty: (domains: Iterable<string>) => void;
+    };
+    indexer.api = {
+      query: {
+        assets: { assetInfosV2: { entriesPaged: assetInfos } },
+        tokens: { totalIssuance: { entriesPaged: tokenIssuance } },
+        balances: { totalIssuance: nativeIssuance },
+        poolXYK: {
+          properties: { entriesPaged: poolProperties },
+          reserves: { entriesPaged: poolReserves },
+          totalIssuances: { entriesPaged: poolIssuance },
+        },
+      },
+    };
+
+    await indexer.loadAssetStorageDomain(10);
+    await indexer.loadPoolStorageDomain(10);
+    indexer.markDerivedStorageDomainsDirty(['assetSupply', 'poolReserves']);
+    await indexer.loadAssetStorageDomain(11);
+    await indexer.loadPoolStorageDomain(11);
+
+    expect(assetInfos).toHaveBeenCalledTimes(1);
+    expect(tokenIssuance).toHaveBeenCalledTimes(2);
+    expect(nativeIssuance).toHaveBeenCalledTimes(2);
+    expect(poolProperties).toHaveBeenCalledTimes(1);
+    expect(poolReserves).toHaveBeenCalledTimes(2);
+    expect(poolIssuance).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let an older in-flight domain load overwrite a newer dirty generation', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      derivedStorageCache: Map<string, { generation: number; value: unknown }>;
+      dirtyDerivedStorageDomains: Set<string>;
+      loadDerivedStorageDomain: <T>(
+        domain: string,
+        blockHeight: number,
+        forceReconciliation: boolean,
+        loader: () => Promise<T>
+      ) => Promise<T>;
+      markDerivedStorageDomainsDirty: (domains: Iterable<string>) => void;
+    };
+    let releaseOldLoad!: () => void;
+    let signalOldLoadStarted!: () => void;
+    const oldLoadGate = new Promise<void>((resolve) => {
+      releaseOldLoad = resolve;
+    });
+    const oldLoadStarted = new Promise<void>((resolve) => {
+      signalOldLoadStarted = resolve;
+    });
+    const oldLoad = indexer.loadDerivedStorageDomain('poolReserves', 100, false, async () => {
+      signalOldLoadStarted();
+      await oldLoadGate;
+      return ['old-pool-state'];
+    });
+
+    await oldLoadStarted;
+    indexer.markDerivedStorageDomainsDirty(['poolReserves']);
+    await expect(
+      indexer.loadDerivedStorageDomain('poolReserves', 101, false, async () => ['fresh-pool-state'])
+    ).resolves.toEqual(['fresh-pool-state']);
+    releaseOldLoad();
+    await expect(oldLoad).resolves.toEqual(['old-pool-state']);
+
+    expect(indexer.derivedStorageCache.get('poolReserves')?.value).toEqual(['fresh-pool-state']);
+    expect(indexer.dirtyDerivedStorageDomains.has('poolReserves')).toBe(false);
+  });
+
+  it('marks a storage load non-authoritative when its domain is dirtied in flight', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      loadDerivedStorageDomainWithStatus: <T>(
+        domain: string,
+        blockHeight: number,
+        forceReconciliation: boolean,
+        loader: () => Promise<T>
+      ) => Promise<{ value: T; refreshed: boolean; authoritativeForGeneration: boolean }>;
+      markDerivedStorageDomainsDirty: (domains: Iterable<string>) => void;
+    };
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const loadStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const load = indexer.loadDerivedStorageDomainWithStatus('assetMetadata', 100, false, async () => {
+      started();
+      await gate;
+      return ['stale-generation'];
+    });
+
+    await loadStarted;
+    indexer.markDerivedStorageDomainsDirty(['assetMetadata']);
+    release();
+
+    await expect(load).resolves.toEqual({
+      value: ['stale-generation'],
+      refreshed: true,
+      authoritativeForGeneration: false,
+    });
+  });
+
+  it('never serves or installs a future-block domain cache for an older request', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      derivedStorageCache: Map<string, { blockHeight: number; value: unknown }>;
+      loadDerivedStorageDomainWithStatus: <T>(
+        domain: string,
+        blockHeight: number,
+        forceReconciliation: boolean,
+        loader: () => Promise<T>
+      ) => Promise<{ value: T; refreshed: boolean; authoritativeForGeneration: boolean }>;
+    };
+    await indexer.loadDerivedStorageDomainWithStatus('poolReserves', 200, false, async () => ['future']);
+    const historicalLoader = vi.fn().mockResolvedValue(['historical']);
+
+    await expect(
+      indexer.loadDerivedStorageDomainWithStatus('poolReserves', 100, false, historicalLoader)
+    ).resolves.toEqual({
+      value: ['historical'],
+      refreshed: true,
+      authoritativeForGeneration: true,
+    });
+    expect(historicalLoader).toHaveBeenCalledOnce();
+    expect(indexer.derivedStorageCache.get('poolReserves')).toMatchObject({
+      blockHeight: 200,
+      value: ['future'],
+    });
+  });
+
+  it('serializes projections and gives each one a query snapshot pinned to its finalized block', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      api: unknown;
+      runProjectionRefreshExclusive: (
+        blockHeight: number,
+        task: (query: { marker: string }) => Promise<void>
+      ) => Promise<void>;
+    };
+    const getBlockHash = vi.fn(async (blockHeight: number) => ({ toString: () => `0x${blockHeight}` }));
+    const at = vi.fn(async (hash: string) => ({ query: { marker: hash } }));
+    indexer.api = { rpc: { chain: { getBlockHash } }, at, query: { marker: 'live-changing-state' } };
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const firstStartedPromise = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    const markers: string[] = [];
+    const first = indexer.runProjectionRefreshExclusive(10, async (query) => {
+      markers.push(query.marker);
+      firstStarted();
+      await firstGate;
+    });
+    const second = indexer.runProjectionRefreshExclusive(11, async (query) => {
+      markers.push(query.marker);
+    });
+
+    await firstStartedPromise;
+    expect(at).toHaveBeenCalledTimes(1);
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(getBlockHash.mock.calls.map(([blockHeight]) => blockHeight)).toEqual([10, 11]);
+    expect(at.mock.calls.map(([hash]) => hash)).toEqual(['0x10', '0x11']);
+    expect(markers).toEqual(['0x10', '0x11']);
+  });
+
+  it('skips an obsolete lower-block projection after a higher block has published shared state', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      api: unknown;
+      assetInfos: Map<string, unknown>;
+      assetInfosBlockHeight: number;
+      networkLiquidityStats: Record<string, unknown>;
+      networkLiquidityStatsBlockHeight: number;
+      lastDerivedStorageReconciliationBlock: number | null;
+      runProjectionRefreshExclusive: (
+        blockHeight: number,
+        task: (query: { marker: string }) => Promise<void>
+      ) => Promise<void>;
+      publishAssetInfos: (assets: Map<string, unknown>, blockHeight: number) => boolean;
+      publishNetworkLiquidityStats: (stats: Record<string, unknown>, blockHeight: number) => boolean;
+      completeDerivedStorageReconciliation: (blockHeight: number, reconciled: boolean) => void;
+    };
+    const getBlockHash = vi.fn(async (blockHeight: number) => ({ toString: () => `0x${blockHeight}` }));
+    const at = vi.fn(async (hash: string) => ({ query: { marker: hash } }));
+    indexer.api = { rpc: { chain: { getBlockHash } }, at };
+    const obsolete = vi.fn(async () => {
+      indexer.publishAssetInfos(new Map([['lower', {}]]), 10);
+      indexer.publishNetworkLiquidityStats({ liquidityUSD: '10' }, 10);
+      indexer.completeDerivedStorageReconciliation(10, true);
+    });
+
+    await indexer.runProjectionRefreshExclusive(11, async () => {
+      indexer.publishAssetInfos(new Map([['higher', {}]]), 11);
+      indexer.publishNetworkLiquidityStats({ liquidityUSD: '11' }, 11);
+      indexer.completeDerivedStorageReconciliation(11, true);
+    });
+    await indexer.runProjectionRefreshExclusive(10, obsolete);
+
+    expect(obsolete).not.toHaveBeenCalled();
+    expect(getBlockHash).toHaveBeenCalledTimes(1);
+    expect(indexer.assetInfos.has('higher')).toBe(true);
+    expect(indexer.assetInfosBlockHeight).toBe(11);
+    expect(indexer.networkLiquidityStats).toEqual({ liquidityUSD: '11' });
+    expect(indexer.networkLiquidityStatsBlockHeight).toBe(11);
+    expect(indexer.lastDerivedStorageReconciliationBlock).toBe(11);
+  });
+
+  it('publishes shared prices monotonically by finalized block height', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      prices: Map<string, bigint>;
+      pricesBlockHeight: number;
+      publishPrices: (prices: Map<string, bigint>, blockHeight: number) => boolean;
+    };
+
+    expect(indexer.publishPrices(new Map([[XOR, 11n]]), 101)).toBe(true);
+    expect(indexer.publishPrices(new Map([[XOR, 10n]]), 100)).toBe(false);
+    expect(indexer.prices.get(XOR)).toBe(11n);
+    expect(indexer.pricesBlockHeight).toBe(101);
+  });
+
+  it('makes clean-cache consumers await an in-flight forced reconciliation', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      loadDerivedStorageDomain: <T>(
+        domain: string,
+        blockHeight: number,
+        forceReconciliation: boolean,
+        loader: () => Promise<T>
+      ) => Promise<T>;
+    };
+    await indexer.loadDerivedStorageDomain('orderBooks', 10, false, async () => ['old-state']);
+
+    let releaseReconciliation!: () => void;
+    let signalReconciliationStarted!: () => void;
+    const reconciliationGate = new Promise<void>((resolve) => {
+      releaseReconciliation = resolve;
+    });
+    const reconciliationStarted = new Promise<void>((resolve) => {
+      signalReconciliationStarted = resolve;
+    });
+    const forced = indexer.loadDerivedStorageDomain('orderBooks', 20, true, async () => {
+      signalReconciliationStarted();
+      await reconciliationGate;
+      return ['reconciled-state'];
+    });
+    await reconciliationStarted;
+
+    const staleLoader = vi.fn().mockResolvedValue(['stale-cache-value']);
+    const overlappingConsumer = indexer.loadDerivedStorageDomain('orderBooks', 20, false, staleLoader);
+    let overlappingSettled = false;
+    void overlappingConsumer.finally(() => {
+      overlappingSettled = true;
+    });
+    await Promise.resolve();
+    expect(overlappingSettled).toBe(false);
+
+    releaseReconciliation();
+    await expect(forced).resolves.toEqual(['reconciled-state']);
+    await expect(overlappingConsumer).resolves.toEqual(['reconciled-state']);
+    expect(staleLoader).not.toHaveBeenCalled();
+  });
+
+  it('releases the old domain generation before a replacement scan and keeps failures dirty', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      derivedStorageCache: Map<string, { value: unknown }>;
+      dirtyDerivedStorageDomains: Set<string>;
+      loadDerivedStorageDomain: <T>(
+        domain: string,
+        blockHeight: number,
+        forceReconciliation: boolean,
+        loader: () => Promise<T>
+      ) => Promise<T>;
+      markDerivedStorageDomainsDirty: (domains: Iterable<string>) => void;
+    };
+
+    await indexer.loadDerivedStorageDomain('vaults', 10, false, async () => ['last-good-vault-state']);
+    indexer.markDerivedStorageDomainsDirty(['vaults']);
+
+    await expect(
+      indexer.loadDerivedStorageDomain('vaults', 11, false, async () => {
+        throw new Error('RPC unavailable');
+      })
+    ).rejects.toThrow('RPC unavailable');
+    expect(indexer.derivedStorageCache.get('vaults')).toBeUndefined();
+    expect(indexer.dirtyDerivedStorageDomains.has('vaults')).toBe(true);
+  });
+
+  it('evicts least-recently-used derived domains to stay within the byte budget', async () => {
+    const indexer = new ChainIndexer(
+      { ...config, derivedStorageCacheMaxBytes: 600 },
+      new MemoryRepository()
+    ) as unknown as {
+      derivedStorageCache: Map<string, { value: unknown }>;
+      dirtyDerivedStorageDomains: Set<string>;
+      loadDerivedStorageDomain: <T>(
+        domain: string,
+        blockHeight: number,
+        forceReconciliation: boolean,
+        loader: () => Promise<T>
+      ) => Promise<T>;
+      getDerivedStorageCacheMetrics: () => {
+        cachedBytes: number;
+        maximumBytes: number;
+        capacityEvictions: number;
+      };
+    };
+
+    await indexer.loadDerivedStorageDomain('poolReserves', 1, false, async () => ['a'.repeat(100)]);
+    await indexer.loadDerivedStorageDomain('vaults', 1, false, async () => ['b'.repeat(100)]);
+
+    expect(indexer.derivedStorageCache.has('poolReserves')).toBe(false);
+    expect(indexer.derivedStorageCache.has('vaults')).toBe(true);
+    expect(indexer.dirtyDerivedStorageDomains.has('poolReserves')).toBe(true);
+    expect(indexer.getDerivedStorageCacheMetrics()).toMatchObject({
+      maximumBytes: 600,
+      capacityEvictions: 1,
+    });
+    expect(indexer.getDerivedStorageCacheMetrics().cachedBytes).toBeLessThanOrEqual(600);
+  });
+
+  it('serves but does not retain a derived domain larger than the byte budget', async () => {
+    const indexer = new ChainIndexer(
+      { ...config, derivedStorageCacheMaxBytes: 256 },
+      new MemoryRepository()
+    ) as unknown as {
+      derivedStorageCache: Map<string, { value: unknown }>;
+      dirtyDerivedStorageDomains: Set<string>;
+      loadDerivedStorageDomain: <T>(
+        domain: string,
+        blockHeight: number,
+        forceReconciliation: boolean,
+        loader: () => Promise<T>
+      ) => Promise<T>;
+      getDerivedStorageCacheMetrics: () => {
+        cachedBytes: number;
+        capacityBypasses: number;
+        capacityBypassedBytes: number;
+      };
+    };
+    const value = ['x'.repeat(10_000)];
+
+    await expect(
+      indexer.loadDerivedStorageDomain('orderBooks', 1, false, async () => value)
+    ).resolves.toBe(value);
+    expect(indexer.derivedStorageCache.has('orderBooks')).toBe(false);
+    expect(indexer.dirtyDerivedStorageDomains.has('orderBooks')).toBe(true);
+    expect(indexer.getDerivedStorageCacheMetrics()).toMatchObject({
+      cachedBytes: 0,
+      capacityBypasses: 1,
+      capacityBypassedBytes: 257,
+    });
+  });
+
+  it('marks block storage domains only after the indexed documents commit', async () => {
+    const repository = new MemoryRepository();
+    vi.spyOn(repository, 'upsertMany').mockRejectedValue(new Error('write failed'));
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      dirtyDerivedStorageDomains: Set<string>;
+      indexFetchedBlock: (block: unknown) => Promise<void>;
+    };
+    indexer.dirtyDerivedStorageDomains.clear();
+
+    await expect(
+      indexer.indexFetchedBlock({
+        signedBlock: {
+          block: {
+            header: {
+              number: { toNumber: () => 249 },
+              hash: { toString: () => '0x249' },
+            },
+            extrinsics: [],
+          },
+        },
+        events: [eventRecord('poolXYK', 'ReservesChanged', {})],
+        timestamp: 994,
+      })
+    ).rejects.toThrow('write failed');
+
+    expect(indexer.dirtyDerivedStorageDomains.size).toBe(0);
+  });
+
+  it('preserves full reconciliation while merging a newer derived-state request', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      mergeDerivedStateRefreshRequests: (
+        left: { blockHeight: number; timestamp: number; includeSnapshots: boolean; forceFullReconciliation?: boolean },
+        right: { blockHeight: number; timestamp: number; includeSnapshots: boolean; forceFullReconciliation?: boolean }
+      ) => { blockHeight: number; includeSnapshots: boolean; forceFullReconciliation?: boolean };
+    };
+
+    expect(
+      indexer.mergeDerivedStateRefreshRequests(
+        { blockHeight: 250, timestamp: 1_000, includeSnapshots: false, forceFullReconciliation: true },
+        { blockHeight: 251, timestamp: 1_006, includeSnapshots: true, forceFullReconciliation: false }
+      )
+    ).toMatchObject({ blockHeight: 251, includeSnapshots: true, forceFullReconciliation: true });
+  });
+
+  it('schedules the 250-block reconciliation independently of the normal refresh interval', async () => {
+    const repository = new MemoryRepository();
+    const requestDerivedStateRefresh = vi.fn();
+    const indexer = new ChainIndexer(
+      { ...config, stateRefreshIntervalBlocks: 60, snapshotIntervalBlocks: 1_000 },
+      repository
+    ) as unknown as {
+      requestDerivedStateRefresh: typeof requestDerivedStateRefresh;
+      indexFetchedBlock: (block: unknown) => Promise<void>;
+    };
+    indexer.requestDerivedStateRefresh = requestDerivedStateRefresh;
+
+    await indexer.indexFetchedBlock({
+      signedBlock: {
+        block: {
+          header: {
+            number: { toNumber: () => 250 },
+            hash: { toString: () => '0x250' },
+          },
+          extrinsics: [],
+        },
+      },
+      events: [],
+      timestamp: 1_000,
+    });
+
+    expect(requestDerivedStateRefresh).toHaveBeenCalledWith(250, 1_000, false, true);
   });
 
   it('propagates block timestamp query failures', async () => {
@@ -666,7 +1048,7 @@ describe('ChainIndexer price derivation', () => {
     indexer.api = { query: { staking: {} } };
 
     await expect(indexer.createStakingValidatorDocuments(1, 1, new Map(), new Map())).rejects.toThrow(
-      'staking.validators.entries is required to refresh staking validators'
+      'staking.validators.entriesPaged is required to refresh staking validators'
     );
   });
 
@@ -680,7 +1062,7 @@ describe('ChainIndexer price derivation', () => {
       query: {
         staking: {
           erasStakersOverview: {
-            entries: async () => [
+            entriesPaged: async () => [
               [
                 { args: [10, 'validator-1'] },
                 { toHuman: () => ({ total: '100', own: '25', pageCount: '1' }) },
@@ -688,7 +1070,7 @@ describe('ChainIndexer price derivation', () => {
             ],
           },
           erasStakersPaged: {
-            entries: async () => [
+            entriesPaged: async () => [
               [
                 { args: [10, 'validator-1', { toString: () => '0' }] },
                 { toHuman: () => ({ pageTotal: '75', others: [{ who: 'nominator-1', value: '75' }] }) },
@@ -717,10 +1099,10 @@ describe('ChainIndexer price derivation', () => {
     indexer.api = {
       query: {
         staking: {
-          erasStakersOverview: { entries: async () => [] },
-          erasStakersPaged: { entries: async () => [] },
+          erasStakersOverview: { entriesPaged: async () => [] },
+          erasStakersPaged: { entriesPaged: async () => [] },
           erasStakers: {
-            entries: async () => [
+            entriesPaged: async () => [
               [
                 { args: [9, 'validator-1'] },
                 {
@@ -883,7 +1265,7 @@ describe('ChainIndexer price derivation', () => {
         },
         staking: {
           validators: {
-            entries: async () => [
+            entriesPaged: async () => [
               [
                 { args: ['validator-1'] },
                 {
@@ -895,14 +1277,14 @@ describe('ChainIndexer price derivation', () => {
           },
           currentEra: async () => ({ toString: () => '10' }),
           erasValidatorReward: {
-            entries: async () => [[{ args: [{ toString: () => '9' }] }, reward]],
+            entriesPaged: async () => [[{ args: [{ toString: () => '9' }] }, reward]],
           },
           erasRewardPoints: async () => ({
             total: { toString: () => '100' },
             individual: new Map([[account, point]]),
           }),
           erasStakers: {
-            entries: async (era: number) => [
+            entriesPaged: async ({ args: [era] }: { args: [number] }) => [
               [
                 { args: [era, 'validator-1'] },
                 {
@@ -970,17 +1352,17 @@ describe('ChainIndexer price derivation', () => {
         identity: { identityOf: async () => ({ isEmpty: true }) },
         staking: {
           validators: {
-            entries: async () => [
+            entriesPaged: async () => [
               [{ args: ['validator-1'] }, { commission: { unwrap: () => ({ toString: () => '0' }) }, blocked: { isTrue: false } }],
             ],
           },
           currentEra: async () => ({ toString: () => '10' }),
-          erasValidatorReward: { entries: async () => [] },
+          erasValidatorReward: { entriesPaged: async () => [] },
           erasRewardPoints: async () => {
             throw new Error('staking.erasRewardPoints should not be read without a completed reward era');
           },
           erasStakers: {
-            entries: async (era: number) => [
+            entriesPaged: async ({ args: [era] }: { args: [number] }) => [
               [
                 { args: [era, 'validator-1'] },
                 {
@@ -1036,20 +1418,20 @@ describe('ChainIndexer price derivation', () => {
         identity: { identityOf: async () => ({ isEmpty: true }) },
         staking: {
           validators: {
-            entries: async () => [
+            entriesPaged: async () => [
               [{ args: ['validator-1'] }, { commission: { unwrap: () => ({ toString: () => '0' }) }, blocked: { isTrue: false } }],
             ],
           },
           currentEra: async () => ({ toString: () => '10' }),
           erasValidatorReward: {
-            entries: async () => [[{ args: [{ toString: () => '9' }] }, { unwrap: () => ({ toString: () => '100' }) }]],
+            entriesPaged: async () => [[{ args: [{ toString: () => '9' }] }, { unwrap: () => ({ toString: () => '100' }) }]],
           },
           erasRewardPoints: async () => ({
             total: { toString: () => '100' },
             individual: rewardPoints,
           }),
           erasStakers: {
-            entries: async (era: number) =>
+            entriesPaged: async ({ args: [era] }: { args: [number] }) =>
               era === 10
                 ? [
                     [
@@ -3729,645 +4111,29 @@ describe('ChainIndexer price derivation', () => {
     expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '0', outgoingUSD: '4' });
   });
 
-  it('backfills account transaction rows from legacy history without external hex addresses', async () => {
-    const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
-      backfillAccountTransactions: () => Promise<boolean>;
-    };
 
-    await repository.upsertMany([
-      {
-        collection: 'historyElements',
-        id: 'legacy-a',
-        blockHeight: 1,
-        timestamp: 100,
-        data: {
-          id: 'legacy-a',
-          blockHeight: 1,
-          timestamp: 100,
-          address: 'alice',
-          dataFrom: 'alice',
-          dataTo: '0xrecipient',
-        },
-      },
-      {
-        collection: 'historyElements',
-        id: 'legacy-b',
-        blockHeight: 2,
-        timestamp: 200,
-        data: {
-          id: 'legacy-b',
-          blockHeight: 2,
-          timestamp: 200,
-          address: '0xbridgepeer',
-          dataFrom: '0xsender',
-          dataTo: 'bob',
-        },
-      },
-      {
-        collection: 'historyElements',
-        id: 'legacy-c',
-        blockHeight: 'not-a-number' as never,
-        timestamp: 'not-a-number' as never,
-        data: {
-          id: 'legacy-c',
-          blockHeight: 'not-a-number',
-          timestamp: 'not-a-number',
-          address: ' alice ',
-          dataFrom: 'not an account',
-          dataTo: { toString: () => 'carol' },
-        },
-      },
-    ]);
 
-    await expect(indexer.backfillAccountTransactions()).resolves.toBe(true);
 
-    const aliceActivity = await repository.get('accountTransactions', 'legacy-a-alice');
-    const bobActivity = await repository.get('accountTransactions', 'legacy-b-bob');
-    const duplicateAliceActivity = await repository.get('accountTransactions', 'legacy-c-alice');
-    const externalRecipient = await repository.get('accountTransactions', 'legacy-a-0xrecipient');
-    const externalSender = await repository.get('accountTransactions', 'legacy-b-0xsender');
-    const malformedText = await repository.get('accountTransactions', 'legacy-c-not an account');
-    const objectCoercion = await repository.get('accountTransactions', 'legacy-c-carol');
-    const backfillState = await repository.get('updatesStreams', 'accountTransactionsBackfill-v1');
 
-    expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: 'legacy-a', timestamp: 100 });
-    expect(bobActivity?.data).toMatchObject({ accountId: 'bob', historyElementId: 'legacy-b', timestamp: 200 });
-    expect(duplicateAliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: 'legacy-c', timestamp: 0 });
-    expect(externalRecipient).toBeNull();
-    expect(externalSender).toBeNull();
-    expect(malformedText).toBeNull();
-    expect(objectCoercion).toBeNull();
-    expect(backfillState?.data).toMatchObject({
-      id: 'accountTransactionsBackfill-v1',
-      block: 2,
-      data: JSON.stringify({ processedDocuments: 3, writtenDocuments: 3, lastIndexedBlock: 2, lastTimestamp: 200 }),
-    });
-    await expect(indexer.backfillAccountTransactions()).resolves.toBe(false);
-    await expect(repository.list('accountTransactions')).resolves.toHaveLength(3);
-  });
 
-  it('does not trust a corrupt account transaction backfill marker', async () => {
-    const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
-      backfillAccountTransactions: () => Promise<boolean>;
-    };
 
-    await repository.upsertMany([
-      {
-        collection: 'updatesStreams',
-        id: 'accountTransactionsBackfill-v1',
-        data: { id: 'accountTransactionsBackfill-v1', data: 'not-json' },
-      },
-      {
-        collection: 'historyElements',
-        id: 'legacy-corrupt-state',
-        blockHeight: 9,
-        timestamp: 900,
-        data: { id: 'legacy-corrupt-state', blockHeight: 9, timestamp: 900, address: 'bob' },
-      },
-    ]);
 
-    await expect(indexer.backfillAccountTransactions()).resolves.toBe(true);
 
-    expect(await repository.get('accountTransactions', 'legacy-corrupt-state-bob')).not.toBeNull();
-    expect((await repository.get('updatesStreams', 'accountTransactionsBackfill-v1'))?.data.data).toBe(
-      JSON.stringify({ processedDocuments: 1, writtenDocuments: 1, lastIndexedBlock: 9, lastTimestamp: 900 })
-    );
-  });
-
-  it('does not trust structurally invalid account transaction backfill markers', async () => {
-    const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
-      backfillAccountTransactions: () => Promise<boolean>;
-    };
-
-    await repository.upsertMany([
-      {
-        collection: 'updatesStreams',
-        id: 'accountTransactionsBackfill-v1',
-        data: {
-          id: 'accountTransactionsBackfill-v1',
-          data: JSON.stringify({
-            processedDocuments: '1',
-            writtenDocuments: 1,
-            lastIndexedBlock: -1,
-            lastTimestamp: 900,
-          }),
-        },
-      },
-      {
-        collection: 'historyElements',
-        id: 'legacy-invalid-state-shape',
-        blockHeight: 10,
-        timestamp: 1_000,
-        data: { id: 'legacy-invalid-state-shape', blockHeight: 10, timestamp: 1_000, address: 'carol' },
-      },
-    ]);
-
-    await expect(indexer.backfillAccountTransactions()).resolves.toBe(true);
-
-    expect(await repository.get('accountTransactions', 'legacy-invalid-state-shape-carol')).not.toBeNull();
-    expect((await repository.get('updatesStreams', 'accountTransactionsBackfill-v1'))?.data.data).toBe(
-      JSON.stringify({ processedDocuments: 1, writtenDocuments: 1, lastIndexedBlock: 10, lastTimestamp: 1_000 })
-    );
-  });
-
-  it('backfills compact XOR burn documents without rewinding chain state', async () => {
-    const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
-      api: unknown;
-      backfillXorBurns: (finalizedBlock: number) => Promise<void>;
-      drainFinalizedHeads: () => Promise<void>;
-    };
-    const burnBlock = 25_043_003;
-    const chainStateBlock = 26_000_000;
-    const nexusRecipient = 'sora-nexus-account';
-    const burnCall = {
-      section: 'assets',
-      method: 'burn',
-      args: [XOR, '10000000000000000000'],
-      meta: { args: [{ name: 'assetId' }, { name: 'amount' }] },
-    };
-    const remarkCall = {
-      section: 'system',
-      method: 'remark',
-      args: [
-        `0x${Buffer.from(
-          JSON.stringify({ type: 'soraNexusXorClaim', version: 1, recipient: nexusRecipient }),
-          'utf8'
-        ).toString('hex')}`,
-      ],
-      meta: { args: [{ name: 'remark' }] },
-    };
-
-    await repository.upsert({
-      collection: 'updatesStreams',
-      id: 'chainState',
-      blockHeight: chainStateBlock,
-      timestamp: 1,
-      data: {
-        id: 'chainState',
-        block: chainStateBlock,
-        data: JSON.stringify({ lastIndexedBlock: chainStateBlock }),
-      },
-    });
-
-    indexer.api = {
-      rpc: {
-        chain: {
-          getBlockHash: async (block: number) => `hash-${block}`,
-          getBlock: async () => ({
-            block: {
-              extrinsics: [
-                {
-                  hash: { toString: () => '0xbackfilledburn' },
-                  method: {
-                    section: 'utility',
-                    method: 'batchAll',
-                    args: [[burnCall, remarkCall]],
-                    meta: { args: [{ name: 'calls' }] },
-                  },
-                },
-              ],
-            },
-          }),
-        },
-      },
-      query: {
-        system: {
-          events: {
-            at: async (hash: string) =>
-              hash === `hash-${burnBlock}`
-                ? [eventRecord('assets', 'Burn', { address: 'alice', assetId: XOR, amount: '10000000000000000000' })]
-                : [],
-          },
-        },
-      },
-    };
-    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
-
-    await indexer.backfillXorBurns(burnBlock + 1);
-
-    const xorBurn = await repository.get('xorBurns', '0xbackfilledburn');
-    const chainState = await repository.get('updatesStreams', 'chainState');
-    const backfillState = await repository.get('updatesStreams', 'xorBurnsBackfill');
-
-    expect(xorBurn?.data).toMatchObject({
-      id: '0xbackfilledburn',
-      address: 'alice',
-      amount: '10',
-      assetId: XOR,
-      blockHeight: burnBlock,
-      txHash: '0xbackfilledburn',
-      nexusRecipient,
-    });
-    expect(chainState?.data).toMatchObject({
-      id: 'chainState',
-      block: chainStateBlock,
-      data: JSON.stringify({ lastIndexedBlock: chainStateBlock }),
-    });
-    expect(backfillState?.data).toMatchObject({
-      id: 'xorBurnsBackfill',
-      block: burnBlock + 1,
-      data: JSON.stringify({ lastIndexedBlock: burnBlock + 1 }),
-    });
-    expect(indexer.drainFinalizedHeads).toHaveBeenCalled();
-  });
-
-  it('skips compact XOR burn backfill when the node has pruned historical state', async () => {
-    const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
-      api: unknown;
-      backfillXorBurns: (finalizedBlock: number) => Promise<void>;
-      drainFinalizedHeads: () => Promise<void>;
-    };
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-
-    indexer.api = {
-      rpc: {
-        chain: {
-          getBlockHash: async () => {
-            throw new Error('State already discarded for historical block');
-          },
-        },
-      },
-      query: { system: { events: { at: async () => [] } } },
-    };
-    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
-
-    try {
-      await expect(indexer.backfillXorBurns(25_043_010)).resolves.toBeUndefined();
-    } finally {
-      warn.mockRestore();
-    }
-
-    expect(await repository.get('updatesStreams', 'xorBurnsBackfill')).toBeNull();
-    expect(indexer.drainFinalizedHeads).not.toHaveBeenCalled();
-  });
-
-  it('backfills bridgeProxy burn history from the first block without rewinding live chain state', async () => {
-    const repository = new MemoryRepository();
-    const indexer = new ChainIndexer({ ...config, chainStartBlock: 123 }, repository) as unknown as {
-      api: unknown;
-      prices: Map<string, bigint>;
-      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
-      backfillBridgeProxyHistory: (finalizedBlock: number) => Promise<void>;
-      drainFinalizedHeads: () => Promise<void>;
-    };
-    const chainStateBlock = 26_000_000;
-    const bridgeBlock = 5;
-    const blockHashCalls: number[] = [];
-
-    indexer.prices = new Map([[XOR, 2n * SCALE]]);
-    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
-    await repository.upsert({
-      collection: 'updatesStreams',
-      id: 'chainState',
-      blockHeight: chainStateBlock,
-      timestamp: 1,
-      data: {
-        id: 'chainState',
-        block: chainStateBlock,
-        data: JSON.stringify({ lastIndexedBlock: chainStateBlock }),
-      },
-    });
-    await repository.upsert({
-      collection: 'accountTransactions',
-      id: `0xbridgebackfill-${LIBERLAND_ACCOUNT}`,
-      blockHeight: bridgeBlock,
-      timestamp: 1,
-      data: {
-        id: `0xbridgebackfill-${LIBERLAND_ACCOUNT}`,
-        accountId: LIBERLAND_ACCOUNT,
-        historyElementId: '0xbridgebackfill',
-        blockHeight: bridgeBlock,
-        timestamp: 1,
-      },
-    });
-
-    indexer.api = {
-      rpc: {
-        chain: {
-          getBlockHash: async (block: number) => {
-            blockHashCalls.push(block);
-            return `hash-${block}`;
-          },
-          getBlock: async (hash: string) => {
-            const block = Number(hash.replace('hash-', ''));
-            return {
-              block: {
-                header: {
-                  number: { toNumber: () => block },
-                  hash: { toString: () => `0xblock-${block}` },
-                },
-                extrinsics:
-                  block === bridgeBlock
-                    ? [
-                        {
-                          isSigned: true,
-                          signer: { toString: () => 'alice' },
-                          hash: { toString: () => '0xbridgebackfill' },
-                          method: {
-                            section: 'bridgeProxy',
-                            method: 'burn',
-                            args: [{ Sub: 'Liberland' }, XOR, { Liberland: LIBERLAND_ACCOUNT }, (7n * SCALE).toString()],
-                            meta: {
-                              args: [{ name: 'networkId' }, { name: 'assetId' }, { name: 'recipient' }, { name: 'amount' }],
-                            },
-                          },
-                        },
-                      ]
-                    : [],
-              },
-            };
-          },
-        },
-        state: {
-          getMetadata: async () => ({
-            asLatest: {
-              pallets: [{ name: { toString: () => 'bridgeProxy' } }],
-            },
-          }),
-        },
-      },
-      at: async (hash: string) => ({
-        query: {
-          system: {
-            events: async () =>
-              hash === `hash-${bridgeBlock}`
-                ? [eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xbridgebackfillrequest', status: 'Done' })]
-                : [],
-          },
-          timestamp: {
-            now: async () => ({ toString: () => '1700000002000' }),
-          },
-        },
-      }),
-      query: {
-        system: {
-          events: {
-            at: async (hash: string) =>
-              hash === `hash-${bridgeBlock}`
-                ? [eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xbridgebackfillrequest', status: 'Done' })]
-                : [],
-          },
-        },
-        timestamp: {
-          now: {
-            at: async () => ({ toString: () => '1700000002000' }),
-          },
-        },
-      },
-    };
-    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
-
-    await indexer.backfillBridgeProxyHistory(bridgeBlock + 1);
-
-    const history = await repository.get('historyElements', '0xbridgebackfill');
-    const aliceActivity = await repository.get('accountTransactions', '0xbridgebackfill-alice');
-    const externalActivity = await repository.get('accountTransactions', `0xbridgebackfill-${LIBERLAND_ACCOUNT}`);
-    const chainState = await repository.get('updatesStreams', 'chainState');
-    const backfillState = await repository.get('updatesStreams', 'bridgeProxyHistoryBackfill-v1');
-
-    expect(blockHashCalls).toContain(0);
-    expect(history?.data).toMatchObject({
-      module: 'bridgeProxy',
-      method: 'burn',
-      address: 'alice',
-      dataFrom: 'alice',
-      dataTo: LIBERLAND_ACCOUNT,
-      data: {
-        assetId: XOR,
-        amount: '7',
-        amountUSD: '14',
-        networkId: 'Liberland',
-        externalNetwork: 'Liberland',
-        externalNetworkType: 'Sub',
-        recipient: LIBERLAND_ACCOUNT,
-        requestHash: '0xbridgebackfillrequest',
-        status: 'Done',
-      },
-    });
-    expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: '0xbridgebackfill' });
-    expect(externalActivity).toBeNull();
-    await expect(repository.list('accounts')).resolves.toHaveLength(0);
-    await expect(repository.list('accountMeta')).resolves.toHaveLength(0);
-    await expect(repository.list('networkSnapshots')).resolves.toHaveLength(0);
-    expect(chainState?.data).toMatchObject({
-      id: 'chainState',
-      block: chainStateBlock,
-      data: JSON.stringify({ lastIndexedBlock: chainStateBlock }),
-    });
-    expect(backfillState?.data).toMatchObject({
-      id: 'bridgeProxyHistoryBackfill-v1',
-      block: bridgeBlock + 1,
-      data: JSON.stringify({ lastIndexedBlock: bridgeBlock + 1 }),
-    });
-    expect(indexer.drainFinalizedHeads).toHaveBeenCalled();
-  });
-
-  it('skips bridgeProxy history backfill when the node has pruned historical state', async () => {
-    const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
-      api: unknown;
-      backfillBridgeProxyHistory: (finalizedBlock: number) => Promise<void>;
-      drainFinalizedHeads: () => Promise<void>;
-    };
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-
-    indexer.api = {
-      rpc: {
-        chain: {
-          getBlockHash: async (block: number) => `hash-${block}`,
-        },
-        state: {
-          getMetadata: async () => {
-            throw new Error('State already discarded for historical block');
-          },
-        },
-      },
-    };
-    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
-
-    try {
-      await expect(indexer.backfillBridgeProxyHistory(10)).resolves.toBeUndefined();
-    } finally {
-      warn.mockRestore();
-    }
-
-    expect(await repository.get('updatesStreams', 'bridgeProxyHistoryBackfill-v1')).toBeNull();
-    expect(indexer.drainFinalizedHeads).not.toHaveBeenCalled();
-  });
-
-  it('backfills completed incoming bridgeProxy mint history without indexing the external Liberland account', async () => {
-    const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
-      api: unknown;
-      prices: Map<string, bigint>;
-      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
-      backfillBridgeProxyHistory: (finalizedBlock: number) => Promise<void>;
-      drainFinalizedHeads: () => Promise<void>;
-    };
-    const bridgeBlock = 7;
-
-    indexer.prices = new Map([[XOR, 2n * SCALE]]);
-    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
-    await repository.upsert({
-      collection: 'accountTransactions',
-      id: `0xincomingbackfillrequest-mint-${LIBERLAND_ACCOUNT}`,
-      blockHeight: bridgeBlock,
-      timestamp: 1,
-      data: {
-        id: `0xincomingbackfillrequest-mint-${LIBERLAND_ACCOUNT}`,
-        accountId: LIBERLAND_ACCOUNT,
-        historyElementId: '0xincomingbackfillrequest-mint',
-        blockHeight: bridgeBlock,
-        timestamp: 1,
-      },
-    });
-
-    indexer.api = {
-      rpc: {
-        chain: {
-          getBlockHash: async (block: number) => `hash-${block}`,
-          getBlock: async (hash: string) => {
-            const block = Number(hash.replace('hash-', ''));
-            return {
-              block: {
-                header: {
-                  number: { toNumber: () => block },
-                  hash: { toString: () => `0xblock-${block}` },
-                },
-                extrinsics:
-                  block === bridgeBlock
-                    ? [
-                        {
-                          isSigned: true,
-                          signer: { toString: () => 'relayer' },
-                          hash: { toString: () => '0xincomingbackfillsubmit' },
-                          method: {
-                            section: 'bridgeChannelInbound',
-                            method: 'submit',
-                            args: [
-                              { Sub: 'Liberland' },
-                              {
-                                source: { Liberland: LIBERLAND_ACCOUNT },
-                                dest: { Sora: 'alice' },
-                                assetId: XOR,
-                              },
-                            ],
-                            meta: {
-                              args: [{ name: 'networkId' }, { name: 'message' }],
-                            },
-                          },
-                        },
-                      ]
-                    : [],
-              },
-            };
-          },
-        },
-        state: {
-          getMetadata: async () => ({
-            asLatest: {
-              pallets: [{ name: { toString: () => 'bridgeChannelInbound' } }],
-            },
-          }),
-        },
-      },
-      at: async (hash: string) => ({
-        query: {
-          system: {
-            events: async () =>
-              hash === `hash-${bridgeBlock}`
-                ? [
-                    eventRecord('bridgeProxy', 'RequestStatusUpdate', {
-                      requestHash: '0xincomingbackfillrequest',
-                      status: 'Done',
-                    }),
-                    eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: (4n * SCALE).toString() }),
-                  ]
-                : [],
-          },
-          timestamp: {
-            now: async () => ({ toString: () => '1700000003000' }),
-          },
-        },
-      }),
-      query: {
-        system: {
-          events: {
-            at: async (hash: string) =>
-              hash === `hash-${bridgeBlock}`
-                ? [
-                    eventRecord('bridgeProxy', 'RequestStatusUpdate', {
-                      requestHash: '0xincomingbackfillrequest',
-                      status: 'Done',
-                    }),
-                    eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: (4n * SCALE).toString() }),
-                  ]
-                : [],
-          },
-        },
-        timestamp: {
-          now: {
-            at: async () => ({ toString: () => '1700000003000' }),
-          },
-        },
-      },
-    };
-    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
-
-    await indexer.backfillBridgeProxyHistory(bridgeBlock);
-
-    const original = await repository.get('historyElements', '0xincomingbackfillsubmit');
-    const history = await repository.get('historyElements', '0xincomingbackfillrequest-mint');
-    const aliceActivity = await repository.get('accountTransactions', '0xincomingbackfillrequest-mint-alice');
-    const externalActivity = await repository.get('accountTransactions', `0xincomingbackfillrequest-mint-${LIBERLAND_ACCOUNT}`);
-
-    expect(original).toBeNull();
-    expect(history?.data).toMatchObject({
-      module: 'bridgeProxy',
-      method: 'mint',
-      address: 'relayer',
-      dataFrom: 'alice',
-      dataTo: LIBERLAND_ACCOUNT,
-      data: {
-        assetId: XOR,
-        amount: '4',
-        amountUSD: '8',
-        networkId: 'Liberland',
-        externalNetwork: 'Liberland',
-        externalNetworkType: 'Sub',
-        recipient: 'alice',
-        sender: LIBERLAND_ACCOUNT,
-        requestHash: '0xincomingbackfillrequest',
-        status: 'Done',
-      },
-    });
-    expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: '0xincomingbackfillrequest-mint' });
-    expect(externalActivity).toBeNull();
-  });
-
-  it('subscribes to finalized heads before running startup maintenance backfills', async () => {
+  it('publishes current-state maintenance before subscribing to finalized heads', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
       start: () => Promise<void>;
-      refreshIndexingState: () => Promise<void>;
-      refreshDerivedState: (blockHeight: number, timestamp: number, includeSnapshots: boolean) => Promise<void>;
-      backfillXorBurns: (finalizedBlock: number) => Promise<void>;
-      backfillBridgeProxyHistory: (finalizedBlock: number) => Promise<void>;
+      stop: () => Promise<void>;
       backfill: () => Promise<boolean>;
-      backfillAccountTransactions: () => Promise<boolean>;
-      backfillNetworkAggregateSnapshots: () => Promise<boolean>;
-      cleanupAssetSnapshotPriceOutliers: () => Promise<boolean>;
-      repairNetworkTransactionCounters: () => Promise<boolean>;
       subscribeFinalizedHeads: () => Promise<void>;
+      runStartupMaintenance: (finalizedBlock: number) => Promise<number>;
+      getStatus: () => { startupComplete: boolean };
     };
     const order: string[] = [];
     let finishBackfill: (() => void) | undefined;
+    let finishMaintenance: (() => void) | undefined;
     const apiCreate = vi.spyOn(ApiPromise, 'create').mockResolvedValue({
+      disconnect: vi.fn(async () => undefined),
       rpc: {
         chain: {
           getFinalizedHead: async () => '0xfinal',
@@ -4376,19 +4142,6 @@ describe('ChainIndexer price derivation', () => {
       },
     } as never);
 
-    indexer.refreshIndexingState = async () => {
-      order.push('indexing-state-refresh');
-    };
-    indexer.cleanupAssetSnapshotPriceOutliers = async () => {
-      order.push('cleanup');
-      return false;
-    };
-    indexer.backfillXorBurns = async () => {
-      order.push('xor-burn-backfill');
-    };
-    indexer.backfillBridgeProxyHistory = async () => {
-      order.push('bridge-history-backfill');
-    };
     indexer.backfill = async () => {
       order.push('normal-backfill-start');
       await new Promise<void>((resolve) => {
@@ -4397,98 +4150,87 @@ describe('ChainIndexer price derivation', () => {
       order.push('normal-backfill-end');
       return false;
     };
-    indexer.backfillAccountTransactions = async () => {
-      order.push('account-backfill');
-      return false;
-    };
-    indexer.repairNetworkTransactionCounters = async () => {
-      order.push('repair-network-counters');
-      return false;
-    };
-    indexer.backfillNetworkAggregateSnapshots = async () => {
-      order.push('network-aggregate-backfill');
-      return false;
-    };
     indexer.subscribeFinalizedHeads = async () => {
       order.push('subscribe');
     };
-
-    const startPromise = indexer.start();
-
-    await vi.waitFor(() => {
-      expect(order).toEqual(['indexing-state-refresh', 'normal-backfill-start']);
-    });
-
-    finishBackfill?.();
-    await startPromise;
-
-    await vi.waitFor(() => {
-      expect(order).toEqual([
-        'indexing-state-refresh',
-        'normal-backfill-start',
-        'normal-backfill-end',
-        'subscribe',
-        'cleanup',
-        'account-backfill',
-        'repair-network-counters',
-        'network-aggregate-backfill',
-        'xor-burn-backfill',
-        'bridge-history-backfill',
-      ]);
-    });
-    apiCreate.mockRestore();
-  });
-
-  it('logs compact XOR burn backfill failures after finalized-head subscription is established', async () => {
-    const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
-      start: () => Promise<void>;
-      refreshIndexingState: () => Promise<void>;
-      refreshDerivedState: (blockHeight: number, timestamp: number, includeSnapshots: boolean) => Promise<void>;
-      backfillXorBurns: (finalizedBlock: number) => Promise<void>;
-      backfillBridgeProxyHistory: (finalizedBlock: number) => Promise<void>;
-      backfill: () => Promise<boolean>;
-      backfillAccountTransactions: () => Promise<boolean>;
-      backfillNetworkAggregateSnapshots: () => Promise<boolean>;
-      cleanupAssetSnapshotPriceOutliers: () => Promise<boolean>;
-      repairNetworkTransactionCounters: () => Promise<boolean>;
-      subscribeFinalizedHeads: () => Promise<void>;
+    indexer.runStartupMaintenance = async () => {
+      order.push('current-state-maintenance');
+      await new Promise<void>((resolve) => {
+        finishMaintenance = resolve;
+      });
+      return 25_900_000;
     };
-    const failure = new Error('xor burn backfill failed');
-    const subscribeFinalizedHeads = vi.fn();
-    const apiCreate = vi.spyOn(ApiPromise, 'create').mockResolvedValue({
-      rpc: {
-        chain: {
-          getFinalizedHead: async () => '0xfinal',
-          getHeader: async () => ({ number: { toNumber: () => 25_900_000 } }),
-        },
-      },
-    } as never);
-
-    indexer.refreshIndexingState = async () => undefined;
-    indexer.cleanupAssetSnapshotPriceOutliers = async () => false;
-    indexer.backfillXorBurns = async () => {
-      throw failure;
-    };
-    indexer.backfillBridgeProxyHistory = async () => undefined;
-    indexer.backfill = async () => false;
-    indexer.backfillAccountTransactions = async () => false;
-    indexer.repairNetworkTransactionCounters = async () => false;
-    indexer.backfillNetworkAggregateSnapshots = async () => false;
-    indexer.subscribeFinalizedHeads = subscribeFinalizedHeads;
-    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
     try {
-      await expect(indexer.start()).resolves.toBeUndefined();
-      expect(subscribeFinalizedHeads).toHaveBeenCalledOnce();
-      await vi.waitFor(() => {
-        expect(consoleError).toHaveBeenCalledWith('XOR burn backfill failed', failure);
-      });
+      const starting = indexer.start();
+      await vi.waitFor(() => expect(order).toEqual(['normal-backfill-start']));
+      finishBackfill?.();
+      await vi.waitFor(() =>
+        expect(order).toEqual([
+          'normal-backfill-start',
+          'normal-backfill-end',
+          'current-state-maintenance',
+        ])
+      );
+      expect(indexer.getStatus().startupComplete).toBe(false);
+      finishMaintenance?.();
+      await starting;
+      expect(order).toEqual([
+        'normal-backfill-start',
+        'normal-backfill-end',
+        'current-state-maintenance',
+        'subscribe',
+      ]);
+      expect(indexer.getStatus().startupComplete).toBe(true);
     } finally {
-      consoleError.mockRestore();
+      await indexer.stop();
       apiCreate.mockRestore();
     }
   });
+
+  it('does not scan historical collections during fresh-store startup maintenance', async () => {
+    const repository = new MemoryRepository();
+    const query = vi.spyOn(repository, 'query');
+    const list = vi.spyOn(repository, 'list');
+    const refreshDerivedState = vi.fn(async () => undefined);
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      runStartupMaintenance: (finalizedBlock: number) => Promise<number>;
+      refreshDerivedState: typeof refreshDerivedState;
+    };
+    indexer.refreshDerivedState = refreshDerivedState;
+
+    await expect(indexer.runStartupMaintenance(100)).resolves.toBe(100);
+
+    expect(query).not.toHaveBeenCalled();
+    expect(list).not.toHaveBeenCalled();
+    expect(refreshDerivedState).toHaveBeenCalledWith(100, expect.any(Number), true, true);
+  });
+
+  it('starts a fresh chain at block zero and rejects malformed persisted chain state', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      getLastIndexedBlock: () => Promise<number>;
+    };
+
+    await expect(indexer.getLastIndexedBlock()).resolves.toBe(-1);
+
+    repository.get = vi.fn(
+      async () =>
+        ({
+          collection: 'updatesStreams',
+          id: 'chainState',
+          blockHeight: 10,
+          data: {
+            id: 'chainState',
+            block: 9,
+            data: JSON.stringify({ lastIndexedBlock: 10 }),
+          },
+        }) as IndexerDocument
+    );
+    await expect(indexer.getLastIndexedBlock()).rejects.toThrow('Stored chainState document is malformed');
+  });
+
+
 
   it('keeps finalized-head subscription alive when the initial RPC update times out', async () => {
     const repository = new MemoryRepository();
@@ -4555,6 +4297,7 @@ describe('ChainIndexer price derivation', () => {
       api: unknown;
       backfill: () => Promise<boolean>;
       indexBlockByNumber: (block: number, options?: { refreshDerivedState?: boolean }) => Promise<void>;
+      initializeHistoricalValuationState: (startBlock: number) => Promise<unknown>;
       refreshDerivedState: (blockHeight: number, timestamp: number, includeSnapshots: boolean) => Promise<void>;
     };
     const indexedBlocks: Array<{ block: number; refreshDerivedState?: boolean }> = [];
@@ -4568,6 +4311,7 @@ describe('ChainIndexer price derivation', () => {
         },
       },
     };
+    indexer.initializeHistoricalValuationState = vi.fn(async () => ({ blockHeight: 0 }));
     indexer.indexBlockByNumber = async (block, options) => {
       indexedBlocks.push({ block, refreshDerivedState: options?.refreshDerivedState });
     };
@@ -4578,6 +4322,7 @@ describe('ChainIndexer price derivation', () => {
     await indexer.backfill();
 
     expect(indexedBlocks).toEqual([
+      { block: 0, refreshDerivedState: false },
       { block: 1, refreshDerivedState: false },
       { block: 2, refreshDerivedState: false },
       { block: 3, refreshDerivedState: false },
@@ -4792,7 +4537,11 @@ describe('ChainIndexer price derivation', () => {
     const indexer = new ChainIndexer(config, repository) as unknown as {
       api: unknown;
       subscribeFinalizedHeads: () => Promise<void>;
-      indexBlockByNumber: (block: number) => Promise<void>;
+      ensureLiveValuationState: (block: number) => Promise<{ blockHeight: number }>;
+      indexBlockByNumber: (
+        block: number,
+        options?: { historicalValuationState?: { blockHeight: number } }
+      ) => Promise<void>;
     };
     const indexedBlocks: number[] = [];
     let finalizedHeadCallback: ((header: { number: { toNumber: () => number } }) => Promise<void>) | undefined;
@@ -4820,11 +4569,15 @@ describe('ChainIndexer price derivation', () => {
         },
       },
     };
-    indexer.indexBlockByNumber = async (block) => {
+    const valuationState = { blockHeight: 9 };
+    indexer.ensureLiveValuationState = vi.fn(async () => valuationState);
+    indexer.indexBlockByNumber = async (block, options) => {
       indexedBlocks.push(block);
       if (block === 10 && indexedBlocks.length === 1) {
         throw new Error('transient database failure');
       }
+
+      options!.historicalValuationState!.blockHeight = block;
 
       await repository.upsert({
         collection: 'updatesStreams',
@@ -4864,7 +4617,11 @@ describe('ChainIndexer price derivation', () => {
     const indexer = new ChainIndexer(config, repository) as unknown as {
       api: unknown;
       subscribeFinalizedHeads: () => Promise<void>;
-      indexBlockByNumber: (block: number) => Promise<void>;
+      ensureLiveValuationState: (block: number) => Promise<{ blockHeight: number }>;
+      indexBlockByNumber: (
+        block: number,
+        options?: { historicalValuationState?: { blockHeight: number } }
+      ) => Promise<void>;
     };
     const indexedBlocks: number[] = [];
 
@@ -4889,8 +4646,11 @@ describe('ChainIndexer price derivation', () => {
         },
       },
     };
-    indexer.indexBlockByNumber = async (block) => {
+    const valuationState = { blockHeight: 9 };
+    indexer.ensureLiveValuationState = vi.fn(async () => valuationState);
+    indexer.indexBlockByNumber = async (block, options) => {
       indexedBlocks.push(block);
+      options!.historicalValuationState!.blockHeight = block;
       await repository.upsert({
         collection: 'updatesStreams',
         id: 'chainState',
@@ -5145,7 +4905,7 @@ describe('ChainIndexer price derivation', () => {
           id: 'dave-charlie',
           referral: 'charlie',
           referrer: 'dave',
-          blockHeight: '12',
+          blockHeight: 12,
           timestamp: 1_700_000_000,
           updated: 1_700_000_000,
           amount: '0',
@@ -5301,6 +5061,92 @@ describe('ChainIndexer price derivation', () => {
     ]);
   });
 
+  it('writes account liquidity only on snapshot ticks and skips unchanged writes in the same bucket', async () => {
+    const repository = new MemoryRepository();
+    const getMany = vi.spyOn(repository, 'getMany');
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      createChangedAccountLiquidityDocuments: (
+        poolProviders: unknown[],
+        pools: unknown[],
+        assets: Map<string, unknown>,
+        prices: Map<string, bigint>,
+        blockHeight: number,
+        timestamp: number,
+        includeSnapshots: boolean
+      ) => Promise<IndexerDocument[]>;
+    };
+    const pools = [
+      {
+        id: `${XOR}-${KUSD}`,
+        poolAccount: 'pool-account',
+        poolTokenSupply: 1_000n * SCALE,
+        liquidityUSD: '1000',
+      },
+    ];
+    const provider = [[{ args: ['pool-account', 'alice'] }, (250n * SCALE).toString()]];
+    const timestamp = 1_700_000_000;
+
+    await expect(
+      indexer.createChangedAccountLiquidityDocuments(provider, pools, new Map(), new Map(), 76, timestamp, false)
+    ).resolves.toEqual([]);
+    expect(getMany).not.toHaveBeenCalled();
+
+    const initial = await indexer.createChangedAccountLiquidityDocuments(
+      provider,
+      pools,
+      new Map(),
+      new Map(),
+      77,
+      timestamp,
+      true
+    );
+    expect(initial).toHaveLength(1);
+    await repository.upsertMany(initial);
+
+    await expect(
+      indexer.createChangedAccountLiquidityDocuments(provider, pools, new Map(), new Map(), 78, timestamp + 10, true)
+    ).resolves.toEqual([]);
+
+    const changed = await indexer.createChangedAccountLiquidityDocuments(
+      [[{ args: ['pool-account', 'alice'] }, (300n * SCALE).toString()]],
+      pools,
+      new Map(),
+      new Map(),
+      79,
+      timestamp + 20,
+      true
+    );
+    expect(changed).toEqual([
+      expect.objectContaining({
+        id: initial[0]?.id,
+        data: expect.objectContaining({ poolTokens: (300n * SCALE).toString(), liquidityUSD: '300' }),
+      }),
+    ]);
+
+    const cleanCachedNextBucket = await indexer.createChangedAccountLiquidityDocuments(
+      provider,
+      pools,
+      new Map(),
+      new Map(),
+      80,
+      timestamp + 300,
+      false
+    );
+    expect(cleanCachedNextBucket).toEqual([]);
+
+    const nextBucket = await indexer.createChangedAccountLiquidityDocuments(
+      provider,
+      pools,
+      new Map(),
+      new Map(),
+      80,
+      timestamp + 300,
+      true
+    );
+    expect(nextBucket).toHaveLength(1);
+    expect(nextBucket[0]?.id).not.toBe(initial[0]?.id);
+  });
+
   it('buckets default asset snapshots into five-minute chart windows', async () => {
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
       createAssetDocuments: (
@@ -5395,8 +5241,10 @@ describe('ChainIndexer price derivation', () => {
     await expect(defaultSnapshotId(1_700_000_400)).resolves.toBe(`asset-${XOR}-DEFAULT-1700000400`);
   });
 
-  it('does not let block height change default asset snapshot buckets', async () => {
-    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+  it('persists only four chart asset granularities and never looks up BLOCK snapshots', async () => {
+    const repository = new MemoryRepository();
+    const getMany = vi.spyOn(repository, 'getMany');
+    const indexer = new ChainIndexer(config, repository) as unknown as {
       createAssetDocuments: (
         assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
         prices: Map<string, bigint>,
@@ -5443,17 +5291,72 @@ describe('ChainIndexer price derivation', () => {
     const secondDefault = secondBlockDocuments.find(
       (document) => document.collection === 'assetSnapshots' && document.data.type === 'DEFAULT'
     );
-    const firstBlock = firstBlockDocuments.find(
-      (document) => document.collection === 'assetSnapshots' && document.data.type === 'BLOCK'
-    );
-    const secondBlock = secondBlockDocuments.find(
-      (document) => document.collection === 'assetSnapshots' && document.data.type === 'BLOCK'
-    );
 
     expect(firstDefault?.id).toBe(secondDefault?.id);
     expect(firstDefault?.id).toBe(`asset-${XOR}-DEFAULT-1700000100`);
-    expect(firstBlock?.id).toBe(`asset-${XOR}-BLOCK-77`);
-    expect(secondBlock?.id).toBe(`asset-${XOR}-BLOCK-78`);
+    for (const documents of [firstBlockDocuments, secondBlockDocuments]) {
+      expect(
+        documents
+          .filter((document) => document.collection === 'assetSnapshots')
+          .map((document) => document.data.type)
+      ).toEqual(['DEFAULT', 'HOUR', 'DAY', 'MONTH']);
+    }
+    expect(getMany.mock.calls.flatMap((call) => call[1]).some((id) => id.includes('-BLOCK-'))).toBe(false);
+  });
+
+  it('persists tiny price changes and large or tiny volumes as plain decimal strings', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      createAssetDocuments: (
+        assets: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>,
+        prices: Map<string, bigint>,
+        liquidity: Map<string, bigint>,
+        analytics: {
+          assets: Map<string, Map<string, unknown>>;
+          assetDayVolumeUSD: Map<string, bigint>;
+          assetWeekVolumeUSD: Map<string, bigint>;
+          assetDayOpenPrice: Map<string, string>;
+          assetWeekOpenPrice: Map<string, string>;
+          assetOrderBookLiquidity: Map<string, bigint>;
+        },
+        blockHeight: number,
+        timestamp: number,
+        includeSnapshots: boolean
+      ) => Promise<IndexerDocument[]>;
+    };
+    const documents = await indexer.createAssetDocuments(
+      new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'SORA', decimals: 18, supply: 1_000n * SCALE }]]),
+      new Map([[XOR, 100_000_000n * SCALE + 10_000_000_000n]]),
+      new Map(),
+      {
+        assets: new Map(),
+        assetDayVolumeUSD: new Map([[XOR, 10n ** 48n]]),
+        assetWeekVolumeUSD: new Map([[XOR, 100_000_000_000n]]),
+        assetDayOpenPrice: new Map([[XOR, '100000000']]),
+        assetWeekOpenPrice: new Map([[XOR, '100000000']]),
+        assetOrderBookLiquidity: new Map(),
+      },
+      77,
+      1_700_000_000,
+      false
+    );
+    const asset = documents.find((document) => document.collection === 'assets');
+
+    expect(asset?.data).toMatchObject({
+      priceChangeDay: '0.00000000000001',
+      priceChangeWeek: '0.00000000000001',
+      volumeDayUSD: '1000000000000000000000000000000',
+      volumeWeekUSD: '0.0000001',
+    });
+    for (const value of [
+      asset?.data.priceChangeDay,
+      asset?.data.priceChangeWeek,
+      asset?.data.volumeDayUSD,
+      asset?.data.volumeWeekUSD,
+    ]) {
+      expect(String(value)).not.toMatch(/[eE]/);
+    }
+    await expect(repository.upsertMany(documents)).resolves.toBeUndefined();
   });
 
   it('buckets default pool snapshots into five-minute chart windows', async () => {
@@ -5512,6 +5415,11 @@ describe('ChainIndexer price derivation', () => {
     expect(defaultSnapshot?.id).toBe(`pool-${poolId}-DEFAULT-1700000100`);
     expect(defaultSnapshot?.data.timestamp).toBe(timestamp);
     expect(daySnapshot?.id).toBe(`pool-${poolId}-DAY-1699920000`);
+    expect(
+      documents
+        .filter((document) => document.collection === 'poolSnapshots')
+        .map((document) => document.data.type)
+    ).toEqual(['DEFAULT', 'HOUR', 'DAY', 'MONTH']);
   });
 
   it('buckets default order book snapshots into five-minute chart windows', async () => {
@@ -5573,6 +5481,11 @@ describe('ChainIndexer price derivation', () => {
     expect(defaultSnapshot?.id).toBe(`orderBook-${orderBookId}-DEFAULT-1700000100`);
     expect(defaultSnapshot?.data.timestamp).toBe(timestamp);
     expect(daySnapshot?.id).toBe(`orderBook-${orderBookId}-DAY-1699920000`);
+    expect(
+      documents
+        .filter((document) => document.collection === 'orderBookSnapshots')
+        .map((document) => document.data.type)
+    ).toEqual(['DEFAULT', 'HOUR', 'DAY', 'MONTH']);
   });
 
   it('projects Polkamarkt runtime storage into production market documents', () => {
@@ -5713,6 +5626,11 @@ describe('ChainIndexer price derivation', () => {
         status: 'Open',
       },
     });
+    expect(
+      documentsWithSnapshots
+        .filter((document) => document.collection === 'marketSnapshots')
+        .map((document) => document.data.type)
+    ).toEqual(['DEFAULT', 'HOUR', 'DAY', 'MONTH']);
 
     const yesOnlyDocuments = indexer.createPolkamarktMarketDocuments(
       [[{ args: [7] }, { question: bytes('Will one-sided YES volume be projected?'), oracle: bytes('SORA Democracy'), resolutionSource: bytes('sora:governance:democracy:referendum:124') }]],
@@ -5954,6 +5872,10 @@ describe('ChainIndexer price derivation', () => {
         [{ args: [99, 'orphan'] }, { yesShares: (1n * SCALE).toString(), noShares: 0, netCollateralPaid: 0 }],
         [{ args: [3, 'zero'] }, { yesShares: 0, noShares: 0, netCollateralPaid: 0 }],
         [{ args: [3, 'bob'] }, { yesShares: (5n * SCALE).toString(), noShares: 0, netCollateralPaid: (2n * SCALE).toString() }],
+        [
+          { args: [3, 'carol'] },
+          { yesShares: (5n * SCALE).toString(), noShares: 0, netCollateralPaid: (2n * SCALE).toString() },
+        ],
       ],
       [[{ args: [3] }, { creator: 'alice', conditionId: 8, closeBlock: 222, collateralAsset: KUSD, status: 'Cancelled' }]],
       [[{ args: [3] }, (1_000n * SCALE).toString()]],
@@ -5966,7 +5888,7 @@ describe('ChainIndexer price derivation', () => {
       1_700_000_555
     );
 
-    expect(documents.map((document) => document.id).sort()).toEqual(['3-bob']);
+    expect(documents.map((document) => document.id).sort()).toEqual(['3-bob', '3-carol']);
     expect(documents.find((document) => document.id === '3-bob')).toMatchObject({
       data: {
         account: 'bob',
@@ -5979,6 +5901,21 @@ describe('ChainIndexer price derivation', () => {
         claimablePayoutUsd: '20',
         marketValueUsd: '20',
         unrealizedPnlUsd: '18',
+      },
+    });
+    expect(documents.find((document) => document.id === '3-carol')).toMatchObject({
+      data: {
+        account: 'carol',
+        marketId: 3,
+        yesShares: '5',
+        noShares: '0',
+        netCollateralPaid: '2',
+        costBasisUsd: null,
+        yesCostBasisUsd: null,
+        noCostBasisUsd: null,
+        claimablePayoutUsd: null,
+        marketValueUsd: null,
+        unrealizedPnlUsd: null,
       },
     });
   });
@@ -6038,7 +5975,7 @@ describe('ChainIndexer price derivation', () => {
           marketId: 7,
           yesShares: '10',
           noShares: '0',
-          costBasisUsd: '6',
+          costBasisUsd: '999',
           yesCostBasisUsd: '6',
           noCostBasisUsd: '0',
         },
@@ -6053,10 +5990,10 @@ describe('ChainIndexer price derivation', () => {
           account: 'alice',
           marketId: 8,
           yesShares: '1',
-          noShares: '0',
-          costBasisUsd: '2',
+          noShares: '1',
+          costBasisUsd: '999',
           yesCostBasisUsd: '2',
-          noCostBasisUsd: '0',
+          noCostBasisUsd: '1',
         },
       },
     ]);
@@ -6105,7 +6042,7 @@ describe('ChainIndexer price derivation', () => {
     await indexer.enrichPolkamarktRealizedPnl([sellContext, claimContext]);
 
     expect((sellContext.history.data as Record<string, unknown>).realizedPnlUsd).toBe('1');
-    expect((claimContext.history.data as Record<string, unknown>).realizedPnlUsd).toBe('3');
+    expect((claimContext.history.data as Record<string, unknown>).realizedPnlUsd).toBe('2');
   });
 
   it('only enriches batch claim realized PnL when every claimed market has prior basis', async () => {
@@ -6119,7 +6056,9 @@ describe('ChainIndexer price derivation', () => {
         id: '7-alice',
         account: 'alice',
         marketId: 7,
-        costBasisUsd: '2',
+        costBasisUsd: '999',
+        yesCostBasisUsd: '2',
+        noCostBasisUsd: '0',
       },
     });
     const indexer = new ChainIndexer(config, repository) as unknown as {
@@ -6161,6 +6100,84 @@ describe('ChainIndexer price derivation', () => {
 
     expect((completeBatch.history.data as Record<string, unknown>).realizedPnlUsd).toBe('3');
     expect((incompleteBatch.history.data as Record<string, unknown>).realizedPnlUsd).toBeUndefined();
+  });
+
+  it('does not enrich Polkamarkt realized PnL from aggregate-only cost basis', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'accountPositions',
+        id: '7-alice',
+        blockHeight: 10,
+        timestamp: 100,
+        data: {
+          id: '7-alice',
+          account: 'alice',
+          marketId: 7,
+          yesShares: '10',
+          noShares: '0',
+          costBasisUsd: '6',
+        },
+      },
+      {
+        collection: 'accountPositions',
+        id: '8-alice',
+        blockHeight: 10,
+        timestamp: 100,
+        data: {
+          id: '8-alice',
+          account: 'alice',
+          marketId: 8,
+          costBasisUsd: '2',
+        },
+      },
+    ]);
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      enrichPolkamarktRealizedPnl: (contexts: any[]) => Promise<void>;
+    };
+    const sellContext = {
+      id: 'sell',
+      module: 'polkamarkt',
+      method: 'sell',
+      address: 'alice',
+      failed: false,
+      history: {
+        data: { marketId: 7, side: 'sell', outcome: 'YES', collateralUsd: '4', shares: '5' },
+        from: 'alice',
+        to: '',
+        assets: [],
+      },
+      calls: [],
+      callNames: [],
+      events: [],
+      accounts: ['alice'],
+      fee: 0n,
+    };
+    const claimContext = {
+      id: 'claim',
+      module: 'polkamarkt',
+      method: 'claim_market',
+      address: 'alice',
+      failed: false,
+      history: {
+        data: { marketId: 8, side: 'claim', collateralUsd: '5' },
+        from: 'alice',
+        to: '',
+        assets: [],
+      },
+      calls: [],
+      callNames: [],
+      events: [
+        eventRecord('polkamarkt', 'MarketClaimed', { marketId: 8, trader: 'alice', payout: (5n * SCALE).toString() }, 0),
+      ],
+      accounts: ['alice'],
+      fee: 0n,
+    };
+
+    await indexer.enrichPolkamarktRealizedPnl([sellContext, claimContext]);
+
+    expect((sellContext.history.data as Record<string, unknown>).realizedPnlUsd).toBeUndefined();
+    expect((claimContext.history.data as Record<string, unknown>).realizedPnlUsd).toBeUndefined();
   });
 
   it('deletes stale Polkamarkt account positions after zero or removed storage entries', async () => {
@@ -6228,6 +6245,110 @@ describe('ChainIndexer price derivation', () => {
     expect((await repository.get('accountPositions', '3-bob'))?.data.yesShares).toBe('5');
     await expect(repository.get('accountPositions', '3-zero')).resolves.toBeNull();
     await expect(repository.get('accountPositions', '4-absent')).resolves.toBeNull();
+  });
+
+  it('streams stale Polkamarkt positions in bounded ID pages and delete batches', async () => {
+    const repository = new MemoryRepository();
+    const documents: IndexerDocument[] = Array.from({ length: 2_505 }, (_item, index) => {
+      const id = `position-${String(index).padStart(5, '0')}`;
+      return {
+        collection: 'accountPositions',
+        id,
+        blockHeight: 70,
+        timestamp: 1_700_000_000,
+        data: { id, account: `account-${index}`, marketId: index },
+      };
+    });
+    await repository.upsertMany(documents);
+    const activeDocuments = documents.filter((_document, index) => index % 500 === 0);
+    const query = vi.spyOn(repository, 'query');
+    const deleteMany = vi.spyOn(repository, 'deleteMany');
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      deleteStaleAccountPositionDocuments: (activeDocuments: IndexerDocument[]) => Promise<void>;
+    };
+
+    await indexer.deleteStaleAccountPositionDocuments(activeDocuments);
+
+    expect(query).toHaveBeenCalledTimes(3);
+    expect(query.mock.calls[1]?.[1]).toMatchObject({
+      orderBy: ['ID_ASC'],
+      offset: null,
+      keyset: { field: 'id', direction: 'asc', numeric: false },
+    });
+    expect(deleteMany.mock.calls.every((call) => call[1].length <= 1_000)).toBe(true);
+    expect(deleteMany.mock.calls.reduce((total, call) => total + call[1].length, 0)).toBe(
+      documents.length - activeDocuments.length
+    );
+    await expect(repository.list('accountPositions')).resolves.toHaveLength(activeDocuments.length);
+  });
+
+  it('reconciles more than one write-call cap of stale authoritative rows in bounded pages', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      upsertDocumentsInCallChunks: (documents: IndexerDocument[]) => Promise<void>;
+      reconcileAuthoritativeCollection: (
+        collectionName: 'assets',
+        activeIds: Iterable<string>,
+        blockHeight: number
+      ) => Promise<void>;
+    };
+    const documents: IndexerDocument[] = Array.from(
+      { length: MAX_REPOSITORY_WRITE_CALL_DOCUMENTS + 5 },
+      (_item, index) => {
+        const id = `asset-${String(index).padStart(5, '0')}`;
+        return {
+          collection: 'assets',
+          id,
+          blockHeight: 10,
+          timestamp: 10,
+          data: { id, priceUSD: '1' },
+        };
+      }
+    );
+    await indexer.upsertDocumentsInCallChunks(documents);
+    const activeIds = documents.slice(-5).map((document) => document.id);
+    const query = vi.spyOn(repository, 'query');
+    const deleteMany = vi.spyOn(repository, 'deleteMany');
+
+    await indexer.reconcileAuthoritativeCollection('assets', activeIds, 10);
+
+    expect(query.mock.calls.length).toBeGreaterThan(10);
+    expect(deleteMany.mock.calls.every((call) => call[1].length <= 1_000)).toBe(true);
+    expect((await repository.list('assets')).map((document) => document.id)).toEqual(activeIds);
+  });
+
+  it('keeps an immutable authoritative retry plan and never deletes newer rows', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      pendingAuthoritativeReconciliations: Map<
+        string,
+        { activeIds: Set<string>; blockHeight: number }
+      >;
+      queueAuthoritativeReconciliation: (
+        collectionName: 'assets',
+        activeIds: Iterable<string>,
+        blockHeight: number
+      ) => void;
+      reconcilePendingAuthoritativeCollection: (collectionName: 'assets') => Promise<void>;
+    };
+    await repository.upsertMany([
+      { collection: 'assets', id: 'active', blockHeight: 100, timestamp: 100, data: { id: 'active', priceUSD: '1' } },
+      { collection: 'assets', id: 'stale', blockHeight: 100, timestamp: 100, data: { id: 'stale', priceUSD: '1' } },
+      { collection: 'assets', id: 'newer', blockHeight: 101, timestamp: 101, data: { id: 'newer', priceUSD: '1' } },
+    ]);
+    indexer.queueAuthoritativeReconciliation('assets', ['active'], 100);
+    const immutablePlan = indexer.pendingAuthoritativeReconciliations.get('assets');
+    const deleteMany = vi.spyOn(repository, 'deleteMany');
+    deleteMany.mockRejectedValueOnce(new Error('delete failed'));
+
+    await expect(indexer.reconcilePendingAuthoritativeCollection('assets')).rejects.toThrow('delete failed');
+    expect(indexer.pendingAuthoritativeReconciliations.get('assets')).toBe(immutablePlan);
+    expect(await repository.get('assets', 'stale')).not.toBeNull();
+
+    await indexer.reconcilePendingAuthoritativeCollection('assets');
+    expect(await repository.get('assets', 'active')).not.toBeNull();
+    expect(await repository.get('assets', 'stale')).toBeNull();
+    expect(await repository.get('assets', 'newer')).not.toBeNull();
   });
 
   it('does not emit price chart snapshots when snapshots are disabled', async () => {
@@ -6441,6 +6562,198 @@ describe('ChainIndexer price derivation', () => {
     expect(firstDefault?.id).toBe('network-all-DEFAULT-1700000100');
   });
 
+  it('retires stale DEFAULT and HOUR rows by indexed type/time, including removed entities', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      retireExpiredChartSnapshotBuckets: (
+        groups: Array<{ collection: string; types?: string[] }>,
+        blockHeight: number,
+        timestamp: number
+      ) => Promise<void>;
+    };
+    const timestamp = 10_000_000;
+    const defaultCutoff = timestamp - 48 * 60 * 60;
+    const hourCutoff = timestamp - 8 * 24 * 60 * 60;
+    const groups = [
+      { collection: 'accountLiquiditySnapshots', types: ['DEFAULT'] },
+      { collection: 'assetSnapshots' },
+      { collection: 'poolSnapshots' },
+      { collection: 'orderBookSnapshots' },
+      { collection: 'marketSnapshots' },
+      { collection: 'networkSnapshots' },
+    ];
+    const documents: IndexerDocument[] = [];
+    for (const [groupIndex, group] of groups.entries()) {
+      const types = group.types ?? ['DEFAULT', 'HOUR'];
+      for (const type of types) {
+        const cutoff = type === 'DEFAULT' ? defaultCutoff : hourCutoff;
+        for (const [suffix, rowTimestamp] of [['removed-old', cutoff - 1], ['boundary', cutoff]] as const) {
+          const id = `${group.collection}-${groupIndex}-${type}-${suffix}`;
+          documents.push({
+            collection: group.collection as IndexerDocument['collection'],
+            id,
+            blockHeight: 1,
+            timestamp: rowTimestamp,
+            data: { id, type, timestamp: rowTimestamp },
+          });
+        }
+      }
+      for (const type of ['DAY', 'MONTH', 'BLOCK'] as const) {
+        const rowTimestamp = defaultCutoff - 1;
+        const id = `${group.collection}-${groupIndex}-${type}`;
+        documents.push({
+          collection: group.collection as IndexerDocument['collection'],
+          id,
+          blockHeight: 1,
+          timestamp: rowTimestamp,
+          data: { id, type, timestamp: rowTimestamp },
+        });
+      }
+    }
+    await repository.upsertMany(documents);
+
+    await indexer.retireExpiredChartSnapshotBuckets(groups, 10, timestamp);
+
+    for (const [groupIndex, group] of groups.entries()) {
+      const remaining = await repository.list(group.collection as IndexerDocument['collection']);
+      expect(remaining.some((document) => document.id.includes('removed-old'))).toBe(false);
+      expect(remaining.map((document) => document.data.type)).toEqual(
+        expect.arrayContaining([...(group.types ?? ['DEFAULT', 'HOUR']), 'DAY', 'MONTH', 'BLOCK'])
+      );
+      expect(remaining.some((document) => document.id.includes(`${groupIndex}`))).toBe(true);
+    }
+    expect(await repository.get('updatesStreams', 'chartSnapshotRetention-v1')).toBeNull();
+  });
+
+  it('bounds query-based retention catch-up and resumes from successfully deleted rows', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      retireExpiredChartSnapshotBuckets: (
+        groups: Array<{ collection: string }>,
+        blockHeight: number,
+        timestamp: number
+      ) => Promise<void>;
+    };
+    const timestamp = 10_000_000;
+    const cutoff = timestamp - 48 * 60 * 60;
+    const groups = [{ collection: 'assetSnapshots' }];
+    const documents: IndexerDocument[] = Array.from({ length: 4_005 }, (_item, index) => {
+      const id = `removed-asset-${String(index).padStart(5, '0')}`;
+      return {
+        collection: 'assetSnapshots' as const,
+        id,
+        blockHeight: 1,
+        timestamp: cutoff - 4_005 + index,
+        data: { id, assetId: `removed-${index}`, type: 'DEFAULT', timestamp: cutoff - 4_005 + index },
+      };
+    });
+    await repository.upsertMany(documents);
+    const query = vi.spyOn(repository, 'query');
+    const deleteMany = vi.spyOn(repository, 'deleteMany');
+
+    await indexer.retireExpiredChartSnapshotBuckets(groups, 2, timestamp);
+
+    expect(query).toHaveBeenCalledTimes(5); // four DEFAULT pages plus an empty HOUR probe
+    expect(deleteMany.mock.calls.every((call) => call[1].length <= 1_000)).toBe(true);
+    expect(await repository.list('assetSnapshots')).toHaveLength(5);
+
+    await indexer.retireExpiredChartSnapshotBuckets(groups, 3, timestamp);
+    expect(await repository.list('assetSnapshots')).toHaveLength(0);
+  });
+
+  it('retries the same retention page after a delete failure', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      retireExpiredChartSnapshotBuckets: (
+        groups: Array<{ collection: string }>,
+        blockHeight: number,
+        timestamp: number
+      ) => Promise<void>;
+    };
+    const baseTimestamp = 10_000_000;
+    const groups = [{ collection: 'marketSnapshots' }];
+    const id = 'removed-market-default';
+    await repository.upsert({
+      collection: 'marketSnapshots',
+      id,
+      blockHeight: 1,
+      timestamp: baseTimestamp - 48 * 60 * 60 - 1,
+      data: { id, marketId: 7, type: 'DEFAULT', timestamp: baseTimestamp - 48 * 60 * 60 - 1 },
+    });
+    const deleteMany = vi.spyOn(repository, 'deleteMany');
+    deleteMany.mockRejectedValueOnce(new Error('delete failed'));
+
+    await expect(indexer.retireExpiredChartSnapshotBuckets(groups, 2, baseTimestamp)).rejects.toThrow(
+      'delete failed'
+    );
+    expect(await repository.get('marketSnapshots', id)).not.toBeNull();
+
+    await expect(indexer.retireExpiredChartSnapshotBuckets(groups, 2, baseTimestamp)).resolves.toBeUndefined();
+    expect(await repository.get('marketSnapshots', id)).toBeNull();
+  });
+
+  it('retains a full rolling month plus overlap while deleting only older network BLOCK rows', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      retireExpiredNetworkBlockSnapshots: (timestamp: number) => Promise<void>;
+    };
+    const timestamp = 10_000_000;
+    const cutoff = timestamp - 31 * 86_400;
+    const oldBlock = createBlockNetworkSnapshot(1, cutoff - 1, { transactions: 1 });
+    const boundaryBlock = createBlockNetworkSnapshot(2, cutoff, { transactions: 2 });
+    const monthBlock = createBlockNetworkSnapshot(3, timestamp - 30 * 86_400, { transactions: 3 });
+    const dayId = 'network-all-DAY-old';
+    const monthId = 'network-all-MONTH-old';
+    await repository.upsertMany([
+      oldBlock,
+      boundaryBlock,
+      monthBlock,
+      {
+        collection: 'networkSnapshots',
+        id: dayId,
+        blockHeight: 1,
+        timestamp: cutoff - 1,
+        data: { id: dayId, type: 'DAY', timestamp: cutoff - 1 },
+      },
+      {
+        collection: 'networkSnapshots',
+        id: monthId,
+        blockHeight: 1,
+        timestamp: cutoff - 1,
+        data: { id: monthId, type: 'MONTH', timestamp: cutoff - 1 },
+      },
+    ]);
+
+    await indexer.retireExpiredNetworkBlockSnapshots(timestamp);
+
+    expect(await repository.get('networkSnapshots', oldBlock.id)).toBeNull();
+    expect(await repository.get('networkSnapshots', boundaryBlock.id)).not.toBeNull();
+    expect(await repository.get('networkSnapshots', monthBlock.id)).not.toBeNull();
+    expect(await repository.get('networkSnapshots', dayId)).not.toBeNull();
+    expect(await repository.get('networkSnapshots', monthId)).not.toBeNull();
+  });
+
+  it('bounds network BLOCK retention catch-up and resumes from deleted pages', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      retireExpiredNetworkBlockSnapshots: (timestamp: number) => Promise<void>;
+    };
+    const timestamp = 10_000_000;
+    const cutoff = timestamp - 31 * 86_400;
+    const documents = Array.from({ length: 4_005 }, (_item, index) =>
+      createBlockNetworkSnapshot(index + 1, cutoff - 4_005 + index, { transactions: 1 })
+    );
+    await repository.upsertMany(documents);
+    const query = vi.spyOn(repository, 'query');
+
+    await indexer.retireExpiredNetworkBlockSnapshots(timestamp);
+    expect(query).toHaveBeenCalledTimes(4);
+    expect(await repository.list('networkSnapshots')).toHaveLength(5);
+
+    await indexer.retireExpiredNetworkBlockSnapshots(timestamp);
+    expect(await repository.list('networkSnapshots')).toHaveLength(0);
+  });
+
   it('does not roll default network aggregates into the next five-minute window early', () => {
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
       createNetworkSnapshotDocuments: (
@@ -6462,7 +6775,7 @@ describe('ChainIndexer price derivation', () => {
     expect(defaultSnapshotId(1_700_000_400)).toBe('network-all-DEFAULT-1700000400');
   });
 
-  it('aggregates network account counts from account creation timestamps', async () => {
+  it('aggregates network account counts from atomic per-block creation deltas', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
       buildAnalytics: (
@@ -6482,30 +6795,9 @@ describe('ChainIndexer price derivation', () => {
     };
 
     await repository.upsertMany([
-      createBlockNetworkSnapshot(1, 100, { accounts: 99, transactions: 1 }),
-      createBlockNetworkSnapshot(2, 4_000, { accounts: 99, transactions: 2 }),
-      createBlockNetworkSnapshot(3, 7_000, { accounts: 99, transactions: 3 }),
-      {
-        collection: 'accountMeta',
-        id: 'old-account',
-        blockHeight: 1,
-        timestamp: 100,
-        data: { id: 'old-account', accountId: 'old-account', createdAtTimestamp: 100 },
-      },
-      {
-        collection: 'accountMeta',
-        id: 'hour-account',
-        blockHeight: 2,
-        timestamp: 4_000,
-        data: { id: 'hour-account', accountId: 'hour-account', createdAtTimestamp: 4_000 },
-      },
-      {
-        collection: 'accountMeta',
-        id: 'default-account',
-        blockHeight: 3,
-        timestamp: 7_000,
-        data: { id: 'default-account', accountId: 'default-account', createdAtTimestamp: 7_000 },
-      },
+      createBlockNetworkSnapshot(1, 100, { accounts: 1, transactions: 1 }),
+      createBlockNetworkSnapshot(2, 4_000, { accounts: 1, transactions: 2 }),
+      createBlockNetworkSnapshot(3, 7_000, { accounts: 1, transactions: 3 }),
     ]);
 
     const analytics = await indexer.buildAnalytics(
@@ -6528,272 +6820,798 @@ describe('ChainIndexer price derivation', () => {
     expect(analytics.network.get('DAY')).toMatchObject({ accounts: 3, transactions: 6 });
   });
 
-  it('repairs legacy network transaction counters from history rows and updates existing aggregates', async () => {
+  it('incrementally refreshes bounded analytics inputs without changing aggregate results', async () => {
     const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
-      repairNetworkTransactionCounters: () => Promise<boolean>;
+    const query = vi.spyOn(repository, 'query');
+    const liquidityStats = {
+      liquidityUSD: '0',
+      poolLiquidityUSD: '0',
+      orderBookLiquidityUSD: '0',
+      activePools: 0,
+      activeOrderBooks: 0,
+      listedAssets: 0,
+    };
+    const cachedIndexer = new ChainIndexer(config, repository) as unknown as {
+      buildAnalytics: (
+        timestamp: number,
+        assets: Map<string, unknown>,
+        prices: Map<string, bigint>,
+        pools: unknown[],
+        liquidity: typeof liquidityStats,
+        sourceVersion?: number
+      ) => Promise<unknown>;
+      getAnalyticsInputCacheMetrics: () => {
+        fullLoads: number;
+        incrementalLoads: number;
+        invalidations: number;
+        documentsRead: number;
+        cachedDocuments: number;
+      };
+      getRollingNetworkInputMetrics: () => {
+        fullBuilds: number;
+        incrementalUpdates: number;
+        blockDocumentsProcessed: number;
+        cachedBlocks: number;
+      };
+      queryAllWithinAnalyticsBudget: (
+        collectionName: string,
+        args: Record<string, unknown>,
+        budget: { maximumBytes: number; retainedBytes: number }
+      ) => Promise<IndexerDocument[]>;
     };
 
     await repository.upsertMany([
-      createBlockNetworkSnapshot(1, 100, { transactions: 2, swaps: 0, bridgeIncomingTransactions: 0 }),
-      createBlockNetworkSnapshot(2, 200, { transactions: 1, swaps: 0, bridgeIncomingTransactions: 0 }),
-      createBlockNetworkSnapshot(3, 300, { transactions: 4, swaps: 0, bridgeIncomingTransactions: 0 }),
-      {
-        collection: 'networkSnapshots',
-        id: 'network-all-DAY-0',
-        blockHeight: 3,
-        timestamp: 300,
-        data: {
-          id: 'network-all-DAY-0',
-          type: 'DAY',
-          timestamp: 300,
-          transactions: 99,
-          swaps: 99,
-          bridgeIncomingTransactions: 99,
-          bridgeOutgoingTransactions: 99,
-          liquidityUSD: '123',
-        },
-      },
-      {
-        collection: 'historyElements',
-        id: '0xpaid-transfer',
-        blockHeight: 1,
-        timestamp: 100,
-        data: {
-          id: '0xpaid-transfer',
-          blockHeight: 1,
-          timestamp: 100,
-          module: 'assets',
-          method: 'transfer',
-          networkFee: SCALE.toString(),
-          execution: { success: true },
-        },
-      },
-      {
-        collection: 'historyElements',
-        id: '0xinbound-mint',
-        blockHeight: 1,
-        timestamp: 100,
-        data: {
-          id: '0xinbound-mint',
-          blockHeight: 1,
-          timestamp: 100,
-          module: 'bridgeProxy',
-          method: 'mint',
-          networkFee: SCALE.toString(),
-          execution: { success: true },
-        },
-      },
-      {
-        collection: 'historyElements',
-        id: '0xpaid-swap',
-        blockHeight: 3,
-        timestamp: 300,
-        data: {
-          id: '0xpaid-swap',
-          blockHeight: 3,
-          timestamp: 300,
-          module: 'liquidityProxy',
-          method: 'swap',
-          networkFee: SCALE.toString(),
-          execution: { success: true },
-        },
-      },
-      {
-        collection: 'historyElements',
-        id: '0xfailed-bridge',
-        blockHeight: 3,
-        timestamp: 300,
-        data: {
-          id: '0xfailed-bridge',
-          blockHeight: 3,
-          timestamp: 300,
-          module: 'bridgeProxy',
-          method: 'burn',
-          networkFee: SCALE.toString(),
-          execution: { success: false },
-        },
-      },
+      createBlockNetworkSnapshot(1, 100, { accounts: 1, transactions: 1 }),
+      createBlockNetworkSnapshot(2, 4_000, { transactions: 2 }),
+      createBlockNetworkSnapshot(3, 7_000, { accounts: 1, transactions: 3 }),
     ]);
 
-    await expect(indexer.repairNetworkTransactionCounters()).resolves.toBe(true);
+    await cachedIndexer.buildAnalytics(7_300, new Map<string, unknown>(), new Map(), [], liquidityStats, 3);
+    const boundedDeltaQueries = vi.spyOn(cachedIndexer, 'queryAllWithinAnalyticsBudget');
+    query.mockClear();
 
-    await expect(repository.get('networkSnapshots', 'block-1')).resolves.toMatchObject({
-      data: { transactions: 1, swaps: 0, bridgeIncomingTransactions: 1, bridgeOutgoingTransactions: 0 },
+    await repository.upsertMany([
+      createBlockNetworkSnapshot(4, 7_500, { accounts: 1, transactions: 4 }),
+      createBlockNetworkSnapshot(5, 7_700, { accounts: 1, transactions: 100 }),
+    ]);
+
+    const incremental = await cachedIndexer.buildAnalytics(
+      7_601,
+      new Map<string, unknown>(),
+      new Map(),
+      [],
+      liquidityStats,
+      4
+    );
+    const uncachedIndexer = new ChainIndexer(config, repository) as unknown as {
+      buildAnalytics: (
+        timestamp: number,
+        assets: Map<string, unknown>,
+        prices: Map<string, bigint>,
+        pools: unknown[],
+        liquidity: typeof liquidityStats
+      ) => Promise<unknown>;
+    };
+    const full = await uncachedIndexer.buildAnalytics(
+      7_601,
+      new Map<string, unknown>(),
+      new Map(),
+      [],
+      liquidityStats
+    );
+
+    expect(incremental).toEqual(full);
+
+    await repository.upsertMany([
+      createBlockNetworkSnapshot(6, 7_800, { accounts: 1, transactions: 6 }),
+    ]);
+    const nextIncremental = await cachedIndexer.buildAnalytics(
+      7_900,
+      new Map<string, unknown>(),
+      new Map(),
+      [],
+      liquidityStats,
+      6
+    );
+    const nextUncachedIndexer = new ChainIndexer(config, repository) as unknown as typeof uncachedIndexer;
+    const nextFull = await nextUncachedIndexer.buildAnalytics(
+      7_900,
+      new Map<string, unknown>(),
+      new Map(),
+      [],
+      liquidityStats
+    );
+    expect(nextIncremental).toEqual(nextFull);
+
+    expect(cachedIndexer.getAnalyticsInputCacheMetrics()).toMatchObject({
+      fullLoads: 1,
+      incrementalLoads: 2,
+      invalidations: 0,
+      cachedDocuments: 6,
     });
-    await expect(repository.get('networkSnapshots', 'block-2')).resolves.toMatchObject({
-      data: { transactions: 0, swaps: 0, bridgeIncomingTransactions: 0, bridgeOutgoingTransactions: 0 },
+    expect(cachedIndexer.getRollingNetworkInputMetrics()).toEqual({
+      fullBuilds: 1,
+      incrementalUpdates: 2,
+      blockDocumentsProcessed: 6,
+      cachedBlocks: 6,
     });
-    await expect(repository.get('networkSnapshots', 'block-3')).resolves.toMatchObject({
-      data: { transactions: 2, swaps: 1, bridgeIncomingTransactions: 0, bridgeOutgoingTransactions: 0 },
+    expect(boundedDeltaQueries).toHaveBeenCalledTimes(10);
+    expect(new Set(boundedDeltaQueries.mock.calls.slice(0, 5).map((call) => call[2])).size).toBe(1);
+    expect(new Set(boundedDeltaQueries.mock.calls.slice(5).map((call) => call[2])).size).toBe(1);
+    expect(
+      query.mock.calls.find(([collectionName]) => collectionName === 'historyElements')?.[1].filter
+    ).toEqual({
+      and: [
+        { timestamp: { greaterThanOrEqualTo: 7_000, lessThanOrEqualTo: 7_601 } },
+        { blockHeight: { lessThanOrEqualTo: 4 } },
+      ],
     });
-    await expect(repository.get('networkSnapshots', 'network-all-DAY-0')).resolves.toMatchObject({
-      data: {
-        transactions: 3,
-        swaps: 1,
-        bridgeIncomingTransactions: 1,
-        bridgeOutgoingTransactions: 0,
-        liquidityUSD: '123',
-      },
-    });
-    await expect(repository.get('updatesStreams', 'networkTransactionCounterRepair-v1')).resolves.not.toBeNull();
+    expect(query.mock.calls.some(([collectionName]) => collectionName === 'accountMeta')).toBe(false);
   });
 
-  it('backfills aggregate network snapshots from indexed block snapshots', async () => {
+  it('updates a large rolling horizon in place and counts only changed delta rows', async () => {
     const repository = new MemoryRepository();
+    const query = vi.spyOn(repository, 'query');
+    const documentCount = 3_000;
+    await repository.upsertMany(
+      Array.from({ length: documentCount }, (_item, index) =>
+        createBlockNetworkSnapshot(index + 1, 10_001 + index, { transactions: 1 })
+      )
+    );
     const indexer = new ChainIndexer(config, repository) as unknown as {
-      backfillNetworkAggregateSnapshots: () => Promise<boolean>;
+      rollingNetworkInputCache: null | { blocks: unknown[] };
+      loadAnalyticsInputDocuments: (
+        timestamp: number,
+        sourceVersion: number
+      ) => Promise<{ documents: { blockSnapshots: IndexerDocument[] } }>;
+      getRollingNetworkInputMetrics: () => {
+        blockDocumentsProcessed: number;
+        incrementalUpdates: number;
+      };
     };
 
+    const cold = await indexer.loadAnalyticsInputDocuments(13_000, documentCount);
+    expect(cold.documents.blockSnapshots).toEqual([]);
+    const networkQueries = query.mock.calls.filter(([collectionName]) => collectionName === 'networkSnapshots');
+    expect(networkQueries).toHaveLength(3);
+    expect(networkQueries.every(([_collectionName, args]) => Number(args.maxBytes) > 0)).toBe(true);
+    const publishedRollingCache = indexer.rollingNetworkInputCache;
+    const publishedBlocks = publishedRollingCache?.blocks;
+    const processedBefore = indexer.getRollingNetworkInputMetrics().blockDocumentsProcessed;
+
+    await repository.upsert(createBlockNetworkSnapshot(documentCount + 1, 13_001, { transactions: 2 }));
+    await indexer.loadAnalyticsInputDocuments(13_001, documentCount + 1);
+
+    expect(indexer.rollingNetworkInputCache).toBe(publishedRollingCache);
+    expect(indexer.rollingNetworkInputCache?.blocks).toBe(publishedBlocks);
+    expect(indexer.getRollingNetworkInputMetrics()).toMatchObject({ incrementalUpdates: 1 });
+    expect(indexer.getRollingNetworkInputMetrics().blockDocumentsProcessed - processedBefore).toBe(1);
+  });
+
+  it('fails a cold paged analytics load before its retained byte budget can grow without bound', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert({
+      collection: 'historyElements',
+      id: 'large-history',
+      blockHeight: 1,
+      timestamp: 1,
+      data: { id: 'large-history', timestamp: 1, module: 'system', method: 'remark', data: { value: 'x'.repeat(512) } },
+    });
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      queryAllWithinAnalyticsBudget: (
+        collectionName: 'historyElements',
+        args: Record<string, unknown>,
+        budget: { maximumBytes: number; retainedBytes: number }
+      ) => Promise<IndexerDocument[]>;
+    };
+    const budget = { maximumBytes: 128, retainedBytes: 0 };
+
+    await expect(
+      indexer.queryAllWithinAnalyticsBudget(
+        'historyElements',
+        { orderBy: ['TIMESTAMP_ASC'] },
+        budget
+      )
+    ).rejects.toThrow(/retained-load limit/);
+    expect(budget.retainedBytes).toBe(0);
+  });
+
+  it('continues byte-truncated repository pages from pageInfo instead of treating a short page as final', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany(
+      Array.from({ length: 3 }, (_item, index) => ({
+        collection: 'historyElements' as const,
+        id: `large-history-${index}`,
+        blockHeight: index + 1,
+        timestamp: index + 1,
+        data: {
+          id: `large-history-${index}`,
+          timestamp: index + 1,
+          module: 'system',
+          method: 'remark',
+          data: { value: 'x'.repeat(512) },
+        },
+      }))
+    );
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      queryPages: (
+        collectionName: 'historyElements',
+        args: { orderBy: string[]; maxBytes: number }
+      ) => AsyncGenerator<IndexerDocument[]>;
+    };
+    const pages: IndexerDocument[][] = [];
+
+    for await (const page of indexer.queryPages('historyElements', {
+      orderBy: ['TIMESTAMP_ASC'],
+      maxBytes: 128,
+    })) {
+      pages.push(page);
+    }
+
+    expect(pages.map((page) => page.length)).toEqual([1, 1, 1]);
+    expect(pages.flat().map((document) => document.id)).toEqual([
+      'large-history-0',
+      'large-history-1',
+      'large-history-2',
+    ]);
+  });
+
+  it('merges a large analytics document horizon into its existing ordered array', async () => {
+    const repository = new MemoryRepository();
+    const documentCount = 2_000;
+    await repository.upsertMany(
+      Array.from({ length: documentCount }, (_item, index) => ({
+        collection: 'historyElements' as const,
+        id: `history-${String(index + 1).padStart(5, '0')}`,
+        blockHeight: index + 1,
+        timestamp: 1_001 + index,
+        data: {
+          id: `history-${String(index + 1).padStart(5, '0')}`,
+          timestamp: 1_001 + index,
+          module: 'system',
+          method: 'remark',
+          data: {},
+        },
+      }))
+    );
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      analyticsInputCache: null | {
+        history: IndexerDocument[];
+        historyById: Map<string, IndexerDocument>;
+      };
+      loadAnalyticsInputDocuments: (timestamp: number, sourceVersion: number) => Promise<unknown>;
+    };
+
+    await indexer.loadAnalyticsInputDocuments(3_000, documentCount);
+    const publishedHistory = indexer.analyticsInputCache?.history;
+    const publishedById = indexer.analyticsInputCache?.historyById;
+    await repository.upsert({
+      collection: 'historyElements',
+      id: 'history-02001',
+      blockHeight: 2_001,
+      timestamp: 3_001,
+      data: { id: 'history-02001', timestamp: 3_001, module: 'system', method: 'remark', data: {} },
+    });
+
+    await indexer.loadAnalyticsInputDocuments(3_001, 2_001);
+
+    expect(indexer.analyticsInputCache?.history).toBe(publishedHistory);
+    expect(indexer.analyticsInputCache?.historyById).toBe(publishedById);
+    expect(indexer.analyticsInputCache?.history).toHaveLength(2_001);
+    expect(indexer.analyticsInputCache?.history.at(-1)?.id).toBe('history-02001');
+  });
+
+  it('uses repository lexical order for same-timestamp analytics delta IDs', async () => {
+    const repository = new MemoryRepository();
+    const historyDocument = (id: string, blockHeight: number): IndexerDocument => ({
+      collection: 'historyElements',
+      id,
+      blockHeight,
+      timestamp: 1_000,
+      data: { id, timestamp: 1_000, module: 'system', method: 'remark', data: {} },
+    });
     await repository.upsertMany([
-      createBlockNetworkSnapshot(1, 100, {
-        accounts: 2,
-        transactions: 1,
-        fees: '10',
-        liquidityUSD: '100',
-        poolLiquidityUSD: '80',
-        orderBookLiquidityUSD: '20',
-        volumeUSD: '1.25',
-        swaps: 1,
-      }),
-      createBlockNetworkSnapshot(2, 86_500, {
-        accounts: 3,
-        transactions: 2,
-        fees: '20',
-        liquidityUSD: '110',
-        poolLiquidityUSD: '85',
-        orderBookLiquidityUSD: '25',
-        volumeUSD: '2.5',
-        bridgeIncomingTransactions: 1,
-      }),
-      createBlockNetworkSnapshot(3, 172_900, {
-        accounts: 5,
-        transactions: 3,
-        fees: '30',
-        liquidityUSD: '120',
-        poolLiquidityUSD: '90',
-        orderBookLiquidityUSD: '30',
-        volumeUSD: '3.5',
-        bridgeOutgoingTransactions: 2,
-      }),
+      historyDocument('history-a', 1),
+      historyDocument('history_A', 2),
+      historyDocument('history-A', 3),
+    ]);
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      analyticsInputCache: null | { history: IndexerDocument[] };
+      loadAnalyticsInputDocuments: (timestamp: number, sourceVersion: number) => Promise<unknown>;
+    };
+    await indexer.loadAnalyticsInputDocuments(1_000, 3);
+    await repository.upsert(historyDocument('history!', 4));
+
+    await indexer.loadAnalyticsInputDocuments(1_001, 4);
+
+    expect(indexer.analyticsInputCache?.history.map((document) => document.id)).toEqual([
+      'history!',
+      'history-A',
+      'history-a',
+      'history_A',
+    ]);
+  });
+
+  it('bypasses analytics retention when the complete cache pair exceeds its byte budget', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert(createBlockNetworkSnapshot(1, 7_000, { transactions: 1 }));
+    const indexer = new ChainIndexer(
+      { ...config, analyticsInputCacheMaxBytes: 256 },
+      repository
+    ) as unknown as {
+      analyticsInputCache: unknown;
+      rollingNetworkInputCache: unknown;
+      loadAnalyticsInputDocuments: (
+        timestamp: number,
+        sourceVersion: number
+      ) => Promise<{ rollingNetworkInputs: { blocks: unknown[] } }>;
+      getAnalyticsInputCacheMetrics: () => {
+        cachedBytes: number;
+        maximumBytes: number;
+        capacityBypasses: number;
+        capacityBypassedBytes: number;
+      };
+    };
+
+    const loaded = await indexer.loadAnalyticsInputDocuments(7_100, 1);
+
+    expect(loaded.rollingNetworkInputs.blocks).toHaveLength(1);
+    expect(indexer.analyticsInputCache).toBeNull();
+    expect(indexer.rollingNetworkInputCache).toBeNull();
+    expect(indexer.getAnalyticsInputCacheMetrics()).toMatchObject({
+      cachedBytes: 0,
+      maximumBytes: 256,
+      capacityBypasses: 1,
+      capacityBypassedBytes: 257,
+    });
+  });
+
+  it('does not reinstall analytics inputs invalidated while repository reads are in flight', async () => {
+    const repository = new MemoryRepository();
+    const originalQuery = repository.query.bind(repository);
+    let releaseHistoryQuery!: () => void;
+    let signalHistoryQueryStarted!: () => void;
+    const historyQueryGate = new Promise<void>((resolve) => {
+      releaseHistoryQuery = resolve;
+    });
+    const historyQueryStarted = new Promise<void>((resolve) => {
+      signalHistoryQueryStarted = resolve;
+    });
+    let delayedHistoryQuery = false;
+
+    vi.spyOn(repository, 'query').mockImplementation(async (collectionName, args) => {
+      if (collectionName === 'historyElements' && !delayedHistoryQuery) {
+        delayedHistoryQuery = true;
+        signalHistoryQueryStarted();
+        await historyQueryGate;
+      }
+
+      return originalQuery(collectionName, args);
+    });
+
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      analyticsInputCache: null | { sourceVersion: number; refreshedAt: number };
+      invalidateAnalyticsInputCache: () => void;
+      loadAnalyticsInputDocuments: (timestamp: number, sourceVersion?: number) => Promise<unknown>;
+      getAnalyticsInputCacheMetrics: () => {
+        invalidations: number;
+        cachedDocuments: number;
+      };
+    };
+    const staleLoad = indexer.loadAnalyticsInputDocuments(7_300, 3);
+
+    await historyQueryStarted;
+    indexer.invalidateAnalyticsInputCache();
+    releaseHistoryQuery();
+    await staleLoad;
+
+    expect(indexer.analyticsInputCache).toBeNull();
+    expect(indexer.getAnalyticsInputCacheMetrics()).toMatchObject({
+      invalidations: 1,
+      cachedDocuments: 0,
+    });
+
+    await indexer.loadAnalyticsInputDocuments(7_400, 4);
+    expect(indexer.analyticsInputCache).toMatchObject({ sourceVersion: 4, refreshedAt: 7_400 });
+  });
+
+  it('retries a raced incremental analytics load from a full horizon after invalidation', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      createBlockNetworkSnapshot(1, 7_000, { accounts: 1, transactions: 1 }),
+    ]);
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      analyticsInputCache: null | { sourceVersion: number; refreshedAt: number };
+      rollingNetworkInputCache: null | {
+        sourceVersion: number;
+        totals: Map<string, { accounts: number; transactions: number }>;
+      };
+      invalidateAnalyticsInputCache: () => void;
+      loadAnalyticsInputDocuments: (
+        timestamp: number,
+        sourceVersion: number
+      ) => Promise<{ rollingNetworkInputs: { totals: Map<string, { accounts: number; transactions: number }> } }>;
+    };
+    await indexer.loadAnalyticsInputDocuments(7_300, 1);
+
+    await repository.upsertMany([
+      createBlockNetworkSnapshot(2, 7_400, { accounts: 1, transactions: 2 }),
+    ]);
+    const originalQuery = repository.query.bind(repository);
+    let releaseIncremental!: () => void;
+    let signalIncrementalStarted!: () => void;
+    const incrementalGate = new Promise<void>((resolve) => {
+      releaseIncremental = resolve;
+    });
+    const incrementalStarted = new Promise<void>((resolve) => {
+      signalIncrementalStarted = resolve;
+    });
+    let delayed = false;
+    vi.spyOn(repository, 'query').mockImplementation(async (collectionName, args) => {
+      if (collectionName === 'historyElements' && !delayed) {
+        delayed = true;
+        signalIncrementalStarted();
+        await incrementalGate;
+      }
+      return originalQuery(collectionName, args);
+    });
+
+    const load = indexer.loadAnalyticsInputDocuments(7_500, 2);
+    await incrementalStarted;
+    indexer.invalidateAnalyticsInputCache();
+    releaseIncremental();
+
+    const result = await load;
+    expect(result.rollingNetworkInputs.totals.get('HOUR')).toMatchObject({ accounts: 2, transactions: 3 });
+    expect(indexer.analyticsInputCache).toMatchObject({ sourceVersion: 2, refreshedAt: 7_500 });
+    expect(indexer.rollingNetworkInputCache?.sourceVersion).toBe(2);
+  });
+
+  it('publishes analytics and rolling caches atomically across conversion failure and retry', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert(createBlockNetworkSnapshot(1, 7_000, { transactions: 1 }));
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      analyticsInputCache: null | { sourceVersion: number };
+      rollingNetworkInputCache: null | {
+        sourceVersion: number;
+        totals: Map<string, { transactions: number }>;
+      };
+      rollingBlockFromSnapshot: (document: IndexerDocument) => unknown;
+      loadAnalyticsInputDocuments: (
+        timestamp: number,
+        sourceVersion: number
+      ) => Promise<{ rollingNetworkInputs: { totals: Map<string, { transactions: number }> } }>;
+    };
+    await indexer.loadAnalyticsInputDocuments(7_100, 1);
+    const publishedDocuments = indexer.analyticsInputCache;
+    const publishedRolling = indexer.rollingNetworkInputCache;
+
+    await repository.upsert(createBlockNetworkSnapshot(2, 7_200, { transactions: 2 }));
+    const originalConverter = indexer.rollingBlockFromSnapshot.bind(indexer);
+    indexer.rollingBlockFromSnapshot = (document) => {
+      if (document.id === 'block-2') throw new Error('malformed rolling row');
+      return originalConverter(document);
+    };
+
+    await expect(indexer.loadAnalyticsInputDocuments(7_250, 2)).rejects.toThrow('malformed rolling row');
+    expect(indexer.analyticsInputCache).toBe(publishedDocuments);
+    expect(indexer.rollingNetworkInputCache).toBe(publishedRolling);
+    expect(indexer.rollingNetworkInputCache?.totals.get('HOUR')?.transactions).toBe(1);
+
+    indexer.rollingBlockFromSnapshot = originalConverter;
+    const retried = await indexer.loadAnalyticsInputDocuments(7_250, 2);
+    expect(retried.rollingNetworkInputs.totals.get('HOUR')?.transactions).toBe(3);
+    expect(indexer.analyticsInputCache?.sourceVersion).toBe(2);
+    expect(indexer.rollingNetworkInputCache?.sourceVersion).toBe(2);
+  });
+
+  it('applies same-id corrections, out-of-order overlap rows, and exact cutoff expiry', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      loadAnalyticsInputDocuments: (
+        timestamp: number,
+        sourceVersion: number
+      ) => Promise<{
+        rollingNetworkInputs: {
+          totals: Map<string, { accounts: number; transactions: number }>;
+        };
+      }>;
+    };
+    await repository.upsertMany([
+      createBlockNetworkSnapshot(1, 1_000, { accounts: 1, transactions: 1 }),
+    ]);
+    await indexer.loadAnalyticsInputDocuments(1_000, 1);
+
+    const correctedBlock = createBlockNetworkSnapshot(2, 1_000, { accounts: 1, transactions: 9 });
+    correctedBlock.id = 'block-1';
+    correctedBlock.data.id = 'block-1';
+    await repository.upsertMany([
+      correctedBlock,
+      createBlockNetworkSnapshot(3, 700, { transactions: 4 }),
     ]);
 
-    await expect(indexer.backfillNetworkAggregateSnapshots()).resolves.toBe(true);
+    const exactCutoff = await indexer.loadAnalyticsInputDocuments(1_000, 3);
+    expect(exactCutoff.rollingNetworkInputs.totals.get('DEFAULT')).toMatchObject({
+      accounts: 1,
+      transactions: 13,
+    });
 
-    const firstDay = await repository.get('networkSnapshots', 'network-all-DAY-0');
-    const secondDay = await repository.get('networkSnapshots', 'network-all-DAY-86400');
-    const thirdDay = await repository.get('networkSnapshots', 'network-all-DAY-172800');
-    const month = await repository.get('networkSnapshots', 'network-all-MONTH-0');
-    const state = await repository.get('updatesStreams', 'networkAggregateSnapshotsBackfill');
+    const expired = await indexer.loadAnalyticsInputDocuments(1_001, 4);
+    expect(expired.rollingNetworkInputs.totals.get('DEFAULT')).toMatchObject({
+      accounts: 1,
+      transactions: 9,
+    });
+  });
 
-    expect(firstDay?.timestamp).toBe(100);
-    expect(firstDay?.blockHeight).toBe(1);
-    expect(firstDay?.data).toMatchObject({
-      type: 'DAY',
-      timestamp: 100,
-      accounts: 2,
-      transactions: 1,
-      fees: '10',
-      volumeUSD: '1.25',
-      swaps: 1,
+  it('trims expired rolling prefixes without retaining stale id-map entries', async () => {
+    const repository = new MemoryRepository();
+    const documents: IndexerDocument[] = [];
+    for (let block = 1; block <= 2_105; block += 1) {
+      documents.push(createBlockNetworkSnapshot(block, block, { transactions: 1 }));
+    }
+    await repository.upsertMany(documents);
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      loadAnalyticsInputDocuments: (
+        timestamp: number,
+        sourceVersion: number
+      ) => Promise<{
+        rollingNetworkInputs: {
+          blocks: unknown[];
+          blocksById: Map<string, unknown>;
+          blockStarts: Map<string, number>;
+        };
+      }>;
+    };
+    await indexer.loadAnalyticsInputDocuments(2_105, 2_105);
+    const advanced = await indexer.loadAnalyticsInputDocuments(2_105 + 30 * 86_400 + 1, 2_106);
+
+    expect(advanced.rollingNetworkInputs.blocks).toHaveLength(0);
+    expect(advanced.rollingNetworkInputs.blocksById.size).toBe(0);
+    expect([...advanced.rollingNetworkInputs.blockStarts.values()]).toEqual([0, 0, 0, 0]);
+  });
+
+
+
+
+  it('initializes fresh aggregate windows without scanning repository history', async () => {
+    const repository = new MemoryRepository();
+    const query = vi.spyOn(repository, 'query');
+    const list = vi.spyOn(repository, 'list');
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      initializeNetworkBackfillWindows: (lastIndexed: number) => Promise<unknown[]>;
+    };
+
+    await expect(indexer.initializeNetworkBackfillWindows(-1)).resolves.toHaveLength(4);
+    expect(query).not.toHaveBeenCalled();
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it('restores only the bounded thirty-day aggregate horizon when resuming', async () => {
+    const repository = new MemoryRepository();
+    const latestTimestamp = 4_000_000;
+    await repository.upsertMany([
+      createBlockNetworkSnapshot(1, 1, { transactions: 1 }),
+      createBlockNetworkSnapshot(2, latestTimestamp - 30 * 86_400, { transactions: 2 }),
+      createBlockNetworkSnapshot(3, latestTimestamp, { transactions: 3 }),
+    ]);
+    const query = vi.spyOn(repository, 'query');
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      initializeNetworkBackfillWindows: (lastIndexed: number) => Promise<unknown[]>;
+    };
+
+    await expect(indexer.initializeNetworkBackfillWindows(3)).resolves.toHaveLength(4);
+
+    expect(query).toHaveBeenCalledWith(
+      'networkSnapshots',
+      expect.objectContaining({
+        filter: {
+          and: expect.arrayContaining([
+            {
+              timestamp: {
+                greaterThanOrEqualTo: latestTimestamp - 30 * 86_400,
+                lessThanOrEqualTo: latestTimestamp,
+              },
+            },
+          ]),
+        },
+        orderBy: ['TIMESTAMP_ASC'],
+      })
+    );
+  });
+
+  it('commits rolling network aggregates atomically with the final backfill chain state', async () => {
+    const repository = new MemoryRepository();
+    const upsertMany = vi.spyOn(repository, 'upsertMany');
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      createNetworkBackfillWindows: () => unknown[];
+      indexFetchedBlock: (
+        block: unknown,
+        options: {
+          refreshDerivedState: boolean;
+          networkAggregateWindows: unknown[];
+          flushNetworkAggregates: boolean;
+        }
+      ) => Promise<void>;
+    };
+    const windows = indexer.createNetworkBackfillWindows();
+    const fetchedBlock = (blockHeight: number, timestamp: number) => ({
+      signedBlock: {
+        block: {
+          header: {
+            number: { toNumber: () => blockHeight },
+            hash: { toString: () => `0x${blockHeight}` },
+          },
+          extrinsics: [],
+        },
+      },
+      events: [],
+      timestamp,
+    });
+
+    await indexer.indexFetchedBlock(fetchedBlock(1, 100), {
+      refreshDerivedState: false,
+      networkAggregateWindows: windows,
+      flushNetworkAggregates: false,
+    });
+    await indexer.indexFetchedBlock(fetchedBlock(2, 86_500), {
+      refreshDerivedState: false,
+      networkAggregateWindows: windows,
+      flushNetworkAggregates: true,
+    });
+
+    const finalBatch = upsertMany.mock.calls.at(-1)?.[0] ?? [];
+    expect(finalBatch.map((document) => document.id)).toEqual(
+      expect.arrayContaining(['network-all-DAY-0', 'network-all-DAY-86400', 'chainState'])
+    );
+    expect(await repository.get('networkSnapshots', 'network-all-DAY-0')).not.toBeNull();
+    expect(await repository.get('networkSnapshots', 'network-all-DAY-86400')).not.toBeNull();
+    expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(2);
+  });
+
+  it('drops expired fine-grained backfill outputs while retaining their DAY and MONTH computations', () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
+      createNetworkBackfillWindows: () => Array<{ type: string; pendingDocument: IndexerDocument | null }>;
+      advanceNetworkBackfillWindow: (
+        window: unknown,
+        block: {
+          blockHeight: number;
+          timestamp: number;
+          accounts: number;
+          transactions: number;
+          fees: bigint;
+          volumeUSD: bigint;
+          swaps: number;
+          bridgeIncomingTransactions: number;
+          bridgeOutgoingTransactions: number;
+        }
+      ) => IndexerDocument;
+      shouldPersistBackfillNetworkAggregate: (
+        document: IndexerDocument,
+        retentionTimestamp: number
+      ) => boolean;
+    };
+    const windows = indexer.createNetworkBackfillWindows();
+    const block = (blockHeight: number, timestamp: number, transactions: number) => ({
+      blockHeight,
+      timestamp,
+      accounts: 0,
+      transactions,
+      fees: 0n,
+      volumeUSD: 0n,
+      swaps: 0,
       bridgeIncomingTransactions: 0,
       bridgeOutgoingTransactions: 0,
     });
-    expect(secondDay?.timestamp).toBe(86_500);
-    expect(secondDay?.blockHeight).toBe(2);
-    expect(secondDay?.data).toMatchObject({
-      type: 'DAY',
-      timestamp: 86_500,
-      accounts: 5,
-      transactions: 3,
-      fees: '30',
-      volumeUSD: '3.75',
-      swaps: 1,
-      bridgeIncomingTransactions: 1,
-      bridgeOutgoingTransactions: 0,
+    const firstByType = new Map(
+      windows.map((window) => [window.type, indexer.advanceNetworkBackfillWindow(window, block(1, 100, 7))])
+    );
+    const completed = windows.map((window) => {
+      const first = firstByType.get(window.type)!;
+      const next = indexer.advanceNetworkBackfillWindow(window, block(2, 86_500, 3));
+      return { type: window.type, document: first.id === next.id ? next : first };
     });
-    expect(thirdDay?.timestamp).toBe(172_900);
-    expect(thirdDay?.blockHeight).toBe(3);
-    expect(thirdDay?.data).toMatchObject({
-      type: 'DAY',
-      timestamp: 172_900,
-      accounts: 8,
-      transactions: 5,
-      fees: '50',
-      volumeUSD: '6',
-      bridgeIncomingTransactions: 1,
-      bridgeOutgoingTransactions: 2,
-    });
-    expect(month?.data).toMatchObject({
-      type: 'MONTH',
-      timestamp: 172_900,
-      accounts: 10,
-      transactions: 6,
-      fees: '60',
-      volumeUSD: '7.25',
-      bridgeIncomingTransactions: 1,
-      bridgeOutgoingTransactions: 2,
-    });
-    for (const document of [firstDay, secondDay, thirdDay, month]) {
-      expectNoBackfilledNetworkStockMetrics(document);
-    }
-    expect(state?.data.data).toBe(JSON.stringify({ lastIndexedBlock: 3, lastTimestamp: 172_900 }));
+    const retentionTimestamp = 10_000_000;
+
+    expect(
+      completed.filter(({ document }) => indexer.shouldPersistBackfillNetworkAggregate(document, retentionTimestamp))
+        .map(({ type }) => type)
+    ).toEqual(['DAY', 'MONTH']);
+    expect(completed.find(({ type }) => type === 'DAY')?.document.data.transactions).toBe(7);
+    expect(completed.find(({ type }) => type === 'MONTH')?.document.data.transactions).toBe(10);
   });
 
-  it('keeps existing aggregate network snapshots during backfill', async () => {
+  it('chunks oversized idempotent projections and retries them without reordering', async () => {
+    const repository = new MemoryRepository();
+    const originalUpsertMany = repository.upsertMany.bind(repository);
+    const upsertMany = vi.spyOn(repository, 'upsertMany');
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      upsertDocumentsInCallChunks: (documents: IndexerDocument[]) => Promise<void>;
+    };
+    const projectionDocuments: IndexerDocument[] = Array.from(
+      { length: MAX_REPOSITORY_WRITE_CALL_DOCUMENTS + 4 },
+      (_item, index) => ({
+        collection: 'historyCalls',
+        id: `projection-${String(index).padStart(5, '0')}`,
+        blockHeight: 10,
+        timestamp: 10,
+        data: { id: `projection-${String(index).padStart(5, '0')}` },
+      })
+    );
+    projectionDocuments.push({
+      collection: 'updatesStreams',
+      id: 'projection-complete',
+      blockHeight: 10,
+      timestamp: 10,
+      data: { id: 'projection-complete', block: 10, data: '{}' },
+    });
+    let call = 0;
+    upsertMany.mockImplementation(async (documents) => {
+      call += 1;
+      if (call === 2) throw new Error('second projection chunk failed');
+      await originalUpsertMany(documents);
+    });
+
+    await expect(indexer.upsertDocumentsInCallChunks(projectionDocuments)).rejects.toThrow(
+      'second projection chunk failed'
+    );
+    expect(await repository.list('historyCalls')).toHaveLength(MAX_REPOSITORY_WRITE_CALL_DOCUMENTS);
+    expect(await repository.get('updatesStreams', 'projection-complete')).toBeNull();
+
+    upsertMany.mockImplementation(originalUpsertMany);
+    await indexer.upsertDocumentsInCallChunks(projectionDocuments);
+    expect(await repository.list('historyCalls')).toHaveLength(MAX_REPOSITORY_WRITE_CALL_DOCUMENTS + 4);
+    expect(await repository.get('updatesStreams', 'projection-complete')).not.toBeNull();
+    const retryCalls = upsertMany.mock.calls.slice(2);
+    expect(retryCalls.map(([documents]) => documents.length)).toEqual([
+      MAX_REPOSITORY_WRITE_CALL_DOCUMENTS,
+      5,
+    ]);
+    expect(retryCalls.at(-1)?.[0].at(-1)?.id).toBe('projection-complete');
+  });
+
+  it('fails an oversized finalized block atomically and retries without double-applying account totals', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
-      backfillNetworkAggregateSnapshots: () => Promise<boolean>;
+      indexFetchedBlock: (block: unknown, options?: { refreshDerivedState?: boolean }) => Promise<void>;
     };
-
-    await repository.upsertMany([
-      createBlockNetworkSnapshot(1, 100, {
-        transactions: 1,
-        fees: '10',
-        volumeUSD: '1',
-      }),
-      createBlockNetworkSnapshot(2, 86_500, {
-        transactions: 2,
-        fees: '20',
-        volumeUSD: '2',
-      }),
-      {
-        collection: 'networkSnapshots',
-        id: 'network-all-DAY-86400',
-        blockHeight: 99,
-        timestamp: 86_600,
-        data: {
-          id: 'network-all-DAY-86400',
-          type: 'DAY',
-          timestamp: 86_600,
-          accounts: 42,
-          transactions: 99,
-          fees: '999',
-          liquidityUSD: '999',
-          poolLiquidityUSD: '999',
-          orderBookLiquidityUSD: '0',
-          volumeUSD: '999',
-          swaps: 0,
-          activePools: 0,
-          activeOrderBooks: 0,
-          listedAssets: 0,
-          bridgeIncomingTransactions: 0,
-          bridgeOutgoingTransactions: 0,
+    const extrinsics = Array.from({ length: 3_334 }, (_item, index) => ({
+      isSigned: true,
+      signer: { toString: () => 'alice' },
+      hash: { toString: () => `0xtransfer-${index}` },
+      method: {
+        section: 'assets',
+        method: 'transfer',
+        args: [XOR, 'bob', SCALE.toString()],
+        meta: { args: [{ name: 'assetId' }, { name: 'to' }, { name: 'amount' }] },
+      },
+    }));
+    const fetchedBlock = (selectedExtrinsics: unknown[]) => ({
+      signedBlock: {
+        block: {
+          header: {
+            number: { toNumber: () => 42 },
+            hash: { toString: () => '0xblock' },
+          },
+          extrinsics: selectedExtrinsics,
         },
       },
-    ]);
-
-    await expect(indexer.backfillNetworkAggregateSnapshots()).resolves.toBe(true);
-
-    expect(await repository.get('networkSnapshots', 'network-all-DAY-86400')).toMatchObject({
-      blockHeight: 99,
-      timestamp: 86_600,
-      data: {
-        transactions: 99,
-        fees: '999',
-        volumeUSD: '999',
-      },
+      events: [eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 0)],
+      timestamp: 1_700_000_000,
     });
+
+    await expect(
+      indexer.indexFetchedBlock(fetchedBlock(extrinsics), { refreshDerivedState: false })
+    ).rejects.toThrow(/maximum is 10000/);
+    expect(await repository.list('historyElements')).toHaveLength(0);
+    expect(await repository.get('accountMeta', 'alice')).toBeNull();
+    expect(await repository.get('updatesStreams', 'chainState')).toBeNull();
+
+    await indexer.indexFetchedBlock(fetchedBlock(extrinsics.slice(0, 1)), { refreshDerivedState: false });
+    expect((await repository.get('accountMeta', 'alice'))?.data.xorFees).toEqual({
+      amount: '1',
+      amountUSD: '0',
+    });
+    expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(42);
   });
 
   it('creates update stream JSON payloads for prices, APY, and asset registration', () => {

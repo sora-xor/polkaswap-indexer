@@ -163,7 +163,11 @@ describe('swap chart fixture data', () => {
     const repository = new MemoryRepository();
     const now = 1_700_000_000;
 
-    await repository.upsertMany(createSwapChartFixtureDocuments(now, 88));
+    const fixtureDocuments = createSwapChartFixtureDocuments(now, 88);
+    await repository.upsertMany(fixtureDocuments);
+    const historyIds = fixtureDocuments
+      .filter((document) => document.collection === 'historyElements')
+      .map((document) => document.id);
 
     const schema = createSchema();
     const historyField = schema.getQueryType()?.getFields().historyElements;
@@ -171,29 +175,9 @@ describe('swap chart fixture data', () => {
       {},
       {
         first: 100,
+        orderBy: ['BLOCK_HEIGHT_ASC'],
         filter: {
-          and: [
-            { blockHeight: { greaterThanOrEqualTo: SOLSWAP_LEGACY_BURN_BLOCK } },
-            { blockHeight: { lessThanOrEqualTo: SOLSWAP_NEXUS_BURN_BLOCK } },
-            {
-              or: [
-                {
-                  and: [
-                    { module: { equalTo: 'assets' } },
-                    { method: { equalTo: 'burn' } },
-                    { data: { contains: { assetId: XOR_ASSET_ID } } },
-                  ],
-                },
-                {
-                  and: [
-                    { module: { equalTo: 'utility' } },
-                    { method: { equalTo: 'batchAll' } },
-                    { callNames: { contains: ['assets.burn'] } },
-                  ],
-                },
-              ],
-            },
-          ],
+          id: { in: historyIds },
         },
       },
       { repository },
@@ -233,10 +217,7 @@ describe('swap chart fixture data', () => {
       {},
       {
         first: 100,
-        orderBy: ['BLOCK_HEIGHT_ASC'],
-        filter: {
-          blockHeight: { greaterThanOrEqualTo: SOLSWAP_LEGACY_BURN_BLOCK },
-        },
+        orderBy: ['ID_ASC'],
       },
       { repository },
       undefined as never

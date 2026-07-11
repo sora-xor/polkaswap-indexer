@@ -1,6 +1,10 @@
+import { readConfig } from './config.js';
+import { assertStandaloneStorageMode } from './deployment.js';
 import { startServer } from './server.js';
 
-const server = await startServer().catch((error) => {
+const config = readConfig();
+assertStandaloneStorageMode(config, 'api');
+const server = await startServer(config).catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

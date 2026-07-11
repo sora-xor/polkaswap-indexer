@@ -1,17 +1,24 @@
+import { isDeepStrictEqual } from 'node:util';
+
 import pg from 'pg';
 
 import { readConfig } from '../config.js';
-import { INDEXER_COLLECTIONS } from '../repository/types.js';
+import { decodePostgresDocumentText } from '../repository/postgres-document.js';
 import { RocksRepository } from '../repository/rocksdb.js';
+import { INDEXER_COLLECTIONS } from '../repository/types.js';
+import { readPositiveSafeInteger, readStrictBoolean } from './env.js';
+import { verifyPostgresRocksdbLogicalEquality } from './verify-postgres-rocksdb-logical.js';
 
 import type { IndexerCollection, IndexerDocument } from '../repository/types.js';
 
 const { Pool } = pg;
 
-const readPositiveInteger = (name: string, fallback: number): number => {
-  const value = Number(process.env[name]);
-
-  return Number.isFinite(value) && value > 0 ? Math.trunc(value) : fallback;
+type PostgresDocumentRow = {
+  collection: IndexerCollection;
+  id: string;
+  blockHeight: number | string | null;
+  timestamp: number | string | null;
+  dataText: string;
 };
 
 const documentsEqual = (left: IndexerDocument | null, right: IndexerDocument): boolean =>
@@ -21,75 +28,86 @@ const documentsEqual = (left: IndexerDocument | null, right: IndexerDocument): b
       left.id === right.id &&
       (left.blockHeight ?? null) === (right.blockHeight ?? null) &&
       (left.timestamp ?? null) === (right.timestamp ?? null) &&
-      JSON.stringify(left.data) === JSON.stringify(right.data)
+      isDeepStrictEqual(left.data, right.data)
   );
 
-const config = readConfig();
-const sampleSize = readPositiveInteger('ROCKSDB_VERIFY_SAMPLE_SIZE', 20);
-const pool = new Pool({ connectionString: config.databaseUrl });
-const repository = new RocksRepository({ ...config, storageEngine: 'rocksdb' });
-let failures = 0;
-
-try {
-  for (const collection of INDEXER_COLLECTIONS) {
-    const countResult = await pool.query<{ count: number }>(
-      `select count(*)::int as count from indexer_documents where collection = $1`,
-      [collection]
-    );
-    const postgresCount = countResult.rows[0]?.count ?? 0;
-    const rocksCount = repository.count(collection);
-
-    if (postgresCount !== rocksCount) {
-      failures += 1;
-      console.error(`${collection}: count mismatch postgres=${postgresCount} rocksdb=${rocksCount}`);
-      continue;
-    }
-
-    const sample = await pool.query<{
-      collection: IndexerCollection;
-      id: string;
-      blockHeight: number | null;
-      timestamp: number | null;
-      data: Record<string, unknown>;
-    }>(
-      `select collection,
-              id,
-              block_height as "blockHeight",
-              timestamp,
-              data
+const selectSample = async (
+  client: pg.PoolClient,
+  collection: IndexerCollection,
+  limit: number,
+  direction: 'asc' | 'desc'
+): Promise<PostgresDocumentRow[]> => {
+  const result = await client.query<PostgresDocumentRow>(
+    `select collection, id, block_height as "blockHeight", timestamp, data::text as "dataText"
        from indexer_documents
-       where collection = $1
-       order by id
-       limit $2::int`,
-      [collection, sampleSize]
-    );
+      where collection = $1
+      order by id collate "C" ${direction}
+      limit $2::int`,
+    [collection, limit]
+  );
+  return result.rows;
+};
 
-    for (const row of sample.rows) {
-      const expected: IndexerDocument = {
-        collection: row.collection,
-        id: row.id,
-        blockHeight: row.blockHeight,
-        timestamp: row.timestamp,
-        data: row.data,
-      };
-      const actual = await repository.get(collection, row.id);
-
-      if (!documentsEqual(actual, expected)) {
-        failures += 1;
-        console.error(`${collection}/${row.id}: document mismatch`);
+const verifySample = async (
+  client: pg.PoolClient,
+  repository: RocksRepository,
+  sampleSize: number
+): Promise<number> => {
+  let compared = 0;
+  for (const collection of INDEXER_COLLECTIONS) {
+    const headLimit = Math.ceil(sampleSize / 2);
+    const tailLimit = Math.floor(sampleSize / 2);
+    const [head, tail] = await Promise.all([
+      selectSample(client, collection, headLimit, 'asc'),
+      tailLimit ? selectSample(client, collection, tailLimit, 'desc') : Promise.resolve([]),
+    ]);
+    const rows = [...new Map([...head, ...tail].map((row) => [row.id, row])).values()];
+    const actual = await repository.getMany(collection, rows.map((row) => row.id));
+    for (const row of rows) {
+      const expected = decodePostgresDocumentText(row);
+      if (!documentsEqual(actual.get(row.id) ?? null, expected)) {
+        throw new Error(`${collection}/${row.id}: sampled PostgreSQL/RocksDB document mismatch`);
       }
     }
-
-    console.info(`${collection}: ok (${postgresCount} rows)`);
+    compared += rows.length;
   }
-} finally {
-  await repository.close().catch(() => undefined);
-  await pool.end();
-}
+  return compared;
+};
 
-if (failures > 0) {
-  console.error(`RocksDB verification failed with ${failures} mismatch(es)`);
-  process.exitCode = 1;
-} else {
-  console.info('RocksDB verification passed');
+export const runRocksdbVerification = async (): Promise<void> => {
+  const config = readConfig();
+  const fullVerification = readStrictBoolean(process.env, 'ROCKSDB_VERIFY_FULL', true);
+  const sampleSize = readPositiveSafeInteger(process.env, 'ROCKSDB_VERIFY_SAMPLE_SIZE', 100);
+  const batchSize = readPositiveSafeInteger(process.env, 'ROCKSDB_VERIFY_BATCH_SIZE', 5_000);
+  const pool = new Pool({ connectionString: config.databaseUrl });
+  const client = await pool.connect();
+  const repository = new RocksRepository({ ...config, storageEngine: 'rocksdb' });
+  let committed = false;
+
+  try {
+    await client.query('begin isolation level repeatable read');
+    await client.query('lock table indexer_documents in share mode');
+    await repository.prepare();
+    await repository.validateCompactIndexes();
+    const compared = fullVerification
+      ? await verifyPostgresRocksdbLogicalEquality(client, repository, batchSize)
+      : await verifySample(client, repository, sampleSize);
+    await client.query('commit');
+    committed = true;
+    console.info(
+      `RocksDB verification passed: compact indexes valid; ${fullVerification ? 'exhaustively verified' : 'sampled'} ${compared} document(s)`
+    );
+  } finally {
+    if (!committed) await client.query('rollback').catch(() => undefined);
+    client.release();
+    await repository.close().catch(() => undefined);
+    await pool.end();
+  }
+};
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  runRocksdbVerification().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
 }
