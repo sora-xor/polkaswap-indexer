@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { INDEXER_COLLECTIONS } from '../src/repository/types.js';
 import { verifyPostgresRocksdbLogicalEquality } from '../src/scripts/verify-postgres-rocksdb-logical.js';
 
 import type pg from 'pg';
@@ -48,6 +49,33 @@ const repositoryFor = (documents: IndexerDocument[]) =>
   }) as unknown as RocksRepository;
 
 describe('sealed PostgreSQL/RocksDB logical verification', () => {
+  it('uses the C-collated composite migration index predicate for every exhaustive collection scan', async () => {
+    const countQueries: string[] = [];
+    const pageQueries: string[] = [];
+    const client = {
+      query: async (sql: string) => {
+        const normalized = sql.replace(/\s+/g, ' ').trim();
+        if (sql.includes('count(*)')) {
+          countQueries.push(normalized);
+          return { rows: [{ count: '0' }], rowCount: 1 };
+        }
+        pageQueries.push(normalized);
+        return { rows: [], rowCount: 0 };
+      },
+    } as unknown as pg.PoolClient;
+
+    await expect(verifyPostgresRocksdbLogicalEquality(client, repositoryFor([]), 10)).resolves.toBe(0);
+    expect(countQueries).toHaveLength(INDEXER_COLLECTIONS.length);
+    expect(pageQueries).toHaveLength(INDEXER_COLLECTIONS.length);
+    for (const sql of [...countQueries, ...pageQueries]) {
+      expect(sql).toContain('where collection collate "C" = $1::text collate "C"');
+    }
+    for (const sql of pageQueries) {
+      expect(sql).toContain('id collate "C" > $2::text collate "C"');
+      expect(sql).toContain('order by id collate "C"');
+    }
+  });
+
   it('accepts an exhaustive semantic match', async () => {
     await expect(
       verifyPostgresRocksdbLogicalEquality(clientFor([source]), repositoryFor([structuredClone(source)]), 10)

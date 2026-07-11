@@ -39,7 +39,9 @@ export const verifyPostgresRocksdbLogicalEquality = async (
 
   for (const collection of INDEXER_COLLECTIONS) {
     const countResult = await client.query<{ count: string }>(
-      `select count(*)::text as count from indexer_documents where collection = $1`,
+      `select count(*)::text as count
+         from indexer_documents
+        where collection collate "C" = $1::text collate "C"`,
       [collection]
     );
     const sourceCount = Number(countResult.rows[0]?.count ?? '');
@@ -63,7 +65,7 @@ export const verifyPostgresRocksdbLogicalEquality = async (
                 timestamp,
                 data::text as "dataText"
            from indexer_documents
-          where collection = $1
+          where collection collate "C" = $1::text collate "C"
             and ($2::text is null or id collate "C" > $2::text collate "C")
           order by id collate "C"
           limit $3::int`,

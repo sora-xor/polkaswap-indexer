@@ -40,7 +40,7 @@ const selectSample = async (
   const result = await client.query<PostgresDocumentRow>(
     `select collection, id, block_height as "blockHeight", timestamp, data::text as "dataText"
        from indexer_documents
-      where collection = $1
+      where collection collate "C" = $1::text collate "C"
       order by id collate "C" ${direction}
       limit $2::int`,
     [collection, limit]
