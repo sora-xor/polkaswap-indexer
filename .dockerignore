@@ -1,0 +1,80 @@
+# Dependency trees and package-manager state generated on the host. Keep
+# tracked Yarn releases/plugins/patches available if the project adds them.
+node_modules/
+.pnp.*
+.yarn/*
+!.yarn/releases/
+!.yarn/releases/**
+!.yarn/plugins/
+!.yarn/plugins/**
+!.yarn/patches/
+!.yarn/patches/**
+!.yarn/versions/
+!.yarn/versions/**
+
+# Version-control and automation metadata.
+.git/
+.gitignore
+.gitattributes
+.github/
+
+# Environment files, credentials, and common private-key formats.
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+.aws/
+.ssh/
+.secrets/
+secrets/
+credentials/
+
+# Runtime databases, migration artifacts, checkpoints, and backups.
+/data/
+/rocksdb/
+/backups/
+/checkpoints/
+/output/
+*.rocksdb
+*.rocksdb/**
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.db
+*.db-*
+**/*-backups/
+**/*-checkpoints/
+
+# Logs, process state, and diagnostic captures.
+/logs/
+*.log
+*.pid
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Tests, local tooling, documentation, and generated development artifacts.
+/tests/
+/ops/
+/docs/
+/coverage/
+/dist/
+/build/
+/.nyc_output/
+/.vitest/
+/.playwright-cli/
+/test-results/
+/playwright-report/
+*.tsbuildinfo
+.DS_Store
+.idea/
+.vscode/
+*.swp
+README.md
+AGENTS.md
+docker-compose*.yml
+vitest.config.ts

@@ -4,6 +4,7 @@ import { normalizeGraphqlUrl, runProductionSmoke } from '../src/scripts/producti
 
 const validHealth = {
   ok: true,
+  repositoryReady: true,
   service: 'polkaswap-indexer',
   serviceId: 'pi.soramitsu.io',
   schemaVersion: 1,
@@ -12,7 +13,20 @@ const validHealth = {
   network: 'mainnet',
   publicBaseUrl: 'https://pi.soramitsu.io/graphql',
   readOnly: true,
+  workerAvailable: true,
+  workerReady: true,
+  workerReadinessReason: null,
+  workerLifecycle: 'running',
+  workerStartupComplete: true,
+  workerLatestFinalizedBlock: 1_000,
+  workerLatestIndexedBlock: 995,
+  workerLag: 5,
+  workerLastSuccessfulIndexTimestamp: 1_700_000_000,
+  workerLastError: null,
+  workerLastErrorTimestamp: null,
 };
+
+const readyWorkerHealth = validHealth;
 
 const jsonResponse = (body: unknown, init: ResponseInit = {}): Response =>
   new Response(JSON.stringify(body), {
@@ -47,7 +61,72 @@ describe('Polkaswap production smoke', () => {
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [URL, RequestInit];
     expect(String(url)).toBe('https://pi.soramitsu.io/graphql');
     expect(init?.method).toBe('POST');
+    expect(init?.cache).toBe('no-store');
+    expect(init?.redirect).toBe('error');
+    expect(init?.signal).toBeInstanceOf(AbortSignal);
+    expect((init?.headers as Record<string, string>)['cache-control']).toBe('no-store');
     expect(String(init?.body)).toContain('_health');
+  });
+
+  it('validates complete ready-worker details when the deployment exposes a worker', async () => {
+    await expect(
+      runProductionSmoke('https://pi.soramitsu.io/graphql', fetchWithHealth(readyWorkerHealth))
+    ).resolves.toBeUndefined();
+  });
+
+  it('rejects an available worker that is not ready even if the top-level flag is inconsistent', async () => {
+    await expect(
+      runProductionSmoke(
+        'https://pi.soramitsu.io/graphql',
+        fetchWithHealth({ ...readyWorkerHealth, workerReady: false, workerReadinessReason: 'lag-exceeded' })
+      )
+    ).rejects.toThrow('available worker must be ready');
+  });
+
+  it('rejects a production API that has no shared worker heartbeat', async () => {
+    await expect(
+      runProductionSmoke(
+        'https://pi.soramitsu.io/graphql',
+        fetchWithHealth({
+          ...validHealth,
+          workerAvailable: false,
+          workerReady: null,
+          workerLifecycle: null,
+        })
+      )
+    ).rejects.toThrow('must expose a shared worker status');
+  });
+
+  it('rejects missing or internally inconsistent ready-worker checkpoints', async () => {
+    await expect(
+      runProductionSmoke(
+        'https://pi.soramitsu.io/graphql',
+        fetchWithHealth({ ...readyWorkerHealth, workerLatestIndexedBlock: null })
+      )
+    ).rejects.toThrow('workerLatestIndexedBlock must be a non-negative safe integer');
+    await expect(
+      runProductionSmoke(
+        'https://pi.soramitsu.io/graphql',
+        fetchWithHealth({ ...readyWorkerHealth, workerLag: 4 })
+      )
+    ).rejects.toThrow('workerLag must match');
+    await expect(
+      runProductionSmoke(
+        'https://pi.soramitsu.io/graphql',
+        fetchWithHealth({
+          ...readyWorkerHealth,
+          workerLatestFinalizedBlock: 1_000,
+          workerLatestIndexedBlock: 1_001,
+          workerLag: 0,
+        })
+      )
+    ).rejects.toThrow('must not exceed');
+    await expect(
+      runProductionSmoke(
+        'https://pi.soramitsu.io/graphql',
+        fetchWithHealth({ ...readyWorkerHealth, workerLastError: null, workerLastErrorTimestamp: 1_700_000_000 })
+      )
+    ).rejects.toThrow('must either both be present');
   });
 
   it('rejects GraphQL errors even when HTTP status is successful', async () => {

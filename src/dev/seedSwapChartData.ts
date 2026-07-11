@@ -7,7 +7,7 @@ const config = readConfig();
 const repository = createRepository(config);
 
 try {
-  if (shouldRunPostgresMigration(config)) await migrate(config.databaseUrl);
+  if (shouldRunPostgresMigration(config)) await migrate(config);
   const documents = createSwapChartFixtureDocuments();
   await repository.upsertMany(documents);
   console.info(`Seeded ${documents.length} swap chart fixture documents`);

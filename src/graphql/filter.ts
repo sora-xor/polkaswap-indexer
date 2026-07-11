@@ -1,4 +1,5 @@
 import { getOrderField, NUMERIC_ORDER_FIELDS } from './order.js';
+import { compareLexical } from '../lexical.js';
 
 export type FilterValue = Record<string, unknown> | null | undefined;
 
@@ -23,11 +24,6 @@ const toComparable = (value: unknown): string | number | boolean | null => {
   if (typeof value === 'number' || typeof value === 'boolean') return value;
   if (typeof value === 'bigint') return value.toString();
   return String(value);
-};
-
-const toNumber = (value: unknown): number => {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
 };
 
 const getPath = (item: Record<string, unknown>, path: string): unknown => {
@@ -66,36 +62,62 @@ const contains = (value: unknown, expected: unknown): boolean => {
   return value === expected;
 };
 
-const matchesComparison = (actual: unknown, comparison: Record<string, unknown>): boolean => {
+const matchesComparison = (actual: unknown, comparison: Record<string, unknown>, numeric: boolean): boolean => {
   return Object.entries(comparison).every(([operator, expected]) => {
     if (isNullishFilterValue(expected)) return true;
 
     switch (operator) {
       case 'equalTo':
-      case 'eq':
-        return toComparable(actual) === toComparable(expected);
+      case 'eq': {
+        if (!numeric) return toComparable(actual) === toComparable(expected);
+        return compareDecimalValues(actual, expected) === 0;
+      }
       case 'equalToInsensitive':
         return String(actual ?? '').toLowerCase() === String(expected ?? '').toLowerCase();
       case 'notEqualTo':
-      case 'not_eq':
-        return toComparable(actual) !== toComparable(expected);
-      case 'in':
-        return Array.isArray(expected) && expected.map(toComparable).includes(toComparable(actual));
+      case 'not_eq': {
+        if (!numeric) return toComparable(actual) !== toComparable(expected);
+        const result = compareDecimalValues(actual, expected);
+        return result !== null && result !== 0;
+      }
+      case 'in': {
+        if (!Array.isArray(expected)) return false;
+        const values = expected.filter((value) => !isNullishFilterValue(value));
+        if (numeric) return values.some((value) => compareDecimalValues(actual, value) === 0);
+        return values.map(toComparable).includes(toComparable(actual));
+      }
       case 'notIn':
-      case 'not_in':
-        return Array.isArray(expected) && !expected.map(toComparable).includes(toComparable(actual));
+      case 'not_in': {
+        if (!Array.isArray(expected)) return false;
+        const values = expected.filter((value) => !isNullishFilterValue(value));
+        if (numeric) {
+          return values.every((value) => {
+            const result = compareDecimalValues(actual, value);
+            return result !== null && result !== 0;
+          });
+        }
+        return !values.map(toComparable).includes(toComparable(actual));
+      }
       case 'greaterThan':
-      case 'gt':
-        return toNumber(actual) > toNumber(expected);
+      case 'gt': {
+        const result = compareDecimalValues(actual, expected);
+        return result !== null && result > 0;
+      }
       case 'greaterThanOrEqualTo':
-      case 'gte':
-        return toNumber(actual) >= toNumber(expected);
+      case 'gte': {
+        const result = compareDecimalValues(actual, expected);
+        return result !== null && result >= 0;
+      }
       case 'lessThan':
-      case 'lt':
-        return toNumber(actual) < toNumber(expected);
+      case 'lt': {
+        const result = compareDecimalValues(actual, expected);
+        return result !== null && result < 0;
+      }
       case 'lessThanOrEqualTo':
-      case 'lte':
-        return toNumber(actual) <= toNumber(expected);
+      case 'lte': {
+        const result = compareDecimalValues(actual, expected);
+        return result !== null && result <= 0;
+      }
       case 'includesInsensitive':
         return includesInsensitive(actual, expected);
       case 'contains':
@@ -126,9 +148,14 @@ export function matchesFilter(item: Record<string, unknown>, filter: FilterValue
     if (!isSafePath(field)) return false;
 
     if (isFilterRecord(condition)) {
-      return matchesComparison(getPath(item, field), condition as Record<string, unknown>);
+      return matchesComparison(
+        getPath(item, field),
+        condition as Record<string, unknown>,
+        NUMERIC_ORDER_FIELDS.has(field)
+      );
     }
 
+    if (NUMERIC_ORDER_FIELDS.has(field)) return compareDecimalValues(getPath(item, field), condition) === 0;
     return getPath(item, field) === condition;
   });
 }
@@ -137,9 +164,12 @@ export function matchesFilter(item: Record<string, unknown>, filter: FilterValue
  * Normalizes decimal-like values for exact sorting without converting token
  * amounts or USD strings to JavaScript floating point numbers.
  */
-const normalizeDecimal = (value: unknown): { sign: -1 | 0 | 1; integer: string; fraction: string } => {
-  const text = String(value ?? '0').trim();
-  if (!/^-?\d+(\.\d+)?$/.test(text)) return { sign: 0, integer: '0', fraction: '' };
+type NormalizedDecimal = { sign: -1 | 0 | 1; integer: string; fraction: string };
+
+export const normalizeDecimal = (value: unknown): NormalizedDecimal | null => {
+  if (value === null || value === undefined || typeof value === 'boolean') return null;
+  const text = String(value);
+  if (!/^-?\d+(\.\d+)?$/.test(text)) return null;
 
   const negative = text.startsWith('-');
   const [integerRaw = '0', fractionRaw = ''] = (negative ? text.slice(1) : text).split('.');
@@ -150,10 +180,7 @@ const normalizeDecimal = (value: unknown): { sign: -1 | 0 | 1; integer: string; 
   return { sign, integer, fraction };
 };
 
-const compareUnsignedDecimals = (
-  left: { integer: string; fraction: string },
-  right: { integer: string; fraction: string }
-): number => {
+const compareUnsignedDecimals = (left: NormalizedDecimal, right: NormalizedDecimal): number => {
   if (left.integer.length !== right.integer.length) return left.integer.length > right.integer.length ? 1 : -1;
   if (left.integer !== right.integer) return left.integer > right.integer ? 1 : -1;
 
@@ -165,15 +192,59 @@ const compareUnsignedDecimals = (
   return leftFraction > rightFraction ? 1 : -1;
 };
 
-const compareNumericValues = (left: unknown, right: unknown): number => {
+export const compareDecimalValues = (left: unknown, right: unknown): number | null => {
   const normalizedLeft = normalizeDecimal(left);
   const normalizedRight = normalizeDecimal(right);
+  if (!normalizedLeft || !normalizedRight) return null;
 
   if (normalizedLeft.sign !== normalizedRight.sign) return normalizedLeft.sign > normalizedRight.sign ? 1 : -1;
   if (normalizedLeft.sign === 0) return 0;
 
   const unsignedComparison = compareUnsignedDecimals(normalizedLeft, normalizedRight);
   return normalizedLeft.sign > 0 ? unsignedComparison : -unsignedComparison;
+};
+
+/** Compares one order value using the list-fallback sort semantics. */
+export const compareOrderValues = (
+  left: unknown,
+  right: unknown,
+  field: string,
+  direction: 'asc' | 'desc'
+): number => {
+  const factor = direction === 'desc' ? -1 : 1;
+  const numeric = NUMERIC_ORDER_FIELDS.has(field);
+  const leftNullish = left === undefined || left === null || (numeric && normalizeDecimal(left) === null);
+  const rightNullish = right === undefined || right === null || (numeric && normalizeDecimal(right) === null);
+
+  if (left === right) return 0;
+  if (leftNullish && rightNullish) return 0;
+  if (leftNullish) return factor;
+  if (rightNullish) return -factor;
+  if (numeric) return (compareDecimalValues(left, right) ?? 0) * factor;
+  if (typeof left === 'number' && typeof right === 'number') return left > right ? factor : -factor;
+
+  return compareLexical(String(left), String(right)) * factor;
+};
+
+export const isAfterOrderPosition = (
+  item: Record<string, unknown>,
+  position: {
+    field: string;
+    value: string | null;
+    id: string;
+    direction: 'asc' | 'desc';
+  }
+): boolean => {
+  const comparison = compareOrderValues(
+    getPath(item, position.field),
+    position.value,
+    position.field,
+    position.direction
+  );
+  if (comparison !== 0) return comparison > 0;
+
+  const idComparison = compareLexical(String(item.id ?? ''), position.id);
+  return position.direction === 'desc' ? idComparison < 0 : idComparison > 0;
 };
 
 export function sortDocuments<T extends Record<string, unknown>>(items: T[], orderBy: unknown): T[] {
@@ -183,23 +254,9 @@ export function sortDocuments<T extends Record<string, unknown>>(items: T[], ord
   return [...items].sort((a, b) => {
     const left = getPath(a, field);
     const right = getPath(b, field);
-    const leftNullishRank = left === undefined ? 0 : left === null ? 1 : -1;
-    const rightNullishRank = right === undefined ? 0 : right === null ? 1 : -1;
+    const comparison = compareOrderValues(left, right, field, direction);
 
-    if (left === right) return 0;
-    if (leftNullishRank >= 0 && rightNullishRank >= 0) return leftNullishRank - rightNullishRank;
-    if (leftNullishRank >= 0) return factor;
-    if (rightNullishRank >= 0) return -factor;
-
-    if (NUMERIC_ORDER_FIELDS.has(field)) {
-      const comparison = compareNumericValues(left, right);
-      return comparison === 0 ? 0 : comparison * factor;
-    }
-
-    if (typeof left === 'number' && typeof right === 'number') {
-      return left > right ? factor : -factor;
-    }
-
-    return String(left).localeCompare(String(right)) * factor;
+    if (comparison !== 0) return comparison;
+    return compareLexical(String(a.id ?? ''), String(b.id ?? '')) * factor;
   });
 }

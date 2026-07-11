@@ -37,6 +37,20 @@ export type IndexerDocument = {
   data: Record<string, unknown>;
 };
 
+/**
+ * Stable sort position decoded from a GraphQL cursor. The logical offset is
+ * retained only for repositories that still use offset pagination and for
+ * page metadata; repositories with ordered indexes should seek by value/id.
+ */
+export type RepositoryKeyset = {
+  scope: string;
+  field: string;
+  value: string | null;
+  id: string;
+  direction: 'asc' | 'desc';
+  numeric: boolean;
+};
+
 export type RepositoryQueryArgs = {
   first?: number | null;
   last?: number | null;
@@ -46,6 +60,9 @@ export type RepositoryQueryArgs = {
   orderBy?: unknown;
   filter?: Record<string, unknown> | null;
   includeTotalCount?: boolean;
+  /** Maximum retained/encoded bytes for returned documents; the first matching document always fits for progress. */
+  maxBytes?: number | null;
+  keyset?: RepositoryKeyset | null;
   seek?: {
     field: 'timestamp' | 'blockHeight';
     value: number;
@@ -56,6 +73,8 @@ export type RepositoryQueryArgs = {
 
 export type RepositoryQueryResult = {
   items: IndexerDocument[];
+  /** Opaque cursors aligned one-to-one with `items`, when available. */
+  itemCursors?: string[];
   totalCount: number | null;
   pageStart?: number;
   hasNextPage?: boolean;
@@ -64,11 +83,24 @@ export type RepositoryQueryResult = {
 
 export type RepositoryMetricsSnapshot = Record<string, number>;
 
+export type RepositoryWatchMutation = 'INSERT' | 'UPDATE' | 'DELETE';
+
+/** Lightweight change identity; full documents are materialized only after transport admission. */
+export type RepositoryWatchEvent = {
+  collection: IndexerCollection;
+  id: string;
+  mutationType: RepositoryWatchMutation;
+};
+
 export interface IndexerRepository {
   prepare?(): Promise<void>;
   list(collection: IndexerCollection): Promise<IndexerDocument[]>;
   query?(collection: IndexerCollection, args: RepositoryQueryArgs): Promise<RepositoryQueryResult>;
-  watch?(collection: IndexerCollection, ids?: string[]): AsyncGenerator<IndexerDocument, void, unknown>;
+  watch?(
+    collection: IndexerCollection,
+    ids?: string[],
+    signal?: AbortSignal
+  ): AsyncGenerator<RepositoryWatchEvent, void, unknown>;
   metricsSnapshot?(): RepositoryMetricsSnapshot;
   healthCheck?(): Promise<boolean>;
   get(collection: IndexerCollection, id: string): Promise<IndexerDocument | null>;

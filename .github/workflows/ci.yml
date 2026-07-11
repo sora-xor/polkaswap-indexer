@@ -1,5 +1,9 @@
 name: CI
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
     branches:
@@ -17,6 +21,7 @@ jobs:
   validate:
     name: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,6 +36,12 @@ jobs:
 
       - name: Install dependencies
         run: yarn install --immutable
+
+      - name: Validate dependency constraints
+        run: yarn constraints
+
+      - name: Reject duplicate dependency resolutions
+        run: yarn dedupe --check
 
       - name: Audit production dependencies
         run: yarn npm audit --environment production
@@ -41,7 +52,22 @@ jobs:
   verify:
     name: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: validate
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: polkaswap
+          POSTGRES_PASSWORD: polkaswap
+          POSTGRES_DB: polkaswap_indexer_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U polkaswap -d polkaswap_indexer_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,8 +83,26 @@ jobs:
       - name: Install dependencies
         run: yarn install --immutable
 
+      - name: Validate Docker Compose deployment
+        run: |
+          docker compose --profile postgres config --quiet
+          docker compose --profile rocksdb config --quiet
+
       - name: Build
         run: yarn build
 
       - name: Test
         run: yarn test
+        env:
+          POSTGRES_TEST_DATABASE_URL: postgres://polkaswap:polkaswap@127.0.0.1:5432/polkaswap_indexer_test
+
+      - name: Reject whitespace errors
+        run: git diff --check
+
+      - name: Build production container
+        run: docker build --tag polkaswap-indexer:ci .
+
+      - name: Verify native RocksDB runtime in production container
+        run: >-
+          docker run --rm --entrypoint node polkaswap-indexer:ci -e
+          "import('@harperfast/rocksdb-js').then(async ({RocksDatabase})=>{const db=RocksDatabase.open('/data/ci-native-smoke.rocksdb');await db.put('ready',true);if(db.getSync('ready')!==true)throw new Error('RocksDB native round trip failed');db.close()})"
