@@ -827,7 +827,7 @@ describeWithPostgres('PostgresRepository integration', () => {
                 pg_typeof(row_hash)::text as "hashType"
            from ${CHANGE_TABLE}
           where seq > 0
-          order by seq`
+          order by ${CHANGE_TABLE}.seq`
       );
       expect(changes.rows.map(({ seq, id }) => [seq, id])).toEqual([
         ['1', 'first'],
@@ -1079,7 +1079,7 @@ describeWithPostgres('PostgresRepository integration', () => {
       process.env.ROCKSDB_MIGRATION_BATCH_SIZE = '100';
       process.env.ROCKSDB_MIGRATION_BATCH_BYTES = '8192';
       process.env.ROCKSDB_CHANGE_REPLAY_BATCH_SIZE = '100';
-      process.env.ROCKSDB_CHANGE_REPLAY_BATCH_BYTES = '8192';
+      process.env.ROCKSDB_CHANGE_REPLAY_BATCH_BYTES = '1048576';
       delete process.env.ROCKSDB_DROP_CHANGE_TABLE;
 
       const migration = runPostgresToRocksdbMigration();
@@ -1097,10 +1097,26 @@ describeWithPostgres('PostgresRepository integration', () => {
       }
       expect(captureVisible).toBe(true);
       await sleep(25);
+      // Keep sequences 1..100 in one replay batch so both replay reads must
+      // preserve bigint order instead of the lexical order of `seq::text`.
       await adminPool.query(
         `insert into indexer_documents(collection, id, block_height, timestamp, data)
-         values ('assets', '000-replayed-behind', 500, 500, $1::jsonb)`,
-        [JSON.stringify({ id: '000-replayed-behind', version: 'captured', payload: 'y'.repeat(1_500) })]
+         select 'assets',
+                case when change_number = 1
+                     then '000-replayed-behind'
+                     else 'captured-change-' || lpad(change_number::text, 3, '0')
+                 end,
+                499 + change_number,
+                499 + change_number,
+                jsonb_build_object(
+                  'id', case when change_number = 1
+                             then '000-replayed-behind'
+                             else 'captured-change-' || lpad(change_number::text, 3, '0')
+                         end,
+                  'version', 'captured',
+                  'payload', repeat('y', 1_500)
+                )
+           from generate_series(1, 100) as changes(change_number)`
       );
       await migration;
       const crashWindow = new RocksRepository(readConfig(), { allowIncompleteMigration: true });
@@ -1138,6 +1154,9 @@ describeWithPostgres('PostgresRepository integration', () => {
         data: { scaled: 1.23, tiny: 0.0012, numericString: '9007199254740992' },
       });
       await expect(rocks.get('assets', '000-replayed-behind')).resolves.toMatchObject({
+        data: { version: 'captured' },
+      });
+      await expect(rocks.get('assets', 'captured-change-100')).resolves.toMatchObject({
         data: { version: 'captured' },
       });
       expect(rocks.getMetadata<Record<string, unknown>>('postgresToRocksdbMigration')).toMatchObject({

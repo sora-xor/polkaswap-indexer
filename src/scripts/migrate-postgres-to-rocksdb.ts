@@ -326,7 +326,7 @@ const replayChanges = async (
          from ${CHANGE_TABLE}
         where seq > $1::bigint
           and ($3::bigint is null or seq <= $3::bigint)
-        order by seq
+        order by ${CHANGE_TABLE}.seq
         limit $2::int`,
       [nextState.lastReplayedSeq, batchSize, throughSeq ?? null, MIGRATION_SIZE_ESTIMATE_OVERHEAD_BYTES]
     );
@@ -355,7 +355,7 @@ const replayChanges = async (
               data::text as "dataText"
          from ${CHANGE_TABLE}
         where seq > $1::bigint and seq <= $2::bigint
-        order by seq`,
+        order by ${CHANGE_TABLE}.seq`,
       [nextState.lastReplayedSeq, selectedHighWater]
     );
     if (result.rows.length !== selected.length) {
