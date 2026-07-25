@@ -15,6 +15,7 @@ import type { RepositoryQueryArgs } from '../src/repository/types.js';
 type OfficialConnectionShape = {
   source: string;
   collection: Parameters<typeof validatePublicConnectionQuery>[0];
+  first?: number;
   orderBy?: unknown;
   filter?: Record<string, unknown>;
 };
@@ -22,6 +23,7 @@ type OfficialConnectionShape = {
 type OfficialPhysicalPlan = {
   rocks: string;
   rocksIndexCodes?: readonly string[];
+  documentScan?: boolean;
   postgres: readonly string[];
 };
 
@@ -35,7 +37,8 @@ const boundedTimestampRange = {
 };
 
 /**
- * Every reachable SubQuery connection in polkaswap-exchange-web@edfac7b plus
+ * Every production SubQuery connection in polkaswap-exchange-web@893783ba,
+ * including the restored snapshot volume path, plus
  * @soramitsu/soraneo-wallet-web@1.46.3. Duplicate documents that intentionally
  * use the same physical shape are listed so source additions cannot silently
  * escape the compatibility audit.
@@ -82,6 +85,12 @@ const OFFICIAL_CONNECTION_SHAPES: readonly OfficialConnectionShape[] = [
     },
   },
   {
+    source: 'src/indexer/queries/burnXor.ts XorBurnsQuery',
+    collection: 'xorBurns',
+    first: 1_000,
+    orderBy: ['BLOCK_HEIGHT_ASC'],
+  },
+  {
     source: 'src/indexer/queries/burnXor.ts (global)',
     collection: 'historyElements',
     orderBy: ['ID_ASC'],
@@ -124,10 +133,52 @@ const OFFICIAL_CONNECTION_SHAPES: readonly OfficialConnectionShape[] = [
     },
   },
   {
-    source: 'src/indexer/queries/network/volume.ts',
+    source: 'src/indexer/queries/network/volume.ts NetworkVolumeQuery',
     collection: 'networkSnapshots',
     orderBy: ['TIMESTAMP_DESC'],
     filter: { and: [{ type: { equalTo: 'DAY' } }, boundedTimestampRange] },
+  },
+  {
+    source: 'src/indexer/queries/network/volume.ts NetworkFeesQuery',
+    collection: 'networkSnapshots',
+    orderBy: ['TIMESTAMP_DESC'],
+    filter: { and: [{ type: { equalTo: 'DAY' } }, boundedTimestampRange] },
+  },
+  {
+    source: 'src/indexer/queries/network/volume.ts NetworkBlockFeesQuery',
+    collection: 'networkSnapshots',
+    orderBy: ['TIMESTAMP_DESC'],
+    filter: {
+      and: [
+        { type: { equalTo: 'BLOCK' } },
+        boundedTimestampRange,
+        { fees: { greaterThan: '0' } },
+      ],
+    },
+  },
+  {
+    source: 'src/indexer/queries/network/volume.ts NetworkBlockVolumeQuery',
+    collection: 'networkSnapshots',
+    orderBy: ['TIMESTAMP_DESC'],
+    filter: {
+      and: [
+        { type: { equalTo: 'BLOCK' } },
+        boundedTimestampRange,
+        { volumeUSD: { greaterThan: '0' } },
+      ],
+    },
+  },
+  {
+    source: 'src/indexer/queries/network/volume.ts NetworkSwapVolumeQuery',
+    collection: 'historyElements',
+    orderBy: ['TIMESTAMP_DESC', 'ID_DESC'],
+    filter: {
+      and: [
+        { timestamp: { lessThanOrEqualTo: 1_800_000_000 } },
+        { timestamp: { greaterThan: 1_700_000_000 } },
+        { module: { equalTo: 'liquidityProxy' } },
+      ],
+    },
   },
   {
     source: 'src/indexer/queries/orderBook/orderBooks.ts (all)',
@@ -314,6 +365,11 @@ const OFFICIAL_PHYSICAL_PLANS: readonly OfficialPhysicalPlan[] = [
   { rocks: 'x:a-t', postgres: ['indexer_documents_asset_snapshots_asset_type_timestamp_idx'] },
   { rocks: 'x:a-t', postgres: ['indexer_documents_asset_snapshots_asset_type_timestamp_idx'] },
   {
+    rocks: 'x:missing-b',
+    documentScan: true,
+    postgres: ['indexer_documents_pkey'],
+  },
+  {
     rocks: 'x:history-signature-block-id',
     rocksIndexCodes: ['xb-b'],
     postgres: ['indexer_documents_history_assets_burn_asset_block_idx'],
@@ -326,6 +382,10 @@ const OFFICIAL_PHYSICAL_PLANS: readonly OfficialPhysicalPlan[] = [
   { rocks: 'x:y-t', postgres: ['indexer_documents_network_snapshots_type_timestamp_idx'] },
   { rocks: 'x:y-t', postgres: ['indexer_documents_network_snapshots_type_timestamp_idx'] },
   { rocks: 'x:y-t', postgres: ['indexer_documents_network_snapshots_type_timestamp_idx'] },
+  { rocks: 'x:y-t', postgres: ['indexer_documents_network_snapshots_type_timestamp_idx'] },
+  { rocks: 'x:y-t', postgres: ['indexer_documents_network_snapshots_type_timestamp_idx'] },
+  { rocks: 'x:y-t', postgres: ['indexer_documents_network_snapshots_type_timestamp_idx'] },
+  { rocks: 'x:t', postgres: ['indexer_documents_history_timestamp_idx'] },
   { rocks: 'document', postgres: ['indexer_documents_pkey'] },
   { rocks: 'x:b-i', postgres: ['indexer_documents_order_books_base_id_idx'] },
   { rocks: 'x:a-t', postgres: ['indexer_documents_order_book_orders_account_timestamp_idx'] },
@@ -382,8 +442,8 @@ describe('pinned official UI public query plans', () => {
   });
 
   it('keeps the inventory explicit and complete', () => {
-    expect(OFFICIAL_CONNECTION_SHAPES).toHaveLength(34);
-    expect(new Set(OFFICIAL_CONNECTION_SHAPES.map(({ source }) => source)).size).toBe(34);
+    expect(OFFICIAL_CONNECTION_SHAPES).toHaveLength(39);
+    expect(new Set(OFFICIAL_CONNECTION_SHAPES.map(({ source }) => source)).size).toBe(39);
     expect(OFFICIAL_PHYSICAL_PLANS).toHaveLength(OFFICIAL_CONNECTION_SHAPES.length);
   });
 
@@ -420,19 +480,24 @@ describe('pinned official UI public query plans', () => {
     };
 
     try {
-      OFFICIAL_CONNECTION_SHAPES.forEach(({ source, collection, orderBy, filter }, index) => {
+      OFFICIAL_CONNECTION_SHAPES.forEach(({ source, collection, first, orderBy, filter }, index) => {
         const expected = OFFICIAL_PHYSICAL_PLANS[index];
         expect(expected, source).toBeDefined();
         const plan = planner.selectQuerySource(collection, {
-          first: PUBLIC_PAGE_SIZE,
+          first: first ?? PUBLIC_PAGE_SIZE,
           orderBy,
           filter,
           includeTotalCount: false,
         });
         expect(plan.reason, source).toBe(expected?.rocks);
         expect(plan.ranges.length, source).toBeGreaterThan(0);
-        expect(plan.preservesOrder || plan.boundedSort, source).toBe(true);
-        expect(['x:scan-id', 'x:scan-sort', 'x:missing-t', 'x:missing-b'], source).not.toContain(plan.reason);
+        expect(plan.preservesOrder || plan.boundedSort || expected?.documentScan, source).toBe(true);
+        if (expected?.documentScan) {
+          expect(collection, source).toBe('xorBurns');
+          expect(first, source).toBe(1_000);
+        } else {
+          expect(['x:scan-id', 'x:scan-sort', 'x:missing-t', 'x:missing-b'], source).not.toContain(plan.reason);
+        }
         if (expected?.rocksIndexCodes) {
           expect(
             plan.ranges.map(({ options }) =>

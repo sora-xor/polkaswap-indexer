@@ -701,9 +701,20 @@ const emptyNetworkTransactionCounters = (): NetworkTransactionCounters => ({
   bridgeOutgoingTransactions: 0,
 });
 
+const LIQUIDITY_PROXY_SWAP_METHODS = new Set(['swap', 'swapTransfer', 'swapTransferBatch']);
+
+/**
+ * Identifies the public liquidity-proxy calls that can execute user exchange
+ * legs. The exact allow-list deliberately excludes other successful
+ * liquidity-proxy operations and also covers the same calls inside utility
+ * batches.
+ */
 const isLiquidityProxySwap = (module: string, method: string, callNames: string[] = []): boolean =>
-  (module === 'liquidityProxy' && (method === 'swap' || method === 'swapTransfer')) ||
-  callNames.some((name) => name === 'liquidityProxy.swap' || name === 'liquidityProxy.swapTransfer');
+  (module === 'liquidityProxy' && LIQUIDITY_PROXY_SWAP_METHODS.has(method)) ||
+  callNames.some((name) => {
+    const [callModule, callMethod] = name.split('.');
+    return callModule === 'liquidityProxy' && LIQUIDITY_PROXY_SWAP_METHODS.has(callMethod ?? '');
+  });
 
 const isBridgeOutgoing = (module: string, method: string): boolean =>
   module === 'ethBridge' || (module === 'bridgeProxy' && method === 'burn');
@@ -5126,9 +5137,22 @@ export class ChainIndexer {
       if (extrinsic.isSigned && fee > 0n) feePayingSignedTransactions += 1;
       const currentAccounts = historyIndexedAccounts(extrinsic.method.section, extrinsic.method.method, address, history);
       totalFees += fee;
-      if (!failed) volumeUSD += this.extractVolumeUSD(history.data);
       if (!failed && isLiquidityProxySwap(extrinsic.method.section, extrinsic.method.method, callNames)) {
+        const exchangeVolumeUSD = this.extractExecutedExchangeVolumeUSD(
+          eventsForExtrinsic,
+          valuationPrices,
+          valuationAssets
+        );
+        volumeUSD += exchangeVolumeUSD;
         swaps += 1;
+        // Keep the event-derived natural decimal beside the persisted call
+        // payload so future snapshot repairs do not require archive event
+        // replay. This also covers utility and swapTransferBatch rows whose
+        // generic call arguments do not otherwise contain executed USD legs.
+        history.data = {
+          ...(isRecord(history.data) ? history.data : { value: history.data }),
+          exchangeVolumeUSD: scaledToString(exchangeVolumeUSD, 8),
+        };
       }
       if (!failed && extrinsic.method.section === 'bridgeMultisig') bridgeIncomingTransactions += 1;
       if (!failed && isBridgeOutgoing(extrinsic.method.section, extrinsic.method.method)) {
@@ -5152,7 +5176,6 @@ export class ChainIndexer {
 
       const incomingContext = createBridgeProxyIncomingContext(context, args, valuationPrices, valuationAssets);
       if (incomingContext) {
-        volumeUSD += this.extractVolumeUSD(incomingContext.history.data);
         bridgeIncomingTransactions += 1;
         incomingContext.accounts.forEach((account) => touchedAccounts.add(account));
         extrinsicContexts.push(incomingContext);
@@ -6967,6 +6990,49 @@ export class ChainIndexer {
     }
 
     return max;
+  }
+
+  /**
+   * Values authoritative liquidity-proxy `Exchange` events for one successful
+   * swap extrinsic. Each executed exchange leg contributes its larger USD side,
+   * preserving the existing transaction-volume convention without treating
+   * unrelated `amountUSD` history fields as trading volume.
+   *
+   * `swapTransferBatch` can include direct transfers or reused output assets;
+   * those legs intentionally contribute zero unless the runtime emitted an
+   * `Exchange` event. Utility-wrapped swaps use the same scoped event stream, so
+   * their volume is available even though the utility history payload itself is
+   * not swap-enriched.
+   */
+  private extractExecutedExchangeVolumeUSD(
+    events: EventRecord[],
+    prices: Map<string, bigint>,
+    assets: Map<string, AssetInfo>
+  ): bigint {
+    return findEvents(events, 'liquidityProxy', 'Exchange').reduce((total, exchange) => {
+      const inputAssetId = firstString(exchange, ['inputAssetId', 'baseAssetId', 'arg2']);
+      const outputAssetId = firstString(exchange, ['outputAssetId', 'targetAssetId', 'arg3']);
+      const inputAmount = firstPresentValue(exchange, ['inputAmount', 'baseAssetAmount', 'arg4']) ?? 0;
+      const outputAmount = firstPresentValue(exchange, ['outputAmount', 'targetAssetAmount', 'arg5']) ?? 0;
+      const inputAmountUSD = decimalStringToScaled(
+        codecUsd(
+          inputAssetId,
+          codecToBigInt(inputAmount),
+          prices,
+          assets.get(inputAssetId)?.decimals ?? DECIMALS
+        )
+      );
+      const outputAmountUSD = decimalStringToScaled(
+        codecUsd(
+          outputAssetId,
+          codecToBigInt(outputAmount),
+          prices,
+          assets.get(outputAssetId)?.decimals ?? DECIMALS
+        )
+      );
+
+      return total + (inputAmountUSD > outputAmountUSD ? inputAmountUSD : outputAmountUSD);
+    }, 0n);
   }
 
   private async createAccountDocuments(
