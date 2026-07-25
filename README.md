@@ -503,6 +503,7 @@ ROCKSDB_BENCHMARK_PATH=/path/to/offline/checkpoint \
 ROCKSDB_BENCHMARK_ITERATIONS=20 yarn storage:benchmark:rocksdb
 ROCKSDB_COMPACT_PREFIX=indexes yarn storage:compact:rocksdb
 ROCKSDB_COMPACT_PREFIX=all yarn storage:compact:rocksdb
+yarn storage:repair:network-volume
 ROCKSDB_BACKUP_DIR=/mnt/indexer-backups \
 ROCKSDB_RESTORE_PARENT_PATH=/srv/indexer-restores \
 ROCKSDB_RESTORE_BACKUP_ID=42 \
@@ -628,6 +629,39 @@ Run `yarn audit:dependencies` for the complete dependency graph and
 `yarn audit:dependencies:production` for the shipped runtime graph. Both fail on
 security advisories at low severity or higher; `--no-deprecations` only excludes
 non-security registry maintenance notices from the gate.
+
+### One-shot network volume repair
+
+`storage:repair:network-volume` repairs legacy `networkSnapshots.volumeUSD`
+values without a full database copy or chain reindex. It streams the indexed
+history range, reconstructs successful Liquidity Proxy volume from the exact
+`exchangeVolumeUSD` projection when present and the strict legacy USD fallback
+otherwise, and checks the reconstructed swap count against every affected block
+and aggregate snapshot. An unvalued swap, malformed amount, or count mismatch
+aborts before the first write.
+
+The command is a dry run by default. Stop `start:combined` first: even the dry
+run requires RocksDB's exclusive lock and refuses a live database handle. Review
+the reported changed-row count, estimated write bytes, write-amplification
+reserve, and free-space result. Apply that exact repair with:
+
+```sh
+NETWORK_VOLUME_REPAIR_APPLY=true \
+NETWORK_VOLUME_REPAIR_CONFIRM=REPAIR:networkSnapshots.volumeUSD:v1 \
+yarn storage:repair:network-volume
+```
+
+Apply mode updates only changed `BLOCK`, `DEFAULT`, `HOUR`, `DAY`, and `MONTH`
+snapshot documents in bounded batches, preserves every other field, verifies
+the rewritten values, and writes the `networkVolumeRepair-v1` completion marker
+last. A crash before the marker is safe to resume because the rewrite is
+idempotent. The default preflight keeps 2 GiB free plus eight times the encoded
+changed-document estimate; tune the guarded caps only after a successful dry
+run with `NETWORK_VOLUME_REPAIR_MIN_FREE_GB`,
+`NETWORK_VOLUME_REPAIR_MAX_WRITE_GB`,
+`NETWORK_VOLUME_REPAIR_MAX_HISTORY_ROWS`,
+`NETWORK_VOLUME_REPAIR_MAX_SWAP_OBSERVATIONS`, and
+`NETWORK_VOLUME_REPAIR_MAX_SNAPSHOTS`.
 
 For every production deployment, run the smoke check against the public GraphQL
 endpoint:
