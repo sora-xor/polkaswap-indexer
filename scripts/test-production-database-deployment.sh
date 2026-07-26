@@ -20,6 +20,8 @@ APPLICATION_IMAGE="${POLKASWAP_TEST_IMAGE:-polkaswap-indexer:migration-preflight
 OWNER_URL='postgresql://pi_migration_owner:owner-test-password@database:5432/polkaswap?sslmode=verify-full'
 API_URL='postgresql://pi_api:api-test-password@database:5432/polkaswap?sslmode=verify-full'
 WORKER_URL='postgresql://pi_worker:worker-test-password@database:5432/polkaswap?sslmode=verify-full'
+IDENTITY_VERIFIED_LOG='Verified distinct least-privilege production PostgreSQL sessions before schema migration'
+PRIVILEGES_VERIFIED_LOG='Verified production PostgreSQL sessions and exact table/column privileges after schema migration'
 
 cleanup() {
   local exit_code=$?
@@ -47,6 +49,16 @@ assert_credential_safe_log() {
       exit 1
     fi
   done
+}
+
+assert_exact() {
+  local actual="$1"
+  local expected="$2"
+  local description="$3"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "[production-database-test][error] unexpected $description" >&2
+    exit 1
+  fi
 }
 
 run_migration() {
@@ -172,8 +184,8 @@ if [[ "$MIGRATION_EXIT" -ne 0 ]]; then
   echo "$MIGRATION_LOGS" >&2
   exit 1
 fi
-[[ "$MIGRATION_LOGS" == *'Verified distinct least-privilege production PostgreSQL sessions before schema migration'* ]]
-[[ "$MIGRATION_LOGS" == *'Verified production PostgreSQL sessions and exact table/column privileges after schema migration'* ]]
+[[ "$MIGRATION_LOGS" == *"$IDENTITY_VERIFIED_LOG"* ]]
+[[ "$MIGRATION_LOGS" == *"$PRIVILEGES_VERIFIED_LOG"* ]]
 
 CHECKPOINT="trusted schema target"
 SCHEMA_TARGET="$(
@@ -334,7 +346,7 @@ docker exec \
 
 CHECKPOINT="idempotent rerun"
 RERUN_LOGS="$(run_migration "$OWNER_URL" "$API_URL" "$WORKER_URL")"
-[[ "$RERUN_LOGS" == *'Verified production PostgreSQL sessions and exact table/column privileges after schema migration'* ]]
+[[ "$RERUN_LOGS" == *"$PRIVILEGES_VERIFIED_LOG"* ]]
 assert_credential_safe_log "$RERUN_LOGS"
 
 CHECKPOINT="process override negative cases"
@@ -449,6 +461,18 @@ docker exec \
   "$POSTGRES_CONTAINER" \
   psql -v ON_ERROR_STOP=1 -U postgres -d polkaswap \
   -c 'grant update(data) on public.indexer_documents to public;' >/dev/null
+PUBLIC_COLUMN_ATTACK_ACTIVE="$(
+  docker exec \
+    --env PGPASSWORD=postgres-test-password \
+    "$POSTGRES_CONTAINER" \
+    psql -U postgres -d polkaswap -Atc \
+    "select has_any_column_privilege(
+       'pi_api',
+       'public.indexer_documents',
+       'UPDATE'
+     )::int;"
+)"
+assert_exact "$PUBLIC_COLUMN_ATTACK_ACTIVE" 1 'PUBLIC column attack setup'
 set +e
 public_column_logs="$(run_migration "$OWNER_URL" "$API_URL" "$WORKER_URL")"
 public_column_exit=$?
@@ -458,28 +482,75 @@ docker exec \
   "$POSTGRES_CONTAINER" \
   psql -v ON_ERROR_STOP=1 -U postgres -d polkaswap \
   -c 'revoke update(data) on public.indexer_documents from public;' >/dev/null
-[[ "$public_column_exit" -eq 1 ]]
-[[ "$public_column_logs" == 'Production database credential preflight failed: database-api-privileges-invalid' ]]
 assert_credential_safe_log "$public_column_logs"
+assert_exact "$public_column_exit" 1 'PUBLIC column attack exit status'
+assert_exact \
+  "$public_column_logs" \
+  "$IDENTITY_VERIFIED_LOG"$'\n''Production database credential preflight failed: database-api-privileges-invalid' \
+  'PUBLIC column attack diagnostics'
 
-CHECKPOINT="column grant-option attack"
+CHECKPOINT="direct column grant-option reconciliation"
 docker exec \
   --env PGPASSWORD=postgres-test-password \
   "$POSTGRES_CONTAINER" \
   psql -v ON_ERROR_STOP=1 -U postgres -d polkaswap \
   -c 'grant update(data) on public.indexer_documents to pi_api with grant option;' >/dev/null
+DIRECT_COLUMN_GRANT_OPTION_BEFORE="$(
+  docker exec \
+    --env PGPASSWORD=postgres-test-password \
+    "$POSTGRES_CONTAINER" \
+    psql -U postgres -d polkaswap -Atc \
+    "select '' ||
+       has_any_column_privilege(
+         'pi_api',
+         'public.indexer_documents',
+         'UPDATE'
+       )::int ||
+       has_any_column_privilege(
+         'pi_api',
+         'public.indexer_documents',
+         'UPDATE WITH GRANT OPTION'
+       )::int;"
+)"
+assert_exact "$DIRECT_COLUMN_GRANT_OPTION_BEFORE" 11 'direct column grant-option setup'
 set +e
 column_grant_option_logs="$(run_migration "$OWNER_URL" "$API_URL" "$WORKER_URL")"
 column_grant_option_exit=$?
 set -e
+DIRECT_COLUMN_GRANT_OPTION_AFTER="$(
+  docker exec \
+    --env PGPASSWORD=postgres-test-password \
+    "$POSTGRES_CONTAINER" \
+    psql -U postgres -d polkaswap -Atc \
+    "select '' ||
+       has_table_privilege(
+         'pi_api',
+         'public.indexer_documents',
+         'UPDATE'
+       )::int ||
+       has_any_column_privilege(
+         'pi_api',
+         'public.indexer_documents',
+         'UPDATE'
+       )::int ||
+       has_any_column_privilege(
+         'pi_api',
+         'public.indexer_documents',
+         'UPDATE WITH GRANT OPTION'
+       )::int;"
+)"
 docker exec \
   --env PGPASSWORD=postgres-test-password \
   "$POSTGRES_CONTAINER" \
   psql -v ON_ERROR_STOP=1 -U postgres -d polkaswap \
   -c 'revoke update(data) on public.indexer_documents from pi_api cascade;' >/dev/null
-[[ "$column_grant_option_exit" -eq 1 ]]
-[[ "$column_grant_option_logs" == 'Production database credential preflight failed: database-api-privileges-invalid' ]]
 assert_credential_safe_log "$column_grant_option_logs"
+assert_exact "$column_grant_option_exit" 0 'direct column grant-option reconciliation exit status'
+assert_exact \
+  "$column_grant_option_logs" \
+  "$IDENTITY_VERIFIED_LOG"$'\n'"$PRIVILEGES_VERIFIED_LOG" \
+  'direct column grant-option reconciliation diagnostics'
+assert_exact "$DIRECT_COLUMN_GRANT_OPTION_AFTER" 000 'reconciled direct column privileges'
 
 CHECKPOINT="assumable extra group ACL"
 docker exec \
