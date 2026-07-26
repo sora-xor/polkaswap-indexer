@@ -66,6 +66,23 @@ run_migration() {
     node dist/src/scripts/production-migrate.js 2>&1
 }
 
+run_migration_with_process_override() {
+  local name="$1"
+  local value="$2"
+  docker run --rm \
+    --network "$NETWORK" \
+    --volume "$CERTIFICATE_VOLUME:/certs:ro" \
+    --env NODE_EXTRA_CA_CERTS=/certs/ca.crt \
+    --env NODE_ENV=production \
+    --env STORAGE_ENGINE=postgres \
+    --env DATABASE_URL="$OWNER_URL" \
+    --env POLKASWAP_API_DATABASE_URL="$API_URL" \
+    --env POLKASWAP_WORKER_DATABASE_URL="$WORKER_URL" \
+    --env "$name=$value" \
+    "$APPLICATION_IMAGE" \
+    node dist/src/scripts/production-migrate.js 2>&1
+}
+
 openssl req \
   -x509 \
   -newkey rsa:2048 \
@@ -137,15 +154,44 @@ docker exec \
   -c 'revoke connect on database polkaswap from public;' \
   -c 'grant connect on database polkaswap to pi_migration_owner, pi_api, pi_worker;' \
   -c 'revoke create on schema public from public;' \
-  -c 'grant usage on schema public to pi_api, pi_worker;' >/dev/null
+  -c 'grant usage on schema public to pi_api, pi_worker;' \
+  -c 'create schema pi_shadow authorization postgres;' \
+  -c 'create table pi_shadow.indexer_documents(shadow_only integer);' \
+  -c 'grant usage on schema pi_shadow to pi_migration_owner, pi_api, pi_worker;' \
+  -c 'alter role pi_migration_owner in database polkaswap set search_path to pi_shadow, public;' \
+  -c 'alter role pi_api in database polkaswap set search_path to pi_shadow, public;' \
+  -c 'alter role pi_worker in database polkaswap set search_path to pi_shadow, public;' >/dev/null
 
 CHECKPOINT="fresh migration"
+set +e
 MIGRATION_LOGS="$(run_migration "$OWNER_URL" "$API_URL" "$WORKER_URL")"
-[[ "$MIGRATION_LOGS" == *'Verified distinct least-privilege production PostgreSQL sessions before schema migration'* ]]
-[[ "$MIGRATION_LOGS" == *'Verified production PostgreSQL runtime table privileges after schema migration'* ]]
+MIGRATION_EXIT=$?
+set -e
 assert_credential_safe_log "$MIGRATION_LOGS"
+if [[ "$MIGRATION_EXIT" -ne 0 ]]; then
+  echo "$MIGRATION_LOGS" >&2
+  exit 1
+fi
+[[ "$MIGRATION_LOGS" == *'Verified distinct least-privilege production PostgreSQL sessions before schema migration'* ]]
+[[ "$MIGRATION_LOGS" == *'Verified production PostgreSQL sessions and exact table/column privileges after schema migration'* ]]
 
-CHECKPOINT="exact ACL matrix"
+CHECKPOINT="trusted schema target"
+SCHEMA_TARGET="$(
+  docker exec \
+    --env PGPASSWORD=postgres-test-password \
+    "$POSTGRES_CONTAINER" \
+    psql -U postgres -d polkaswap -Atc \
+    "select
+       (to_regclass('public.indexer_documents') is not null)::int || '|' ||
+       (to_regclass('public.polkaswap_indexer_worker_lease_fence') is not null)::int || '|' ||
+       (select count(*) from information_schema.columns
+         where table_schema = 'pi_shadow' and table_name = 'indexer_documents') || '|' ||
+       (select count(*) from information_schema.columns
+         where table_schema = 'public' and table_name = 'indexer_documents');"
+)"
+[[ "$SCHEMA_TARGET" == 1'|'1'|'1'|'* ]]
+
+CHECKPOINT="exact table and column ACL matrix"
 ACL_MATRIX="$(
   docker exec \
     --env PGPASSWORD=postgres-test-password \
@@ -182,6 +228,22 @@ ACL_MATRIX="$(
        has_table_privilege('pi_worker','public.polkaswap_indexer_worker_lease_fence','TRIGGER')::int;"
 )"
 [[ "$ACL_MATRIX" == '1000000|0000000|1111000|1110000' ]]
+GRANT_OPTION_MATRIX="$(
+  docker exec \
+    --env PGPASSWORD=postgres-test-password \
+    "$POSTGRES_CONTAINER" \
+    psql -U postgres -d polkaswap -Atc \
+    "select '' ||
+       has_table_privilege('pi_api','public.indexer_documents','SELECT WITH GRANT OPTION')::int ||
+       has_any_column_privilege('pi_api','public.indexer_documents','SELECT WITH GRANT OPTION')::int ||
+       has_table_privilege('pi_api','public.polkaswap_indexer_worker_lease_fence','SELECT WITH GRANT OPTION')::int ||
+       has_any_column_privilege('pi_api','public.polkaswap_indexer_worker_lease_fence','SELECT WITH GRANT OPTION')::int || '|' ||
+       has_table_privilege('pi_worker','public.indexer_documents','UPDATE WITH GRANT OPTION')::int ||
+       has_any_column_privilege('pi_worker','public.indexer_documents','UPDATE WITH GRANT OPTION')::int ||
+       has_table_privilege('pi_worker','public.polkaswap_indexer_worker_lease_fence','UPDATE WITH GRANT OPTION')::int ||
+       has_any_column_privilege('pi_worker','public.polkaswap_indexer_worker_lease_fence','UPDATE WITH GRANT OPTION')::int;"
+)"
+[[ "$GRANT_OPTION_MATRIX" == '0000|0000' ]]
 
 CHECKPOINT="runtime API"
 docker run -d \
@@ -231,7 +293,7 @@ CHECKPOINT="runtime operations"
     --env PGPASSWORD=api-test-password \
     "$POSTGRES_CONTAINER" \
     psql -h 127.0.0.1 -U pi_api -d polkaswap -Atc \
-    'select count(*) from indexer_documents;'
+    'select count(*) from public.indexer_documents;'
 )" == 0 ]]
 set +e
 api_fence_output="$(
@@ -239,7 +301,7 @@ api_fence_output="$(
     --env PGPASSWORD=api-test-password \
     "$POSTGRES_CONTAINER" \
     psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U pi_api -d polkaswap -c \
-    'select count(*) from polkaswap_indexer_worker_lease_fence;' 2>&1
+    'select count(*) from public.polkaswap_indexer_worker_lease_fence;' 2>&1
 )"
 api_fence_exit=$?
 worker_ddl_output="$(
@@ -255,7 +317,7 @@ worker_fence_delete_output="$(
     --env PGPASSWORD=worker-test-password \
     "$POSTGRES_CONTAINER" \
     psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U pi_worker -d polkaswap -c \
-    'delete from polkaswap_indexer_worker_lease_fence;' 2>&1
+    'delete from public.polkaswap_indexer_worker_lease_fence;' 2>&1
 )"
 worker_fence_delete_exit=$?
 set -e
@@ -266,14 +328,32 @@ docker exec \
   --env PGPASSWORD=worker-test-password \
   "$POSTGRES_CONTAINER" \
   psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U pi_worker -d polkaswap \
-  -c "insert into indexer_documents(collection,id,data) values ('assets','worker-can-write','{}');" \
-  -c "delete from indexer_documents where collection='assets' and id='worker-can-write';" \
+  -c "insert into public.indexer_documents(collection,id,data) values ('assets','worker-can-write','{}');" \
+  -c "delete from public.indexer_documents where collection='assets' and id='worker-can-write';" \
   >/dev/null
 
 CHECKPOINT="idempotent rerun"
 RERUN_LOGS="$(run_migration "$OWNER_URL" "$API_URL" "$WORKER_URL")"
-[[ "$RERUN_LOGS" == *'Verified production PostgreSQL runtime table privileges after schema migration'* ]]
+[[ "$RERUN_LOGS" == *'Verified production PostgreSQL sessions and exact table/column privileges after schema migration'* ]]
 assert_credential_safe_log "$RERUN_LOGS"
+
+CHECKPOINT="process override negative cases"
+set +e
+node_tls_override_logs="$(
+  run_migration_with_process_override NODE_TLS_REJECT_UNAUTHORIZED 0
+)"
+node_tls_override_exit=$?
+pgoptions_override_logs="$(
+  run_migration_with_process_override PGOPTIONS '-c search_path=pi_shadow,public'
+)"
+pgoptions_override_exit=$?
+set -e
+[[ "$node_tls_override_exit" -eq 1 ]]
+[[ "$node_tls_override_logs" == 'Production database credential preflight failed: process-environment-override' ]]
+[[ "$pgoptions_override_exit" -eq 1 ]]
+[[ "$pgoptions_override_logs" == 'Production database credential preflight failed: process-environment-override' ]]
+assert_credential_safe_log "$node_tls_override_logs"
+assert_credential_safe_log "$pgoptions_override_logs"
 
 CHECKPOINT="TLS negative cases"
 wrong_owner="${OWNER_URL//@database:/@wrong-database:}"
@@ -320,6 +400,25 @@ docker exec \
 [[ "$ddl_group_logs" == 'Production database credential preflight failed: database-runtime-role-privileges-invalid' ]]
 assert_credential_safe_log "$ddl_group_logs"
 
+CHECKPOINT="dangerous predefined role membership"
+docker exec \
+  --env PGPASSWORD=postgres-test-password \
+  "$POSTGRES_CONTAINER" \
+  psql -v ON_ERROR_STOP=1 -U postgres -d polkaswap \
+  -c 'grant pg_execute_server_program to pi_worker;' >/dev/null
+set +e
+predefined_role_logs="$(run_migration "$OWNER_URL" "$API_URL" "$WORKER_URL")"
+predefined_role_exit=$?
+set -e
+docker exec \
+  --env PGPASSWORD=postgres-test-password \
+  "$POSTGRES_CONTAINER" \
+  psql -v ON_ERROR_STOP=1 -U postgres -d polkaswap \
+  -c 'revoke pg_execute_server_program from pi_worker;' >/dev/null
+[[ "$predefined_role_exit" -eq 1 ]]
+[[ "$predefined_role_logs" == 'Production database credential preflight failed: database-runtime-role-privileges-invalid' ]]
+assert_credential_safe_log "$predefined_role_logs"
+
 CHECKPOINT="assumable object ownership"
 docker exec \
   --env PGPASSWORD=postgres-test-password \
@@ -344,6 +443,44 @@ docker exec \
 [[ "$object_group_logs" == 'Production database credential preflight failed: database-runtime-role-privileges-invalid' ]]
 assert_credential_safe_log "$object_group_logs"
 
+CHECKPOINT="public column privilege attack"
+docker exec \
+  --env PGPASSWORD=postgres-test-password \
+  "$POSTGRES_CONTAINER" \
+  psql -v ON_ERROR_STOP=1 -U postgres -d polkaswap \
+  -c 'grant update(data) on public.indexer_documents to public;' >/dev/null
+set +e
+public_column_logs="$(run_migration "$OWNER_URL" "$API_URL" "$WORKER_URL")"
+public_column_exit=$?
+set -e
+docker exec \
+  --env PGPASSWORD=postgres-test-password \
+  "$POSTGRES_CONTAINER" \
+  psql -v ON_ERROR_STOP=1 -U postgres -d polkaswap \
+  -c 'revoke update(data) on public.indexer_documents from public;' >/dev/null
+[[ "$public_column_exit" -eq 1 ]]
+[[ "$public_column_logs" == 'Production database credential preflight failed: database-api-privileges-invalid' ]]
+assert_credential_safe_log "$public_column_logs"
+
+CHECKPOINT="column grant-option attack"
+docker exec \
+  --env PGPASSWORD=postgres-test-password \
+  "$POSTGRES_CONTAINER" \
+  psql -v ON_ERROR_STOP=1 -U postgres -d polkaswap \
+  -c 'grant update(data) on public.indexer_documents to pi_api with grant option;' >/dev/null
+set +e
+column_grant_option_logs="$(run_migration "$OWNER_URL" "$API_URL" "$WORKER_URL")"
+column_grant_option_exit=$?
+set -e
+docker exec \
+  --env PGPASSWORD=postgres-test-password \
+  "$POSTGRES_CONTAINER" \
+  psql -v ON_ERROR_STOP=1 -U postgres -d polkaswap \
+  -c 'revoke update(data) on public.indexer_documents from pi_api cascade;' >/dev/null
+[[ "$column_grant_option_exit" -eq 1 ]]
+[[ "$column_grant_option_logs" == 'Production database credential preflight failed: database-api-privileges-invalid' ]]
+assert_credential_safe_log "$column_grant_option_logs"
+
 CHECKPOINT="assumable extra group ACL"
 docker exec \
   --env PGPASSWORD=postgres-test-password \
@@ -366,8 +503,8 @@ docker exec \
   -c 'revoke select on polkaswap_indexer_worker_lease_fence from pi_extra_acl;' \
   -c 'drop role pi_extra_acl;' >/dev/null
 [[ "$extra_acl_exit" -eq 1 ]]
-[[ "$extra_acl_logs" == *'Production database credential preflight failed: database-api-privileges-invalid'* ]]
+[[ "$extra_acl_logs" == 'Production database credential preflight failed: database-runtime-role-privileges-invalid' ]]
 assert_credential_safe_log "$extra_acl_logs"
 
 CHECKPOINT="complete"
-echo "[production-database-test] TLS fresh migration, idempotent rerun, API readiness, exact ACLs, hostname verification, role-membership defenses, and credential-safe diagnostics passed."
+echo "[production-database-test] TLS migration, hostile search-path isolation, idempotency, API readiness, exact table/column ACLs, grant-option checks, hostname verification, role defenses, override rejection, and credential-safe diagnostics passed."

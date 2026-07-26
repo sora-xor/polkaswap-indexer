@@ -94,6 +94,7 @@ describe('PostgresRepository', () => {
         connectionTimeoutMillis: 15_000,
         query_timeout: 90_000,
         statement_timeout: 95_000,
+        options: '-c search_path=pg_catalog,public,pg_temp',
         max: 7,
       })
     );
@@ -104,6 +105,7 @@ describe('PostgresRepository', () => {
         connectionTimeoutMillis: 15_000,
         query_timeout: 90_000,
         statement_timeout: 95_000,
+        options: '-c search_path=pg_catalog,public,pg_temp',
         max: 3,
       })
     );

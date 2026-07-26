@@ -1,6 +1,7 @@
 import pg from 'pg';
 import { pathToFileURL } from 'node:url';
 
+import { POSTGRES_TRUSTED_SESSION_OPTIONS } from '../postgres-session.js';
 import {
   isStoredSoraChainStateCoherent,
   parseStoredSoraChainIdentity,
@@ -264,6 +265,7 @@ const defaultDatabase = (databaseUrl: string): WorkerHealthDatabase => {
     idleTimeoutMillis: WORKER_HEALTH_CLEANUP_TIMEOUT_MS,
     query_timeout: WORKER_HEALTH_QUERY_TIMEOUT_MS,
     statement_timeout: WORKER_HEALTH_QUERY_TIMEOUT_MS,
+    options: POSTGRES_TRUSTED_SESSION_OPTIONS,
     application_name: 'polkaswap-worker-health',
     allowExitOnIdle: true,
   });

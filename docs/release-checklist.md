@@ -54,12 +54,16 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   database-only probe. Confirm the manifest rejects owner/runtime URL reuse,
   weak migration dependencies, runtime migration commands/entrypoints,
   per-service shutdown/logging overrides, short shutdown grace, and unbounded
-  logging. Confirm the resolved-manifest audit checks all three services.
+  logging. Confirm the resolved-manifest audit checks the exact service and
+  environment maps for all three services and rejects Node/PostgreSQL process
+  overrides.
 - Build the exact candidate image and run
   `POLKASWAP_TEST_IMAGE=<candidate> yarn test:production-database-deployment`.
   Confirm the pinned PostgreSQL 16 TLS test passes the fresh migration,
-  idempotent rerun, exact per-table ACL matrix, API repository probe,
-  hostname-verification negative case, and assumable-role/object-owner/extra-ACL
+  idempotent rerun, hostile role-default search path, exact table and column ACL
+  matrix, absence of grant options, API repository probe, hostname-verification
+  and process-override negative cases, predefined/assumable-role,
+  schema/object-owner, PUBLIC column-ACL, column grant-option, and extra-ACL
   adversarial cases without logging credential components.
 - Run `docker build -t polkaswap-indexer:release .` and confirm the production
   image builds from the checked-in container contract.

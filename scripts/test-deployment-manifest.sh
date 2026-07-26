@@ -136,10 +136,35 @@ cp "$ROOT_DIR/Dockerfile" "$remote_health"
 perl -0pi -e 's#http://127\.0\.0\.1:#https://attacker.invalid:#' "$remote_health"
 expect_failure "remote-health" "$remote_health" "$ROOT_DIR/.dockerignore" "runtime healthcheck must probe the loopback GraphQL endpoint"
 
+dockerfile_tls_override="$TMP_DIR/Dockerfile.tls-override"
+cp "$ROOT_DIR/Dockerfile" "$dockerfile_tls_override"
+printf '\nENV NODE_TLS_REJECT_UNAUTHORIZED=0\n' >> "$dockerfile_tls_override"
+expect_failure "dockerfile-tls-override" "$dockerfile_tls_override" "$ROOT_DIR/.dockerignore" "production image and Compose must not set Node or PostgreSQL process overrides"
+
 public_bind="$TMP_DIR/docker-compose.public-bind.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$public_bind"
 perl -0pi -e 's/127\.0\.0\.1:4350:4350/0.0.0.0:4350:4350/' "$public_bind"
 expect_failure "public-bind" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "must publish GraphQL only on host loopback" "$public_bind"
+
+migration_pgoptions_override="$TMP_DIR/docker-compose.migration-pgoptions.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$migration_pgoptions_override"
+perl -0pi -e 's/(^  migrate:\n.*?^      NODE_ENV: production\n)/$1      PGOPTIONS: "-c search_path=attacker,public"\n/ms' "$migration_pgoptions_override"
+expect_failure "migration-pgoptions-override" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "production image and Compose must not set Node or PostgreSQL process overrides" "$migration_pgoptions_override"
+
+api_tls_override="$TMP_DIR/docker-compose.api-tls-override.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_tls_override"
+perl -0pi -e 's/(^  api:\n.*?^      NODE_ENV: production\n)/$1      NODE_TLS_REJECT_UNAUTHORIZED: "0"\n/ms' "$api_tls_override"
+expect_failure "api-tls-override" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "production image and Compose must not set Node or PostgreSQL process overrides" "$api_tls_override"
+
+worker_node_options_override="$TMP_DIR/docker-compose.worker-node-options.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$worker_node_options_override"
+perl -0pi -e 's/(^  worker:\n.*?^      NODE_ENV: production\n)/$1      NODE_OPTIONS: "--require=\/tmp\/unreviewed.js"\n/ms' "$worker_node_options_override"
+expect_failure "worker-node-options-override" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "production image and Compose must not set Node or PostgreSQL process overrides" "$worker_node_options_override"
+
+api_extra_environment="$TMP_DIR/docker-compose.api-extra-environment.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_extra_environment"
+perl -0pi -e 's/(^  api:\n.*?^      NODE_ENV: production\n)/$1      UNREVIEWED_RUNTIME_INPUT: "1"\n/ms' "$api_extra_environment"
+expect_failure "api-extra-environment" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved api environment must match its exact audited map" "$api_extra_environment"
 
 api_extra_port="$TMP_DIR/docker-compose.api-extra-port.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$api_extra_port"

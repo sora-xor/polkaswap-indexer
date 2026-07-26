@@ -44,6 +44,7 @@ const productionDatabaseSessionIdentities = (): ProductionDatabaseSessionIdentit
     currentRole: 'pi_migration_owner',
     sessionRole: 'pi_migration_owner',
     databaseIdentity: 'polkaswap',
+    searchPath: 'pg_catalog,public,pg_temp',
     isSuperuser: false,
     canCreateRoles: false,
     canCreateDatabases: false,
@@ -54,11 +55,14 @@ const productionDatabaseSessionIdentities = (): ProductionDatabaseSessionIdentit
     ownsApplicationObjects: true,
     isMigrationOwnerMember: true,
     canAssumeElevatedRole: false,
+    isDatabaseOwnerMember: true,
+    hasUnexpectedRoleMembership: false,
   },
   {
     currentRole: 'pi_api',
     sessionRole: 'pi_api',
     databaseIdentity: 'polkaswap',
+    searchPath: 'pg_catalog,public,pg_temp',
     isSuperuser: false,
     canCreateRoles: false,
     canCreateDatabases: false,
@@ -69,11 +73,14 @@ const productionDatabaseSessionIdentities = (): ProductionDatabaseSessionIdentit
     ownsApplicationObjects: false,
     isMigrationOwnerMember: false,
     canAssumeElevatedRole: false,
+    isDatabaseOwnerMember: false,
+    hasUnexpectedRoleMembership: false,
   },
   {
     currentRole: 'pi_worker',
     sessionRole: 'pi_worker',
     databaseIdentity: 'polkaswap',
+    searchPath: 'pg_catalog,public,pg_temp',
     isSuperuser: false,
     canCreateRoles: false,
     canCreateDatabases: false,
@@ -84,6 +91,8 @@ const productionDatabaseSessionIdentities = (): ProductionDatabaseSessionIdentit
     ownsApplicationObjects: false,
     isMigrationOwnerMember: false,
     canAssumeElevatedRole: false,
+    isDatabaseOwnerMember: false,
+    hasUnexpectedRoleMembership: false,
   },
 ];
 
@@ -93,6 +102,8 @@ const productionRuntimeDatabasePrivileges =
       currentRole: 'pi_api',
       sessionRole: 'pi_api',
       databaseIdentity: 'polkaswap',
+      searchPath: 'pg_catalog,public,pg_temp',
+      hasOtherRoleMembership: false,
       canSelectDocuments: true,
       canInsertDocuments: false,
       canUpdateDocuments: false,
@@ -100,6 +111,11 @@ const productionRuntimeDatabasePrivileges =
       canTruncateDocuments: false,
       canReferenceDocuments: false,
       canTriggerDocuments: false,
+      canInsertAnyDocumentColumn: false,
+      canUpdateAnyDocumentColumn: false,
+      canReferenceAnyDocumentColumn: false,
+      hasDocumentTableGrantOptions: false,
+      hasDocumentColumnGrantOptions: false,
       canSelectWorkerFence: false,
       canInsertWorkerFence: false,
       canUpdateWorkerFence: false,
@@ -107,11 +123,19 @@ const productionRuntimeDatabasePrivileges =
       canTruncateWorkerFence: false,
       canReferenceWorkerFence: false,
       canTriggerWorkerFence: false,
+      canSelectAnyWorkerFenceColumn: false,
+      canInsertAnyWorkerFenceColumn: false,
+      canUpdateAnyWorkerFenceColumn: false,
+      canReferenceAnyWorkerFenceColumn: false,
+      hasWorkerFenceTableGrantOptions: false,
+      hasWorkerFenceColumnGrantOptions: false,
     },
     {
       currentRole: 'pi_worker',
       sessionRole: 'pi_worker',
       databaseIdentity: 'polkaswap',
+      searchPath: 'pg_catalog,public,pg_temp',
+      hasOtherRoleMembership: false,
       canSelectDocuments: true,
       canInsertDocuments: true,
       canUpdateDocuments: true,
@@ -119,6 +143,11 @@ const productionRuntimeDatabasePrivileges =
       canTruncateDocuments: false,
       canReferenceDocuments: false,
       canTriggerDocuments: false,
+      canInsertAnyDocumentColumn: true,
+      canUpdateAnyDocumentColumn: true,
+      canReferenceAnyDocumentColumn: false,
+      hasDocumentTableGrantOptions: false,
+      hasDocumentColumnGrantOptions: false,
       canSelectWorkerFence: true,
       canInsertWorkerFence: true,
       canUpdateWorkerFence: true,
@@ -126,6 +155,12 @@ const productionRuntimeDatabasePrivileges =
       canTruncateWorkerFence: false,
       canReferenceWorkerFence: false,
       canTriggerWorkerFence: false,
+      canSelectAnyWorkerFenceColumn: true,
+      canInsertAnyWorkerFenceColumn: true,
+      canUpdateAnyWorkerFenceColumn: true,
+      canReferenceAnyWorkerFenceColumn: false,
+      hasWorkerFenceTableGrantOptions: false,
+      hasWorkerFenceColumnGrantOptions: false,
     },
   ];
 
@@ -134,6 +169,41 @@ describe('production PostgreSQL migration credential preflight', () => {
     expect(readProductionDatabaseTopology(validEnvironment())).toEqual(
       productionDatabaseTopology()
     );
+  });
+
+  it.each([
+    ['global TLS disable', 'NODE_TLS_REJECT_UNAUTHORIZED', '0'],
+    ['Node preload', 'NODE_OPTIONS', '--require=/tmp/unreviewed.js'],
+    ['shadow search path', 'PGOPTIONS', '-c search_path=attacker,public'],
+    ['TLS mode override', 'PGSSLMODE', 'disable'],
+    ['password fallback', 'PGPASSWORD', 'migration-secret-must-not-log'],
+  ])('rejects the %s process override before config or DDL', async (_label, name, value) => {
+    const readMigrationConfig = vi.fn(() => migrationConfig());
+    const readDatabaseIdentities = vi.fn(async () => productionDatabaseSessionIdentities());
+    const applyRuntimeDatabasePrivileges = vi.fn(async () => undefined);
+    const readRuntimeDatabasePrivileges = vi.fn(
+      async () => productionRuntimeDatabasePrivileges()
+    );
+    const migrate = vi.fn(async () => undefined);
+
+    const operation = runProductionMigration(validEnvironment({ [name]: value }), {
+      readMigrationConfig,
+      readDatabaseIdentities,
+      applyRuntimeDatabasePrivileges,
+      readRuntimeDatabasePrivileges,
+      migrate,
+    });
+    await expect(operation).rejects.toThrow(
+      'Production database credential preflight failed: process-environment-override'
+    );
+    await operation.catch((error: unknown) => {
+      expect(String(error)).not.toContain(value);
+    });
+    expect(readMigrationConfig).not.toHaveBeenCalled();
+    expect(readDatabaseIdentities).not.toHaveBeenCalled();
+    expect(applyRuntimeDatabasePrivileges).not.toHaveBeenCalled();
+    expect(readRuntimeDatabasePrivileges).not.toHaveBeenCalled();
+    expect(migrate).not.toHaveBeenCalled();
   });
 
   it('normalizes protocol aliases, host case, default ports, and escaped database names', () => {
@@ -169,7 +239,7 @@ describe('production PostgreSQL migration credential preflight', () => {
     });
 
     expect(readMigrationConfig).toHaveBeenCalledTimes(1);
-    expect(readDatabaseIdentities).toHaveBeenCalledTimes(1);
+    expect(readDatabaseIdentities).toHaveBeenCalledTimes(2);
     expect(readDatabaseIdentities).toHaveBeenCalledWith(productionDatabaseTopology(), config);
     expect(migrate).toHaveBeenCalledTimes(1);
     expect(migrate).toHaveBeenCalledWith(config);
@@ -189,6 +259,9 @@ describe('production PostgreSQL migration credential preflight', () => {
       applyRuntimeDatabasePrivileges.mock.invocationCallOrder[0]!
     );
     expect(applyRuntimeDatabasePrivileges.mock.invocationCallOrder[0]).toBeLessThan(
+      readDatabaseIdentities.mock.invocationCallOrder[1]!
+    );
+    expect(readDatabaseIdentities.mock.invocationCallOrder[1]).toBeLessThan(
       readRuntimeDatabasePrivileges.mock.invocationCallOrder[0]!
     );
     expect(info).toHaveBeenNthCalledWith(
@@ -197,7 +270,7 @@ describe('production PostgreSQL migration credential preflight', () => {
     );
     expect(info).toHaveBeenNthCalledWith(
       2,
-      'Verified production PostgreSQL runtime table privileges after schema migration'
+      'Verified production PostgreSQL sessions and exact table/column privileges after schema migration'
     );
     info.mockRestore();
   });
@@ -534,6 +607,12 @@ describe('production PostgreSQL migration credential preflight', () => {
         identities[0]!.canCreateInPublicSchema = false;
       },
     ],
+    [
+      'a migration owner with an unrelated role membership',
+      (identities: ProductionDatabaseSessionIdentity[]) => {
+        identities[0]!.hasUnexpectedRoleMembership = true;
+      },
+    ],
   ])('rejects %s before executing DDL', async (_label, mutate) => {
     const identities = productionDatabaseSessionIdentities();
     mutate(identities);
@@ -594,6 +673,18 @@ describe('production PostgreSQL migration credential preflight', () => {
         identity.canAssumeElevatedRole = true;
       },
     ],
+    [
+      'database-owner member',
+      (identity: ProductionDatabaseSessionIdentity) => {
+        identity.isDatabaseOwnerMember = true;
+      },
+    ],
+    [
+      'unrelated predefined-role member',
+      (identity: ProductionDatabaseSessionIdentity) => {
+        identity.hasUnexpectedRoleMembership = true;
+      },
+    ],
   ])('rejects an elevated API %s before executing DDL', async (_label, mutate) => {
     const identities = productionDatabaseSessionIdentities();
     mutate(identities[1]!);
@@ -614,6 +705,55 @@ describe('production PostgreSQL migration credential preflight', () => {
       'Production database credential preflight failed: database-runtime-role-privileges-invalid'
     );
     expect(migrate).not.toHaveBeenCalled();
+    expect(readRuntimeDatabasePrivileges).not.toHaveBeenCalled();
+  });
+
+  it('rejects a shadowable PostgreSQL search path before executing DDL', async () => {
+    const identities = productionDatabaseSessionIdentities();
+    identities[1]!.searchPath = 'attacker, public';
+    const migrate = vi.fn(async () => undefined);
+
+    await expect(
+      runProductionMigration(validEnvironment(), {
+        readMigrationConfig: () => migrationConfig(),
+        readDatabaseIdentities: async () => identities,
+        applyRuntimeDatabasePrivileges: async () => undefined,
+        readRuntimeDatabasePrivileges: async () => productionRuntimeDatabasePrivileges(),
+        migrate,
+      })
+    ).rejects.toThrow(
+      'Production database credential preflight failed: database-session-search-path-invalid'
+    );
+    expect(migrate).not.toHaveBeenCalled();
+  });
+
+  it('rechecks all identities after DDL and rejects role-membership drift', async () => {
+    const postMigrationIdentities = productionDatabaseSessionIdentities();
+    postMigrationIdentities[2]!.hasUnexpectedRoleMembership = true;
+    const readDatabaseIdentities = vi
+      .fn()
+      .mockResolvedValueOnce(productionDatabaseSessionIdentities())
+      .mockResolvedValueOnce(postMigrationIdentities);
+    const applyRuntimeDatabasePrivileges = vi.fn(async () => undefined);
+    const readRuntimeDatabasePrivileges = vi.fn(
+      async () => productionRuntimeDatabasePrivileges()
+    );
+    const migrate = vi.fn(async () => undefined);
+
+    await expect(
+      runProductionMigration(validEnvironment(), {
+        readMigrationConfig: () => migrationConfig(),
+        readDatabaseIdentities,
+        applyRuntimeDatabasePrivileges,
+        readRuntimeDatabasePrivileges,
+        migrate,
+      })
+    ).rejects.toThrow(
+      'Production database credential preflight failed: database-runtime-role-privileges-invalid'
+    );
+    expect(migrate).toHaveBeenCalledOnce();
+    expect(applyRuntimeDatabasePrivileges).toHaveBeenCalledOnce();
+    expect(readDatabaseIdentities).toHaveBeenCalledTimes(2);
     expect(readRuntimeDatabasePrivileges).not.toHaveBeenCalled();
   });
 
@@ -655,6 +795,48 @@ describe('production PostgreSQL migration credential preflight', () => {
     expect(migrate).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    [
+      'column-level document UPDATE',
+      (privileges: ProductionRuntimeDatabasePrivileges) => {
+        privileges.canUpdateAnyDocumentColumn = true;
+      },
+    ],
+    [
+      'column-level worker-fence SELECT',
+      (privileges: ProductionRuntimeDatabasePrivileges) => {
+        privileges.canSelectAnyWorkerFenceColumn = true;
+      },
+    ],
+    [
+      'document table grant option',
+      (privileges: ProductionRuntimeDatabasePrivileges) => {
+        privileges.hasDocumentTableGrantOptions = true;
+      },
+    ],
+    [
+      'worker-fence column grant option',
+      (privileges: ProductionRuntimeDatabasePrivileges) => {
+        privileges.hasWorkerFenceColumnGrantOptions = true;
+      },
+    ],
+  ])('rejects API %s after migration', async (_label, mutate) => {
+    const privileges = productionRuntimeDatabasePrivileges();
+    mutate(privileges[0]!);
+
+    await expect(
+      runProductionMigration(validEnvironment(), {
+        readMigrationConfig: () => migrationConfig(),
+        readDatabaseIdentities: async () => productionDatabaseSessionIdentities(),
+        applyRuntimeDatabasePrivileges: async () => undefined,
+        readRuntimeDatabasePrivileges: async () => privileges,
+        migrate: async () => undefined,
+      })
+    ).rejects.toThrow(
+      'Production database credential preflight failed: database-api-privileges-invalid'
+    );
+  });
+
   it('rejects incomplete worker DML privileges after migration and blocks runtime handoff', async () => {
     const privileges = productionRuntimeDatabasePrivileges();
     privileges[1]!.canUpdateWorkerFence = false;
@@ -693,6 +875,48 @@ describe('production PostgreSQL migration credential preflight', () => {
     expect(migrate).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    [
+      'column-level document REFERENCES',
+      (privileges: ProductionRuntimeDatabasePrivileges) => {
+        privileges.canReferenceAnyDocumentColumn = true;
+      },
+    ],
+    [
+      'column-level worker-fence REFERENCES',
+      (privileges: ProductionRuntimeDatabasePrivileges) => {
+        privileges.canReferenceAnyWorkerFenceColumn = true;
+      },
+    ],
+    [
+      'document column grant option',
+      (privileges: ProductionRuntimeDatabasePrivileges) => {
+        privileges.hasDocumentColumnGrantOptions = true;
+      },
+    ],
+    [
+      'worker-fence table grant option',
+      (privileges: ProductionRuntimeDatabasePrivileges) => {
+        privileges.hasWorkerFenceTableGrantOptions = true;
+      },
+    ],
+  ])('rejects worker %s after migration', async (_label, mutate) => {
+    const privileges = productionRuntimeDatabasePrivileges();
+    mutate(privileges[1]!);
+
+    await expect(
+      runProductionMigration(validEnvironment(), {
+        readMigrationConfig: () => migrationConfig(),
+        readDatabaseIdentities: async () => productionDatabaseSessionIdentities(),
+        applyRuntimeDatabasePrivileges: async () => undefined,
+        readRuntimeDatabasePrivileges: async () => privileges,
+        migrate: async () => undefined,
+      })
+    ).rejects.toThrow(
+      'Production database credential preflight failed: database-worker-privileges-invalid'
+    );
+  });
+
   it('rejects a changed runtime session during the post-migration privilege check', async () => {
     const privileges = productionRuntimeDatabasePrivileges();
     privileges[0]!.currentRole = 'pi_migration_owner';
@@ -710,6 +934,36 @@ describe('production PostgreSQL migration credential preflight', () => {
       'Production database credential preflight failed: database-runtime-session-mismatch'
     );
     expect(migrate).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    [
+      'search-path drift',
+      (privileges: ProductionRuntimeDatabasePrivileges) => {
+        privileges.searchPath = 'public, pg_temp';
+      },
+    ],
+    [
+      'new role membership',
+      (privileges: ProductionRuntimeDatabasePrivileges) => {
+        privileges.hasOtherRoleMembership = true;
+      },
+    ],
+  ])('rejects runtime %s during the exact privilege check', async (_label, mutate) => {
+    const privileges = productionRuntimeDatabasePrivileges();
+    mutate(privileges[0]!);
+
+    await expect(
+      runProductionMigration(validEnvironment(), {
+        readMigrationConfig: () => migrationConfig(),
+        readDatabaseIdentities: async () => productionDatabaseSessionIdentities(),
+        applyRuntimeDatabasePrivileges: async () => undefined,
+        readRuntimeDatabasePrivileges: async () => privileges,
+        migrate: async () => undefined,
+      })
+    ).rejects.toThrow(
+      'Production database credential preflight failed: database-runtime-session-invalid'
+    );
   });
 
   it('does not inspect runtime privileges when schema migration itself fails', async () => {

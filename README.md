@@ -136,21 +136,33 @@ target, malformed URLs, and unaudited connection controls before reading
 migration configuration. Only `sslmode` and `sslnegotiation` URL parameters are
 accepted, and `sslmode=verify-full` is mandatory; plaintext, downgrade,
 CA-only, and hostname-unverified modes are rejected. Client, statement, and
-query deadlines cannot be overridden by a URL.
+query deadlines cannot be overridden by a URL. Production also rejects
+`NODE_OPTIONS`, `NODE_TLS_REJECT_UNAUTHORIZED`, and every `PG*` process
+override so the reviewed URL, TLS policy, and startup options cannot be
+silently replaced.
 It then connects with every credential and requires the live PostgreSQL
 `session_user` and `current_user` to match the URL role and
-`current_database()` to match the shared target. Before DDL, it also requires a
-non-superuser migration owner with schema-create access and runtime roles with
-no elevated role attributes, direct or assumable DDL access, migration-owner
-membership, or direct/assumable application-object ownership. After DDL, the
-migration owner atomically replaces the runtime ACLs: API gets `SELECT` on
-`indexer_documents` and no fence access; worker gets
+`current_database()` to match the shared target. Every application-controlled
+PostgreSQL client pins and verifies `search_path=pg_catalog,public,pg_temp`, so
+role/database defaults and temporary or attacker-owned schemas cannot redirect
+an unqualified relation. Before DDL, the wrapper also requires a non-superuser
+migration owner with schema-create access and no unrelated memberships, and
+runtime roles with no membership in any other role (including predefined
+server-file/program roles), elevated role attributes, direct or assumable DDL
+access, migration-owner membership, or direct/assumable schema, relation,
+routine, or type ownership. After DDL, the migration owner atomically replaces
+the runtime ACLs: API gets `SELECT` on `indexer_documents` and no fence access;
+worker gets
 `SELECT`/`INSERT`/`UPDATE`/`DELETE` on `indexer_documents` and only
 `SELECT`/`INSERT`/`UPDATE` on the worker fence. The wrapper reopens both runtime
 sessions and verifies those exact privileges across the login and every role it
-can assume, including `NOINHERIT` memberships, before handoff. Its fixed
-diagnostics never print a URL, username, password, or host.
-Every connection/query and even failed-client cleanup has a hard deadline. The
+can assume, including table privileges, column privileges, every grant-option
+path, `NOINHERIT` memberships, and a second complete identity check before
+handoff. Its fixed diagnostics never print a URL, username, password, or host.
+Every preflight/privilege connection and query, plus failed-client cleanup, has
+a hard deadline. Actual migration DDL uses separately configured deadlines and
+intentionally defaults to unlimited for production-scale validation and index
+builds. The
 owner URL is mounted only into the migration service; API and worker set
 `SKIP_POSTGRES_MIGRATION=true`, run exact compiled entrypoints with no
 shell/entrypoint override, and start only after that service exits successfully.
@@ -252,7 +264,8 @@ read-only access to indexed documents and the worker login with its required
 document DML plus `SELECT`, `INSERT`, and `UPDATE` on the fence table. Neither
 runtime login needs schema ownership or DDL privileges; grant both database
 `CONNECT` and schema `USAGE`, then let the one-shot migration owner install and
-verify the exact table ACLs before handoff. A
+verify the exact table/column ACLs and absence of grant options before handoff.
+A
 worker started against an unmigrated database fails closed with an instruction
 to run the migration; it never attempts runtime DDL. API-only and administrative
 repository instances are not fenced unless they are explicitly constructed with

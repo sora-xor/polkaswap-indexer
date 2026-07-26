@@ -1,5 +1,7 @@
 import { isIP } from 'node:net';
 
+import { findUnsafePostgresProcessEnvironmentOverride } from './postgres-session.js';
+
 export type AppConfig = {
   host: string;
   port: number;
@@ -286,6 +288,15 @@ const validateNetworkHost = (name: string, value: string): string => {
 /** Reads and strictly validates all long-lived runtime configuration. */
 export function readConfig(): AppConfig {
   const nodeEnvironment = readNodeEnvironment();
+  if (nodeEnvironment === 'production') {
+    const override = findUnsafePostgresProcessEnvironmentOverride(process.env);
+    if (override !== null) {
+      invalid(
+        override,
+        'must not override production PostgreSQL connection or TLS policy'
+      );
+    }
+  }
   const host = validateNetworkHost('HOST', readString('HOST', '0.0.0.0'));
   const workerMetricsHost = validateNetworkHost(
     'WORKER_METRICS_HOST',

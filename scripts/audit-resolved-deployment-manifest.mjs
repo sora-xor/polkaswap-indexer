@@ -38,6 +38,68 @@ const expectedRestarts = {
 };
 const expectedImage =
   'registry.invalid/polkaswap-indexer@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const expectedEnvironments = {
+  migrate: {
+    DATABASE_URL:
+      'postgresql://manifest_migration_owner:owner-test-only@database.invalid/polkaswap?sslmode=verify-full',
+    NODE_ENV: 'production',
+    POLKASWAP_API_DATABASE_URL:
+      'postgresql://manifest_api:api-test-only@database.invalid/polkaswap?sslmode=verify-full',
+    POLKASWAP_WORKER_DATABASE_URL:
+      'postgresql://manifest_worker:worker-test-only@database.invalid/polkaswap?sslmode=verify-full',
+    POSTGRES_MIGRATION_QUERY_TIMEOUT_MS: '0',
+    POSTGRES_MIGRATION_STATEMENT_TIMEOUT_MS: '0',
+    STORAGE_ENGINE: 'postgres',
+  },
+  api: {
+    DATABASE_URL:
+      'postgresql://manifest_api:api-test-only@database.invalid/polkaswap?sslmode=verify-full',
+    GRAPHQL_ALLOW_INTROSPECTION: 'false',
+    GRAPHQL_HTTP_MAX_BODY_BYTES: '65536',
+    GRAPHQL_HTTP_MAX_IN_FLIGHT: '100',
+    GRAPHQL_MAX_ALIASES: '50',
+    GRAPHQL_MAX_DEPTH: '12',
+    GRAPHQL_MAX_DOCUMENT_NODES: '2000',
+    GRAPHQL_MAX_FIELDS: '300',
+    GRAPHQL_MAX_FRAGMENT_SPREADS: '100',
+    GRAPHQL_MAX_OPERATION_COST: '100000',
+    GRAPHQL_PATH: '/graphql',
+    GRAPHQL_WS_CONNECTION_INIT_TIMEOUT_MS: '10000',
+    GRAPHQL_WS_MAX_CONNECTIONS: '512',
+    GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT: '512',
+    GRAPHQL_WS_MAX_OPERATIONS: '1024',
+    GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION: '32',
+    GRAPHQL_WS_MAX_PAYLOAD_BYTES: '65536',
+    GRAPHQL_WS_MAX_PENDING_MESSAGES_PER_CONNECTION: '64',
+    HOST: '0.0.0.0',
+    HTTP_MAX_CONNECTIONS: '2048',
+    HTTP_MAX_HEADER_BYTES: '16384',
+    HTTP_MAX_REQUESTS_PER_SOCKET: '1000',
+    NODE_ENV: 'production',
+    PORT: '4350',
+    RATE_LIMIT_GLOBAL_MAX: '50000',
+    RATE_LIMIT_GLOBAL_WINDOW_MS: '60000',
+    RATE_LIMIT_MAX: '50000',
+    RATE_LIMIT_MAX_KEYS: '20000',
+    RATE_LIMIT_WINDOW_MS: '60000',
+    SKIP_POSTGRES_MIGRATION: 'true',
+    STORAGE_ENGINE: 'postgres',
+  },
+  worker: {
+    CHAIN_BATCH_SIZE: '25',
+    CHAIN_SNAPSHOT_INTERVAL_BLOCKS: '25',
+    CHAIN_START_BLOCK: '14000000',
+    CHAIN_STATE_REFRESH_INTERVAL_BLOCKS: '25',
+    DATABASE_URL:
+      'postgresql://manifest_worker:worker-test-only@database.invalid/polkaswap?sslmode=verify-full',
+    NODE_ENV: 'production',
+    PI_WORKER_HEALTH_TIMEOUT_MS: '4000',
+    SKIP_POSTGRES_MIGRATION: 'true',
+    SORA_ARCHIVE_WS_ENDPOINT: 'wss://archive.invalid',
+    SORA_WS_ENDPOINT: 'wss://primary.invalid',
+    STORAGE_ENGINE: 'postgres',
+  },
+};
 const expectedServiceKeys = {
   migrate: [
     'cap_drop',
@@ -112,6 +174,10 @@ const exactArray = (actual, expected) =>
   Array.isArray(actual) &&
   actual.length === expected.length &&
   actual.every((value, index) => value === expected[index]);
+const exactRecord = (actual, expected) =>
+  isRecord(actual) &&
+  Object.keys(actual).sort().join('\0') === Object.keys(expected).sort().join('\0') &&
+  Object.entries(expected).every(([key, value]) => actual[key] === value);
 
 for (const name of ['migrate', 'api', 'worker']) {
   const service = services[name];
@@ -129,6 +195,9 @@ for (const name of ['migrate', 'api', 'worker']) {
     [...expectedServiceKeys[name]].sort().join('\0')
   ) {
     fail(`resolved ${name} must contain only its exact audited service keys`);
+  }
+  if (!exactRecord(service.environment, expectedEnvironments[name])) {
+    fail(`resolved ${name} environment must match its exact audited map`);
   }
   if (
     service.image !== expectedImage ||

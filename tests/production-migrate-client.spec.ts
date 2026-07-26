@@ -105,6 +105,7 @@ const identityRows = (): ProductionDatabaseSessionIdentity[] => [
     currentRole: 'pi_migration_owner',
     sessionRole: 'pi_migration_owner',
     databaseIdentity: 'polkaswap',
+    searchPath: 'pg_catalog,public,pg_temp',
     isSuperuser: false,
     canCreateRoles: false,
     canCreateDatabases: false,
@@ -115,11 +116,14 @@ const identityRows = (): ProductionDatabaseSessionIdentity[] => [
     ownsApplicationObjects: false,
     isMigrationOwnerMember: true,
     canAssumeElevatedRole: false,
+    isDatabaseOwnerMember: true,
+    hasUnexpectedRoleMembership: false,
   },
   {
     currentRole: 'pi_api',
     sessionRole: 'pi_api',
     databaseIdentity: 'polkaswap',
+    searchPath: 'pg_catalog,public,pg_temp',
     isSuperuser: false,
     canCreateRoles: false,
     canCreateDatabases: false,
@@ -130,11 +134,14 @@ const identityRows = (): ProductionDatabaseSessionIdentity[] => [
     ownsApplicationObjects: false,
     isMigrationOwnerMember: false,
     canAssumeElevatedRole: false,
+    isDatabaseOwnerMember: false,
+    hasUnexpectedRoleMembership: false,
   },
   {
     currentRole: 'pi_worker',
     sessionRole: 'pi_worker',
     databaseIdentity: 'polkaswap',
+    searchPath: 'pg_catalog,public,pg_temp',
     isSuperuser: false,
     canCreateRoles: false,
     canCreateDatabases: false,
@@ -145,6 +152,8 @@ const identityRows = (): ProductionDatabaseSessionIdentity[] => [
     ownsApplicationObjects: false,
     isMigrationOwnerMember: false,
     canAssumeElevatedRole: false,
+    isDatabaseOwnerMember: false,
+    hasUnexpectedRoleMembership: false,
   },
 ];
 
@@ -153,6 +162,8 @@ const runtimePrivilegeRows = (): ProductionRuntimeDatabasePrivileges[] =>
     currentRole: role,
     sessionRole: role,
     databaseIdentity: 'polkaswap',
+    searchPath: 'pg_catalog,public,pg_temp',
+    hasOtherRoleMembership: false,
     canSelectDocuments: true,
     canInsertDocuments: index === 1,
     canUpdateDocuments: index === 1,
@@ -160,6 +171,11 @@ const runtimePrivilegeRows = (): ProductionRuntimeDatabasePrivileges[] =>
     canTruncateDocuments: false,
     canReferenceDocuments: false,
     canTriggerDocuments: false,
+    canInsertAnyDocumentColumn: index === 1,
+    canUpdateAnyDocumentColumn: index === 1,
+    canReferenceAnyDocumentColumn: false,
+    hasDocumentTableGrantOptions: false,
+    hasDocumentColumnGrantOptions: false,
     canSelectWorkerFence: index === 1,
     canInsertWorkerFence: index === 1,
     canUpdateWorkerFence: index === 1,
@@ -167,6 +183,12 @@ const runtimePrivilegeRows = (): ProductionRuntimeDatabasePrivileges[] =>
     canTruncateWorkerFence: false,
     canReferenceWorkerFence: false,
     canTriggerWorkerFence: false,
+    canSelectAnyWorkerFenceColumn: index === 1,
+    canInsertAnyWorkerFenceColumn: index === 1,
+    canUpdateAnyWorkerFenceColumn: index === 1,
+    canReferenceAnyWorkerFenceColumn: false,
+    hasWorkerFenceTableGrantOptions: false,
+    hasWorkerFenceColumnGrantOptions: false,
   }));
 
 beforeEach(() => {
@@ -197,10 +219,23 @@ describe('production PostgreSQL client preflight', () => {
         connectionTimeoutMillis: 250,
         query_timeout: 250,
         statement_timeout: 250,
+        options: '-c search_path=pg_catalog,public,pg_temp',
       });
       expect(client.connect).toHaveBeenCalledOnce();
       expect(client.query).toHaveBeenCalledWith(
         expect.stringContaining('pg_has_role'),
+        ['pi_migration_owner']
+      );
+      expect(client.query).toHaveBeenCalledWith(
+        expect.stringContaining("current_setting('search_path')"),
+        ['pi_migration_owner']
+      );
+      expect(client.query).toHaveBeenCalledWith(
+        expect.stringContaining('from pg_namespace schema_object'),
+        ['pi_migration_owner']
+      );
+      expect(client.query).toHaveBeenCalledWith(
+        expect.stringContaining('"hasUnexpectedRoleMembership"'),
         ['pi_migration_owner']
       );
       expect(client.end).toHaveBeenCalledOnce();
@@ -239,8 +274,11 @@ describe('production PostgreSQL client preflight', () => {
     ).resolves.toBeUndefined();
 
     const client = mocks.clients[0]!;
+    expect(client.config).toMatchObject({
+      options: '-c search_path=pg_catalog,public,pg_temp',
+    });
     expect(client.query.mock.calls.map(([query]) => query)).toEqual([
-      expect.stringContaining('current_user::text'),
+      expect.stringContaining("current_setting('search_path')"),
       'begin',
       'revoke all privileges on table public.indexer_documents from "pi_api", "pi_worker"',
       'revoke all privileges on table public.polkaswap_indexer_worker_lease_fence from "pi_api", "pi_worker"',
@@ -260,6 +298,11 @@ describe('production PostgreSQL client preflight', () => {
     ).resolves.toEqual(runtimePrivilegeRows());
     expect(mocks.Client).toHaveBeenCalledTimes(2);
     expect(mocks.clients.every((client) => client.end.mock.calls.length === 1)).toBe(true);
+    expect(
+      mocks.clients.every(
+        (client) => client.config.options === '-c search_path=pg_catalog,public,pg_temp'
+      )
+    ).toBe(true);
     expect(mocks.clients[0]!.query).toHaveBeenCalledWith(
       expect.stringContaining('canSelectDocuments')
     );
@@ -268,6 +311,18 @@ describe('production PostgreSQL client preflight', () => {
     );
     expect(mocks.clients[0]!.query).toHaveBeenCalledWith(
       expect.stringContaining("pg_has_role(current_user, assumable.oid, 'MEMBER')")
+    );
+    expect(mocks.clients[0]!.query).toHaveBeenCalledWith(
+      expect.stringContaining('has_any_column_privilege')
+    );
+    expect(mocks.clients[0]!.query).toHaveBeenCalledWith(
+      expect.stringContaining('WITH GRANT OPTION')
+    );
+    expect(mocks.clients[0]!.query).toHaveBeenCalledWith(
+      expect.stringContaining('"hasOtherRoleMembership"')
+    );
+    expect(mocks.clients[0]!.query).toHaveBeenCalledWith(
+      expect.stringContaining("current_setting('search_path')")
     );
   });
 

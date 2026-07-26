@@ -2,6 +2,7 @@ import pg from 'pg';
 
 import { getOrderField, NUMERIC_ORDER_FIELDS } from '../graphql/order.js';
 import { metrics } from '../metrics.js';
+import { POSTGRES_TRUSTED_SESSION_OPTIONS } from '../postgres-session.js';
 import {
   assertPostgresWorkerFencingToken,
   postgresAdvisoryLockParts,
@@ -478,6 +479,7 @@ export class PostgresRepository implements IndexerRepository {
       connectionTimeoutMillis: config.postgresConnectionTimeoutMs,
       query_timeout: config.postgresQueryTimeoutMs,
       statement_timeout: config.postgresStatementTimeoutMs,
+      options: POSTGRES_TRUSTED_SESSION_OPTIONS,
     };
 
     this.pool = new Pool({

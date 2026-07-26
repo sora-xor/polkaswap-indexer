@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import pg from 'pg';
 
 import { readConfig } from '../config.js';
+import { POSTGRES_TRUSTED_SESSION_OPTIONS } from '../postgres-session.js';
 import { decodePostgresDocumentText } from '../repository/postgres-document.js';
 import { RocksRepository } from '../repository/rocksdb.js';
 import { INDEXER_COLLECTIONS } from '../repository/types.js';
@@ -79,7 +80,10 @@ export const runRocksdbVerification = async (): Promise<void> => {
   const fullVerification = readStrictBoolean(process.env, 'ROCKSDB_VERIFY_FULL', true);
   const sampleSize = readPositiveSafeInteger(process.env, 'ROCKSDB_VERIFY_SAMPLE_SIZE', 100);
   const batchSize = readPositiveSafeInteger(process.env, 'ROCKSDB_VERIFY_BATCH_SIZE', 5_000);
-  const pool = new Pool({ connectionString: config.databaseUrl });
+  const pool = new Pool({
+    connectionString: config.databaseUrl,
+    options: POSTGRES_TRUSTED_SESSION_OPTIONS,
+  });
   const client = await pool.connect();
   const repository = new RocksRepository({ ...config, storageEngine: 'rocksdb' });
   let committed = false;

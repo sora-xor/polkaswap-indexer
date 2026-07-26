@@ -9,6 +9,11 @@ import {
 
 const CONFIG_ENV_KEYS = [
   'NODE_ENV',
+  'NODE_OPTIONS',
+  'NODE_TLS_REJECT_UNAUTHORIZED',
+  'PGOPTIONS',
+  'PGPASSWORD',
+  'PGSSLMODE',
   'HOST',
   'PORT',
   'GRAPHQL_PATH',
@@ -238,6 +243,27 @@ describe('runtime configuration', () => {
     expect(() => readConfig()).toThrow(
       /Invalid DATABASE_URL:.*may use only one lowercase sslmode/
     );
+  });
+
+  it.each([
+    ['global TLS disable', 'NODE_TLS_REJECT_UNAUTHORIZED', '0'],
+    ['Node preload options', 'NODE_OPTIONS', '--require=/tmp/unreviewed.js'],
+    ['PostgreSQL startup options', 'PGOPTIONS', '-c search_path=attacker,public'],
+    ['PostgreSQL TLS mode', 'PGSSLMODE', 'disable'],
+    ['PostgreSQL password fallback', 'PGPASSWORD', 'must-not-log'],
+  ])('rejects the production %s process override', (_label, name, value) => {
+    process.env.NODE_ENV = 'production';
+    process.env.DATABASE_URL =
+      'postgresql://pi@database.internal/polkaswap?sslmode=verify-full';
+    process.env[name] = value;
+    expect(() => readConfig()).toThrow(
+      new RegExp(`Invalid ${name}:.*must not override production PostgreSQL`)
+    );
+    try {
+      readConfig();
+    } catch (error) {
+      expect(String(error)).not.toContain(value);
+    }
   });
 
   it('treats an exactly empty archive endpoint as absent only outside the production worker', () => {

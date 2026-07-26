@@ -1,5 +1,10 @@
 import { readConfig } from '../config.js';
 import { migrate } from '../db/migrate.js';
+import {
+  findUnsafePostgresProcessEnvironmentOverride,
+  POSTGRES_TRUSTED_SEARCH_PATH,
+  POSTGRES_TRUSTED_SESSION_OPTIONS,
+} from '../postgres-session.js';
 import pg from 'pg';
 
 import type { MigrationRuntimeConfig } from '../db/migrate.js';
@@ -41,6 +46,7 @@ export type ProductionDatabaseSessionIdentity = {
   currentRole: string;
   sessionRole: string;
   databaseIdentity: string;
+  searchPath: string;
   isSuperuser: boolean;
   canCreateRoles: boolean;
   canCreateDatabases: boolean;
@@ -51,12 +57,16 @@ export type ProductionDatabaseSessionIdentity = {
   ownsApplicationObjects: boolean;
   isMigrationOwnerMember: boolean;
   canAssumeElevatedRole: boolean;
+  isDatabaseOwnerMember: boolean;
+  hasUnexpectedRoleMembership: boolean;
 };
 
 export type ProductionRuntimeDatabasePrivileges = {
   currentRole: string;
   sessionRole: string;
   databaseIdentity: string;
+  searchPath: string;
+  hasOtherRoleMembership: boolean;
   canSelectDocuments: boolean;
   canInsertDocuments: boolean;
   canUpdateDocuments: boolean;
@@ -64,6 +74,11 @@ export type ProductionRuntimeDatabasePrivileges = {
   canTruncateDocuments: boolean;
   canReferenceDocuments: boolean;
   canTriggerDocuments: boolean;
+  canInsertAnyDocumentColumn: boolean;
+  canUpdateAnyDocumentColumn: boolean;
+  canReferenceAnyDocumentColumn: boolean;
+  hasDocumentTableGrantOptions: boolean;
+  hasDocumentColumnGrantOptions: boolean;
   canSelectWorkerFence: boolean;
   canInsertWorkerFence: boolean;
   canUpdateWorkerFence: boolean;
@@ -71,6 +86,12 @@ export type ProductionRuntimeDatabasePrivileges = {
   canTruncateWorkerFence: boolean;
   canReferenceWorkerFence: boolean;
   canTriggerWorkerFence: boolean;
+  canSelectAnyWorkerFenceColumn: boolean;
+  canInsertAnyWorkerFenceColumn: boolean;
+  canUpdateAnyWorkerFenceColumn: boolean;
+  canReferenceAnyWorkerFenceColumn: boolean;
+  hasWorkerFenceTableGrantOptions: boolean;
+  hasWorkerFenceColumnGrantOptions: boolean;
 };
 
 export type ProductionMigrationDependencies = {
@@ -183,6 +204,9 @@ const validateProductionDatabaseTopology = (
   topology: ProductionDatabaseTopology;
   validated: ValidatedProductionDatabaseUrl[];
 } => {
+  if (findUnsafePostgresProcessEnvironmentOverride(environment) !== null) {
+    throw preflightError('process-environment-override');
+  }
   const topology = {
     migrationOwnerUrl: requiredUrl(environment, OWNER_URL_ENV, 'migration-owner'),
     apiUrl: requiredUrl(environment, API_URL_ENV, 'api'),
@@ -250,6 +274,7 @@ const createDatabaseClients = (
       connectionTimeoutMillis: config.postgresConnectionTimeoutMs,
       query_timeout: config.postgresConnectionTimeoutMs,
       statement_timeout: config.postgresConnectionTimeoutMs,
+      options: POSTGRES_TRUSTED_SESSION_OPTIONS,
     });
     client.on('error', () => undefined);
     return client;
@@ -283,6 +308,7 @@ export const readProductionDatabaseIdentities = async (
           currentRole: string;
           sessionRole: string;
           databaseIdentity: string;
+          searchPath: string;
           isSuperuser: boolean;
           canCreateRoles: boolean;
           canCreateDatabases: boolean;
@@ -293,10 +319,13 @@ export const readProductionDatabaseIdentities = async (
           ownsApplicationObjects: boolean;
           isMigrationOwnerMember: boolean;
           canAssumeElevatedRole: boolean;
+          isDatabaseOwnerMember: boolean;
+          hasUnexpectedRoleMembership: boolean;
         }>(
           `select current_user::text as "currentRole",
                   session_user::text as "sessionRole",
                   current_database()::text as "databaseIdentity",
+                  current_setting('search_path')::text as "searchPath",
                   role.rolsuper as "isSuperuser",
                   role.rolcreaterole as "canCreateRoles",
                   role.rolcreatedb as "canCreateDatabases",
@@ -307,6 +336,12 @@ export const readProductionDatabaseIdentities = async (
                   has_schema_privilege(current_user, 'public', 'CREATE')
                     as "canCreateInPublicSchema",
                   exists (
+                    select 1
+                    from pg_namespace schema_object
+                    where pg_has_role(current_user, schema_object.nspowner, 'MEMBER')
+                      and schema_object.nspname !~ '^pg_'
+                      and schema_object.nspname <> 'information_schema'
+                    union all
                     select 1
                     from pg_class object
                     join pg_namespace namespace on namespace.oid = object.relnamespace
@@ -347,7 +382,16 @@ export const readProductionDatabaseIdentities = async (
                         )
                         or has_schema_privilege(assumable.rolname, 'public', 'CREATE')
                       )
-                  ) as "canAssumeElevatedRole"
+                  ) as "canAssumeElevatedRole",
+                  pg_has_role(current_user, 'pg_database_owner', 'MEMBER')
+                    as "isDatabaseOwnerMember",
+                  exists (
+                    select 1
+                    from pg_roles assumable
+                    where assumable.oid <> role.oid
+                      and assumable.rolname <> 'pg_database_owner'
+                      and pg_has_role(current_user, assumable.oid, 'MEMBER')
+                  ) as "hasUnexpectedRoleMembership"
              from pg_roles role
             where role.rolname = current_user`,
           [decodeURIComponent(new URL(topology.migrationOwnerUrl).username)]
@@ -392,16 +436,19 @@ export const applyProductionRuntimeDatabasePrivileges = async (
       currentRole: string;
       sessionRole: string;
       databaseIdentity: string;
+      searchPath: string;
     }>(
       `select current_user::text as "currentRole",
               session_user::text as "sessionRole",
-              current_database()::text as "databaseIdentity"`
+              current_database()::text as "databaseIdentity",
+              current_setting('search_path')::text as "searchPath"`
     );
     if (
       session.rows.length !== 1 ||
       session.rows[0]!.currentRole !== ownerRole ||
       session.rows[0]!.sessionRole !== ownerRole ||
-      session.rows[0]!.databaseIdentity !== databaseIdentity
+      session.rows[0]!.databaseIdentity !== databaseIdentity ||
+      session.rows[0]!.searchPath !== POSTGRES_TRUSTED_SEARCH_PATH
     ) {
       throw preflightError('database-runtime-privilege-provision-failed');
     }
@@ -455,6 +502,13 @@ export const readProductionRuntimeDatabasePrivileges = async (
            select current_user::text as "currentRole",
                   session_user::text as "sessionRole",
                   current_database()::text as "databaseIdentity",
+                  current_setting('search_path')::text as "searchPath",
+                  exists (
+                    select 1
+                      from pg_roles other_role
+                     where other_role.rolname <> current_user
+                       and pg_has_role(current_user, other_role.oid, 'MEMBER')
+                  ) as "hasOtherRoleMembership",
                   exists (
                     select 1 from reachable_runtime_roles
                      where has_table_privilege("roleName", 'public.indexer_documents', 'SELECT')
@@ -494,6 +548,62 @@ export const readProductionRuntimeDatabasePrivileges = async (
                      where has_table_privilege("roleName", 'public.indexer_documents', 'TRIGGER')
                   )
                     as "canTriggerDocuments",
+                  exists (
+                    select 1 from reachable_runtime_roles
+                     where has_any_column_privilege(
+                       "roleName",
+                       'public.indexer_documents',
+                       'INSERT'
+                     )
+                  ) as "canInsertAnyDocumentColumn",
+                  exists (
+                    select 1 from reachable_runtime_roles
+                     where has_any_column_privilege(
+                       "roleName",
+                       'public.indexer_documents',
+                       'UPDATE'
+                     )
+                  ) as "canUpdateAnyDocumentColumn",
+                  exists (
+                    select 1 from reachable_runtime_roles
+                     where has_any_column_privilege(
+                       "roleName",
+                       'public.indexer_documents',
+                       'REFERENCES'
+                     )
+                  ) as "canReferenceAnyDocumentColumn",
+                  exists (
+                    select 1
+                      from reachable_runtime_roles
+                      cross join unnest(
+                        array[
+                          'SELECT',
+                          'INSERT',
+                          'UPDATE',
+                          'DELETE',
+                          'TRUNCATE',
+                          'REFERENCES',
+                          'TRIGGER'
+                        ]
+                      ) privilege("name")
+                     where has_table_privilege(
+                       "roleName",
+                       'public.indexer_documents',
+                       privilege."name" || ' WITH GRANT OPTION'
+                     )
+                  ) as "hasDocumentTableGrantOptions",
+                  exists (
+                    select 1
+                      from reachable_runtime_roles
+                      cross join unnest(
+                        array['SELECT', 'INSERT', 'UPDATE', 'REFERENCES']
+                      ) privilege("name")
+                     where has_any_column_privilege(
+                       "roleName",
+                       'public.indexer_documents',
+                       privilege."name" || ' WITH GRANT OPTION'
+                     )
+                  ) as "hasDocumentColumnGrantOptions",
                   exists (
                     select 1 from reachable_runtime_roles
                      where has_table_privilege(
@@ -549,7 +659,71 @@ export const readProductionRuntimeDatabasePrivileges = async (
                        'public.polkaswap_indexer_worker_lease_fence',
                        'TRIGGER'
                      )
-                  ) as "canTriggerWorkerFence"`
+                  ) as "canTriggerWorkerFence",
+                  exists (
+                    select 1 from reachable_runtime_roles
+                     where has_any_column_privilege(
+                       "roleName",
+                       'public.polkaswap_indexer_worker_lease_fence',
+                       'SELECT'
+                     )
+                  ) as "canSelectAnyWorkerFenceColumn",
+                  exists (
+                    select 1 from reachable_runtime_roles
+                     where has_any_column_privilege(
+                       "roleName",
+                       'public.polkaswap_indexer_worker_lease_fence',
+                       'INSERT'
+                     )
+                  ) as "canInsertAnyWorkerFenceColumn",
+                  exists (
+                    select 1 from reachable_runtime_roles
+                     where has_any_column_privilege(
+                       "roleName",
+                       'public.polkaswap_indexer_worker_lease_fence',
+                       'UPDATE'
+                     )
+                  ) as "canUpdateAnyWorkerFenceColumn",
+                  exists (
+                    select 1 from reachable_runtime_roles
+                     where has_any_column_privilege(
+                       "roleName",
+                       'public.polkaswap_indexer_worker_lease_fence',
+                       'REFERENCES'
+                     )
+                  ) as "canReferenceAnyWorkerFenceColumn",
+                  exists (
+                    select 1
+                      from reachable_runtime_roles
+                      cross join unnest(
+                        array[
+                          'SELECT',
+                          'INSERT',
+                          'UPDATE',
+                          'DELETE',
+                          'TRUNCATE',
+                          'REFERENCES',
+                          'TRIGGER'
+                        ]
+                      ) privilege("name")
+                     where has_table_privilege(
+                       "roleName",
+                       'public.polkaswap_indexer_worker_lease_fence',
+                       privilege."name" || ' WITH GRANT OPTION'
+                     )
+                  ) as "hasWorkerFenceTableGrantOptions",
+                  exists (
+                    select 1
+                      from reachable_runtime_roles
+                      cross join unnest(
+                        array['SELECT', 'INSERT', 'UPDATE', 'REFERENCES']
+                      ) privilege("name")
+                     where has_any_column_privilege(
+                       "roleName",
+                       'public.polkaswap_indexer_worker_lease_fence',
+                       privilege."name" || ' WITH GRANT OPTION'
+                     )
+                  ) as "hasWorkerFenceColumnGrantOptions"`
         )
       )
     );
@@ -608,10 +782,17 @@ const validateDatabaseSessionIdentities = (
     if (identity.databaseIdentity !== validated[index]!.databaseIdentity) {
       throw preflightError('database-session-target-mismatch');
     }
+    if (identity.searchPath !== POSTGRES_TRUSTED_SEARCH_PATH) {
+      throw preflightError('database-session-search-path-invalid');
+    }
   }
 
   const owner = identities[0]!;
-  if (hasElevatedRoleAttributes(owner) || !owner.canCreateInPublicSchema) {
+  if (
+    hasElevatedRoleAttributes(owner) ||
+    !owner.canCreateInPublicSchema ||
+    owner.hasUnexpectedRoleMembership
+  ) {
     throw preflightError('database-migration-owner-privileges-invalid');
   }
   for (const runtime of identities.slice(1)) {
@@ -621,7 +802,9 @@ const validateDatabaseSessionIdentities = (
       runtime.canCreateInPublicSchema ||
       runtime.ownsApplicationObjects ||
       runtime.isMigrationOwnerMember ||
-      runtime.canAssumeElevatedRole
+      runtime.canAssumeElevatedRole ||
+      runtime.isDatabaseOwnerMember ||
+      runtime.hasUnexpectedRoleMembership
     ) {
       throw preflightError('database-runtime-role-privileges-invalid');
     }
@@ -644,6 +827,12 @@ const validateRuntimeDatabasePrivileges = (
     ) {
       throw preflightError('database-runtime-session-mismatch');
     }
+    if (
+      identity.searchPath !== POSTGRES_TRUSTED_SEARCH_PATH ||
+      identity.hasOtherRoleMembership
+    ) {
+      throw preflightError('database-runtime-session-invalid');
+    }
   }
 
   const api = privileges[0]!;
@@ -655,13 +844,24 @@ const validateRuntimeDatabasePrivileges = (
     api.canTruncateDocuments ||
     api.canReferenceDocuments ||
     api.canTriggerDocuments ||
+    api.canInsertAnyDocumentColumn ||
+    api.canUpdateAnyDocumentColumn ||
+    api.canReferenceAnyDocumentColumn ||
+    api.hasDocumentTableGrantOptions ||
+    api.hasDocumentColumnGrantOptions ||
     api.canSelectWorkerFence ||
     api.canInsertWorkerFence ||
     api.canUpdateWorkerFence ||
     api.canDeleteWorkerFence ||
     api.canTruncateWorkerFence ||
     api.canReferenceWorkerFence ||
-    api.canTriggerWorkerFence
+    api.canTriggerWorkerFence ||
+    api.canSelectAnyWorkerFenceColumn ||
+    api.canInsertAnyWorkerFenceColumn ||
+    api.canUpdateAnyWorkerFenceColumn ||
+    api.canReferenceAnyWorkerFenceColumn ||
+    api.hasWorkerFenceTableGrantOptions ||
+    api.hasWorkerFenceColumnGrantOptions
   ) {
     throw preflightError('database-api-privileges-invalid');
   }
@@ -675,13 +875,19 @@ const validateRuntimeDatabasePrivileges = (
     worker.canTruncateDocuments ||
     worker.canReferenceDocuments ||
     worker.canTriggerDocuments ||
+    worker.canReferenceAnyDocumentColumn ||
+    worker.hasDocumentTableGrantOptions ||
+    worker.hasDocumentColumnGrantOptions ||
     !worker.canSelectWorkerFence ||
     !worker.canInsertWorkerFence ||
     !worker.canUpdateWorkerFence ||
     worker.canDeleteWorkerFence ||
     worker.canTruncateWorkerFence ||
     worker.canReferenceWorkerFence ||
-    worker.canTriggerWorkerFence
+    worker.canTriggerWorkerFence ||
+    worker.canReferenceAnyWorkerFenceColumn ||
+    worker.hasWorkerFenceTableGrantOptions ||
+    worker.hasWorkerFenceColumnGrantOptions
   ) {
     throw preflightError('database-worker-privileges-invalid');
   }
@@ -708,9 +914,13 @@ export const runProductionMigration = async (
   );
   await dependencies.migrate(config);
   await dependencies.applyRuntimeDatabasePrivileges(topology, config);
+  const postMigrationIdentities = await dependencies.readDatabaseIdentities(topology, config);
+  validateDatabaseSessionIdentities(postMigrationIdentities, validated);
   const runtimePrivileges = await dependencies.readRuntimeDatabasePrivileges(topology, config);
   validateRuntimeDatabasePrivileges(runtimePrivileges, validated);
-  console.info('Verified production PostgreSQL runtime table privileges after schema migration');
+  console.info(
+    'Verified production PostgreSQL sessions and exact table/column privileges after schema migration'
+  );
 };
 
 if (import.meta.url === `file://${process.argv[1]}`) {

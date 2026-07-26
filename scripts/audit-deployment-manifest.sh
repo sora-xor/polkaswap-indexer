@@ -97,6 +97,11 @@ if grep -Eq '\|\|[[:space:]]*yarn[[:space:]]+install' "$DOCKERFILE"; then
   fail "Dockerfile must not fall back to a mutable yarn install"
 fi
 
+if grep -Eq '^[[:space:]]*(ENV[[:space:]]+)?(NODE_OPTIONS|NODE_TLS_REJECT_UNAUTHORIZED|PG[A-Z0-9_]*)([=:[:space:]]|$)' \
+  "$DOCKERFILE" "$PRODUCTION_COMPOSE"; then
+  fail "production image and Compose must not set Node or PostgreSQL process overrides"
+fi
+
 require_literal "$DOCKERFILE" "FROM $NODE_IMAGE AS dependencies" "Dockerfile must pin the dependency-stage Node image by digest"
 require_literal "$DOCKERFILE" 'RUN corepack enable && yarn install --immutable' "dependency installation must be immutable and fail closed"
 require_literal "$DOCKERFILE" 'FROM dependencies AS production-dependencies' "Dockerfile must derive a production dependency stage from the immutable install"

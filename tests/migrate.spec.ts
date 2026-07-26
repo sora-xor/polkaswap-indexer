@@ -66,6 +66,7 @@ describe('migrate', () => {
       connectionTimeoutMillis: 7_000,
       query_timeout: 8_000,
       statement_timeout: 9_000,
+      options: '-c search_path=pg_catalog,public,pg_temp',
     });
   });
 
@@ -79,6 +80,7 @@ describe('migrate', () => {
       connectionTimeoutMillis: 10_000,
       query_timeout: 0,
       statement_timeout: 0,
+      options: '-c search_path=pg_catalog,public,pg_temp',
     });
   });
 
@@ -118,7 +120,7 @@ describe('migrate', () => {
       'indexer_documents_collection_module_method_timestamp_id_idx',
       'indexer_documents_collection_status_idx',
     ]) {
-      expect(statements).toContain(`drop index if exists "${obsolete}";`);
+      expect(statements).toContain(`drop index if exists public."${obsolete}";`);
       expect(statements.some((sql) => sql.includes(`create index concurrently "${obsolete}" `))).toBe(false);
     }
   });
@@ -128,8 +130,12 @@ describe('migrate', () => {
 
     await migrate(DATABASE_URL);
     const statements = mocks.client.query.mock.calls.map(([sql]) => String(sql));
-    expect(statements).toContain('drop index if exists indexer_documents_collection_timestamp_idx;');
-    expect(statements).toContain('drop index if exists indexer_documents_collection_block_idx;');
+    expect(statements).toContain(
+      'drop index if exists public.indexer_documents_collection_timestamp_idx;'
+    );
+    expect(statements).toContain(
+      'drop index if exists public.indexer_documents_collection_block_idx;'
+    );
     expect(statements.some((sql) => sql.includes('collection collate "C", timestamp, id collate "C"'))).toBe(true);
     expect(
       statements.some(
@@ -151,7 +157,10 @@ describe('migrate', () => {
 
     await migrate(DATABASE_URL);
     const statements = mocks.client.query.mock.calls.map(([sql]) => String(sql));
-    const table = statements.find((sql) => sql.includes('create table if not exists indexer_documents')) ?? '';
+    const table =
+      statements.find((sql) =>
+        sql.includes('create table if not exists public.indexer_documents')
+      ) ?? '';
     const workerFenceTable = statements.find((sql) =>
       sql.includes('create table if not exists public.polkaswap_indexer_worker_lease_fence')
     );
@@ -164,7 +173,16 @@ describe('migrate', () => {
     ).toBe(true);
     expect(table).not.toContain('constraint indexer_documents_');
     expect(workerFenceTable).toContain('fencing_token uuid not null');
-    expect(statements).toContain('drop index if exists "indexer_documents_collection_id_c_idx";');
+    expect(statements).toContain(
+      'drop index if exists public."indexer_documents_collection_id_c_idx";'
+    );
+    expect(
+      statements.some((sql) =>
+        sql.includes(
+          'create or replace function public.indexer_json_number_is_exact_v1'
+        )
+      )
+    ).toBe(true);
     for (const { name, expression } of POSTGRES_DOCUMENT_CHECK_CONSTRAINTS) {
       expect(
         statements.some((sql) =>
@@ -173,7 +191,9 @@ describe('migrate', () => {
         name
       ).toBe(true);
       expect(
-        statements.some((sql) => sql.includes(`comment on constraint "${name}" on indexer_documents`)),
+        statements.some((sql) =>
+          sql.includes(`comment on constraint "${name}" on public.indexer_documents`)
+        ),
         name
       ).toBe(true);
       expect(
@@ -201,7 +221,7 @@ describe('migrate', () => {
     const manifestComments = new Map<string, string>();
     for (const { name } of POSTGRES_DOCUMENT_CHECK_CONSTRAINTS) {
       const comment = firstRunStatements.find((sql) =>
-        sql.includes(`comment on constraint "${name}" on indexer_documents`)
+        sql.includes(`comment on constraint "${name}" on public.indexer_documents`)
       );
       const manifest = comment?.match(/ is '([^']+)';$/)?.[1];
       if (manifest) manifestComments.set(name, manifest);
@@ -243,7 +263,9 @@ describe('migrate', () => {
 
     await migrate(DATABASE_URL);
     const statements = mocks.client.query.mock.calls.map(([sql]) => String(sql));
-    expect(statements).toContain(`alter table indexer_documents drop constraint "${constraint.name}";`);
+    expect(statements).toContain(
+      `alter table public.indexer_documents drop constraint "${constraint.name}";`
+    );
     expect(
       statements.some((sql) =>
         sql.includes(`add constraint "${constraint.name}" check (${constraint.expression}) not valid`)
