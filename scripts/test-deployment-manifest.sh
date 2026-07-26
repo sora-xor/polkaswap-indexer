@@ -13,8 +13,9 @@ expect_failure() {
   local dockerignore="$3"
   local expected="$4"
   local compose="${5:-$ROOT_DIR/docker-compose.production.yml}"
+  local readme="${6:-$ROOT_DIR/README.md}"
   local output="$TMP_DIR/$label.out"
-  if bash "$AUDIT_SCRIPT" "$dockerfile" "$dockerignore" "$compose" >"$output" 2>&1; then
+  if bash "$AUDIT_SCRIPT" "$dockerfile" "$dockerignore" "$compose" "$readme" >"$output" 2>&1; then
     echo "[deployment-manifest-test][error] $label unexpectedly passed" >&2
     exit 1
   fi
@@ -107,15 +108,70 @@ cp "$ROOT_DIR/docker-compose.production.yml" "$unbounded_pids"
 perl -0pi -e 's/  pids_limit: 128\n//' "$unbounded_pids"
 expect_failure "unbounded-pids" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "must bound process IDs" "$unbounded_pids"
 
-optional_database="$TMP_DIR/docker-compose.optional-database.yml"
-cp "$ROOT_DIR/docker-compose.production.yml" "$optional_database"
-perl -0pi -e 's/\$\{POLKASWAP_DATABASE_URL:\?/\${POLKASWAP_DATABASE_URL-/g' "$optional_database"
-expect_failure "optional-database" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "must require an external database URL" "$optional_database"
+short_shutdown_grace="$TMP_DIR/docker-compose.short-shutdown-grace.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$short_shutdown_grace"
+perl -0pi -e 's/stop_grace_period: 4m/stop_grace_period: 10s/' "$short_shutdown_grace"
+expect_failure "short-shutdown-grace" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "must allow the runtime shutdown deadline to drain" "$short_shutdown_grace"
+
+unbounded_logging="$TMP_DIR/docker-compose.unbounded-logging.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$unbounded_logging"
+perl -0pi -e 's/^    max-size:.*$/    max-size: "0"/m' "$unbounded_logging"
+expect_failure "unbounded-logging" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "must bound each log file" "$unbounded_logging"
+
+missing_migration_service="$TMP_DIR/docker-compose.missing-migration-service.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$missing_migration_service"
+perl -0pi -e 's/^  migrate:\n.*?(?=^  api:\n)//ms' "$missing_migration_service"
+expect_failure "missing-migration-service" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "must define a one-shot migration service" "$missing_migration_service"
+
+restarting_migration="$TMP_DIR/docker-compose.restarting-migration.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$restarting_migration"
+perl -0pi -e 's/restart: "no"/restart: on-failure/' "$restarting_migration"
+expect_failure "restarting-migration" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "migration must be a restart-disabled one-shot service" "$restarting_migration"
+
+optional_migration_owner="$TMP_DIR/docker-compose.optional-migration-owner.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$optional_migration_owner"
+perl -0pi -e 's/\$\{POLKASWAP_MIGRATION_OWNER_DATABASE_URL:\?/\${POLKASWAP_MIGRATION_OWNER_DATABASE_URL-/' "$optional_migration_owner"
+expect_failure "optional-migration-owner" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "migration must require its separate migration-owner database URL" "$optional_migration_owner"
+
+migration_reuses_api_role="$TMP_DIR/docker-compose.migration-reuses-api-role.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$migration_reuses_api_role"
+perl -0pi -e 's/POLKASWAP_MIGRATION_OWNER_DATABASE_URL/POLKASWAP_API_DATABASE_URL/' "$migration_reuses_api_role"
+expect_failure "migration-reuses-api-role" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "migration must require its separate migration-owner database URL" "$migration_reuses_api_role"
+
+api_reuses_owner_role="$TMP_DIR/docker-compose.api-reuses-owner-role.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_reuses_owner_role"
+perl -0pi -e 's/POLKASWAP_API_DATABASE_URL/POLKASWAP_MIGRATION_OWNER_DATABASE_URL/' "$api_reuses_owner_role"
+expect_failure "api-reuses-owner-role" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "api must require only its separate runtime database URL" "$api_reuses_owner_role"
+
+worker_reuses_api_role="$TMP_DIR/docker-compose.worker-reuses-api-role.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$worker_reuses_api_role"
+perl -0pi -e 's/POLKASWAP_WORKER_DATABASE_URL/POLKASWAP_API_DATABASE_URL/' "$worker_reuses_api_role"
+expect_failure "worker-reuses-api-role" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "worker must require only its separate runtime database URL" "$worker_reuses_api_role"
+
+api_runs_migration="$TMP_DIR/docker-compose.api-runs-migration.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_runs_migration"
+perl -0pi -e 's/^      SKIP_POSTGRES_MIGRATION: "true"\n//m' "$api_runs_migration"
+expect_failure "api-runs-migration" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "api must disable in-process PostgreSQL migration" "$api_runs_migration"
+
+worker_runs_migration="$TMP_DIR/docker-compose.worker-runs-migration.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$worker_runs_migration"
+perl -0pi -e 's/(^  worker:\n.*?)SKIP_POSTGRES_MIGRATION: "true"/${1}SKIP_POSTGRES_MIGRATION: "false"/ms' "$worker_runs_migration"
+expect_failure "worker-runs-migration" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "worker must disable in-process PostgreSQL migration" "$worker_runs_migration"
+
+api_weak_migration_dependency="$TMP_DIR/docker-compose.api-weak-migration-dependency.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_weak_migration_dependency"
+perl -0pi -e 's/condition: service_completed_successfully/condition: service_started/' "$api_weak_migration_dependency"
+expect_failure "api-weak-migration-dependency" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "api must depend exactly on successful completion of the one-shot migration" "$api_weak_migration_dependency"
+
+worker_optional_migration_dependency="$TMP_DIR/docker-compose.worker-optional-migration-dependency.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$worker_optional_migration_dependency"
+perl -0pi -e 's/(^  worker:\n.*?condition: service_completed_successfully)/$1\n        required: false/ms' "$worker_optional_migration_dependency"
+expect_failure "worker-optional-migration-dependency" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "worker must depend exactly on successful completion of the one-shot migration" "$worker_optional_migration_dependency"
 
 worker_without_hardening="$TMP_DIR/docker-compose.worker-without-hardening.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$worker_without_hardening"
 perl -0pi -e 's/(  worker:\n)    <<: \*runtime-security\n/$1/' "$worker_without_hardening"
-expect_failure "worker-without-hardening" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "must apply the hardened runtime anchor to both API and worker" "$worker_without_hardening"
+expect_failure "worker-without-hardening" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "must apply the hardened runtime anchor to migration, API, and worker" "$worker_without_hardening"
 
 worker_without_health_override="$TMP_DIR/docker-compose.worker-without-health-override.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$worker_without_health_override"
@@ -201,5 +257,10 @@ unsafe_context="$TMP_DIR/.dockerignore"
 cp "$ROOT_DIR/.dockerignore" "$unsafe_context"
 perl -0pi -e 's#^node_modules/?\n##m' "$unsafe_context"
 expect_failure "unsafe-context" "$ROOT_DIR/Dockerfile" "$unsafe_context" ".dockerignore must exclude node_modules"
+
+credential_leaking_instructions="$TMP_DIR/README.credential-leaking.md"
+cp "$ROOT_DIR/README.md" "$credential_leaking_instructions"
+perl -0pi -e 's/docker compose -f docker-compose\.production\.yml config --quiet/docker compose -f docker-compose.production.yml config/' "$credential_leaking_instructions"
+expect_failure "credential-leaking-instructions" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "Production instructions must validate Compose without printing interpolated credentials" "$ROOT_DIR/docker-compose.production.yml" "$credential_leaking_instructions"
 
 echo "[deployment-manifest-test] all assertions passed"

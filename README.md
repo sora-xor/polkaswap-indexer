@@ -124,18 +124,30 @@ only to bounded, trusted internal repository callers.
 ## Production Notes
 
 Run the API and worker as separate processes against the same PostgreSQL
-database. For a fresh production deployment, set `CHAIN_START_BLOCK` to the
-earliest block you need indexed; a full-chain backfill is intentionally long.
-Set `NODE_ENV=production` and inject `DATABASE_URL`; production startup rejects
-the development database fallback. Primary and archive SORA URLs must be
+database through distinct least-privilege logins. Production Compose requires
+three separately managed URLs: `POLKASWAP_MIGRATION_OWNER_DATABASE_URL` for the
+one-shot DDL owner, `POLKASWAP_API_DATABASE_URL` for the API reader, and
+`POLKASWAP_WORKER_DATABASE_URL` for the worker writer and lease holder. Never
+reuse the migration-owner login for either long-lived service, and do not reuse
+one runtime login for both API and worker. The owner URL is mounted only into
+the migration service; API and worker set `SKIP_POSTGRES_MIGRATION=true` and
+start only after that service exits successfully. Direct non-Compose production
+launches still set `NODE_ENV=production` and inject their role-specific URL as
+`DATABASE_URL`; production startup rejects the development database fallback.
+
+For a fresh production deployment, set `CHAIN_START_BLOCK` to the earliest
+block you need indexed; a full-chain backfill is intentionally long. Primary
+and archive SORA URLs must be
 credential-free `wss:` endpoints without query strings or fragments, on
 different hosts. The production worker requires `SORA_ARCHIVE_WS_ENDPOINT`.
-Before constructing, migrating, reading, or writing the repository, it proves
-the reviewed SORA mainnet genesis and immutable history anchor independently on
-both endpoints. The in-process worker repeats the primary proof and validates a
-self-consistent finalized head before it may persist even its first heartbeat.
-Every archived block then has to match the primary endpoint by height/hash, raw
-SCALE block and event bytes, and timestamp.
+After the chain-neutral schema migration completes and before constructing,
+reading, or writing its runtime repository, the worker proves the reviewed SORA
+mainnet genesis and immutable history anchor independently on both endpoints.
+The in-process worker repeats the primary proof and validates a self-consistent
+finalized head before it may persist even its first heartbeat. Every archived
+block then has to match the primary endpoint by height/hash, raw SCALE block and
+event bytes, and timestamp.
+
 The one-shot PostgreSQL schema migration uses
 `POSTGRES_MIGRATION_QUERY_TIMEOUT_MS` and
 `POSTGRES_MIGRATION_STATEMENT_TIMEOUT_MS`, both defaulting to `0` (unlimited),
@@ -207,12 +219,16 @@ unpredictable lease epoch while holding a shared transaction fence; lease
 handoff takes that fence exclusively, drains already-validated writes, and
 rejects every old-token write after loss. A second worker fails startup, and
 loss of the lease connection triggers fatal shutdown. The schema migration
-creates `public.polkaswap_indexer_worker_lease_fence`; a split runtime worker
-role needs `SELECT`, `INSERT`, and `UPDATE` on that table but does not need DDL
-privileges. A worker started against an unmigrated database fails closed with an
-instruction to run the migration; it never attempts runtime DDL. API-only and
-administrative repository instances are not fenced unless they are explicitly
-constructed with a worker fencing token.
+creates `public.indexer_documents` and
+`public.polkaswap_indexer_worker_lease_fence`. Provision the API login with
+read-only access to indexed documents and the worker login with its required
+document DML plus `SELECT`, `INSERT`, and `UPDATE` on the fence table. Neither
+runtime login needs schema ownership or DDL privileges; configure grants/default
+privileges for those roles before the one-shot migration hands off to them. A
+worker started against an unmigrated database fails closed with an instruction
+to run the migration; it never attempts runtime DDL. API-only and administrative
+repository instances are not fenced unless they are explicitly constructed with
+a worker fencing token.
 
 The public GraphQL boundary is fail-closed and resource bounded. HTTP POST
 requests accept JSON only, with a default 256 KiB body cap; multipart uploads
@@ -490,13 +506,23 @@ configuration and immutable image evidence:
 ```sh
 export POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.example/polkaswap-indexer
 export POLKASWAP_INDEXER_IMAGE_DIGEST=<reviewed-64-hex-digest>
-export POLKASWAP_DATABASE_URL=postgresql://<managed-secret>@db.example/indexer?sslmode=require
+export POLKASWAP_MIGRATION_OWNER_DATABASE_URL=postgresql://pi_migration_owner:<owner-secret>@db.example/indexer?sslmode=require
+export POLKASWAP_API_DATABASE_URL=postgresql://pi_api:<api-secret>@db.example/indexer?sslmode=require
+export POLKASWAP_WORKER_DATABASE_URL=postgresql://pi_worker:<worker-secret>@db.example/indexer?sslmode=require
 export POLKASWAP_SORA_WS_ENDPOINT=wss://<controlled-verifying-primary>
 export POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://<independently-operated-archive>
 export POLKASWAP_CHAIN_START_BLOCK=<reviewed-first-required-block>
-docker compose -f docker-compose.production.yml config
+docker compose -f docker-compose.production.yml config --quiet
 docker compose -f docker-compose.production.yml up -d
 ```
+
+Never run an unqualified `docker compose ... config` after exporting database
+credentials because its rendered output contains the interpolated URLs. Use
+`config --quiet` for validation. For a human-readable manifest review, run
+`docker compose -f docker-compose.production.yml config --no-interpolate`
+before loading secrets, then inspect the unresolved variable references.
+Production services retain four minutes of graceful-stop time—longer than the
+internal 30-second shutdown deadline—and use bounded local log rotation.
 
 The production worker overrides the image's API healthcheck with
 `dist/src/scripts/worker-health.js`. This probe has no HTTP or API-container

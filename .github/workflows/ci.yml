@@ -117,7 +117,9 @@ jobs:
           docker compose --profile rocksdb config --quiet
           POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.invalid/polkaswap-indexer \
           POLKASWAP_INDEXER_IMAGE_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-          POLKASWAP_DATABASE_URL=postgres://polkaswap:polkaswap@database.invalid:5432/polkaswap \
+          POLKASWAP_MIGRATION_OWNER_DATABASE_URL=postgres://migration-owner:owner-test-only@database.invalid:5432/polkaswap \
+          POLKASWAP_API_DATABASE_URL=postgres://api-runtime:api-test-only@database.invalid:5432/polkaswap \
+          POLKASWAP_WORKER_DATABASE_URL=postgres://worker-runtime:worker-test-only@database.invalid:5432/polkaswap \
           POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
           POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
           POLKASWAP_CHAIN_START_BLOCK=14000000 \

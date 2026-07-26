@@ -1,9 +1,17 @@
+x-bounded-logging: &bounded-logging
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 x-runtime-security: &runtime-security
   image: "${POLKASWAP_INDEXER_IMAGE_REPOSITORY:?Set the reviewed image repository}@sha256:${POLKASWAP_INDEXER_IMAGE_DIGEST:?Set the reviewed 64-hex image digest}"
   init: true
   restart: unless-stopped
+  stop_grace_period: 4m
   read_only: true
   user: "node"
+  logging: *bounded-logging
   cap_drop:
     - ALL
   security_opt:
@@ -13,15 +21,31 @@ x-runtime-security: &runtime-security
     - /tmp:rw,noexec,nosuid,nodev,size=16m
 
 services:
+  migrate:
+    <<: *runtime-security
+    restart: "no"
+    command: ["node", "dist/src/db/migrate.js"]
+    healthcheck:
+      disable: true
+    environment:
+      NODE_ENV: production
+      STORAGE_ENGINE: postgres
+      DATABASE_URL: "${POLKASWAP_MIGRATION_OWNER_DATABASE_URL:?Set the separately managed PostgreSQL migration-owner URL}"
+      POSTGRES_MIGRATION_QUERY_TIMEOUT_MS: "${POLKASWAP_POSTGRES_MIGRATION_QUERY_TIMEOUT_MS:-0}"
+      POSTGRES_MIGRATION_STATEMENT_TIMEOUT_MS: "${POLKASWAP_POSTGRES_MIGRATION_STATEMENT_TIMEOUT_MS:-0}"
   api:
     <<: *runtime-security
     command: ["node", "dist/src/index.js"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:4350:4350"
     environment:
       NODE_ENV: production
       STORAGE_ENGINE: postgres
-      DATABASE_URL: "${POLKASWAP_DATABASE_URL:?Set the externally managed PostgreSQL URL}"
+      DATABASE_URL: "${POLKASWAP_API_DATABASE_URL:?Set the separately managed PostgreSQL API runtime URL}"
+      SKIP_POSTGRES_MIGRATION: "true"
       HOST: 0.0.0.0
       PORT: "4350"
       GRAPHQL_PATH: /graphql
@@ -52,6 +76,9 @@ services:
   worker:
     <<: *runtime-security
     command: ["node", "dist/src/worker/index.js"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "node", "dist/src/scripts/worker-health.js"]
       interval: 30s
@@ -61,7 +88,8 @@ services:
     environment:
       NODE_ENV: production
       STORAGE_ENGINE: postgres
-      DATABASE_URL: "${POLKASWAP_DATABASE_URL:?Set the externally managed PostgreSQL URL}"
+      DATABASE_URL: "${POLKASWAP_WORKER_DATABASE_URL:?Set the separately managed PostgreSQL worker runtime URL}"
+      SKIP_POSTGRES_MIGRATION: "true"
       SORA_WS_ENDPOINT: "${POLKASWAP_SORA_WS_ENDPOINT:?Set the reviewed SORA mainnet WSS endpoint}"
       SORA_ARCHIVE_WS_ENDPOINT: "${POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT:?Set an independently reviewed SORA mainnet archive WSS endpoint}"
       CHAIN_START_BLOCK: "${POLKASWAP_CHAIN_START_BLOCK:?Set the reviewed first SORA block to index}"
