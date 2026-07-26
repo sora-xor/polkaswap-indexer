@@ -24,10 +24,25 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Branch flow audit
+        run: |
+          bash scripts/test-branch-flow-audit.sh
+          bash scripts/audit-branch-flow.sh
+
+      - name: Audit public artifacts
+        run: |
+          bash scripts/test-public-artifacts-audit.sh
+          bash scripts/audit-public-artifacts.sh
+
+      - name: TODO debt audit
+        run: |
+          bash scripts/test-todo-debt-audit.sh
+          bash scripts/audit-todo-debt.sh
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
 
@@ -43,8 +58,11 @@ jobs:
       - name: Reject duplicate dependency resolutions
         run: yarn dedupe --check
 
+      - name: Audit all dependencies
+        run: yarn audit:dependencies
+
       - name: Audit production dependencies
-        run: yarn npm audit --environment production
+        run: yarn audit:dependencies:production
 
       - name: Run deployment evidence audit tests
         run: |
@@ -52,6 +70,9 @@ jobs:
           yarn generate:deployment-evidence-template --output build/reports/production-deployment-evidence-template.json
           yarn test:deployment-evidence-audit
           yarn audit:deployment-evidence
+
+      - name: Run deployment manifest contract tests
+        run: yarn test:deployment-manifest
 
       - name: Run production smoke contract tests
         run: yarn test:production-smoke
@@ -77,10 +98,10 @@ jobs:
           --health-retries 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
 
@@ -94,6 +115,13 @@ jobs:
         run: |
           docker compose --profile postgres config --quiet
           docker compose --profile rocksdb config --quiet
+          POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.invalid/polkaswap-indexer \
+          POLKASWAP_INDEXER_IMAGE_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+          POLKASWAP_DATABASE_URL=postgres://polkaswap:polkaswap@database.invalid:5432/polkaswap \
+          POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
+          POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
+          POLKASWAP_CHAIN_START_BLOCK=14000000 \
+            docker compose -f docker-compose.production.yml config --quiet
 
       - name: Build
         run: yarn build
@@ -108,6 +136,12 @@ jobs:
 
       - name: Build production container
         run: docker build --tag polkaswap-indexer:ci .
+
+      - name: Verify production image user and dependency boundary
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' polkaswap-indexer:ci)" = node
+          docker run --rm --entrypoint node polkaswap-indexer:ci -e \
+            "const {createRequire}=await import('node:module');const require=createRequire(import.meta.url);for(const name of ['@babel/runtime/helpers/typeof','@graphql-tools/schema','@harperfast/rocksdb-js','@polkadot/api','@sora-substrate/type-definitions','graphql','graphql-ws','graphql-yoga','pg','ws'])require.resolve(name);for(const name of ['tsx','typescript','vitest']){let found=true;try{require.resolve(name)}catch{found=false}if(found)throw new Error('development dependency shipped: '+name)}"
 
       - name: Verify native RocksDB runtime in production container
         run: >-

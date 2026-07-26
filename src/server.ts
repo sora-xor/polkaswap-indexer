@@ -28,6 +28,7 @@ import {
   LEGACY_GRAPHQL_WS_PROTOCOL,
   useLegacyGraphqlWebSocketServer,
 } from './graphql/legacy-websocket.js';
+import { AbuseLimiter } from './http/abuseLimiter.js';
 import { metrics } from './metrics.js';
 import { createRepository, shouldRunPostgresMigration } from './repository/factory.js';
 import { idempotentShutdown, runShutdownSteps } from './shutdown.js';
@@ -90,6 +91,17 @@ const writeMetrics = (response: ServerResponse, repository: IndexerRepository): 
     'cache-control': 'no-store',
   });
   response.end(metrics.render());
+};
+
+const writeJsonError = (response: ServerResponse, status: number, message: string, headers: Record<string, string> = {}): void => {
+  response.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'access-control-allow-origin': '*',
+    ...headers,
+  });
+  response.end(JSON.stringify({ errors: [{ message }] }));
 };
 
 const listen = (server: ReturnType<typeof createServer>, config: AppConfig): Promise<void> =>
@@ -203,9 +215,10 @@ const websocketProtocols = (header: string | string[] | undefined): string[] =>
     .map((protocol) => protocol.trim())
     .filter((protocol) => protocol.length > 0);
 
-const rejectWebSocketUpgrade = (socket: import('node:stream').Duplex, status: 404 | 503): void => {
+const rejectWebSocketUpgrade = (socket: import('node:stream').Duplex, status: 404 | 429 | 503): void => {
   if (socket.destroyed) return;
-  const reason = status === 503 ? 'Service Unavailable' : 'Not Found';
+  const reason =
+    status === 429 ? 'Too Many Requests' : status === 503 ? 'Service Unavailable' : 'Not Found';
   socket.end(
     `HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\nRetry-After: 1\r\n\r\n`
   );
@@ -304,6 +317,13 @@ export async function startServer(
 
   const { schema, queryLimits, yoga } = createGraphQLHandler(config, repository, workerStatusProvider);
   const httpRequestLimiter = new HttpRequestLimiter<ServerResponse>(config.graphqlHttpMaxInFlight);
+  const abuseLimiter = new AbuseLimiter({
+    windowMs: config.rateLimitWindowMs,
+    max: config.rateLimitMax,
+    maxKeys: config.rateLimitMaxKeys,
+    globalWindowMs: config.rateLimitGlobalWindowMs,
+    globalMax: config.rateLimitGlobalMax,
+  });
   const executionMemoryBudget = new GraphQLExecutionMemoryBudget<object>(
     config.graphqlExecutionMemoryMaxBytes
   );
@@ -328,111 +348,124 @@ export async function startServer(
         createGraphQLExecutionContext(config, repository, workerStatusProvider),
     });
 
-  const server = createServer((request: IncomingMessage, response: ServerResponse) => {
-    const startedAt = Date.now();
-    const path = normalizeRequestPath(request.url, config.graphqlPath);
-    const method = normalizeHttpMethodLabel(request.method);
+  const server = createServer(
+    { maxHeaderSize: config.httpMaxHeaderBytes },
+    (request: IncomingMessage, response: ServerResponse) => {
+      const startedAt = Date.now();
+      const path = normalizeRequestPath(request.url, config.graphqlPath);
+      const method = normalizeHttpMethodLabel(request.method);
 
-    response.once('finish', () => {
-      const labels = { method, path, status: response.statusCode };
+      response.once('finish', () => {
+        const labels = { method, path, status: response.statusCode };
 
-      metrics.increment('indexer_http_requests_total', labels);
-      metrics.observe('indexer_http_request_duration_seconds', labels, secondsSince(startedAt));
-    });
-
-    if (path === '/metrics' && method !== 'GET') {
-      response.shouldKeepAlive = false;
-      response.writeHead(405, {
-        allow: 'GET',
-        'cache-control': 'no-store',
-        connection: 'close',
-        'content-length': '0',
+        metrics.increment('indexer_http_requests_total', labels);
+        metrics.observe('indexer_http_request_duration_seconds', labels, secondsSince(startedAt));
       });
-      response.end();
-      return;
-    }
 
-    if (path === '/metrics') {
-      writeMetrics(response, repository);
-      return;
-    }
-
-    if (path === 'other') {
-      response.shouldKeepAlive = false;
-      response.writeHead(404, {
-        'cache-control': 'no-store',
-        connection: 'close',
-        'content-length': '0',
-      });
-      response.end();
-      return;
-    }
-
-    if (path === config.graphqlPath) {
-      if (!httpRequestLimiter.acquire(response)) {
-        metrics.increment('indexer_http_admission_rejections_total', { method, path });
-        response.shouldKeepAlive = false;
-        response.writeHead(503, {
-          'content-type': 'application/graphql-response+json; charset=utf-8',
-          'cache-control': 'no-store',
-          connection: 'close',
-          'retry-after': '1',
+      const now = Date.now();
+      const client = request.socket.remoteAddress ?? 'unknown';
+      const rateLimit = abuseLimiter.check(`http:${client}`, now);
+      response.setHeader('x-ratelimit-limit', String(rateLimit.limit));
+      response.setHeader('x-ratelimit-remaining', String(rateLimit.remaining));
+      response.setHeader('x-ratelimit-reset', String(Math.ceil(rateLimit.resetAt / 1_000)));
+      response.setHeader('x-content-type-options', 'nosniff');
+      if (!rateLimit.allowed) {
+        request.resume();
+        writeJsonError(response, 429, 'Too many requests.', {
+          'retry-after': String(Math.max(1, Math.ceil((rateLimit.resetAt - now) / 1_000))),
         });
-        response.end(
-          JSON.stringify({
-            errors: [
-              {
-                message: 'GraphQL server is at its concurrent request limit. Retry later.',
-                extensions: { code: 'SERVICE_UNAVAILABLE' },
-              },
-            ],
-          })
-        );
-        return;
-      }
-      if (!executionMemoryBudget.acquire(response, config.graphqlMaxResultBytes)) {
-        httpRequestLimiter.release(response);
-        metrics.increment('indexer_graphql_execution_memory_rejections_total', { protocol: 'http' });
-        response.shouldKeepAlive = false;
-        response.writeHead(503, {
-          'content-type': 'application/graphql-response+json; charset=utf-8',
-          'cache-control': 'no-store',
-          connection: 'close',
-          'retry-after': '1',
-        });
-        response.end(
-          JSON.stringify({
-            errors: [
-              {
-                message: 'GraphQL execution memory is at capacity. Retry later.',
-                extensions: { code: 'GRAPHQL_EXECUTION_MEMORY_LIMIT_EXCEEDED' },
-              },
-            ],
-          })
-        );
         return;
       }
 
-      metrics.setGauge('indexer_http_in_flight_requests', {}, httpRequestLimiter.activeRequests);
-      updateExecutionMemoryMetrics();
-      const release = (): void => {
-        const releasedRequest = httpRequestLimiter.release(response);
-        const releasedMemory = executionMemoryBudget.release(response);
-        if (!releasedRequest && !releasedMemory) return;
+      if (path === '/metrics') {
+        if (method !== 'GET' && method !== 'HEAD') {
+          request.resume();
+          writeJsonError(response, 405, 'Method not allowed.', { allow: 'GET, HEAD' });
+          return;
+        }
+        writeMetrics(response, repository);
+        return;
+      }
+
+      if (path === 'other') {
+        response.shouldKeepAlive = false;
+        response.writeHead(404, {
+          'cache-control': 'no-store',
+          connection: 'close',
+          'content-length': '0',
+        });
+        response.end();
+        return;
+      }
+
+      if (path === config.graphqlPath) {
+        if (!httpRequestLimiter.acquire(response)) {
+          metrics.increment('indexer_http_admission_rejections_total', { method, path });
+          response.shouldKeepAlive = false;
+          response.writeHead(503, {
+            'content-type': 'application/graphql-response+json; charset=utf-8',
+            'cache-control': 'no-store',
+            connection: 'close',
+            'retry-after': '1',
+          });
+          response.end(
+            JSON.stringify({
+              errors: [
+                {
+                  message: 'GraphQL server is at its concurrent request limit. Retry later.',
+                  extensions: { code: 'SERVICE_UNAVAILABLE' },
+                },
+              ],
+            })
+          );
+          return;
+        }
+        if (!executionMemoryBudget.acquire(response, config.graphqlMaxResultBytes)) {
+          httpRequestLimiter.release(response);
+          metrics.increment('indexer_graphql_execution_memory_rejections_total', { protocol: 'http' });
+          response.shouldKeepAlive = false;
+          response.writeHead(503, {
+            'content-type': 'application/graphql-response+json; charset=utf-8',
+            'cache-control': 'no-store',
+            connection: 'close',
+            'retry-after': '1',
+          });
+          response.end(
+            JSON.stringify({
+              errors: [
+                {
+                  message: 'GraphQL execution memory is at capacity. Retry later.',
+                  extensions: { code: 'GRAPHQL_EXECUTION_MEMORY_LIMIT_EXCEEDED' },
+                },
+              ],
+            })
+          );
+          return;
+        }
+
         metrics.setGauge('indexer_http_in_flight_requests', {}, httpRequestLimiter.activeRequests);
         updateExecutionMemoryMetrics();
-      };
-      response.once('finish', release);
-      response.once('close', release);
-    }
+        const release = (): void => {
+          const releasedRequest = httpRequestLimiter.release(response);
+          const releasedMemory = executionMemoryBudget.release(response);
+          if (!releasedRequest && !releasedMemory) return;
+          metrics.setGauge('indexer_http_in_flight_requests', {}, httpRequestLimiter.activeRequests);
+          updateExecutionMemoryMetrics();
+        };
+        response.once('finish', release);
+        response.once('close', release);
+      }
 
-    yoga(request, response);
-  });
+      yoga(request, response);
+    }
+  );
   server.maxConnections = config.httpMaxConnections;
+  server.maxRequestsPerSocket = config.httpMaxRequestsPerSocket;
   server.on('drop', () => {
     metrics.increment('indexer_http_connection_rejections_total');
   });
   const webSocketLimiter = new WebSocketConnectionLimiter<WebSocket>(config.graphqlWsMaxConnections);
+  const activeWebSocketsByClient = new Map<string, number>();
   const webSocketOperationBudget = new WebSocketOperationBudget(config.graphqlWsMaxOperations);
   const commonWebSocketOptions = {
     noServer: true as const,
@@ -449,18 +482,38 @@ export async function startServer(
     handleProtocols: (protocols) =>
       protocols.has(LEGACY_GRAPHQL_WS_PROTOCOL) ? LEGACY_GRAPHQL_WS_PROTOCOL : false,
   });
-  const trackWebSocketConnection = (protocol: 'modern' | 'legacy') => (socket: WebSocket): void => {
-    if (!webSocketLimiter.acquire(socket)) {
-      socket.close(4429, 'Too many WebSocket connections');
-      return;
-    }
-    metrics.increment('indexer_websocket_connections_total', { protocol });
-    metrics.setGauge('indexer_websocket_connections', {}, webSocketLimiter.activeConnections);
-    socket.once('close', () => {
-      webSocketLimiter.release(socket);
+  const trackWebSocketConnection =
+    (protocol: 'modern' | 'legacy') =>
+    (socket: WebSocket, request: IncomingMessage): void => {
+      const client = request.socket.remoteAddress ?? 'unknown';
+      if (
+        (activeWebSocketsByClient.get(client) ?? 0) >=
+        config.graphqlWsMaxConnectionsPerClient
+      ) {
+        metrics.increment('indexer_websocket_admission_rejections_total', {
+          reason: 'per-client-connection-limit',
+        });
+        socket.close(4429, 'Too many WebSocket connections');
+        return;
+      }
+      if (!webSocketLimiter.acquire(socket)) {
+        metrics.increment('indexer_websocket_admission_rejections_total', {
+          reason: 'global-connection-limit',
+        });
+        socket.close(4429, 'Too many WebSocket connections');
+        return;
+      }
+      activeWebSocketsByClient.set(client, (activeWebSocketsByClient.get(client) ?? 0) + 1);
+      metrics.increment('indexer_websocket_connections_total', { protocol });
       metrics.setGauge('indexer_websocket_connections', {}, webSocketLimiter.activeConnections);
-    });
-  };
+      socket.once('close', () => {
+        webSocketLimiter.release(socket);
+        const remaining = Math.max((activeWebSocketsByClient.get(client) ?? 1) - 1, 0);
+        if (remaining === 0) activeWebSocketsByClient.delete(client);
+        else activeWebSocketsByClient.set(client, remaining);
+        metrics.setGauge('indexer_websocket_connections', {}, webSocketLimiter.activeConnections);
+      });
+    };
   modernWsServer.on('connection', trackWebSocketConnection('modern'));
   legacyWsServer.on('connection', trackWebSocketConnection('legacy'));
 
@@ -548,13 +601,33 @@ export async function startServer(
       rejectWebSocketUpgrade(socket, 404);
       return;
     }
-    if (!webSocketLimiter.hasCapacity) {
+    const client = request.socket.remoteAddress ?? 'unknown';
+    const rateLimit = abuseLimiter.check(`ws:${client}`);
+    if (!rateLimit.allowed) {
+      metrics.increment('indexer_websocket_admission_rejections_total', { reason: 'rate-limit' });
+      rejectWebSocketUpgrade(socket, 429);
+      return;
+    }
+    if (
+      !webSocketLimiter.hasCapacity ||
+      (activeWebSocketsByClient.get(client) ?? 0) >= config.graphqlWsMaxConnectionsPerClient
+    ) {
       metrics.increment('indexer_websocket_admission_rejections_total');
       rejectWebSocketUpgrade(socket, 503);
       return;
     }
 
     const protocols = websocketProtocols(request.headers['sec-websocket-protocol']);
+    if (
+      !protocols.includes(LEGACY_GRAPHQL_WS_PROTOCOL) &&
+      !protocols.includes(GRAPHQL_TRANSPORT_WS_PROTOCOL)
+    ) {
+      metrics.increment('indexer_websocket_admission_rejections_total', {
+        reason: 'unsupported-protocol',
+      });
+      rejectWebSocketUpgrade(socket, 404);
+      return;
+    }
     const selected =
       protocols.includes(LEGACY_GRAPHQL_WS_PROTOCOL) && !protocols.includes(GRAPHQL_TRANSPORT_WS_PROTOCOL)
         ? legacyWsServer

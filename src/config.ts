@@ -10,6 +10,13 @@ export type AppConfig = {
   httpHeadersTimeoutMs: number;
   httpRequestTimeoutMs: number;
   httpMaxConnections: number;
+  httpMaxHeaderBytes: number;
+  httpMaxRequestsPerSocket: number;
+  rateLimitWindowMs: number;
+  rateLimitMax: number;
+  rateLimitMaxKeys: number;
+  rateLimitGlobalWindowMs: number;
+  rateLimitGlobalMax: number;
   graphqlHttpMaxBodyBytes: number;
   graphqlHttpMaxInFlight: number;
   graphqlMaxDepth: number;
@@ -22,6 +29,7 @@ export type AppConfig = {
   graphqlWsMaxPayloadBytes: number;
   graphqlWsConnectionInitTimeoutMs: number;
   graphqlWsMaxConnections: number;
+  graphqlWsMaxConnectionsPerClient: number;
   graphqlWsMaxOperations: number;
   graphqlWsMaxOperationsPerConnection: number;
   graphqlWsMaxPendingMessagesPerConnection: number;
@@ -79,6 +87,7 @@ export type AppConfig = {
 };
 
 const DEFAULT_DATABASE_URL = 'postgres://polkaswap:polkaswap@127.0.0.1:5432/polkaswap_indexer';
+const NODE_ENVIRONMENTS = new Set(['development', 'test', 'production']);
 
 const invalid = (name: string, reason: string): never => {
   throw new Error(`Invalid ${name}: ${reason}`);
@@ -99,7 +108,6 @@ const readInteger = (
   const value = process.env[name];
   if (value === undefined) return fallback;
   if (!/^-?\d+$/.test(value.trim())) return invalid(name, 'must be an integer');
-
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed)) return invalid(name, 'must be a safe integer');
   if (parsed < minimum) return invalid(name, `must be at least ${minimum}`);
@@ -149,11 +157,66 @@ const validateUrl = (name: string, value: string, protocols: readonly string[]):
   return value;
 };
 
-const readOptionalUrl = (name: string, protocols: readonly string[]): string => {
-  const value = process.env[name]?.trim();
-  if (!value) return '';
-  return validateUrl(name, value, protocols);
+const readNodeEnvironment = (): string => {
+  const value = process.env.NODE_ENV ?? 'development';
+  if (!NODE_ENVIRONMENTS.has(value)) {
+    return invalid('NODE_ENV', 'must be development, test, or production');
+  }
+  return value;
 };
+
+const validateSoraWsUrl = (name: string, value: string): string => {
+  if (value !== value.trim() || /[\u0000-\u001f\u007f]/.test(value)) {
+    return invalid(name, 'must be a non-empty single-line URL without surrounding whitespace');
+  }
+  validateUrl(name, value, ['ws:', 'wss:']);
+  const parsed = new URL(value);
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    return invalid(name, 'must not contain credentials, a query string, or a fragment');
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname.endsWith('.')) {
+    return invalid(name, 'hostname must not have a trailing dot');
+  }
+  const localhost = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+  if (!localhost && parsed.protocol !== 'wss:') {
+    return invalid(name, 'must use TLS outside localhost');
+  }
+  return value;
+};
+
+export function readSoraArchiveWsEndpoint(requireConfigured = false): string | null {
+  const value = process.env.SORA_ARCHIVE_WS_ENDPOINT;
+  if (value === undefined || value === '') {
+    if (requireConfigured) {
+      return invalid('SORA_ARCHIVE_WS_ENDPOINT', 'is required for the production worker');
+    }
+    return null;
+  }
+  return validateSoraWsUrl('SORA_ARCHIVE_WS_ENDPOINT', value);
+}
+
+/**
+ * Production workers must not silently inherit development chain inputs.
+ * The values themselves are parsed and validated by readConfig().
+ */
+export function assertExplicitProductionWorkerChainInputs(): void {
+  if (process.env.NODE_ENV !== 'production') return;
+  if (process.env.SORA_WS_ENDPOINT === undefined) {
+    invalid('SORA_WS_ENDPOINT', 'is required for the production worker');
+  }
+  if (process.env.CHAIN_START_BLOCK === undefined) {
+    invalid('CHAIN_START_BLOCK', 'is required for the production worker');
+  }
+}
+
+export function assertIndependentSoraRpcEndpoints(primary: string, archive: string): void {
+  const canonicalHostname = (value: string): string =>
+    new URL(value).hostname.toLowerCase().replace(/\.$/, '');
+  if (canonicalHostname(primary) === canonicalHostname(archive)) {
+    throw new Error('SORA primary and archive endpoints must use different reviewed hosts.');
+  }
+}
 
 const validateGraphqlPath = (value: string): string => {
   if (!value.startsWith('/')) return invalid('GRAPHQL_PATH', 'must start with /');
@@ -190,20 +253,24 @@ const validateNetworkHost = (name: string, value: string): string => {
 
 /** Reads and strictly validates all long-lived runtime configuration. */
 export function readConfig(): AppConfig {
+  const nodeEnvironment = readNodeEnvironment();
   const host = validateNetworkHost('HOST', readString('HOST', '0.0.0.0'));
   const workerMetricsHost = validateNetworkHost(
     'WORKER_METRICS_HOST',
     readString('WORKER_METRICS_HOST', '127.0.0.1')
   );
 
+  if (nodeEnvironment === 'production' && process.env.DATABASE_URL === undefined) {
+    invalid('DATABASE_URL', 'is required when NODE_ENV=production');
+  }
   const databaseUrl = validateUrl('DATABASE_URL', readString('DATABASE_URL', DEFAULT_DATABASE_URL), [
     'postgres:',
     'postgresql:',
   ]);
-  const soraWsEndpoint = validateUrl('SORA_WS_ENDPOINT', readString('SORA_WS_ENDPOINT', 'wss://mof2.sora.org'), [
-    'ws:',
-    'wss:',
-  ]);
+  const soraWsEndpoint = validateSoraWsUrl(
+    'SORA_WS_ENDPOINT',
+    readString('SORA_WS_ENDPOINT', 'wss://mof2.sora.org')
+  );
   const httpKeepAliveTimeoutMs = readInteger('HTTP_KEEP_ALIVE_TIMEOUT_MS', 75_000, {
     minimum: 1,
     maximum: 3_600_000,
@@ -287,6 +354,34 @@ export function readConfig(): AppConfig {
       minimum: 1,
       maximum: 1_000_000,
     }),
+    httpMaxHeaderBytes: readInteger('HTTP_MAX_HEADER_BYTES', 16 * 1_024, {
+      minimum: 1_024,
+      maximum: 64 * 1_024,
+    }),
+    httpMaxRequestsPerSocket: readInteger('HTTP_MAX_REQUESTS_PER_SOCKET', 1_000, {
+      minimum: 1,
+      maximum: 100_000,
+    }),
+    rateLimitWindowMs: readInteger('RATE_LIMIT_WINDOW_MS', 60_000, {
+      minimum: 1_000,
+      maximum: 3_600_000,
+    }),
+    rateLimitMax: readInteger('RATE_LIMIT_MAX', 600, {
+      minimum: 1,
+      maximum: 1_000_000,
+    }),
+    rateLimitMaxKeys: readInteger('RATE_LIMIT_MAX_KEYS', 20_000, {
+      minimum: 1,
+      maximum: 1_000_000,
+    }),
+    rateLimitGlobalWindowMs: readInteger('RATE_LIMIT_GLOBAL_WINDOW_MS', 60_000, {
+      minimum: 1_000,
+      maximum: 3_600_000,
+    }),
+    rateLimitGlobalMax: readInteger('RATE_LIMIT_GLOBAL_MAX', 50_000, {
+      minimum: 1,
+      maximum: 10_000_000,
+    }),
     graphqlHttpMaxBodyBytes: readInteger('GRAPHQL_HTTP_MAX_BODY_BYTES', 256 * 1_024, {
       minimum: 1,
       maximum: 16 * 1_024 * 1_024,
@@ -322,6 +417,10 @@ export function readConfig(): AppConfig {
     graphqlWsMaxConnections: readInteger('GRAPHQL_WS_MAX_CONNECTIONS', 1_000, {
       minimum: 1,
       maximum: 1_000_000,
+    }),
+    graphqlWsMaxConnectionsPerClient: readInteger('GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT', 16, {
+      minimum: 1,
+      maximum: 10_000,
     }),
     graphqlWsMaxOperations: readInteger('GRAPHQL_WS_MAX_OPERATIONS', 2_000, {
       minimum: 1,
@@ -439,7 +538,7 @@ export function readConfig(): AppConfig {
       maximum: 10_000_000,
     }),
     legacySoraBlockTypes: readBoolean('CHAIN_LEGACY_SORA_BLOCK_TYPES'),
-    archiveSoraWsEndpoint: readOptionalUrl('SORA_ARCHIVE_WS_ENDPOINT', ['ws:', 'wss:']),
+    archiveSoraWsEndpoint: readSoraArchiveWsEndpoint() ?? '',
     workerReadinessMaxLagBlocks: readInteger('WORKER_READINESS_MAX_LAG_BLOCKS', 25, { minimum: 0 }),
     workerReadinessMaxStalenessSeconds: readInteger('WORKER_READINESS_MAX_STALENESS_SECONDS', 120, {
       minimum: 30,

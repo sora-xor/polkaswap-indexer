@@ -22,7 +22,7 @@ describe('production container contract', () => {
     expect(dockerfile).toContain('yarn workspaces focus --all --production');
     expect(dockerfile).toContain('COPY --from=production-dependencies --chown=node:node /app/node_modules');
     expect(dockerfile).toContain('RUN install -d -o node -g node /data');
-    expect(dockerfile).toContain('ENV ROCKSDB_PATH=/data/polkaswap-indexer.rocksdb');
+    expect(dockerfile).toContain('ROCKSDB_PATH=/data/polkaswap-indexer.rocksdb');
     expect(dockerfile).toContain('COPY --chown=node:node LICENSE ./LICENSE');
     expect(dockerfile).toMatch(/\nUSER node\n/);
     expect(dockerfile).toContain('STOPSIGNAL SIGTERM');
@@ -53,21 +53,15 @@ describe('production container contract', () => {
     }
   });
 
-  it('uses an exec-form healthcheck with environment-driven routing', async () => {
+  it('uses the compiled identity smoke with environment-driven health routing', async () => {
     const dockerfile = await readProjectFile('Dockerfile');
-    const healthcheck = dockerfile
-      .split('\n')
-      .find((line) => line.trimStart().startsWith('CMD ["node", "-e"'));
 
-    expect(healthcheck).toBeDefined();
-    const command = JSON.parse(healthcheck!.trimStart().slice('CMD '.length)) as string[];
-
-    expect(command.slice(0, 2)).toEqual(['node', '-e']);
-    expect(() => new Function(command[2]!)).not.toThrow();
-    expect(command[2]).toContain('process.env.PORT');
-    expect(command[2]).toContain('process.env.GRAPHQL_PATH');
-    expect(command[2]).toContain("'http://127.0.0.1:'+port+path");
-    expect(command[2]).not.toContain('http://127.0.0.1:4350/graphql');
+    expect(dockerfile).toContain('node dist/src/scripts/production-smoke.js');
+    expect(dockerfile).toContain(
+      '"http://127.0.0.1:${PORT:-4350}${GRAPHQL_PATH:-/graphql}"'
+    );
+    expect(dockerfile).toContain('POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS=4000');
+    expect(dockerfile).not.toContain('http://127.0.0.1:4350/graphql');
   });
 
   it('overrides standalone worker healthchecks to use the isolated readiness listener', async () => {

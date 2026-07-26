@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { readConfig } from '../src/config.js';
 import { MemoryRepository } from '../src/repository/memory.js';
+import { SORA_MAINNET_GENESIS_HASH } from '../src/soraIdentity.js';
 import { ChainIndexer, summarizeExactPoolLiquidity } from '../src/worker/chain.js';
 
 const SCALE = 10n ** 18n;
@@ -80,19 +81,23 @@ const fetchedBlock = (
   extrinsics: unknown[],
   events: unknown[],
   timestamp = 1_700_000_000 + height
-) => ({
-  signedBlock: {
-    block: {
-      header: {
-        number: { toNumber: () => height },
-        hash: { toString: () => `0xblock-${height}` },
+) => {
+  const requestedHash = `0x${height.toString(16).padStart(64, '0')}`;
+  return {
+    requestedHash,
+    signedBlock: {
+      block: {
+        header: {
+          number: { toNumber: () => height },
+          hash: { toString: () => requestedHash },
+        },
+        extrinsics,
       },
-      extrinsics,
     },
-  },
-  events,
-  timestamp,
-});
+    events,
+    timestamp,
+  };
+};
 
 const historicalState = (blockHeight = 9) => ({
   blockHeight,
@@ -125,6 +130,8 @@ const historicalState = (blockHeight = 9) => ({
 });
 
 const prepareState = (indexer: ChainIndexer, blockHeight = 9) => {
+  (indexer as unknown as { observedGenesisHash: string }).observedGenesisHash =
+    SORA_MAINNET_GENESIS_HASH;
   const state = historicalState(blockHeight);
   (indexer as any).recalculateHistoricalValuationState(state);
   return state;

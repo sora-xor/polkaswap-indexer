@@ -9,6 +9,10 @@ import {
   PINNED_WALLET_HISTORY_DOCUMENT,
   PINNED_WALLET_OPERATION_CRITERIA,
 } from './pinned-wallet-history-fixture.js';
+import {
+  createHealthIdentityDocuments,
+  HEALTH_TEST_STATE_BLOCK,
+} from './sora-health-fixture.js';
 
 import type { AppConfig } from '../src/config.js';
 
@@ -22,6 +26,13 @@ const config: AppConfig = {
   httpHeadersTimeoutMs: 80_000,
   httpRequestTimeoutMs: 120_000,
   httpMaxConnections: 10_000,
+  httpMaxHeaderBytes: 16_384,
+  httpMaxRequestsPerSocket: 1_000,
+  rateLimitWindowMs: 60_000,
+  rateLimitMax: 600,
+  rateLimitMaxKeys: 20_000,
+  rateLimitGlobalWindowMs: 60_000,
+  rateLimitGlobalMax: 50_000,
   graphqlHttpMaxBodyBytes: 262_144,
   graphqlHttpMaxInFlight: 100,
   graphqlMaxDepth: 12,
@@ -34,6 +45,7 @@ const config: AppConfig = {
   graphqlWsMaxPayloadBytes: 65_536,
   graphqlWsConnectionInitTimeoutMs: 30_000,
   graphqlWsMaxConnections: 1_000,
+  graphqlWsMaxConnectionsPerClient: 16,
   graphqlWsMaxOperations: 2_000,
   graphqlWsMaxOperationsPerConnection: 20,
   graphqlWsMaxPendingMessagesPerConnection: 64,
@@ -104,18 +116,19 @@ describe('production GraphQL handler', () => {
   it('executes a normal request without binding a TCP port', async () => {
     const now = Math.floor(Date.now() / 1_000);
     const repository = new MemoryRepository();
-    await repository.upsert(
+    await repository.upsertMany([
+      ...createHealthIdentityDocuments(now),
       createPersistedWorkerStatusDocument({
         lifecycle: 'running',
         startupComplete: true,
-        latestFinalizedBlock: 1_000,
-        latestIndexedBlock: 995,
+        latestFinalizedBlock: HEALTH_TEST_STATE_BLOCK + 5,
+        latestIndexedBlock: HEALTH_TEST_STATE_BLOCK,
         lag: 5,
         lastSuccessfulIndexTimestamp: now,
         lastError: null,
         lastErrorTimestamp: null,
-      })
-    );
+      }),
+    ]);
     const { yoga } = createGraphQLHandler(config, repository);
     const response = await post(yoga, '{ _health { ok serviceId readOnly } }');
 

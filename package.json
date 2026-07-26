@@ -39,10 +39,13 @@
     "storage:cleanup:postgres-rocksdb-capture:dist": "node dist/src/scripts/cleanup-postgres-rocksdb-capture.js",
     "seed:swap-chart": "tsx src/dev/seedSwapChartData.ts",
     "audit:deployment-evidence": "bash scripts/audit-deployment-evidence.sh",
+    "audit:dependencies": "yarn npm audit --all --recursive --severity low --no-deprecations",
+    "audit:dependencies:production": "yarn npm audit --all --recursive --environment production --severity low --no-deprecations",
     "generate:deployment-evidence-template": "bash scripts/generate-deployment-evidence-template.sh",
     "smoke:production": "tsx src/scripts/production-smoke.ts",
     "test:deployment-evidence-audit": "bash scripts/test-deployment-evidence-audit.sh",
     "test:deployment-evidence-template": "bash scripts/test-deployment-evidence-template.sh",
+    "test:deployment-manifest": "bash scripts/test-deployment-manifest.sh",
     "test:production-smoke": "vitest run tests/production-smoke.spec.ts",
     "test": "vitest run"
   },

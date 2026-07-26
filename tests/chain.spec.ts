@@ -1,9 +1,15 @@
+import { createHash } from 'node:crypto';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import { ApiPromise } from '@polkadot/api';
 import { ChainIndexer } from '../src/worker/chain.js';
 import { MemoryRepository } from '../src/repository/memory.js';
 import { MAX_REPOSITORY_WRITE_CALL_DOCUMENTS } from '../src/repository/validation.js';
+import {
+  SORA_LEGACY_IDENTITY_ANCHOR,
+  SORA_MAINNET_GENESIS_HASH,
+} from '../src/soraIdentity.js';
 
 import type { IndexerDocument } from '../src/repository/types.js';
 
@@ -16,6 +22,11 @@ const ETH = '0x0200070000000000000000000000000000000000000000000000000000000000'
 const XSTUSD = '0x0200080000000000000000000000000000000000000000000000000000000000';
 const KUSD = '0x02000c0000000000000000000000000000000000000000000000000000000000';
 const LIBERLAND_ACCOUNT = '5GrwvaEF5zXb26Fz9rcQpDWSxZ9zC7d4L4sUx8m6RRnF9jqw';
+const canonicalBlockHash = (label: string): string =>
+  `0x${createHash('sha256').update(label).digest('hex')}`;
+const markIndexerMainnet = (indexer: unknown): void => {
+  (indexer as { observedGenesisHash: string }).observedGenesisHash = SORA_MAINNET_GENESIS_HASH;
+};
 
 const eventRecord = (section: string, method: string, data: Record<string, unknown>, extrinsicIndex = 0) => ({
   phase: {
@@ -53,6 +64,13 @@ const config = {
   httpHeadersTimeoutMs: 80_000,
   httpRequestTimeoutMs: 120_000,
   httpMaxConnections: 10_000,
+  httpMaxHeaderBytes: 16_384,
+  httpMaxRequestsPerSocket: 1_000,
+  rateLimitWindowMs: 60_000,
+  rateLimitMax: 600,
+  rateLimitMaxKeys: 20_000,
+  rateLimitGlobalWindowMs: 60_000,
+  rateLimitGlobalMax: 50_000,
   graphqlHttpMaxBodyBytes: 262_144,
   graphqlHttpMaxInFlight: 100,
   graphqlMaxDepth: 12,
@@ -65,6 +83,7 @@ const config = {
   graphqlWsMaxPayloadBytes: 65_536,
   graphqlWsConnectionInitTimeoutMs: 30_000,
   graphqlWsMaxConnections: 1_000,
+  graphqlWsMaxConnectionsPerClient: 16,
   graphqlWsMaxOperations: 2_000,
   graphqlWsMaxOperationsPerConnection: 20,
   graphqlWsMaxPendingMessagesPerConnection: 64,
@@ -118,6 +137,42 @@ const config = {
   workerMetricsHost: '127.0.0.1',
   workerMetricsPort: 9464,
   workerMetricsMaxInFlight: 10,
+};
+
+const mainnetStartApi = (finalizedBlock = SORA_LEGACY_IDENTITY_ANCHOR.block + 100) => {
+  const finalizedHash = canonicalBlockHash(`finalized-${finalizedBlock}`);
+  return {
+    disconnect: vi.fn(async () => undefined),
+    rpc: {
+      chain: {
+        getBlockHash: async (block: number) => ({
+          toString: () => block === 0
+            ? SORA_MAINNET_GENESIS_HASH
+            : block === SORA_LEGACY_IDENTITY_ANCHOR.block
+              ? SORA_LEGACY_IDENTITY_ANCHOR.hash
+              : canonicalBlockHash(`block-${block}`),
+        }),
+        getFinalizedHead: async () => ({ toString: () => finalizedHash }),
+        getHeader: async () => ({
+          number: { toNumber: () => finalizedBlock },
+          hash: { toString: () => finalizedHash },
+        }),
+      },
+    },
+    query: {
+      timestamp: {
+        now: {
+          at: async (blockHash: string) => ({
+            toString: () => String(
+              (blockHash === SORA_LEGACY_IDENTITY_ANCHOR.hash
+                ? SORA_LEGACY_IDENTITY_ANCHOR.timestamp
+                : 1_800_000_000) * 1_000,
+            ),
+          }),
+        },
+      },
+    },
+  };
 };
 
 const createBlockNetworkSnapshot = (
@@ -931,14 +986,17 @@ describe('ChainIndexer price derivation', () => {
       indexFetchedBlock: (block: unknown) => Promise<void>;
     };
     indexer.dirtyDerivedStorageDomains.clear();
+    markIndexerMainnet(indexer);
+    const requestedHash = canonicalBlockHash('storage-domains-249');
 
     await expect(
       indexer.indexFetchedBlock({
+        requestedHash,
         signedBlock: {
           block: {
             header: {
               number: { toNumber: () => 249 },
-              hash: { toString: () => '0x249' },
+              hash: { toString: () => requestedHash },
             },
             extrinsics: [],
           },
@@ -978,13 +1036,16 @@ describe('ChainIndexer price derivation', () => {
       indexFetchedBlock: (block: unknown) => Promise<void>;
     };
     indexer.requestDerivedStateRefresh = requestDerivedStateRefresh;
+    markIndexerMainnet(indexer);
+    const requestedHash = canonicalBlockHash('reconciliation-250');
 
     await indexer.indexFetchedBlock({
+      requestedHash,
       signedBlock: {
         block: {
           header: {
             number: { toNumber: () => 250 },
-            hash: { toString: () => '0x250' },
+            hash: { toString: () => requestedHash },
           },
           extrinsics: [],
         },
@@ -1013,7 +1074,7 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await expect(indexer.fetchBlockTimestamp('0xblock')).rejects.toBe(failure);
+    await expect(indexer.fetchBlockTimestamp(canonicalBlockHash('block'))).rejects.toBe(failure);
   });
 
   it('propagates validator identity query failures', async () => {
@@ -1608,7 +1669,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 42 },
-                hash: { toString: () => '0xblock' },
+                hash: { toString: () => canonicalBlockHash('block') },
               },
               extrinsics: [
                 {
@@ -1641,7 +1702,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xblock');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('block'));
 
     const snapshot = await repository.get('networkSnapshots', 'block-42');
     const aliceActivity = await repository.get('accountTransactions', '0xtransfer-alice');
@@ -1677,7 +1739,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 46 },
-                hash: { toString: () => '0xpolkamarkt-claims-block' },
+                hash: { toString: () => canonicalBlockHash('polkamarkt-claims-block') },
               },
               extrinsics: [
                 {
@@ -1715,7 +1777,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xpolkamarkt-claims-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('polkamarkt-claims-block'));
 
     const history = await repository.get('historyElements', '0xpolkamarkt-claims');
     expect(history?.data).toMatchObject({
@@ -1747,7 +1810,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 47 },
-                hash: { toString: () => '0xpolkamarkt-zero-claim-block' },
+                hash: { toString: () => canonicalBlockHash('polkamarkt-zero-claim-block') },
               },
               extrinsics: [
                 {
@@ -1784,7 +1847,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xpolkamarkt-zero-claim-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('polkamarkt-zero-claim-block'));
 
     const history = await repository.get('historyElements', '0xpolkamarkt-zero-claim');
     const snapshot = await repository.get('networkSnapshots', 'block-47');
@@ -1818,7 +1882,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 47 },
-                hash: { toString: () => '0xpolkamarkt-bare-claims-block' },
+                hash: { toString: () => canonicalBlockHash('polkamarkt-bare-claims-block') },
               },
               extrinsics: [
                 {
@@ -1854,7 +1918,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xpolkamarkt-bare-claims-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('polkamarkt-bare-claims-block'));
 
     const history = await repository.get('historyElements', '0xpolkamarkt-bare-claims');
     expect(history?.data.data).toMatchObject({ marketIds: [1, 2] });
@@ -1877,7 +1942,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 49 },
-                hash: { toString: () => '0xpolkamarkt-mismatched-claims-block' },
+                hash: { toString: () => canonicalBlockHash('polkamarkt-mismatched-claims-block') },
               },
               extrinsics: [
                 {
@@ -1914,7 +1979,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xpolkamarkt-mismatched-claims-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('polkamarkt-mismatched-claims-block'));
 
     const history = await repository.get('historyElements', '0xpolkamarkt-mismatched-claims');
     const bobActivity = await repository.get('accountTransactions', '0xpolkamarkt-mismatched-claims-bob');
@@ -1939,7 +2005,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 50 },
-                hash: { toString: () => '0xpolkamarkt-creator-liquidity-block' },
+                hash: { toString: () => canonicalBlockHash('polkamarkt-creator-liquidity-block') },
               },
               extrinsics: [
                 {
@@ -1975,7 +2041,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xpolkamarkt-creator-liquidity-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('polkamarkt-creator-liquidity-block'));
 
     const history = await repository.get('historyElements', '0xpolkamarkt-creator-liquidity');
     expect(history?.data.data).toMatchObject({ marketId: 7 });
@@ -1998,7 +2065,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 43 },
-                hash: { toString: () => '0xblock-transactions' },
+                hash: { toString: () => canonicalBlockHash('block-transactions') },
               },
               extrinsics: [
                 {
@@ -2065,7 +2132,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xblock-transactions');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('block-transactions'));
 
     const snapshot = await repository.get('networkSnapshots', 'block-43');
 
@@ -2091,7 +2159,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 60 },
-                hash: { toString: () => '0xfailed-swap-block' },
+                hash: { toString: () => canonicalBlockHash('failed-swap-block') },
               },
               extrinsics: [
                 {
@@ -2143,7 +2211,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xfailed-swap-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('failed-swap-block'));
 
     const snapshot = await repository.get('networkSnapshots', 'block-60');
     const accountMeta = await repository.get('accountMeta', 'alice');
@@ -2173,7 +2242,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 61 },
-                hash: { toString: () => '0xfailed-bridge-block' },
+                hash: { toString: () => canonicalBlockHash('failed-bridge-block') },
               },
               extrinsics: [
                 {
@@ -2211,7 +2280,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xfailed-bridge-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('failed-bridge-block'));
 
     const snapshot = await repository.get('networkSnapshots', 'block-61');
     const accountMeta = await repository.get('accountMeta', 'alice');
@@ -2250,7 +2320,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 25_900_001 },
-                hash: { toString: () => '0xblock' },
+                hash: { toString: () => canonicalBlockHash('block') },
               },
               extrinsics: [
                 {
@@ -2283,7 +2353,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xblock');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('block'));
 
     const history = await repository.get('historyElements', '0xbatchburn');
     const xorBurn = await repository.get('xorBurns', '0xbatchburn');
@@ -2321,7 +2392,12 @@ describe('ChainIndexer price derivation', () => {
     expect(chainState?.data).toMatchObject({
       id: 'chainState',
       block: 25_900_001,
-      data: JSON.stringify({ lastIndexedBlock: 25_900_001 }),
+      data: JSON.stringify({
+        lastIndexedBlock: 25_900_001,
+        genesisHash: SORA_MAINNET_GENESIS_HASH,
+        blockHash: canonicalBlockHash('block'),
+        blockTimestamp: 1_700_000_000,
+      }),
     });
   });
 
@@ -2343,7 +2419,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 42 },
-                hash: { toString: () => '0xbridgeblock' },
+                hash: { toString: () => canonicalBlockHash('bridgeblock') },
               },
               extrinsics: [
                 {
@@ -2378,7 +2454,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xbridgeblock');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('bridgeblock'));
 
     const history = await repository.get('historyElements', '0xevmburn');
     const snapshot = await repository.get('networkSnapshots', 'block-42');
@@ -2426,7 +2503,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 45 },
-                hash: { toString: () => '0xliberlandoutblock' },
+                hash: { toString: () => canonicalBlockHash('liberlandoutblock') },
               },
               extrinsics: [
                 {
@@ -2463,7 +2540,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xliberlandoutblock');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('liberlandoutblock'));
 
     const history = await repository.get('historyElements', '0xliberlandout');
     const snapshot = await repository.get('networkSnapshots', 'block-45');
@@ -2519,7 +2597,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 44 },
-                hash: { toString: () => '0xswapblock' },
+                hash: { toString: () => canonicalBlockHash('swapblock') },
               },
               extrinsics: [
                 {
@@ -2583,7 +2661,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xswapblock');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('swapblock'));
 
     const history = await repository.get('historyElements', '0xswap');
     const snapshot = await repository.get('networkSnapshots', 'block-44');
@@ -2625,7 +2704,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 43 },
-                hash: { toString: () => '0xethincomingblock' },
+                hash: { toString: () => canonicalBlockHash('ethincomingblock') },
               },
               extrinsics: [
                 {
@@ -2660,7 +2739,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xethincomingblock');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('ethincomingblock'));
 
     const history = await repository.get('historyElements', '0xethincoming');
     const accountMeta = await repository.get('accountMeta', 'alice');
@@ -2705,7 +2785,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 43 },
-                hash: { toString: () => '0xinboundblock' },
+                hash: { toString: () => canonicalBlockHash('inboundblock') },
               },
               extrinsics: [
                 {
@@ -2749,7 +2829,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinboundblock');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inboundblock'));
 
     const original = await repository.get('historyElements', '0xinboundsubmit');
     const history = await repository.get('historyElements', '0xinboundrequest-mint');
@@ -2800,7 +2881,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 46 },
-                hash: { toString: () => '0xliberlandinblock' },
+                hash: { toString: () => canonicalBlockHash('liberlandinblock') },
               },
               extrinsics: [
                 {
@@ -2845,7 +2926,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xliberlandinblock');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('liberlandinblock'));
 
     const original = await repository.get('historyElements', '0xliberlandinboundsubmit');
     const history = await repository.get('historyElements', '0xliberlandinrequest-mint');
@@ -2902,7 +2984,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 44 },
-                hash: { toString: () => '0xinbound-no-request-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-no-request-block') },
               },
               extrinsics: [
                 {
@@ -2943,7 +3025,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-no-request-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-no-request-block'));
 
     const original = await repository.get('historyElements', '0xinbound-no-request');
     const accidentalSynthetic = await repository.get('historyElements', '-mint');
@@ -2978,7 +3061,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 45 },
-                hash: { toString: () => '0xinbound-no-asset-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-no-asset-block') },
               },
               extrinsics: [
                 {
@@ -3021,7 +3104,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-no-asset-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-no-asset-block'));
 
     const synthetic = await repository.get('historyElements', '0xrequest-no-asset-mint');
     const snapshot = await repository.get('networkSnapshots', 'block-45');
@@ -3050,7 +3134,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 46 },
-                hash: { toString: () => '0xinbound-invalid-amount-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-invalid-amount-block') },
               },
               extrinsics: [
                 {
@@ -3094,7 +3178,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-invalid-amount-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-invalid-amount-block'));
 
     const synthetic = await repository.get('historyElements', '0xrequest-invalid-amount-mint');
     const snapshot = await repository.get('networkSnapshots', 'block-46');
@@ -3123,7 +3208,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 47 },
-                hash: { toString: () => '0xinbound-zero-amount-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-zero-amount-block') },
               },
               extrinsics: [
                 {
@@ -3167,7 +3252,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-zero-amount-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-zero-amount-block'));
 
     const synthetic = await repository.get('historyElements', '0xrequest-zero-amount-mint');
     const snapshot = await repository.get('networkSnapshots', 'block-47');
@@ -3196,7 +3282,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 48 },
-                hash: { toString: () => '0xinbound-failed-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-failed-block') },
               },
               extrinsics: [
                 {
@@ -3241,7 +3327,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-failed-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-failed-block'));
 
     const original = await repository.get('historyElements', '0xinbound-failed');
     const synthetic = await repository.get('historyElements', '0xrequest-failed-mint');
@@ -3272,7 +3359,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 53 },
-                hash: { toString: () => '0xinbound-missing-recipient-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-missing-recipient-block') },
               },
               extrinsics: [
                 {
@@ -3315,7 +3402,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-missing-recipient-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-missing-recipient-block'));
 
     const synthetic = await repository.get('historyElements', '0xrequest-missing-recipient-mint');
     const snapshot = await repository.get('networkSnapshots', 'block-53');
@@ -3344,7 +3432,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 54 },
-                hash: { toString: () => '0xinbound-missing-sender-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-missing-sender-block') },
               },
               extrinsics: [
                 {
@@ -3387,7 +3475,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-missing-sender-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-missing-sender-block'));
 
     const synthetic = await repository.get('historyElements', '0xrequest-missing-sender-mint');
     const snapshot = await repository.get('networkSnapshots', 'block-54');
@@ -3416,7 +3505,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 55 },
-                hash: { toString: () => '0xinbound-missing-network-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-missing-network-block') },
               },
               extrinsics: [
                 {
@@ -3459,7 +3548,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-missing-network-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-missing-network-block'));
 
     const synthetic = await repository.get('historyElements', '0xrequest-missing-network-mint');
     const snapshot = await repository.get('networkSnapshots', 'block-55');
@@ -3488,7 +3578,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 56 },
-                hash: { toString: () => '0xinbound-malformed-network-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-malformed-network-block') },
               },
               extrinsics: [
                 {
@@ -3532,7 +3622,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-malformed-network-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-malformed-network-block'));
 
     const synthetic = await repository.get('historyElements', '0xrequest-malformed-network-mint');
     const snapshot = await repository.get('networkSnapshots', 'block-56');
@@ -3561,7 +3652,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 57 },
-                hash: { toString: () => '0xinbound-pending-status-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-pending-status-block') },
               },
               extrinsics: [
                 {
@@ -3605,7 +3696,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-pending-status-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-pending-status-block'));
 
     const synthetic = await repository.get('historyElements', '0xrequest-pending-status-mint');
     const snapshot = await repository.get('networkSnapshots', 'block-57');
@@ -3634,7 +3726,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 50 },
-                hash: { toString: () => '0xinbound-recipient-filter-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-recipient-filter-block') },
               },
               extrinsics: [
                 {
@@ -3684,7 +3776,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-recipient-filter-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-recipient-filter-block'));
 
     const synthetic = await repository.get('historyElements', '0xrequest-recipient-filter-mint');
     const snapshot = await repository.get('networkSnapshots', 'block-50');
@@ -3731,7 +3824,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 58 },
-                hash: { toString: () => '0xinbound-asset-mismatch-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-asset-mismatch-block') },
               },
               extrinsics: [
                 {
@@ -3776,7 +3869,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-asset-mismatch-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-asset-mismatch-block'));
 
     const synthetic = await repository.get('historyElements', '0xrequest-asset-mismatch-mint');
     const snapshot = await repository.get('networkSnapshots', 'block-58');
@@ -3811,7 +3905,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 59 },
-                hash: { toString: () => '0xinbound-asset-filter-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-asset-filter-block') },
               },
               extrinsics: [
                 {
@@ -3857,7 +3951,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-asset-filter-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-asset-filter-block'));
 
     const synthetic = await repository.get('historyElements', '0xrequest-asset-filter-mint');
     const snapshot = await repository.get('networkSnapshots', 'block-59');
@@ -3897,7 +3992,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 51 },
-                hash: { toString: () => '0xinbound-failed-status-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-failed-status-block') },
               },
               extrinsics: [
                 {
@@ -3941,7 +4036,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-failed-status-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-failed-status-block'));
 
     const synthetic = await repository.get('historyElements', '0xrequest-failed-status-mint');
     const snapshot = await repository.get('networkSnapshots', 'block-51');
@@ -3970,7 +4066,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 52 },
-                hash: { toString: () => '0xinbound-wrong-phase-block' },
+                hash: { toString: () => canonicalBlockHash('inbound-wrong-phase-block') },
               },
               extrinsics: [
                 {
@@ -4014,7 +4110,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xinbound-wrong-phase-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('inbound-wrong-phase-block'));
 
     const original = await repository.get('historyElements', '0xinbound-wrong-phase');
     const synthetic = await repository.get('historyElements', '0xrequest-wrong-phase-mint');
@@ -4048,7 +4145,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 49 },
-                hash: { toString: () => '0xevmburn-no-duplicate-block' },
+                hash: { toString: () => canonicalBlockHash('evmburn-no-duplicate-block') },
               },
               extrinsics: [
                 {
@@ -4091,7 +4188,8 @@ describe('ChainIndexer price derivation', () => {
       },
     };
 
-    await indexer.indexBlockByHash('0xevmburn-no-duplicate-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('evmburn-no-duplicate-block'));
 
     const outgoing = await repository.get('historyElements', '0xevmburn-no-duplicate');
     const synthetic = await repository.get('historyElements', '0xburn-request-mint');
@@ -4132,15 +4230,7 @@ describe('ChainIndexer price derivation', () => {
     const order: string[] = [];
     let finishBackfill: (() => void) | undefined;
     let finishMaintenance: (() => void) | undefined;
-    const apiCreate = vi.spyOn(ApiPromise, 'create').mockResolvedValue({
-      disconnect: vi.fn(async () => undefined),
-      rpc: {
-        chain: {
-          getFinalizedHead: async () => '0xfinal',
-          getHeader: async () => ({ number: { toNumber: () => 25_900_000 } }),
-        },
-      },
-    } as never);
+    const apiCreate = vi.spyOn(ApiPromise, 'create').mockResolvedValue(mainnetStartApi() as never);
 
     indexer.backfill = async () => {
       order.push('normal-backfill-start');
@@ -4206,13 +4296,13 @@ describe('ChainIndexer price derivation', () => {
     expect(refreshDerivedState).toHaveBeenCalledWith(100, expect.any(Number), true, true);
   });
 
-  it('starts a fresh chain at block zero and rejects malformed persisted chain state', async () => {
+  it('starts a fresh chain after genesis and rejects malformed persisted chain state', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
       getLastIndexedBlock: () => Promise<number>;
     };
 
-    await expect(indexer.getLastIndexedBlock()).resolves.toBe(-1);
+    await expect(indexer.getLastIndexedBlock()).resolves.toBe(0);
 
     repository.get = vi.fn(
       async () =>
@@ -4227,7 +4317,9 @@ describe('ChainIndexer price derivation', () => {
           },
         }) as IndexerDocument
     );
-    await expect(indexer.getLastIndexedBlock()).rejects.toThrow('Stored chainState document is malformed');
+    await expect(indexer.getLastIndexedBlock()).rejects.toThrow(
+      'Stored PI chainState checkpoint is malformed'
+    );
   });
 
 
@@ -4290,8 +4382,16 @@ describe('ChainIndexer price derivation', () => {
 
   it('skips expensive derived-state refreshes while backfilling historical blocks', async () => {
     const repository = new MemoryRepository();
+    const startBlock = SORA_LEGACY_IDENTITY_ANCHOR.block;
+    const finalizedBlock = startBlock + 3;
+    const finalizedHash = canonicalBlockHash(`finalized-${finalizedBlock}`);
     const indexer = new ChainIndexer(
-      { ...config, stateRefreshIntervalBlocks: 1, snapshotIntervalBlocks: 1 },
+      {
+        ...config,
+        chainStartBlock: startBlock,
+        stateRefreshIntervalBlocks: 1,
+        snapshotIntervalBlocks: 1,
+      },
       repository
     ) as unknown as {
       api: unknown;
@@ -4306,8 +4406,11 @@ describe('ChainIndexer price derivation', () => {
     indexer.api = {
       rpc: {
         chain: {
-          getFinalizedHead: async () => '0xfinal',
-          getHeader: async () => ({ number: { toNumber: () => 3 } }),
+          getFinalizedHead: async () => ({ toString: () => finalizedHash }),
+          getHeader: async () => ({
+            number: { toNumber: () => finalizedBlock },
+            hash: { toString: () => finalizedHash },
+          }),
         },
       },
     };
@@ -4322,10 +4425,10 @@ describe('ChainIndexer price derivation', () => {
     await indexer.backfill();
 
     expect(indexedBlocks).toEqual([
-      { block: 0, refreshDerivedState: false },
-      { block: 1, refreshDerivedState: false },
-      { block: 2, refreshDerivedState: false },
-      { block: 3, refreshDerivedState: false },
+      { block: startBlock, refreshDerivedState: false },
+      { block: startBlock + 1, refreshDerivedState: false },
+      { block: startBlock + 2, refreshDerivedState: false },
+      { block: finalizedBlock, refreshDerivedState: false },
     ]);
     expect(refreshes).toEqual([]);
   });
@@ -4342,16 +4445,17 @@ describe('ChainIndexer price derivation', () => {
     };
     const failure = new Error('refresh query timeout');
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const requestedHash = canonicalBlockHash('scheduled-refresh-10');
 
     indexer.api = {
       rpc: {
         chain: {
-          getBlockHash: async () => ({ toString: () => '0xblock' }),
+          getBlockHash: async () => ({ toString: () => requestedHash }),
           getBlock: async () => ({
             block: {
               header: {
                 number: { toNumber: () => 10 },
-                hash: { toString: () => '0xblock' },
+                hash: { toString: () => requestedHash },
               },
               extrinsics: [],
             },
@@ -4371,6 +4475,7 @@ describe('ChainIndexer price derivation', () => {
         },
       },
     };
+    markIndexerMainnet(indexer);
     indexer.refreshDerivedState = async () => {
       throw failure;
     };
@@ -4403,7 +4508,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 11 },
-                hash: { toString: () => '0xpolkamarkt-trade-block' },
+                hash: { toString: () => canonicalBlockHash('polkamarkt-trade-block') },
               },
               extrinsics: [
                 {
@@ -4462,7 +4567,8 @@ describe('ChainIndexer price derivation', () => {
       refreshes.push({ blockHeight, timestamp, includeSnapshots });
     };
 
-    await indexer.indexBlockByHash('0xpolkamarkt-trade-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('polkamarkt-trade-block'));
 
     await vi.waitFor(() => {
       expect(refreshes).toEqual([{ blockHeight: 11, timestamp: 1_700_000_011, includeSnapshots: true }]);
@@ -4485,7 +4591,7 @@ describe('ChainIndexer price derivation', () => {
             block: {
               header: {
                 number: { toNumber: () => 12 },
-                hash: { toString: () => '0xbalances-block' },
+                hash: { toString: () => canonicalBlockHash('balances-block') },
               },
               extrinsics: [
                 {
@@ -4526,7 +4632,8 @@ describe('ChainIndexer price derivation', () => {
       refreshes.push({ blockHeight, timestamp, includeSnapshots });
     };
 
-    await indexer.indexBlockByHash('0xbalances-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('balances-block'));
     await Promise.resolve();
 
     expect(refreshes).toEqual([]);
@@ -4544,17 +4651,22 @@ describe('ChainIndexer price derivation', () => {
       ) => Promise<void>;
     };
     const indexedBlocks: number[] = [];
-    let finalizedHeadCallback: ((header: { number: { toNumber: () => number } }) => Promise<void>) | undefined;
+    const baseBlock = SORA_LEGACY_IDENTITY_ANCHOR.block;
+    const initialFinalizedHash = canonicalBlockHash('retry-initial-finalized');
+    let finalizedHeadCallback: ((header: {
+      number: { toNumber: () => number };
+      hash: { toString: () => string };
+    }) => void) | undefined;
 
     await repository.upsert({
       collection: 'updatesStreams',
       id: 'chainState',
-      blockHeight: 9,
+      blockHeight: baseBlock + 9,
       timestamp: 1,
       data: {
         id: 'chainState',
-        block: 9,
-        data: JSON.stringify({ lastIndexedBlock: 9 }),
+        block: baseBlock + 9,
+        data: JSON.stringify({ lastIndexedBlock: baseBlock + 9 }),
       },
     });
 
@@ -4564,8 +4676,11 @@ describe('ChainIndexer price derivation', () => {
           subscribeFinalizedHeads: async (callback: typeof finalizedHeadCallback) => {
             finalizedHeadCallback = callback;
           },
-          getFinalizedHead: async () => '0xfinal',
-          getHeader: async () => ({ number: { toNumber: () => 9 } }),
+          getFinalizedHead: async () => ({ toString: () => initialFinalizedHash }),
+          getHeader: async () => ({
+            number: { toNumber: () => baseBlock + 9 },
+            hash: { toString: () => initialFinalizedHash },
+          }),
         },
       },
     };
@@ -4573,7 +4688,7 @@ describe('ChainIndexer price derivation', () => {
     indexer.ensureLiveValuationState = vi.fn(async () => valuationState);
     indexer.indexBlockByNumber = async (block, options) => {
       indexedBlocks.push(block);
-      if (block === 10 && indexedBlocks.length === 1) {
+      if (block === baseBlock + 10 && indexedBlocks.length === 1) {
         throw new Error('transient database failure');
       }
 
@@ -4595,18 +4710,29 @@ describe('ChainIndexer price derivation', () => {
 
     try {
       await indexer.subscribeFinalizedHeads();
-      await finalizedHeadCallback?.({ number: { toNumber: () => 10 } });
-      await vi.waitFor(() => {
-        expect(indexedBlocks).toEqual([10]);
+      finalizedHeadCallback?.({
+        number: { toNumber: () => baseBlock + 10 },
+        hash: { toString: () => canonicalBlockHash('retry-head-10') },
       });
-      expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(9);
-      expect(consoleError).toHaveBeenCalledWith('Failed to index finalized block 10', expect.any(Error));
+      await vi.waitFor(() => {
+        expect(indexedBlocks).toEqual([baseBlock + 10]);
+      });
+      expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(baseBlock + 9);
+      expect(consoleError).toHaveBeenCalledWith(`Failed to index finalized block ${baseBlock + 10}`, expect.any(Error));
 
-      await finalizedHeadCallback?.({ number: { toNumber: () => 12 } });
-      await vi.waitFor(() => {
-        expect(indexedBlocks).toEqual([10, 10, 11, 12]);
+      finalizedHeadCallback?.({
+        number: { toNumber: () => baseBlock + 12 },
+        hash: { toString: () => canonicalBlockHash('retry-head-12') },
       });
-      expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(12);
+      await vi.waitFor(() => {
+        expect(indexedBlocks).toEqual([
+          baseBlock + 10,
+          baseBlock + 10,
+          baseBlock + 11,
+          baseBlock + 12,
+        ]);
+      });
+      expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(baseBlock + 12);
     } finally {
       consoleError.mockRestore();
     }
@@ -4624,16 +4750,18 @@ describe('ChainIndexer price derivation', () => {
       ) => Promise<void>;
     };
     const indexedBlocks: number[] = [];
+    const baseBlock = SORA_LEGACY_IDENTITY_ANCHOR.block;
+    const finalizedHash = canonicalBlockHash('drain-finalized');
 
     await repository.upsert({
       collection: 'updatesStreams',
       id: 'chainState',
-      blockHeight: 9,
+      blockHeight: baseBlock + 9,
       timestamp: 1,
       data: {
         id: 'chainState',
-        block: 9,
-        data: JSON.stringify({ lastIndexedBlock: 9 }),
+        block: baseBlock + 9,
+        data: JSON.stringify({ lastIndexedBlock: baseBlock + 9 }),
       },
     });
 
@@ -4641,8 +4769,11 @@ describe('ChainIndexer price derivation', () => {
       rpc: {
         chain: {
           subscribeFinalizedHeads: async () => undefined,
-          getFinalizedHead: async () => '0xfinal',
-          getHeader: async () => ({ number: { toNumber: () => 12 } }),
+          getFinalizedHead: async () => ({ toString: () => finalizedHash }),
+          getHeader: async () => ({
+            number: { toNumber: () => baseBlock + 12 },
+            hash: { toString: () => finalizedHash },
+          }),
         },
       },
     };
@@ -4666,8 +4797,8 @@ describe('ChainIndexer price derivation', () => {
 
     await indexer.subscribeFinalizedHeads();
 
-    expect(indexedBlocks).toEqual([10, 11, 12]);
-    expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(12);
+    expect(indexedBlocks).toEqual([baseBlock + 10, baseBlock + 11, baseBlock + 12]);
+    expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(baseBlock + 12);
   });
 
   it('continues existing account point metadata from the repository', async () => {
@@ -7434,19 +7565,24 @@ describe('ChainIndexer price derivation', () => {
       ) => Promise<void>;
     };
     const windows = indexer.createNetworkBackfillWindows();
-    const fetchedBlock = (blockHeight: number, timestamp: number) => ({
-      signedBlock: {
-        block: {
-          header: {
-            number: { toNumber: () => blockHeight },
-            hash: { toString: () => `0x${blockHeight}` },
+    markIndexerMainnet(indexer);
+    const fetchedBlock = (blockHeight: number, timestamp: number) => {
+      const requestedHash = canonicalBlockHash(`network-aggregate-${blockHeight}`);
+      return {
+        requestedHash,
+        signedBlock: {
+          block: {
+            header: {
+              number: { toNumber: () => blockHeight },
+              hash: { toString: () => requestedHash },
+            },
+            extrinsics: [],
           },
-          extrinsics: [],
         },
-      },
-      events: [],
-      timestamp,
-    });
+        events: [],
+        timestamp,
+      };
+    };
 
     await indexer.indexFetchedBlock(fetchedBlock(1, 100), {
       refreshDerivedState: false,
@@ -7585,12 +7721,15 @@ describe('ChainIndexer price derivation', () => {
         meta: { args: [{ name: 'assetId' }, { name: 'to' }, { name: 'amount' }] },
       },
     }));
+    markIndexerMainnet(indexer);
+    const requestedHash = canonicalBlockHash('oversized-finalized-block');
     const fetchedBlock = (selectedExtrinsics: unknown[]) => ({
+      requestedHash,
       signedBlock: {
         block: {
           header: {
             number: { toNumber: () => 42 },
-            hash: { toString: () => '0xblock' },
+            hash: { toString: () => requestedHash },
           },
           extrinsics: selectedExtrinsics,
         },

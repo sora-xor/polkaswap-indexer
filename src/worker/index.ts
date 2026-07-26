@@ -1,14 +1,35 @@
-import { readConfig } from '../config.js';
+import {
+  assertExplicitProductionWorkerChainInputs,
+  assertIndependentSoraRpcEndpoints,
+  readConfig,
+  readSoraArchiveWsEndpoint,
+} from '../config.js';
 import { assertStandaloneStorageMode } from '../deployment.js';
 import { migrate } from '../db/migrate.js';
 import { createRepository, shouldRunPostgresMigration } from '../repository/factory.js';
 import { idempotentShutdown, runShutdownGroup, runShutdownSteps } from '../shutdown.js';
 import { ChainIndexer } from './chain.js';
+import { preflightSoraMainnetIdentity } from './identityPreflight.js';
 import { acquirePostgresWorkerLease, stopOnWorkerLeaseLoss } from './lease.js';
 import { startWorkerObservabilityServer } from './observability.js';
 
 const config = readConfig();
 assertStandaloneStorageMode(config, 'worker');
+assertExplicitProductionWorkerChainInputs();
+
+const archiveSoraWsEndpoint = readSoraArchiveWsEndpoint(process.env.NODE_ENV === 'production');
+if (archiveSoraWsEndpoint) {
+  assertIndependentSoraRpcEndpoints(config.soraWsEndpoint, archiveSoraWsEndpoint);
+}
+await Promise.all([
+  preflightSoraMainnetIdentity(config.soraWsEndpoint, { requireAnchorTimestamp: true }),
+  ...(archiveSoraWsEndpoint ? [preflightSoraMainnetIdentity(archiveSoraWsEndpoint)] : []),
+]);
+console.info(
+  archiveSoraWsEndpoint
+    ? 'Verified reviewed primary and archive SORA mainnet identities before storage initialization'
+    : 'Verified reviewed SORA mainnet identity before storage initialization'
+);
 
 if (!config.skipPostgresMigration && shouldRunPostgresMigration(config)) await migrate(config);
 const workerLease =

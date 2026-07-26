@@ -1,0 +1,29 @@
+name: Branch Flow
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  branch-flow:
+    name: branch-flow
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Branch flow audit self-test
+        run: bash scripts/test-branch-flow-audit.sh
+
+      - name: Branch flow audit
+        run: bash scripts/audit-branch-flow.sh
+
+      - name: Validate PR target
+        # Normal work targets develop; only develop, release/*, or hotfix/*
+        # promotion branches may target master.
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: bash scripts/validate-pr-target.sh

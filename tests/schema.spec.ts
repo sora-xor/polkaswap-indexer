@@ -13,6 +13,10 @@ import {
   decodeRepositoryCursor,
   encodeRepositoryCursor,
 } from '../src/repository/cursor.js';
+import {
+  createHealthIdentityDocuments,
+  HEALTH_TEST_STATE_BLOCK,
+} from './sora-health-fixture.js';
 
 import type { IndexerDocument, IndexerRepository, RepositoryQueryArgs } from '../src/repository/types.js';
 
@@ -100,6 +104,10 @@ describe('Polkaswap indexer schema', () => {
       network: 'mainnet',
       publicBaseUrl: 'https://pi.soramitsu.io/graphql',
       readOnly: true,
+      genesisHash: null,
+      latestIndexedBlock: null,
+      latestIndexedBlockHash: null,
+      latestIndexedAt: null,
       workerAvailable: false,
       workerReady: false,
       workerReadinessReason: 'status-unavailable',
@@ -133,6 +141,10 @@ describe('Polkaswap indexer schema', () => {
       network: 'mainnet',
       publicBaseUrl: 'https://pi.soramitsu.io/graphql',
       readOnly: true,
+      genesisHash: null,
+      latestIndexedBlock: null,
+      latestIndexedBlockHash: null,
+      latestIndexedAt: null,
       workerAvailable: false,
       workerReady: false,
       workerReadinessReason: 'status-unavailable',
@@ -188,12 +200,14 @@ describe('Polkaswap indexer schema', () => {
   it('reports detailed ready worker status in combined mode', async () => {
     const healthField = createSchema().getQueryType()?.getFields()._health;
     const now = Math.floor(Date.now() / 1_000);
+    const repository = new MemoryRepository();
+    await repository.upsertMany(createHealthIdentityDocuments(now));
     const workerStatusProvider = {
       getStatus: () => ({
         lifecycle: 'running' as const,
         startupComplete: true,
-        latestFinalizedBlock: 1_000,
-        latestIndexedBlock: 995,
+        latestFinalizedBlock: HEALTH_TEST_STATE_BLOCK + 5,
+        latestIndexedBlock: HEALTH_TEST_STATE_BLOCK,
         lag: 5,
         lastSuccessfulIndexTimestamp: now,
         lastError: null,
@@ -206,7 +220,7 @@ describe('Polkaswap indexer schema', () => {
         {},
         {},
         {
-          repository: new MemoryRepository(),
+          repository,
           workerStatusProvider,
           workerReadinessThresholds: { maxLagBlocks: 25, maxStalenessSeconds: 120 },
         },
@@ -219,8 +233,8 @@ describe('Polkaswap indexer schema', () => {
       workerReadinessReason: null,
       workerLifecycle: 'running',
       workerStartupComplete: true,
-      workerLatestFinalizedBlock: 1_000,
-      workerLatestIndexedBlock: 995,
+      workerLatestFinalizedBlock: HEALTH_TEST_STATE_BLOCK + 5,
+      workerLatestIndexedBlock: HEALTH_TEST_STATE_BLOCK,
       workerLag: 5,
       workerLastSuccessfulIndexTimestamp: now,
     });

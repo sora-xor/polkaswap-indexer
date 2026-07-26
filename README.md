@@ -126,6 +126,16 @@ only to bounded, trusted internal repository callers.
 Run the API and worker as separate processes against the same PostgreSQL
 database. For a fresh production deployment, set `CHAIN_START_BLOCK` to the
 earliest block you need indexed; a full-chain backfill is intentionally long.
+Set `NODE_ENV=production` and inject `DATABASE_URL`; production startup rejects
+the development database fallback. Primary and archive SORA URLs must be
+credential-free `wss:` endpoints without query strings or fragments, on
+different hosts. The production worker requires `SORA_ARCHIVE_WS_ENDPOINT`.
+Before constructing, migrating, reading, or writing the repository, it proves
+the reviewed SORA mainnet genesis and immutable history anchor independently on
+both endpoints. The in-process worker repeats the primary proof and validates a
+self-consistent finalized head before it may persist even its first heartbeat.
+Every archived block then has to match the primary endpoint by height/hash, raw
+SCALE block and event bytes, and timestamp.
 The one-shot PostgreSQL schema migration uses
 `POSTGRES_MIGRATION_QUERY_TIMEOUT_MS` and
 `POSTGRES_MIGRATION_STATEMENT_TIMEOUT_MS`, both defaulting to `0` (unlimited),
@@ -175,8 +185,9 @@ catch-up inherits that value unless
 bounded at `256`. Set
 `CHAIN_PRICE_STREAM_REFRESH_INTERVAL_BLOCKS` to a positive interval (maximum
 `10,000,000`) to refresh the price stream independently; `0` keeps it coupled
-to normal derived-state refreshes. `SORA_ARCHIVE_WS_ENDPOINT` optionally selects
-a validated `ws:`/`wss:` historical block endpoint, while
+to normal derived-state refreshes. Outside production,
+`SORA_ARCHIVE_WS_ENDPOINT` optionally selects a validated historical block
+endpoint, while
 `CHAIN_LEGACY_SORA_BLOCK_TYPES=true` enables the legacy type bundle. Invalid or
 out-of-range values abort startup.
 
@@ -240,10 +251,14 @@ point-read during field execution after that emission reservation is acquired.
 Polling fallback likewise hashes one legal document at a time and retains only
 fixed-size SHA-256 fingerprints.
 
-These in-process limits bound the work admitted by one request or connection;
-they are not an identity-aware rate limiter. Production ingress should also
-enforce per-client request/connection rates and its own compatible body/header
-limits at the load balancer or reverse proxy.
+The server also applies bounded fixed-window request and WebSocket-upgrade rates
+to the raw TCP peer, caps tracked peer identities, caps concurrent WebSockets
+per raw peer, bounds header bytes and requests per keep-alive socket, and ignores
+spoofable forwarding headers. A trusted loopback proxy is one raw peer, not the
+end client: production Compose raises that peer bucket only to the process-wide
+backstop, while the TLS edge must overwrite untrusted forwarding headers and
+enforce the attested per-client request, upgrade, connection, body, and header
+limits.
 
 For RocksDB production deployment, use `start:combined` instead of separate API
 and worker processes. RocksDB is embedded local storage; the API and worker must
@@ -457,8 +472,63 @@ same-filesystem checkpoint is the safer fallback on a nearly-full root disk
 because RocksDB hard-links immutable files instead of copying the full database.
 Keep the old Postgres data directory until rollback is no longer required.
 
-Before enabling production routing, run the smoke check against the public
-GraphQL endpoint:
+The public GraphQL runtime applies a 64 KiB HTTP/WS payload ceiling, disables
+batching and multipart uploads, bounds query depth, expanded fields, aliases,
+HTTP identities, total request rate, WebSocket connections, and operations per
+connection, and disables introspection by default in production. Forwarding
+headers are intentionally ignored; the local TLS proxy must reach the
+loopback-published service from `docker-compose.production.yml`.
+Because every proxied request has the proxy's raw socket identity, the Compose
+contract sets the peer bucket equal to the process-wide ceiling; the TLS edge
+must enforce its own client-IP request and WebSocket limits after replacing
+untrusted forwarding headers. Direct deployments retain the stricter per-peer
+defaults from the image.
+
+Launch the hardened API and worker contract with externally managed service
+configuration and immutable image evidence:
+
+```sh
+export POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.example/polkaswap-indexer
+export POLKASWAP_INDEXER_IMAGE_DIGEST=<reviewed-64-hex-digest>
+export POLKASWAP_DATABASE_URL=postgresql://<managed-secret>@db.example/indexer?sslmode=require
+export POLKASWAP_SORA_WS_ENDPOINT=wss://<controlled-verifying-primary>
+export POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://<independently-operated-archive>
+export POLKASWAP_CHAIN_START_BLOCK=<reviewed-first-required-block>
+docker compose -f docker-compose.production.yml config
+docker compose -f docker-compose.production.yml up -d
+```
+
+The production worker overrides the image's API healthcheck with
+`dist/src/scripts/worker-health.js`. This probe has no HTTP or API-container
+dependency. It uses the worker's existing `DATABASE_URL` to require the exact
+immutable SORA mainnet anchor, a strictly shaped `chainState`, and the exact
+matching `BLOCK` snapshot. The state height/hash/timestamp must be coherent with
+the anchor, and its timestamp may be at most 300 seconds old or 30 seconds
+ahead. PostgreSQL connection, statement/query, and cleanup waits are bounded;
+the 4-second hard process deadline remains below the 5-second container timeout.
+Diagnostics contain only fixed failure codes and never include the database URL
+or raw driver error text.
+
+During rollout, confirm worker health independently of GraphQL:
+
+```sh
+docker compose -f docker-compose.production.yml exec worker \
+  node dist/src/scripts/worker-health.js
+docker inspect --format '{{json .State.Health}}' <worker-container>
+```
+
+An empty database, an incomplete first block, a stopped or stale worker, a
+future clock, a malformed row, or a snapshot that does not exactly match
+`chainState` is intentionally unhealthy. The public API production smoke is a
+separate release gate and must not replace this database-backed worker check.
+
+Run `yarn audit:dependencies` for the complete dependency graph and
+`yarn audit:dependencies:production` for the shipped runtime graph. Both fail on
+security advisories at low severity or higher; `--no-deprecations` only excludes
+non-security registry maintenance notices from the gate.
+
+For every production deployment, run the smoke check against the public GraphQL
+endpoint:
 
 ```sh
 POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production
@@ -474,8 +544,27 @@ consistent finalized, indexed, lag, heartbeat, and commit-time details.
 
 Production release evidence is tracked in
 `scripts/production-deployment-evidence.json`. The committed manifest must stay
-blocked until the deployed image digest, git commit, deployment id, operator,
-PI health response, and live smoke timestamp have been recorded.
+blocked on `production-deployment-evidence-missing` and
+`live-production-smoke-failing` until the current public smoke passes and an
+operator records the deployed image digest, git commit, deployment id, PI health
+response, and live smoke timestamp for the intended release. The attested health
+response must
+contain the exact SORA mainnet genesis hash
+`0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5`,
+a positive safe-integer indexed block, its canonical nonzero lowercase 32-byte
+hash, and an integer Unix-seconds checkpoint timestamp no more than 300 seconds
+before or 30 seconds after `smokePassedAt`. The same record must include exact
+`soraRpcControls`: canonical credential-free `wss` URLs on distinct non-public
+hosts, the roles `locally-controlled-verifying-archive` and
+`independently-operated-verifying-archive`, successful exact identity preflight,
+and `height-hash-scale-block-events-timestamp` raw payload agreement. Public
+`*.sora.org` convenience nodes are useful for diagnostics but cannot satisfy
+that production trust attestation. Because the loopback service cannot
+derive end-client identities behind the local proxy, the same record must attest
+that the TLS edge terminates TLS, overwrites untrusted forwarded-client headers,
+enforces 600 HTTP requests per client per 60 seconds, permits at most 600
+WebSocket upgrades per client per 60 seconds, and caps concurrent WebSockets at
+16 per client.
 
 Prepare the operator template and run the ready gate before enabling release
 routing:

@@ -76,6 +76,7 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
+      NODE_ENV: development
       DATABASE_URL: ${POSTGRES_WORKER_DATABASE_URL:-postgres://polkaswap:polkaswap@postgres:5432/polkaswap_indexer}
       SKIP_POSTGRES_MIGRATION: "true"
       SORA_WS_ENDPOINT: wss://mof2.sora.org
@@ -99,6 +100,7 @@ services:
     profiles:
       - rocksdb
     environment:
+      NODE_ENV: development
       STORAGE_ENGINE: rocksdb
       ROCKSDB_PATH: /data/polkaswap-indexer.rocksdb
       HOST: 0.0.0.0
