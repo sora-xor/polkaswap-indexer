@@ -167,6 +167,7 @@ describe('Polkaswap production smoke', () => {
   it('rejects deployed health objects missing identity fields with a deployment hint', async () => {
     const fetchImpl = fetchWithHealth({
       ok: true,
+      repositoryReady: true,
       service: 'polkaswap-indexer',
     });
 
