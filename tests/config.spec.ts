@@ -202,9 +202,41 @@ describe('runtime configuration', () => {
       /Invalid DATABASE_URL:.*required when NODE_ENV=production/
     );
 
-    process.env.DATABASE_URL = 'postgresql://pi@database.internal/polkaswap';
+    process.env.DATABASE_URL =
+      'postgresql://pi@database.internal/polkaswap?sslmode=verify-full';
     expect(readConfig().databaseUrl).toBe(
-      'postgresql://pi@database.internal/polkaswap'
+      'postgresql://pi@database.internal/polkaswap?sslmode=verify-full'
+    );
+  });
+
+  it.each([
+    ['missing TLS mode', 'postgresql://pi@database.internal/polkaswap'],
+    [
+      'plaintext TLS mode',
+      'postgresql://pi@database.internal/polkaswap?sslmode=disable',
+    ],
+    [
+      'downgrade TLS mode',
+      'postgresql://pi@database.internal/polkaswap?sslmode=prefer',
+    ],
+    [
+      'hostname-unverified TLS mode',
+      'postgresql://pi@database.internal/polkaswap?sslmode=require',
+    ],
+  ])('rejects a production database URL with %s', (_label, databaseUrl) => {
+    process.env.NODE_ENV = 'production';
+    process.env.DATABASE_URL = databaseUrl;
+    expect(() => readConfig()).toThrow(
+      /Invalid DATABASE_URL:.*must use sslmode=verify-full in production/
+    );
+  });
+
+  it('rejects production database URL controls that can override client policy', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.DATABASE_URL =
+      'postgresql://pi@database.internal/polkaswap?sslmode=verify-full&query_timeout=0';
+    expect(() => readConfig()).toThrow(
+      /Invalid DATABASE_URL:.*may use only one lowercase sslmode/
     );
   });
 

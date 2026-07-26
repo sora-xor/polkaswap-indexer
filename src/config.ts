@@ -157,6 +157,38 @@ const validateUrl = (name: string, value: string, protocols: readonly string[]):
   return value;
 };
 
+const validateProductionDatabaseUrl = (value: string, nodeEnvironment: string): string => {
+  if (nodeEnvironment !== 'production') return value;
+  const url = new URL(value);
+  const entries = [...url.searchParams.entries()];
+  const keys = entries.map(([key]) => key);
+  if (
+    new Set(keys).size !== keys.length ||
+    keys.some((key) => key !== key.toLowerCase()) ||
+    keys.some((key) => key !== 'sslmode' && key !== 'sslnegotiation')
+  ) {
+    return invalid(
+      'DATABASE_URL',
+      'may use only one lowercase sslmode and optional sslnegotiation parameter in production'
+    );
+  }
+  if (url.searchParams.get('sslmode') !== 'verify-full') {
+    return invalid('DATABASE_URL', 'must use sslmode=verify-full in production');
+  }
+  const sslNegotiation = url.searchParams.get('sslnegotiation');
+  if (
+    sslNegotiation !== null &&
+    sslNegotiation !== 'direct' &&
+    sslNegotiation !== 'postgres'
+  ) {
+    return invalid(
+      'DATABASE_URL',
+      'sslnegotiation must be direct or postgres in production'
+    );
+  }
+  return value;
+};
+
 const readNodeEnvironment = (): string => {
   const value = process.env.NODE_ENV ?? 'development';
   if (!NODE_ENVIRONMENTS.has(value)) {
@@ -263,10 +295,13 @@ export function readConfig(): AppConfig {
   if (nodeEnvironment === 'production' && process.env.DATABASE_URL === undefined) {
     invalid('DATABASE_URL', 'is required when NODE_ENV=production');
   }
-  const databaseUrl = validateUrl('DATABASE_URL', readString('DATABASE_URL', DEFAULT_DATABASE_URL), [
-    'postgres:',
-    'postgresql:',
-  ]);
+  const databaseUrl = validateProductionDatabaseUrl(
+    validateUrl('DATABASE_URL', readString('DATABASE_URL', DEFAULT_DATABASE_URL), [
+      'postgres:',
+      'postgresql:',
+    ]),
+    nodeEnvironment
+  );
   const soraWsEndpoint = validateSoraWsUrl(
     'SORA_WS_ENDPOINT',
     readString('SORA_WS_ENDPOINT', 'wss://mof2.sora.org')

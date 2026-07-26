@@ -24,13 +24,15 @@ services:
   migrate:
     <<: *runtime-security
     restart: "no"
-    command: ["node", "dist/src/db/migrate.js"]
+    command: ["node", "dist/src/scripts/production-migrate.js"]
     healthcheck:
       disable: true
     environment:
       NODE_ENV: production
       STORAGE_ENGINE: postgres
       DATABASE_URL: "${POLKASWAP_MIGRATION_OWNER_DATABASE_URL:?Set the separately managed PostgreSQL migration-owner URL}"
+      POLKASWAP_API_DATABASE_URL: "${POLKASWAP_API_DATABASE_URL:?Set the separately managed PostgreSQL API runtime URL}"
+      POLKASWAP_WORKER_DATABASE_URL: "${POLKASWAP_WORKER_DATABASE_URL:?Set the separately managed PostgreSQL worker runtime URL}"
       POSTGRES_MIGRATION_QUERY_TIMEOUT_MS: "${POLKASWAP_POSTGRES_MIGRATION_QUERY_TIMEOUT_MS:-0}"
       POSTGRES_MIGRATION_STATEMENT_TIMEOUT_MS: "${POLKASWAP_POSTGRES_MIGRATION_STATEMENT_TIMEOUT_MS:-0}"
   api:

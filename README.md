@@ -129,11 +129,34 @@ three separately managed URLs: `POLKASWAP_MIGRATION_OWNER_DATABASE_URL` for the
 one-shot DDL owner, `POLKASWAP_API_DATABASE_URL` for the API reader, and
 `POLKASWAP_WORKER_DATABASE_URL` for the worker writer and lease holder. Never
 reuse the migration-owner login for either long-lived service, and do not reuse
-one runtime login for both API and worker. The owner URL is mounted only into
-the migration service; API and worker set `SKIP_POSTGRES_MIGRATION=true` and
-start only after that service exits successfully. Direct non-Compose production
-launches still set `NODE_ENV=production` and inject their role-specific URL as
-`DATABASE_URL`; production startup rejects the development database fallback.
+one runtime login for both API and worker. The migration container receives all
+three URLs only for a credential-safe preflight: it rejects an identical URL,
+any repeated decoded PostgreSQL role identity, any different host/port/database
+target, malformed URLs, and unaudited connection controls before reading
+migration configuration. Only `sslmode` and `sslnegotiation` URL parameters are
+accepted, and `sslmode=verify-full` is mandatory; plaintext, downgrade,
+CA-only, and hostname-unverified modes are rejected. Client, statement, and
+query deadlines cannot be overridden by a URL.
+It then connects with every credential and requires the live PostgreSQL
+`session_user` and `current_user` to match the URL role and
+`current_database()` to match the shared target. Before DDL, it also requires a
+non-superuser migration owner with schema-create access and runtime roles with
+no elevated role attributes, direct or assumable DDL access, migration-owner
+membership, or direct/assumable application-object ownership. After DDL, the
+migration owner atomically replaces the runtime ACLs: API gets `SELECT` on
+`indexer_documents` and no fence access; worker gets
+`SELECT`/`INSERT`/`UPDATE`/`DELETE` on `indexer_documents` and only
+`SELECT`/`INSERT`/`UPDATE` on the worker fence. The wrapper reopens both runtime
+sessions and verifies those exact privileges across the login and every role it
+can assume, including `NOINHERIT` memberships, before handoff. Its fixed
+diagnostics never print a URL, username, password, or host.
+Every connection/query and even failed-client cleanup has a hard deadline. The
+owner URL is mounted only into the migration service; API and worker set
+`SKIP_POSTGRES_MIGRATION=true`, run exact compiled entrypoints with no
+shell/entrypoint override, and start only after that service exits successfully.
+Direct non-Compose production launches still set `NODE_ENV=production` and
+inject their role-specific URL as `DATABASE_URL`; production startup rejects
+the development database fallback.
 
 For a fresh production deployment, set `CHAIN_START_BLOCK` to the earliest
 block you need indexed; a full-chain backfill is intentionally long. Primary
@@ -148,7 +171,11 @@ finalized head before it may persist even its first heartbeat. Every archived
 block then has to match the primary endpoint by height/hash, raw SCALE block and
 event bytes, and timestamp.
 
-The one-shot PostgreSQL schema migration uses
+The one-shot `dist/src/scripts/production-migrate.js` wrapper validates the URL
+topology, all three live database session identities, and pre-DDL role
+privileges, then invokes the PostgreSQL schema migration with the owner
+configuration, atomically applies the exact per-table runtime grants, and
+verifies them. The migration uses
 `POSTGRES_MIGRATION_QUERY_TIMEOUT_MS` and
 `POSTGRES_MIGRATION_STATEMENT_TIMEOUT_MS`, both defaulting to `0` (unlimited),
 instead of the bounded runtime query deadlines. Check constraints are installed
@@ -223,8 +250,9 @@ creates `public.indexer_documents` and
 `public.polkaswap_indexer_worker_lease_fence`. Provision the API login with
 read-only access to indexed documents and the worker login with its required
 document DML plus `SELECT`, `INSERT`, and `UPDATE` on the fence table. Neither
-runtime login needs schema ownership or DDL privileges; configure grants/default
-privileges for those roles before the one-shot migration hands off to them. A
+runtime login needs schema ownership or DDL privileges; grant both database
+`CONNECT` and schema `USAGE`, then let the one-shot migration owner install and
+verify the exact table ACLs before handoff. A
 worker started against an unmigrated database fails closed with an instruction
 to run the migration; it never attempts runtime DDL. API-only and administrative
 repository instances are not fenced unless they are explicitly constructed with
@@ -506,9 +534,9 @@ configuration and immutable image evidence:
 ```sh
 export POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.example/polkaswap-indexer
 export POLKASWAP_INDEXER_IMAGE_DIGEST=<reviewed-64-hex-digest>
-export POLKASWAP_MIGRATION_OWNER_DATABASE_URL=postgresql://pi_migration_owner:<owner-secret>@db.example/indexer?sslmode=require
-export POLKASWAP_API_DATABASE_URL=postgresql://pi_api:<api-secret>@db.example/indexer?sslmode=require
-export POLKASWAP_WORKER_DATABASE_URL=postgresql://pi_worker:<worker-secret>@db.example/indexer?sslmode=require
+export POLKASWAP_MIGRATION_OWNER_DATABASE_URL=postgresql://pi_migration_owner:<owner-secret>@db.example/indexer?sslmode=verify-full
+export POLKASWAP_API_DATABASE_URL=postgresql://pi_api:<api-secret>@db.example/indexer?sslmode=verify-full
+export POLKASWAP_WORKER_DATABASE_URL=postgresql://pi_worker:<worker-secret>@db.example/indexer?sslmode=verify-full
 export POLKASWAP_SORA_WS_ENDPOINT=wss://<controlled-verifying-primary>
 export POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://<independently-operated-archive>
 export POLKASWAP_CHAIN_START_BLOCK=<reviewed-first-required-block>
@@ -521,6 +549,9 @@ credentials because its rendered output contains the interpolated URLs. Use
 `config --quiet` for validation. For a human-readable manifest review, run
 `docker compose -f docker-compose.production.yml config --no-interpolate`
 before loading secrets, then inspect the unresolved variable references.
+`config --quiet` validates required inputs but cannot compare secret values;
+the one-shot credential preflight is the fail-closed URL and live-session role
+and privilege check and runs before every schema migration.
 Production services retain four minutes of graceful-stop time—longer than the
 internal 30-second shutdown deadline—and use bounded local log rotation.
 

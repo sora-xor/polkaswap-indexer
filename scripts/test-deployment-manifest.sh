@@ -4,8 +4,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 AUDIT_SCRIPT="$SCRIPT_DIR/audit-deployment-manifest.sh"
+RESOLVED_AUDIT_SCRIPT="$SCRIPT_DIR/audit-resolved-deployment-manifest.mjs"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
+
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  COMPOSE_COMMAND=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE_COMMAND=(docker-compose)
+else
+  echo "[deployment-manifest-test][error] Docker Compose is required" >&2
+  exit 1
+fi
 
 expect_failure() {
   local label="$1"
@@ -16,6 +26,39 @@ expect_failure() {
   local readme="${6:-$ROOT_DIR/README.md}"
   local output="$TMP_DIR/$label.out"
   if bash "$AUDIT_SCRIPT" "$dockerfile" "$dockerignore" "$compose" "$readme" >"$output" 2>&1; then
+    echo "[deployment-manifest-test][error] $label unexpectedly passed" >&2
+    exit 1
+  fi
+  if ! grep -Fq "$expected" "$output"; then
+    echo "[deployment-manifest-test][error] $label did not report: $expected" >&2
+    cat "$output" >&2
+    exit 1
+  fi
+}
+
+expect_resolved_failure() {
+  local label="$1"
+  local expected="$2"
+  local owner_url="$3"
+  local api_url="$4"
+  local worker_url="$5"
+  local output="$TMP_DIR/$label.out"
+  local resolved
+  if ! resolved="$(
+    POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.invalid/polkaswap-indexer \
+    POLKASWAP_INDEXER_IMAGE_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    POLKASWAP_MIGRATION_OWNER_DATABASE_URL="$owner_url" \
+    POLKASWAP_API_DATABASE_URL="$api_url" \
+    POLKASWAP_WORKER_DATABASE_URL="$worker_url" \
+    POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
+    POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
+    POLKASWAP_CHAIN_START_BLOCK=14000000 \
+      "${COMPOSE_COMMAND[@]}" -f "$ROOT_DIR/docker-compose.production.yml" config --format json
+  )"; then
+    echo "[deployment-manifest-test][error] $label fixture did not render" >&2
+    exit 1
+  fi
+  if node "$RESOLVED_AUDIT_SCRIPT" <<<"$resolved" >"$output" 2>&1; then
     echo "[deployment-manifest-test][error] $label unexpectedly passed" >&2
     exit 1
   fi
@@ -68,6 +111,16 @@ cp "$ROOT_DIR/Dockerfile" "$root_runtime"
 perl -0pi -e 's/^USER node\n//m' "$root_runtime"
 expect_failure "root-runtime" "$root_runtime" "$ROOT_DIR/.dockerignore" "runtime must use the non-root node user"
 
+shell_runtime_entrypoint="$TMP_DIR/Dockerfile.shell-runtime-entrypoint"
+cp "$ROOT_DIR/Dockerfile" "$shell_runtime_entrypoint"
+perl -0pi -e 's/ENTRYPOINT \["docker-entrypoint\.sh"\]/ENTRYPOINT ["sh", "-c"]/' "$shell_runtime_entrypoint"
+expect_failure "shell-runtime-entrypoint" "$shell_runtime_entrypoint" "$ROOT_DIR/.dockerignore" "runtime image must use exactly the pinned Node exec entrypoint"
+
+shell_runtime_command="$TMP_DIR/Dockerfile.shell-runtime-command"
+cp "$ROOT_DIR/Dockerfile" "$shell_runtime_command"
+perl -0pi -e 's#CMD \["node", "dist/src/index\.js"\]#CMD ["sh", "-c", "node dist/src/db/migrate.js && node dist/src/index.js"]#' "$shell_runtime_command"
+expect_failure "shell-runtime-command" "$shell_runtime_command" "$ROOT_DIR/.dockerignore" "runtime image must use exactly the compiled API default command"
+
 weak_health_identity="$TMP_DIR/Dockerfile.weak-health-identity"
 cp "$ROOT_DIR/Dockerfile" "$weak_health_identity"
 perl -0pi -e 's#node dist/src/scripts/production-smoke\.js#node dist/src/index.js#' "$weak_health_identity"
@@ -87,6 +140,16 @@ public_bind="$TMP_DIR/docker-compose.public-bind.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$public_bind"
 perl -0pi -e 's/127\.0\.0\.1:4350:4350/0.0.0.0:4350:4350/' "$public_bind"
 expect_failure "public-bind" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "must publish GraphQL only on host loopback" "$public_bind"
+
+api_extra_port="$TMP_DIR/docker-compose.api-extra-port.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_extra_port"
+perl -0pi -e 's/(      - "127\.0\.0\.1:4350:4350"\n)/$1      - "127.0.0.1:9999:9999"\n/' "$api_extra_port"
+expect_failure "api-extra-port" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved api must publish exactly TCP 4350 on host loopback" "$api_extra_port"
+
+anchor_runtime_ports="$TMP_DIR/docker-compose.anchor-runtime-ports.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_runtime_ports"
+perl -0pi -e 's/(x-runtime-security: &runtime-security\n)/$1  ports:\n    - "127.0.0.1:9999:9999"\n/' "$anchor_runtime_ports"
+expect_failure "anchor-runtime-ports" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate must contain only its exact audited service keys" "$anchor_runtime_ports"
 
 writable_root="$TMP_DIR/docker-compose.writable-root.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$writable_root"
@@ -108,6 +171,71 @@ cp "$ROOT_DIR/docker-compose.production.yml" "$unbounded_pids"
 perl -0pi -e 's/  pids_limit: 128\n//' "$unbounded_pids"
 expect_failure "unbounded-pids" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "must bound process IDs" "$unbounded_pids"
 
+anchor_host_network="$TMP_DIR/docker-compose.anchor-host-network.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_host_network"
+perl -0pi -e 's/(x-runtime-security: &runtime-security\n)/$1  network_mode: host\n/' "$anchor_host_network"
+expect_failure "anchor-host-network" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate must not override host or network namespaces" "$anchor_host_network"
+
+anchor_host_pid="$TMP_DIR/docker-compose.anchor-host-pid.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_host_pid"
+perl -0pi -e 's/(x-runtime-security: &runtime-security\n)/$1  pid: host\n/' "$anchor_host_pid"
+expect_failure "anchor-host-pid" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate must not override host or network namespaces" "$anchor_host_pid"
+
+anchor_host_ipc="$TMP_DIR/docker-compose.anchor-host-ipc.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_host_ipc"
+perl -0pi -e 's/(x-runtime-security: &runtime-security\n)/$1  ipc: host\n/' "$anchor_host_ipc"
+expect_failure "anchor-host-ipc" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate must not override host or network namespaces" "$anchor_host_ipc"
+
+anchor_host_uts="$TMP_DIR/docker-compose.anchor-host-uts.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_host_uts"
+perl -0pi -e 's/(x-runtime-security: &runtime-security\n)/$1  uts: host\n/' "$anchor_host_uts"
+expect_failure "anchor-host-uts" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate must not override host or network namespaces" "$anchor_host_uts"
+
+anchor_host_userns="$TMP_DIR/docker-compose.anchor-host-userns.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_host_userns"
+perl -0pi -e 's/(x-runtime-security: &runtime-security\n)/$1  userns_mode: host\n/' "$anchor_host_userns"
+expect_failure "anchor-host-userns" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate must not override host or network namespaces" "$anchor_host_userns"
+
+anchor_extra_hosts="$TMP_DIR/docker-compose.anchor-extra-hosts.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_extra_hosts"
+perl -0pi -e 's/(x-runtime-security: &runtime-security\n)/$1  extra_hosts:\n    - "database=127.0.0.1"\n/' "$anchor_extra_hosts"
+expect_failure "anchor-extra-hosts" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate must not override host or network namespaces" "$anchor_extra_hosts"
+
+anchor_dns_override="$TMP_DIR/docker-compose.anchor-dns-override.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_dns_override"
+perl -0pi -e 's/(x-runtime-security: &runtime-security\n)/$1  dns:\n    - "8.8.8.8"\n/' "$anchor_dns_override"
+expect_failure "anchor-dns-override" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate must not override host or network namespaces" "$anchor_dns_override"
+
+anchor_init_decoy="$TMP_DIR/docker-compose.anchor-init-decoy.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_init_decoy"
+perl -0pi -e 's/  init: true/  init: false\n  x-decoy-init: true/' "$anchor_init_decoy"
+expect_failure "anchor-init-decoy" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate security and image contract is not exact" "$anchor_init_decoy"
+
+anchor_capability_decoy="$TMP_DIR/docker-compose.anchor-capability-decoy.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_capability_decoy"
+perl -0pi -e 's/(  cap_drop:\n    - ALL\n)/$1    - NET_ADMIN\n/' "$anchor_capability_decoy"
+expect_failure "anchor-capability-decoy" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate security and image contract is not exact" "$anchor_capability_decoy"
+
+anchor_security_option_decoy="$TMP_DIR/docker-compose.anchor-security-option-decoy.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_security_option_decoy"
+perl -0pi -e 's/(  security_opt:\n    - no-new-privileges:true\n)/$1    - seccomp=unconfined\n/' "$anchor_security_option_decoy"
+expect_failure "anchor-security-option-decoy" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate security and image contract is not exact" "$anchor_security_option_decoy"
+
+anchor_pids_decoy="$TMP_DIR/docker-compose.anchor-pids-decoy.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_pids_decoy"
+perl -0pi -e 's/  pids_limit: 128/  pids_limit: 129\n  x-decoy-pids_limit: 128/' "$anchor_pids_decoy"
+expect_failure "anchor-pids-decoy" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate security and image contract is not exact" "$anchor_pids_decoy"
+
+anchor_tmpfs_decoy="$TMP_DIR/docker-compose.anchor-tmpfs-decoy.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_tmpfs_decoy"
+perl -0pi -e 's#    - /tmp:rw,noexec,nosuid,nodev,size=16m#    - /tmp:rw,size=1g\n  x-decoy-tmpfs: "/tmp:rw,noexec,nosuid,nodev,size=16m"#' "$anchor_tmpfs_decoy"
+expect_failure "anchor-tmpfs-decoy" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate security and image contract is not exact" "$anchor_tmpfs_decoy"
+
+anchor_image_decoy="$TMP_DIR/docker-compose.anchor-image-decoy.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$anchor_image_decoy"
+perl -0pi -e 's#(  image: ".*")#  image: "attacker.invalid/indexer:latest"\n  \# $1#' "$anchor_image_decoy"
+expect_failure "anchor-image-decoy" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate security and image contract is not exact" "$anchor_image_decoy"
+
 short_shutdown_grace="$TMP_DIR/docker-compose.short-shutdown-grace.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$short_shutdown_grace"
 perl -0pi -e 's/stop_grace_period: 4m/stop_grace_period: 10s/' "$short_shutdown_grace"
@@ -118,6 +246,36 @@ cp "$ROOT_DIR/docker-compose.production.yml" "$unbounded_logging"
 perl -0pi -e 's/^    max-size:.*$/    max-size: "0"/m' "$unbounded_logging"
 expect_failure "unbounded-logging" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "must bound each log file" "$unbounded_logging"
 
+migration_short_grace_override="$TMP_DIR/docker-compose.migration-short-grace-override.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$migration_short_grace_override"
+perl -0pi -e 's/(^  migrate:\n    <<: \*runtime-security\n)/$1    stop_grace_period: 1s\n/m' "$migration_short_grace_override"
+expect_failure "migration-short-grace-override" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate stop grace must be exactly four minutes" "$migration_short_grace_override"
+
+migration_logging_override="$TMP_DIR/docker-compose.migration-logging-override.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$migration_logging_override"
+perl -0pi -e 's/(^  migrate:\n    <<: \*runtime-security\n)/$1    logging:\n      driver: json-file\n/m' "$migration_logging_override"
+expect_failure "migration-logging-override" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved migrate logging must be local with exact 10m/5 bounds" "$migration_logging_override"
+
+api_short_grace_override="$TMP_DIR/docker-compose.api-short-grace-override.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_short_grace_override"
+perl -0pi -e 's/(^  api:\n    <<: \*runtime-security\n)/$1    stop_grace_period: 1s\n/m' "$api_short_grace_override"
+expect_failure "api-short-grace-override" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved api stop grace must be exactly four minutes" "$api_short_grace_override"
+
+api_logging_override="$TMP_DIR/docker-compose.api-logging-override.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_logging_override"
+perl -0pi -e 's/(^  api:\n    <<: \*runtime-security\n)/$1    logging:\n      driver: json-file\n/m' "$api_logging_override"
+expect_failure "api-logging-override" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved api logging must be local with exact 10m/5 bounds" "$api_logging_override"
+
+worker_short_grace_override="$TMP_DIR/docker-compose.worker-short-grace-override.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$worker_short_grace_override"
+perl -0pi -e 's/(^  worker:\n    <<: \*runtime-security\n)/$1    stop_grace_period: 1s\n/m' "$worker_short_grace_override"
+expect_failure "worker-short-grace-override" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved worker stop grace must be exactly four minutes" "$worker_short_grace_override"
+
+worker_logging_override="$TMP_DIR/docker-compose.worker-logging-override.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$worker_logging_override"
+perl -0pi -e 's/(^  worker:\n    <<: \*runtime-security\n)/$1    logging:\n      driver: json-file\n/m' "$worker_logging_override"
+expect_failure "worker-logging-override" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved worker logging must be local with exact 10m/5 bounds" "$worker_logging_override"
+
 missing_migration_service="$TMP_DIR/docker-compose.missing-migration-service.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$missing_migration_service"
 perl -0pi -e 's/^  migrate:\n.*?(?=^  api:\n)//ms' "$missing_migration_service"
@@ -127,6 +285,16 @@ restarting_migration="$TMP_DIR/docker-compose.restarting-migration.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$restarting_migration"
 perl -0pi -e 's/restart: "no"/restart: on-failure/' "$restarting_migration"
 expect_failure "restarting-migration" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "migration must be a restart-disabled one-shot service" "$restarting_migration"
+
+migration_bypasses_credential_preflight="$TMP_DIR/docker-compose.migration-bypasses-credential-preflight.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$migration_bypasses_credential_preflight"
+perl -0pi -e 's#dist/src/scripts/production-migrate\.js#dist/src/db/migrate.js#' "$migration_bypasses_credential_preflight"
+expect_failure "migration-bypasses-credential-preflight" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "migration must run the credential-preflight schema migration command exactly once" "$migration_bypasses_credential_preflight"
+
+migration_missing_runtime_credentials="$TMP_DIR/docker-compose.migration-missing-runtime-credentials.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$migration_missing_runtime_credentials"
+perl -0pi -e 's/^      POLKASWAP_WORKER_DATABASE_URL:.*\n//m' "$migration_missing_runtime_credentials"
+expect_failure "migration-missing-runtime-credentials" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "migration preflight must receive the exact API and worker runtime credentials" "$migration_missing_runtime_credentials"
 
 optional_migration_owner="$TMP_DIR/docker-compose.optional-migration-owner.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$optional_migration_owner"
@@ -140,13 +308,48 @@ expect_failure "migration-reuses-api-role" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.do
 
 api_reuses_owner_role="$TMP_DIR/docker-compose.api-reuses-owner-role.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$api_reuses_owner_role"
-perl -0pi -e 's/POLKASWAP_API_DATABASE_URL/POLKASWAP_MIGRATION_OWNER_DATABASE_URL/' "$api_reuses_owner_role"
+perl -0pi -e 's/(^  api:\n.*?)(POLKASWAP_API_DATABASE_URL)/${1}POLKASWAP_MIGRATION_OWNER_DATABASE_URL/ms' "$api_reuses_owner_role"
 expect_failure "api-reuses-owner-role" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "api must require only its separate runtime database URL" "$api_reuses_owner_role"
 
 worker_reuses_api_role="$TMP_DIR/docker-compose.worker-reuses-api-role.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$worker_reuses_api_role"
-perl -0pi -e 's/POLKASWAP_WORKER_DATABASE_URL/POLKASWAP_API_DATABASE_URL/' "$worker_reuses_api_role"
+perl -0pi -e 's/(^  worker:\n.*?)(POLKASWAP_WORKER_DATABASE_URL)/${1}POLKASWAP_API_DATABASE_URL/ms' "$worker_reuses_api_role"
 expect_failure "worker-reuses-api-role" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "worker must require only its separate runtime database URL" "$worker_reuses_api_role"
+
+api_shells_through_migration="$TMP_DIR/docker-compose.api-shells-through-migration.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_shells_through_migration"
+perl -0pi -e 's#    command: \["node", "dist/src/index\.js"\]#    command: ["sh", "-c", "node dist/src/db/migrate.js && node dist/src/index.js"]#' "$api_shells_through_migration"
+expect_failure "api-shells-through-migration" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "api must run only the exact compiled API command" "$api_shells_through_migration"
+
+worker_shells_through_migration="$TMP_DIR/docker-compose.worker-shells-through-migration.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$worker_shells_through_migration"
+perl -0pi -e 's#    command: \["node", "dist/src/worker/index\.js"\]#    command: ["sh", "-c", "node dist/src/db/migrate.js && node dist/src/worker/index.js"]#' "$worker_shells_through_migration"
+expect_failure "worker-shells-through-migration" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "worker must run only the exact compiled worker command" "$worker_shells_through_migration"
+
+api_migration_entrypoint="$TMP_DIR/docker-compose.api-migration-entrypoint.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_migration_entrypoint"
+perl -0pi -e 's#(^  api:\n    <<: \*runtime-security\n)#$1    entrypoint: ["node", "dist/src/db/migrate.js"]\n#m' "$api_migration_entrypoint"
+expect_failure "api-migration-entrypoint" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "api must not override its entrypoint or invoke any migration executable" "$api_migration_entrypoint"
+
+worker_migration_entrypoint="$TMP_DIR/docker-compose.worker-migration-entrypoint.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$worker_migration_entrypoint"
+perl -0pi -e 's#(^  worker:\n    <<: \*runtime-security\n)#$1    entrypoint: ["node", "dist/src/db/migrate.js"]\n#m' "$worker_migration_entrypoint"
+expect_failure "worker-migration-entrypoint" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "worker must not override its entrypoint or invoke any migration executable" "$worker_migration_entrypoint"
+
+api_migration_healthcheck="$TMP_DIR/docker-compose.api-migration-healthcheck.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_migration_healthcheck"
+perl -0pi -e 's#(^  api:\n    <<: \*runtime-security\n)#$1    healthcheck:\n      test: ["CMD", "node", "dist/src/db/migrate.js"]\n#m' "$api_migration_healthcheck"
+expect_failure "api-migration-healthcheck" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "api must not override its entrypoint or invoke any migration executable" "$api_migration_healthcheck"
+
+worker_migration_post_start="$TMP_DIR/docker-compose.worker-migration-post-start.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$worker_migration_post_start"
+perl -0pi -e 's#(^  worker:\n    <<: \*runtime-security\n)#$1    post_start:\n      - command: ["node", "dist/src/db/migrate.js"]\n#m' "$worker_migration_post_start"
+expect_failure "worker-migration-post-start" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "worker must not override its entrypoint or invoke any migration executable" "$worker_migration_post_start"
+
+api_runtime_volume_override="$TMP_DIR/docker-compose.api-runtime-volume-override.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_runtime_volume_override"
+perl -0pi -e 's#(^  api:\n    <<: \*runtime-security\n)#$1    volumes:\n      - ./dist:/app/dist:ro\n#m' "$api_runtime_volume_override"
+expect_failure "api-runtime-volume-override" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "api must contain only its exact audited top-level service keys" "$api_runtime_volume_override"
 
 api_runs_migration="$TMP_DIR/docker-compose.api-runs-migration.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$api_runs_migration"
@@ -262,5 +465,32 @@ credential_leaking_instructions="$TMP_DIR/README.credential-leaking.md"
 cp "$ROOT_DIR/README.md" "$credential_leaking_instructions"
 perl -0pi -e 's/docker compose -f docker-compose\.production\.yml config --quiet/docker compose -f docker-compose.production.yml config/' "$credential_leaking_instructions"
 expect_failure "credential-leaking-instructions" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "Production instructions must validate Compose without printing interpolated credentials" "$ROOT_DIR/docker-compose.production.yml" "$credential_leaking_instructions"
+
+insecure_database_instructions="$TMP_DIR/README.insecure-database.md"
+cp "$ROOT_DIR/README.md" "$insecure_database_instructions"
+perl -0pi -e 's/sslmode=verify-full/sslmode=require/g' "$insecure_database_instructions"
+expect_failure "insecure-database-instructions" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "Production instructions must require hostname-verified PostgreSQL TLS" "$ROOT_DIR/docker-compose.production.yml" "$insecure_database_instructions"
+
+secure_owner_url='postgresql://manifest_migration_owner:owner-test-only@database.invalid/polkaswap?sslmode=verify-full'
+secure_api_url='postgresql://manifest_api:api-test-only@database.invalid/polkaswap?sslmode=verify-full'
+secure_worker_url='postgresql://manifest_worker:worker-test-only@database.invalid/polkaswap?sslmode=verify-full'
+expect_resolved_failure \
+  "resolved-plaintext-owner-url" \
+  "resolved PostgreSQL URLs must require verified TLS without unaudited controls" \
+  'postgresql://manifest_migration_owner:owner-test-only@database.invalid/polkaswap' \
+  "$secure_api_url" \
+  "$secure_worker_url"
+expect_resolved_failure \
+  "resolved-downgrade-api-url" \
+  "resolved PostgreSQL URLs must require verified TLS without unaudited controls" \
+  "$secure_owner_url" \
+  'postgresql://manifest_api:api-test-only@database.invalid/polkaswap?sslmode=prefer' \
+  "$secure_worker_url"
+expect_resolved_failure \
+  "resolved-timeout-override-worker-url" \
+  "resolved PostgreSQL URLs must require verified TLS without unaudited controls" \
+  "$secure_owner_url" \
+  "$secure_api_url" \
+  'postgresql://manifest_worker:worker-test-only@database.invalid/polkaswap?sslmode=verify-full&query_timeout=0'
 
 echo "[deployment-manifest-test] all assertions passed"

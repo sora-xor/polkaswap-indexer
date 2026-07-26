@@ -117,9 +117,9 @@ jobs:
           docker compose --profile rocksdb config --quiet
           POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.invalid/polkaswap-indexer \
           POLKASWAP_INDEXER_IMAGE_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-          POLKASWAP_MIGRATION_OWNER_DATABASE_URL=postgres://migration-owner:owner-test-only@database.invalid:5432/polkaswap \
-          POLKASWAP_API_DATABASE_URL=postgres://api-runtime:api-test-only@database.invalid:5432/polkaswap \
-          POLKASWAP_WORKER_DATABASE_URL=postgres://worker-runtime:worker-test-only@database.invalid:5432/polkaswap \
+          POLKASWAP_MIGRATION_OWNER_DATABASE_URL=postgres://migration-owner:owner-test-only@database.invalid:5432/polkaswap?sslmode=verify-full \
+          POLKASWAP_API_DATABASE_URL=postgres://api-runtime:api-test-only@database.invalid:5432/polkaswap?sslmode=verify-full \
+          POLKASWAP_WORKER_DATABASE_URL=postgres://worker-runtime:worker-test-only@database.invalid:5432/polkaswap?sslmode=verify-full \
           POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
           POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
           POLKASWAP_CHAIN_START_BLOCK=14000000 \
@@ -149,3 +149,6 @@ jobs:
         run: >-
           docker run --rm --entrypoint node polkaswap-indexer:ci -e
           "import('@harperfast/rocksdb-js').then(async ({RocksDatabase})=>{const db=RocksDatabase.open('/data/ci-native-smoke.rocksdb');await db.put('ready',true);if(db.getSync('ready')!==true)throw new Error('RocksDB native round trip failed');db.close()})"
+
+      - name: Verify production PostgreSQL migration and runtime handoff
+        run: POLKASWAP_TEST_IMAGE=polkaswap-indexer:ci yarn test:production-database-deployment

@@ -16,8 +16,18 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   `POLKASWAP_API_DATABASE_URL`, and
   `POLKASWAP_WORKER_DATABASE_URL`. Verify the API and worker logins are
   different, neither is the schema owner, and omitting any URL aborts Compose
-  validation. Direct production processes must still receive their role URL as
-  `DATABASE_URL` with `NODE_ENV=production`.
+  validation. Confirm the one-shot credential preflight also rejects equal URL
+  values, repeated decoded role identities, different database targets, and
+  target-changing or deadline-overriding URL parameters without printing any
+  credential component. Only the audited `sslmode` and `sslnegotiation`
+  parameters may be present, and every URL must use `sslmode=verify-full`.
+  Confirm it connects all three credentials and verifies the expected
+  `session_user`, `current_user`, and `current_database()` before DDL. Confirm
+  the owner is a non-superuser schema creator; API and worker must have no
+  elevated role attributes, direct or assumable DDL access, owner membership,
+  or direct/assumable application-object ownership.
+  Direct production processes must still receive their role URL as `DATABASE_URL`
+  with `NODE_ENV=production`.
 - Run `bash scripts/test-branch-flow-audit.sh` and
   `bash scripts/audit-branch-flow.sh`.
 - Run `bash scripts/test-public-artifacts-audit.sh` and
@@ -42,7 +52,15 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   wait for its successful completion with in-process migration disabled, and
   the worker overrides the inherited API healthcheck with the compiled
   database-only probe. Confirm the manifest rejects owner/runtime URL reuse,
-  weak migration dependencies, short shutdown grace, and unbounded logging.
+  weak migration dependencies, runtime migration commands/entrypoints,
+  per-service shutdown/logging overrides, short shutdown grace, and unbounded
+  logging. Confirm the resolved-manifest audit checks all three services.
+- Build the exact candidate image and run
+  `POLKASWAP_TEST_IMAGE=<candidate> yarn test:production-database-deployment`.
+  Confirm the pinned PostgreSQL 16 TLS test passes the fresh migration,
+  idempotent rerun, exact per-table ACL matrix, API repository probe,
+  hostname-verification negative case, and assumable-role/object-owner/extra-ACL
+  adversarial cases without logging credential components.
 - Run `docker build -t polkaswap-indexer:release .` and confirm the production
   image builds from the checked-in container contract.
 - Inspect the image user and dependency surface; the runtime user must be `node`,
@@ -50,9 +68,17 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   must not resolve in the final image.
 - Confirm any database migration has a tested backup, restore, and rollback
   path. Stop or quiesce writers before a destructive storage cutover. Confirm
-  the migration-owner role provisions the runtime grants/default privileges,
-  the one-shot migration exits successfully, and its credential is absent from
-  the API and worker containers.
+  the migration-owner role can atomically provision the exact runtime ACLs,
+  the credential preflight completes before DDL, the one-shot migration exits
+  successfully, and its credential is absent from the API and worker
+  containers. The API and worker credentials are transiently present in the
+  one-shot container only so it can prove all three live session roles and the
+  database target. After DDL, confirm the same one-shot gate proves the API has
+  only `SELECT` on `indexer_documents` and no fence access. Confirm the worker
+  has `SELECT`/`INSERT`/`UPDATE`/`DELETE` on `indexer_documents`, only
+  `SELECT`/`INSERT`/`UPDATE` on the fence, and no `TRUNCATE`, `REFERENCES`, or
+  `TRIGGER` on either table. Confirm this audit includes every directly or
+  indirectly assumable role, including `NOINHERIT` memberships.
 - Validate production Compose with `docker compose -f
   docker-compose.production.yml config --quiet`; never print the interpolated
   manifest after loading secrets. Inspect an unresolved manifest with

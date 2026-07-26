@@ -26,6 +26,7 @@ describe('production container contract', () => {
     expect(dockerfile).toContain('COPY --chown=node:node LICENSE ./LICENSE');
     expect(dockerfile).toMatch(/\nUSER node\n/);
     expect(dockerfile).toContain('STOPSIGNAL SIGTERM');
+    expect(dockerfile).toContain('ENTRYPOINT ["docker-entrypoint.sh"]');
     expect(dockerfile).toContain('CMD ["node", "dist/src/index.js"]');
   });
 
@@ -35,6 +36,7 @@ describe('production container contract', () => {
     };
     const expectedScripts = [
       'db:migrate:dist',
+      'db:migrate:production:dist',
       'storage:migrate:postgres-to-rocksdb:dist',
       'storage:verify:rocksdb:dist',
       'storage:backup:rocksdb:dist',
@@ -106,8 +108,10 @@ describe('production container contract', () => {
 
     expect(compose.match(/<<: \*runtime-security/g)).toHaveLength(3);
     expect(migration).toContain('restart: "no"');
-    expect(migration).toContain('["node", "dist/src/db/migrate.js"]');
+    expect(migration).toContain('["node", "dist/src/scripts/production-migrate.js"]');
     expect(migration).toContain('POLKASWAP_MIGRATION_OWNER_DATABASE_URL:?');
+    expect(migration).toContain('POLKASWAP_API_DATABASE_URL:?');
+    expect(migration).toContain('POLKASWAP_WORKER_DATABASE_URL:?');
     expect(migration).toContain('disable: true');
     expect(migration).not.toContain('SKIP_POSTGRES_MIGRATION');
     expect(migration).not.toContain('ports:');
@@ -120,8 +124,14 @@ describe('production container contract', () => {
 
     expect(api).toContain('POLKASWAP_API_DATABASE_URL:?');
     expect(api).not.toContain('POLKASWAP_WORKER_DATABASE_URL');
+    expect(api).toContain('command: ["node", "dist/src/index.js"]');
+    expect(api).not.toContain('entrypoint:');
+    expect(api).not.toContain('dist/src/db/migrate.js');
     expect(worker).toContain('POLKASWAP_WORKER_DATABASE_URL:?');
     expect(worker).not.toContain('POLKASWAP_API_DATABASE_URL');
+    expect(worker).toContain('command: ["node", "dist/src/worker/index.js"]');
+    expect(worker).not.toContain('entrypoint:');
+    expect(worker).not.toContain('dist/src/db/migrate.js');
     expect(compose).not.toContain('POLKASWAP_DATABASE_URL');
   });
 

@@ -55,6 +55,7 @@ ENV NODE_ENV=production \
     ROCKSDB_PATH=/data/polkaswap-indexer.rocksdb
 
 STOPSIGNAL SIGTERM
+ENTRYPOINT ["docker-entrypoint.sh"]
 
 RUN install -d -o node -g node /data
 

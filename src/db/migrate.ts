@@ -15,7 +15,7 @@ const { Pool } = pg;
 const NUMERIC_TEXT_PATTERN = "^-?[0-9]+(\\.[0-9]+)?$";
 const MIGRATION_LOCK_KEY = 4_350_435_000;
 
-type MigrationRuntimeConfig = Pick<
+export type MigrationRuntimeConfig = Pick<
   import('../config.js').AppConfig,
   | 'databaseUrl'
   | 'postgresConnectionTimeoutMs'
