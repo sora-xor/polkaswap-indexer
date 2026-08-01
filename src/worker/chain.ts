@@ -7,8 +7,22 @@ import {
   normalizeIndexedAccountId,
   uniqueIndexedAccountIds,
 } from '../account-activity.js';
-import type { AppConfig } from '../config.js';
+import {
+  assertIndependentSoraRpcEndpoints,
+  readSoraArchiveWsEndpoint,
+  type AppConfig,
+} from '../config.js';
 import type { IndexerCollection, IndexerDocument, IndexerRepository, RepositoryQueryArgs } from '../repository/types.js';
+import {
+  isNonzeroCanonicalSubstrateHash,
+  parseStoredSoraChainIdentity,
+  parseStoredSoraChainState,
+  SORA_LEGACY_IDENTITY_ANCHOR,
+  SORA_MAX_BLOCK_NUMBER,
+  SORA_MAINNET_GENESIS_HASH,
+  type StoredSoraChainIdentity,
+  type StoredSoraChainState,
+} from '../soraIdentity.js';
 
 type CodecLike = {
   toJSON?: () => unknown;
@@ -204,9 +218,17 @@ type IndexBlockOptions = {
 };
 
 type FetchedBlock = {
+  requestedHash: string;
   signedBlock: any;
   events: EventRecord[];
   timestamp: number;
+};
+
+type FetchedBlockPayload = {
+  fetchedBlock: FetchedBlock;
+  blockHex: string | null;
+  eventsHex: string | null;
+  timestampMilliseconds: string;
 };
 
 type DerivedStateRefreshRequest = {
@@ -257,6 +279,35 @@ type NetworkTransactionCounters = {
 };
 
 const CHAIN_STATE_ID = 'chainState';
+const CHAIN_IDENTITY_ID = 'chainIdentity';
+const ALL_INDEXER_COLLECTIONS: readonly IndexerCollection[] = [
+  'accounts',
+  'accountMeta',
+  'accountPointSystems',
+  'accountPositions',
+  'accountTrades',
+  'accountTransactions',
+  'accountLiquiditySnapshots',
+  'assets',
+  'assetSnapshots',
+  'historyCalls',
+  'historyElements',
+  'markets',
+  'marketSnapshots',
+  'networkSnapshots',
+  'orderBooks',
+  'orderBookOrders',
+  'orderBookSnapshots',
+  'poolXYKs',
+  'poolSnapshots',
+  'referrerRewards',
+  'stakingStakers',
+  'stakingValidators',
+  'updatesStreams',
+  'vaults',
+  'vaultEvents',
+  'xorBurns',
+];
 const XOR_BURN_BACKFILL_STATE_ID = 'xorBurnsBackfill';
 const BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID = 'bridgeProxyHistoryBackfill-v1';
 const NETWORK_AGGREGATE_BACKFILL_STATE_ID = 'networkAggregateSnapshotsBackfill';
@@ -288,6 +339,7 @@ const FINALIZED_HEAD_RETRY_DELAY_MS = 5_000;
 const FINALIZED_HEAD_POLL_INTERVAL_MS = 1_000;
 const DERIVED_STATE_REFRESH_RETRY_DELAY_MS = 15_000;
 const CHAIN_RPC_TIMEOUT_MS = 15_000;
+const CHAIN_DISCONNECT_TIMEOUT_MS = 5_000;
 const BACKFILL_PREFETCH_CONCURRENCY = readPositiveIntegerEnv('CHAIN_BACKFILL_PREFETCH_CONCURRENCY', 1);
 const FINALIZED_CATCHUP_PREFETCH_CONCURRENCY = readPositiveIntegerEnv(
   'CHAIN_FINALIZED_CATCHUP_PREFETCH_CONCURRENCY',
@@ -297,10 +349,15 @@ const PRICE_STREAM_REFRESH_INTERVAL_BLOCKS = Math.max(
   0,
   Math.floor(Number(process.env.CHAIN_PRICE_STREAM_REFRESH_INTERVAL_BLOCKS ?? 0))
 );
-const USE_LEGACY_SORA_BLOCK_TYPES = ['1', 'true', 'yes'].includes(
-  String(process.env.CHAIN_LEGACY_SORA_BLOCK_TYPES ?? '').toLowerCase()
-);
-const ARCHIVE_SORA_WS_ENDPOINT = process.env.SORA_ARCHIVE_WS_ENDPOINT?.trim() ?? '';
+const readStrictBooleanEnv = (name: string, fallback: boolean): boolean => {
+  const configured = process.env[name];
+  if (configured === undefined) return fallback;
+  const value = configured.trim().toLowerCase();
+  if (['1', 'true', 'yes'].includes(value)) return true;
+  if (['0', 'false', 'no'].includes(value)) return false;
+  throw new Error(`${name} must be one of true, false, 1, 0, yes, or no`);
+};
+const USE_LEGACY_SORA_BLOCK_TYPES = readStrictBooleanEnv('CHAIN_LEGACY_SORA_BLOCK_TYPES', false);
 const soraSpec1Types = {
   ...soraTypes,
   DispatchErrorModuleV0: { index: 'u8', error: 'u8' },
@@ -447,6 +504,46 @@ const withTimeout = async <T>(promise: Promise<T>, label: string, timeoutMs = CH
   } finally {
     if (timeout) clearTimeout(timeout);
   }
+};
+
+const disconnectRpcEndpoint = async (endpoint: unknown): Promise<void> => {
+  const disconnect = (endpoint as { disconnect?: () => unknown } | null)?.disconnect;
+  if (typeof disconnect === 'function') {
+    await withTimeout(
+      Promise.resolve(disconnect.call(endpoint)),
+      'SORA RPC disconnect',
+      CHAIN_DISCONNECT_TIMEOUT_MS,
+    );
+  }
+};
+
+type ParsedChainTimestamp = { seconds: number; milliseconds: string };
+
+const parseChainTimestamp = (codec: unknown, label: string): ParsedChainTimestamp => {
+  const text = String((codec as CodecLike | undefined)?.toString?.() ?? codec);
+  if (!/^(0|[1-9][0-9]*)$/.test(text)) {
+    throw new Error(`Invalid ${label} timestamp value`);
+  }
+  const timestampMs = Number(text);
+  if (!Number.isSafeInteger(timestampMs) || timestampMs <= 0) {
+    throw new Error(`Invalid ${label} timestamp value`);
+  }
+  const timestamp = Math.floor(timestampMs / 1000);
+  if (!Number.isSafeInteger(timestamp) || timestamp <= 0) {
+    throw new Error(`Invalid ${label} timestamp value`);
+  }
+  return { seconds: timestamp, milliseconds: text };
+};
+
+const parseChainTimestampSeconds = (codec: unknown, label: string): number =>
+  parseChainTimestamp(codec, label).seconds;
+
+const canonicalCodecHex = (codec: unknown, label: string): string => {
+  const value = (codec as { toHex?: () => unknown } | null)?.toHex?.();
+  if (typeof value !== 'string' || !/^0x[0-9a-f]*$/i.test(value) || (value.length - 2) % 2 !== 0) {
+    throw new Error(`${label} did not expose canonical SCALE bytes`);
+  }
+  return value.toLowerCase();
 };
 
 const isPrunedHistoricalStateErrorValue = (error: unknown): boolean => {
@@ -2056,8 +2153,11 @@ const isPolkamarktTradeContext = (context: BlockExtrinsicContext): boolean => {
 
 export class ChainIndexer {
   private api: ApiPromise | null = null;
+  private primaryProvider: WsProvider | null = null;
+  private observedGenesisHash: string | null = null;
   private legacyBlockApi: ApiPromise | null = null;
   private legacyBlockApiPromise: Promise<ApiPromise> | null = null;
+  private unsubscribeFinalizedHeads: (() => void) | null = null;
   private assetInfos = new Map<string, AssetInfo>();
   private prices = new Map<string, bigint>();
   private networkLiquidityStats = emptyNetworkLiquidityStats();
@@ -2081,25 +2181,403 @@ export class ChainIndexer {
   private xorBurnBackfillRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private xorBurnBackfillRunning = false;
   private xorBurnBackfillTargetBlock = 0;
+  private lifecycleGeneration = 0;
+  private readonly archiveSoraWsEndpoint: string;
 
   constructor(
     private readonly config: AppConfig,
     private readonly repository: IndexerRepository
-  ) {}
+  ) {
+    this.archiveSoraWsEndpoint = config.soraArchiveWsEndpoint ?? readSoraArchiveWsEndpoint() ?? '';
+    if (process.env.NODE_ENV === 'production') {
+      if (!this.archiveSoraWsEndpoint) {
+        throw new Error('SORA_ARCHIVE_WS_ENDPOINT is required for the production worker.');
+      }
+      assertIndependentSoraRpcEndpoints(config.soraWsEndpoint, this.archiveSoraWsEndpoint);
+    }
+  }
 
   async start(): Promise<void> {
+    const generation = ++this.lifecycleGeneration;
     const provider = new WsProvider(this.config.soraWsEndpoint);
-    this.api = await ApiPromise.create({ provider });
-    const finalizedHash = await withTimeout(this.api.rpc.chain.getFinalizedHead(), 'chain.getFinalizedHead()');
-    const finalizedHeader = await withTimeout(this.api.rpc.chain.getHeader(finalizedHash), `chain.getHeader(${finalizedHash.toString()})`);
-    const finalizedBlock = finalizedHeader.number.toNumber();
+    this.primaryProvider = provider;
+    try {
+      const creation = ApiPromise.create({ provider }).then(async (created) => {
+        if (generation !== this.lifecycleGeneration) {
+          await disconnectRpcEndpoint(created);
+          throw new Error('PI chain indexer startup was cancelled');
+        }
+        return created;
+      });
+      const api = await withTimeout(creation, 'primary SORA endpoint connection');
+      this.api = api;
+      this.observedGenesisHash = await this.requireMainnetIdentity(this.api, 'primary SORA endpoint');
+      await this.requireReviewedMainnetAnchor(this.api, 'primary SORA endpoint', true);
+      const finalizedHash = await withTimeout(this.api.rpc.chain.getFinalizedHead(), 'chain.getFinalizedHead()');
+      const finalizedHeader = await withTimeout(
+        this.api.rpc.chain.getHeader(finalizedHash),
+        `chain.getHeader(${finalizedHash.toString()})`
+      );
+      const finalizedBlock = this.validatedFinalizedHeaderHeight(finalizedHeader, 'primary SORA endpoint');
+      const finalizedHashText = finalizedHash.toString().toLowerCase();
+      const finalizedHeaderHash = finalizedHeader.hash.toString().toLowerCase();
+      if (!isNonzeroCanonicalSubstrateHash(finalizedHashText) || finalizedHeaderHash !== finalizedHashText) {
+        throw new Error('Primary SORA endpoint returned a malformed finalized block identity');
+      }
+      const finalizedTimestamp = await this.fetchBlockTimestamp(finalizedHashText, this.api);
+      if (!Number.isSafeInteger(finalizedTimestamp) || finalizedTimestamp <= 0) {
+        throw new Error('Primary SORA endpoint returned a malformed finalized block timestamp');
+      }
 
-    await this.refreshIndexingState();
-    const indexedAny = await this.backfill();
-    await this.subscribeFinalizedHeads();
-    void this.runStartupMaintenance(finalizedBlock, indexedAny).catch((error: unknown) => {
-      console.error('Startup maintenance failed', error);
-    });
+      await this.ensureChainIdentity(finalizedBlock);
+
+      await this.refreshIndexingState();
+      const indexedAny = await this.backfill();
+      await this.subscribeFinalizedHeads();
+      void this.runStartupMaintenance(finalizedBlock, indexedAny).catch((error: unknown) => {
+        console.error('Startup maintenance failed', error);
+      });
+    } catch (error) {
+      await this.stop();
+      throw error;
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.lifecycleGeneration += 1;
+    try {
+      this.unsubscribeFinalizedHeads?.();
+    } catch {
+      // Continue disconnecting the providers even if an RPC unsubscribe hook fails.
+    }
+    this.unsubscribeFinalizedHeads = null;
+    for (const timer of [
+      this.finalizedHeadRetryTimer,
+      this.derivedStateRefreshRetryTimer,
+      this.priceStreamRefreshRetryTimer,
+      this.polkamarktStateRefreshRetryTimer,
+      this.xorBurnBackfillRetryTimer,
+    ]) {
+      if (timer) clearTimeout(timer);
+    }
+    if (this.finalizedHeadPollTimer) clearInterval(this.finalizedHeadPollTimer);
+    this.finalizedHeadRetryTimer = null;
+    this.finalizedHeadPollTimer = null;
+    this.derivedStateRefreshRetryTimer = null;
+    this.priceStreamRefreshRetryTimer = null;
+    this.polkamarktStateRefreshRetryTimer = null;
+    this.xorBurnBackfillRetryTimer = null;
+
+    const primary = this.api;
+    const primaryProvider = this.primaryProvider;
+    const legacy = this.legacyBlockApi;
+    this.api = null;
+    this.primaryProvider = null;
+    this.legacyBlockApi = null;
+    this.legacyBlockApiPromise = null;
+    this.observedGenesisHash = null;
+    await Promise.allSettled([
+      legacy && legacy !== primary ? disconnectRpcEndpoint(legacy) : Promise.resolve(),
+      primary ? disconnectRpcEndpoint(primary) : Promise.resolve(),
+      primaryProvider ? disconnectRpcEndpoint(primaryProvider) : Promise.resolve(),
+    ]);
+  }
+
+  private async requireMainnetIdentity(api: ApiPromise, label: string): Promise<string> {
+    const genesis = await withTimeout(api.rpc.chain.getBlockHash(0), `${label}.chain.getBlockHash(0)`);
+    const observed = genesis?.toString?.().toLowerCase() ?? '';
+    if (!isNonzeroCanonicalSubstrateHash(observed)) {
+      throw new Error(`${label} returned a missing, zero, or malformed genesis hash`);
+    }
+    if (observed !== SORA_MAINNET_GENESIS_HASH) {
+      throw new Error(`${label} genesis hash does not match the reviewed SORA mainnet identity`);
+    }
+    return observed;
+  }
+
+  private async requireReviewedMainnetAnchor(
+    api: ApiPromise,
+    label: string,
+    requireTimestamp = false
+  ): Promise<void> {
+    const anchor = await withTimeout(
+      api.rpc.chain.getBlockHash(SORA_LEGACY_IDENTITY_ANCHOR.block),
+      `${label}.chain.getBlockHash(${SORA_LEGACY_IDENTITY_ANCHOR.block})`
+    );
+    const observed = anchor?.toString?.().toLowerCase() ?? '';
+    if (observed !== SORA_LEGACY_IDENTITY_ANCHOR.hash) {
+      throw new Error(`${label} does not contain the reviewed SORA mainnet history anchor`);
+    }
+    if (requireTimestamp) {
+      const timestamp = await this.fetchBlockTimestamp(observed, api);
+      if (timestamp !== SORA_LEGACY_IDENTITY_ANCHOR.timestamp) {
+        throw new Error(`${label} does not contain the reviewed SORA mainnet history anchor timestamp`);
+      }
+    }
+  }
+
+  private chainIdentityDocument(migration: StoredSoraChainIdentity['migration']): IndexerDocument {
+    const verificationBlock = SORA_LEGACY_IDENTITY_ANCHOR.block;
+    const verificationBlockHash = SORA_LEGACY_IDENTITY_ANCHOR.hash;
+    const verificationBlockTimestamp = SORA_LEGACY_IDENTITY_ANCHOR.timestamp;
+    const identity: StoredSoraChainIdentity = {
+      schemaVersion: 1,
+      genesisHash: SORA_MAINNET_GENESIS_HASH,
+      verificationBlock,
+      verificationBlockHash,
+      verificationBlockTimestamp,
+      migration,
+    };
+    return {
+      collection: collection('updatesStreams'),
+      id: CHAIN_IDENTITY_ID,
+      blockHeight: verificationBlock,
+      timestamp: verificationBlockTimestamp,
+      data: {
+        id: CHAIN_IDENTITY_ID,
+        block: verificationBlock,
+        data: JSON.stringify(identity),
+      },
+    };
+  }
+
+  private parseChainIdentity(document: IndexerDocument): StoredSoraChainIdentity {
+    if (document.collection !== 'updatesStreams' || document.id !== CHAIN_IDENTITY_ID ||
+        Object.keys(document.data).sort().join(',') !== 'block,data,id' ||
+        document.data.id !== CHAIN_IDENTITY_ID) {
+      throw new Error('Stored PI chain identity envelope is malformed');
+    }
+    if (typeof document.data?.data !== 'string') throw new Error('Stored PI chain identity data must be JSON text');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(document.data.data);
+    } catch {
+      throw new Error('Stored PI chain identity data must be valid JSON');
+    }
+    const value = parseStoredSoraChainIdentity(parsed);
+    if (!value) {
+      throw new Error('Stored PI chain identity checkpoint is malformed');
+    }
+    if (document.data.block !== value.verificationBlock ||
+        document.blockHeight !== value.verificationBlock ||
+        document.timestamp !== value.verificationBlockTimestamp) {
+      throw new Error('Stored PI chain identity envelope does not match its checkpoint');
+    }
+    if (value.migration === 'legacy-production-anchor-v1' &&
+        (value.verificationBlock !== SORA_LEGACY_IDENTITY_ANCHOR.block ||
+         value.verificationBlockHash !== SORA_LEGACY_IDENTITY_ANCHOR.hash ||
+         value.verificationBlockTimestamp !== SORA_LEGACY_IDENTITY_ANCHOR.timestamp)) {
+      throw new Error('Stored PI legacy chain identity does not match the audited migration anchor');
+    }
+    return value;
+  }
+
+  private async repositoryIsEmpty(): Promise<boolean> {
+    for (const name of ALL_INDEXER_COLLECTIONS) {
+      if (this.repository.query) {
+        if ((await this.repository.query(name, { first: 1, includeTotalCount: false })).items.length > 0) return false;
+      } else if ((await this.repository.list(name)).length > 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async repositoryContainsOnlyChainIdentity(): Promise<boolean> {
+    for (const name of ALL_INDEXER_COLLECTIONS) {
+      const documents = this.repository.query
+        ? (await this.repository.query(name, { first: 2, includeTotalCount: false })).items
+        : await this.repository.list(name);
+      if (documents.some((document) =>
+        document.collection !== 'updatesStreams' || document.id !== CHAIN_IDENTITY_ID
+      )) return false;
+    }
+    return true;
+  }
+
+  private async verifyStoredChainIdentity(
+    identity: StoredSoraChainIdentity,
+    finalizedBlock: number
+  ): Promise<void> {
+    if (!this.api) throw new Error('Cannot verify PI chain identity before the chain API is initialized');
+    if (identity.verificationBlock > finalizedBlock) {
+      throw new Error('Stored PI chain identity checkpoint is ahead of the primary finalized chain');
+    }
+    const liveHash = (
+      await withTimeout(
+        this.api.rpc.chain.getBlockHash(identity.verificationBlock),
+        `chain.getBlockHash(${identity.verificationBlock})`
+      )
+    )?.toString?.().toLowerCase() ?? '';
+    if (!isNonzeroCanonicalSubstrateHash(liveHash) || liveHash !== identity.verificationBlockHash) {
+      throw new Error('Stored PI chain identity checkpoint hash does not match the primary SORA chain');
+    }
+    const liveTimestamp = await this.fetchBlockTimestamp(liveHash, this.api);
+    if (liveTimestamp !== identity.verificationBlockTimestamp) {
+      throw new Error('Stored PI chain identity checkpoint timestamp does not match the primary SORA chain');
+    }
+  }
+
+  private parseLegacyChainState(document: IndexerDocument): number {
+    if (document.collection !== 'updatesStreams' || document.id !== CHAIN_STATE_ID ||
+        Object.keys(document.data).sort().join(',') !== 'block,data,id' ||
+        document.data.id !== CHAIN_STATE_ID || typeof document.data.data !== 'string') {
+      throw new Error('Legacy PI chainState envelope is malformed');
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(document.data.data);
+    } catch {
+      throw new Error('Legacy PI chainState data must be valid JSON');
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
+        Object.keys(parsed as Record<string, unknown>).join(',') !== 'lastIndexedBlock') {
+      throw new Error('Legacy PI chainState data is malformed');
+    }
+    const lastIndexedBlock = (parsed as { lastIndexedBlock?: unknown }).lastIndexedBlock;
+    if (!Number.isSafeInteger(lastIndexedBlock) || Number(lastIndexedBlock) <= 0 ||
+        Number(lastIndexedBlock) > SORA_MAX_BLOCK_NUMBER ||
+        document.data.block !== lastIndexedBlock || document.blockHeight !== lastIndexedBlock ||
+        !Number.isSafeInteger(document.timestamp) || Number(document.timestamp) <= 0) {
+      throw new Error('Legacy PI chainState checkpoint is malformed');
+    }
+    return Number(lastIndexedBlock);
+  }
+
+  private parseCurrentChainState(document: IndexerDocument): StoredSoraChainState {
+    if (document.collection !== 'updatesStreams' || document.id !== CHAIN_STATE_ID ||
+        Object.keys(document.data).sort().join(',') !== 'block,data,id' ||
+        document.data.id !== CHAIN_STATE_ID || typeof document.data.data !== 'string') {
+      throw new Error('Stored PI chainState envelope is malformed');
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(document.data.data);
+    } catch {
+      throw new Error('Stored PI chainState data must be valid JSON');
+    }
+    const state = parseStoredSoraChainState(parsed);
+    if (!state) throw new Error('Stored PI chainState checkpoint is malformed');
+    if (document.data.block !== state.lastIndexedBlock || document.blockHeight !== state.lastIndexedBlock ||
+        !Number.isSafeInteger(document.timestamp) || Number(document.timestamp) <= 0) {
+      throw new Error('Stored PI chainState envelope does not match its checkpoint');
+    }
+    return state;
+  }
+
+  private async requireMatchingBlockSnapshot(block: number, timestamp: number): Promise<void> {
+    const expectedId = `block-${block}`;
+    const snapshot = await this.repository.get(collection('networkSnapshots'), expectedId);
+    if (!snapshot || snapshot.collection !== 'networkSnapshots' || snapshot.id !== expectedId ||
+        snapshot.blockHeight !== block || snapshot.timestamp !== timestamp ||
+        snapshot.data?.id !== expectedId || snapshot.data?.type !== 'BLOCK' ||
+        snapshot.data?.timestamp !== timestamp) {
+      throw new Error('Stored PI chainState does not have an exact matching BLOCK snapshot');
+    }
+  }
+
+  private async verifyChainStateDocument(document: IndexerDocument, finalizedBlock: number): Promise<void> {
+    let block: number;
+    let expectedHash: string | null;
+    let expectedTimestamp: number;
+    try {
+      const state = this.parseCurrentChainState(document);
+      block = state.lastIndexedBlock;
+      expectedHash = state.blockHash;
+      expectedTimestamp = state.blockTimestamp;
+    } catch (currentError) {
+      try {
+        block = this.parseLegacyChainState(document);
+      } catch {
+        throw currentError;
+      }
+      const snapshot = await this.repository.get(collection('networkSnapshots'), `block-${block}`);
+      expectedHash = null;
+      expectedTimestamp = Number(snapshot?.timestamp);
+      if (!Number.isSafeInteger(expectedTimestamp) || expectedTimestamp <= 0) {
+        throw new Error('Legacy PI chainState does not have a timestamped BLOCK snapshot');
+      }
+    }
+    if (block > finalizedBlock) {
+      throw new Error('Stored PI chainState is ahead of the primary finalized SORA chain');
+    }
+    await this.requireMatchingBlockSnapshot(block, expectedTimestamp);
+    if (!this.api) throw new Error('Cannot verify PI chainState before the chain API is initialized');
+    const liveHash = (
+      await withTimeout(this.api.rpc.chain.getBlockHash(block), `chain.getBlockHash(${block})`)
+    )?.toString?.().toLowerCase() ?? '';
+    if (!isNonzeroCanonicalSubstrateHash(liveHash) || (expectedHash !== null && liveHash !== expectedHash)) {
+      throw new Error('Stored PI chainState block hash does not match the primary SORA chain');
+    }
+    const liveTimestamp = await this.fetchBlockTimestamp(liveHash, this.api);
+    if (liveTimestamp !== expectedTimestamp) {
+      throw new Error('Stored PI chainState timestamp does not match the primary SORA chain');
+    }
+  }
+
+  private async verifyStoredChainState(finalizedBlock: number): Promise<void> {
+    const state = await this.repository.get(collection('updatesStreams'), CHAIN_STATE_ID);
+    if (!state) {
+      if (!(await this.repositoryContainsOnlyChainIdentity())) {
+        throw new Error('PI database has indexed data but no chainState checkpoint');
+      }
+      return;
+    }
+    await this.verifyChainStateDocument(state, finalizedBlock);
+  }
+
+  private async ensureChainIdentity(finalizedBlock: number): Promise<void> {
+    const stored = await this.repository.get(collection('updatesStreams'), CHAIN_IDENTITY_ID);
+    if (stored) {
+      await this.verifyStoredChainIdentity(this.parseChainIdentity(stored), finalizedBlock);
+      await this.verifyStoredChainState(finalizedBlock);
+      return;
+    }
+
+    const chainState = await this.repository.get(collection('updatesStreams'), CHAIN_STATE_ID);
+    if (!chainState) {
+      if (!(await this.repositoryIsEmpty())) {
+        throw new Error('PI database is nonempty but has no immutable chain identity or chainState');
+      }
+      await this.repository.upsert(
+        this.chainIdentityDocument('fresh-database')
+      );
+      return;
+    }
+
+    const lastIndexedBlock = this.parseLegacyChainState(chainState);
+    if (lastIndexedBlock < SORA_LEGACY_IDENTITY_ANCHOR.block) {
+      throw new Error('Legacy PI database predates the audited SORA mainnet identity migration anchor');
+    }
+    await this.verifyChainStateDocument(chainState, finalizedBlock);
+    const anchorSnapshot = await this.repository.get(
+      collection('networkSnapshots'),
+      `block-${SORA_LEGACY_IDENTITY_ANCHOR.block}`
+    );
+    if (!anchorSnapshot || anchorSnapshot.timestamp !== SORA_LEGACY_IDENTITY_ANCHOR.timestamp ||
+        anchorSnapshot.blockHeight !== SORA_LEGACY_IDENTITY_ANCHOR.block ||
+        anchorSnapshot.data?.id !== `block-${SORA_LEGACY_IDENTITY_ANCHOR.block}` ||
+        anchorSnapshot.data?.type !== 'BLOCK' ||
+        anchorSnapshot.data?.timestamp !== SORA_LEGACY_IDENTITY_ANCHOR.timestamp) {
+      throw new Error('Legacy PI database does not contain the audited SORA mainnet migration anchor snapshot');
+    }
+    if (!this.api) throw new Error('Cannot migrate PI chain identity before the chain API is initialized');
+    const liveAnchorHash = (
+      await withTimeout(
+        this.api.rpc.chain.getBlockHash(SORA_LEGACY_IDENTITY_ANCHOR.block),
+        `chain.getBlockHash(${SORA_LEGACY_IDENTITY_ANCHOR.block})`
+      )
+    ).toString().toLowerCase();
+    if (liveAnchorHash !== SORA_LEGACY_IDENTITY_ANCHOR.hash) {
+      throw new Error('Live SORA chain does not match the audited PI migration anchor block hash');
+    }
+    const liveAnchorTimestamp = await this.fetchBlockTimestamp(liveAnchorHash, this.api);
+    if (liveAnchorTimestamp !== SORA_LEGACY_IDENTITY_ANCHOR.timestamp) {
+      throw new Error('Live SORA chain does not match the audited PI migration anchor timestamp');
+    }
+    await this.repository.upsert(
+      this.chainIdentityDocument('legacy-production-anchor-v1')
+    );
   }
 
   private async runStartupMaintenance(finalizedBlock: number, indexedAny: boolean): Promise<void> {
@@ -2162,17 +2640,25 @@ export class ChainIndexer {
 
   private async getLastIndexedBlock(): Promise<number> {
     const state = await this.repository.get('updatesStreams', CHAIN_STATE_ID);
-    if (!state?.data?.data || typeof state.data.data !== 'string') return 0;
-
+    if (!state) return 0;
     try {
-      const parsed = JSON.parse(state.data.data) as { lastIndexedBlock?: number };
-      return Number(parsed.lastIndexedBlock ?? 0);
-    } catch {
-      return 0;
+      return this.parseCurrentChainState(state).lastIndexedBlock;
+    } catch (currentError) {
+      try {
+        return this.parseLegacyChainState(state);
+      } catch {
+        throw currentError;
+      }
     }
   }
 
-  private createChainStateDocument(block: number): IndexerDocument {
+  private createChainStateDocument(block: number, blockHash: string, blockTimestamp: number): IndexerDocument {
+    if (this.observedGenesisHash !== SORA_MAINNET_GENESIS_HASH ||
+        !Number.isSafeInteger(block) || block <= 0 || block > SORA_MAX_BLOCK_NUMBER ||
+        !isNonzeroCanonicalSubstrateHash(blockHash) ||
+        !Number.isSafeInteger(blockTimestamp) || blockTimestamp <= 0) {
+      throw new Error('Cannot persist PI chainState without validated SORA mainnet block identity');
+    }
     return {
       collection: collection('updatesStreams'),
       id: CHAIN_STATE_ID,
@@ -2181,7 +2667,12 @@ export class ChainIndexer {
       data: {
         id: CHAIN_STATE_ID,
         block,
-        data: JSON.stringify({ lastIndexedBlock: block }),
+        data: JSON.stringify({
+          lastIndexedBlock: block,
+          genesisHash: this.observedGenesisHash,
+          blockHash: blockHash.toLowerCase(),
+          blockTimestamp,
+        }),
       },
     };
   }
@@ -3143,13 +3634,20 @@ export class ChainIndexer {
   private async subscribeFinalizedHeads(): Promise<void> {
     if (!this.api) return;
 
-    await this.api.rpc.chain.subscribeFinalizedHeads((header) => {
-      if (ARCHIVE_SORA_WS_ENDPOINT) {
+    this.unsubscribeFinalizedHeads = await this.api.rpc.chain.subscribeFinalizedHeads((header) => {
+      let finalizedBlock: number;
+      try {
+        finalizedBlock = this.validatedFinalizedHeaderHeight(header, 'finalized-head subscription');
+      } catch {
+        this.requestPendingFinalizedBlockUpdate('Failed to recover from a malformed finalized-head subscription update');
+        return;
+      }
+      if (this.archiveSoraWsEndpoint) {
         this.requestPendingFinalizedBlockUpdate('Failed to update finalized head from subscription');
         return;
       }
 
-      this.pendingFinalizedBlock = Math.max(this.pendingFinalizedBlock, header.number.toNumber());
+      this.pendingFinalizedBlock = Math.max(this.pendingFinalizedBlock, finalizedBlock);
       void this.drainFinalizedHeads();
     });
 
@@ -3284,32 +3782,81 @@ export class ChainIndexer {
 
   private async fetchBlockByNumber(block: number): Promise<FetchedBlock> {
     if (!this.api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
+    if (!Number.isSafeInteger(block) || block <= 0 || block > SORA_MAX_BLOCK_NUMBER) {
+      throw new Error(`Cannot fetch invalid SORA block height ${block}`);
+    }
 
     const blockApi = await this.getBlockDataApi();
     const hash = await withTimeout(blockApi.rpc.chain.getBlockHash(block), `chain.getBlockHash(${block})`);
-    if (!hash || hash.toString() === '0x0000000000000000000000000000000000000000000000000000000000000000') {
+    const hashText = hash?.toString?.().toLowerCase() ?? '';
+    if (!isNonzeroCanonicalSubstrateHash(hashText)) {
       throw new Error(`No SORA block hash available for block ${block} from the configured block data endpoint`);
     }
+    if (blockApi !== this.api) {
+      const primaryHash = await withTimeout(this.api.rpc.chain.getBlockHash(block), `primary.chain.getBlockHash(${block})`);
+      const primaryHashText = primaryHash?.toString?.().toLowerCase() ?? '';
+      if (!isNonzeroCanonicalSubstrateHash(primaryHashText) || primaryHashText !== hashText) {
+        throw new Error(`SORA block data endpoint hash diverges from the primary endpoint at block ${block}`);
+      }
+    }
 
-    return this.fetchBlockByHash(hash.toString());
+    const fetched = await this.fetchBlockByHash(hashText);
+    const fetchedHeight = fetched.signedBlock?.block?.header?.number?.toNumber?.();
+    if (fetchedHeight !== block) {
+      throw new Error(`SORA block data endpoint returned block ${fetchedHeight} for requested height ${block}`);
+    }
+    return fetched;
   }
 
   private async fetchBlockByHash(hash: string): Promise<FetchedBlock> {
     if (!this.api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
+    const requestedHash = hash.toLowerCase();
+    if (!isNonzeroCanonicalSubstrateHash(requestedHash)) {
+      throw new Error('Cannot fetch a missing, zero, or malformed SORA block hash');
+    }
 
     const blockApi = await this.getBlockDataApi();
+    if (blockApi === this.api) {
+      return (await this.fetchBlockPayloadFromApi(requestedHash, blockApi, false)).fetchedBlock;
+    }
+
+    const [blockDataPayload, primaryPayload] = await Promise.all([
+      this.fetchBlockPayloadFromApi(requestedHash, blockApi, true),
+      this.fetchBlockPayloadFromApi(requestedHash, this.api, true),
+    ]);
+    if (blockDataPayload.blockHex !== primaryPayload.blockHex ||
+        blockDataPayload.eventsHex !== primaryPayload.eventsHex ||
+        blockDataPayload.timestampMilliseconds !== primaryPayload.timestampMilliseconds) {
+      throw new Error(`SORA primary and block data endpoints returned different payloads for block ${requestedHash}`);
+    }
+    return blockDataPayload.fetchedBlock;
+  }
+
+  private async fetchBlockPayloadFromApi(
+    hash: string,
+    blockApi: ApiPromise,
+    requireCanonicalBytes: boolean
+  ): Promise<FetchedBlockPayload> {
     const canFetchApiAt = typeof (blockApi as unknown as { at?: unknown }).at === 'function';
     if (!canFetchApiAt) {
       const [signedBlock, eventsCodec, timestamp] = await Promise.all([
         withTimeout(this.fetchSignedBlock(hash, blockApi), `chain.getBlock(${hash})`),
         withTimeout((blockApi.query as any).system.events.at(hash), `system.events.at(${hash})`),
-        withTimeout(this.fetchBlockTimestamp(hash, blockApi), `timestamp.now.at(${hash})`),
+        withTimeout(this.fetchBlockTimestampIdentity(hash, blockApi), `timestamp.now.at(${hash})`),
       ]);
 
       return {
-        signedBlock,
-        events: eventsCodec as unknown as EventRecord[],
-        timestamp,
+        fetchedBlock: {
+          requestedHash: hash,
+          signedBlock,
+          events: eventsCodec as unknown as EventRecord[],
+          timestamp: timestamp.seconds,
+        },
+        blockHex: requireCanonicalBytes
+          ? canonicalCodecHex((signedBlock as { block?: unknown })?.block, `SORA block ${hash}`)
+          : null,
+        eventsHex: requireCanonicalBytes ? canonicalCodecHex(eventsCodec, `SORA events ${hash}`) : null,
+        timestampMilliseconds: timestamp.milliseconds,
       };
     }
 
@@ -3326,20 +3873,23 @@ export class ChainIndexer {
     const [signedBlock, eventsCodec, timestamp] = await Promise.all([
       withTimeout(this.fetchSignedBlock(hash, blockApi), `chain.getBlock(${hash})`),
       withTimeout(system.events.call(system), `system.events(${hash})`),
-      withTimeout(timestampNow(), `timestamp.now(${hash})`).then((codec) => {
-        const timestampMs = Number((codec as CodecLike | undefined)?.toString?.() ?? codec);
-        if (!Number.isFinite(timestampMs)) {
-          throw new Error(`Invalid timestamp.now value for block ${hash}`);
-        }
-
-        return Math.floor(timestampMs / 1000);
-      }),
+      withTimeout(timestampNow(), `timestamp.now(${hash})`).then((codec) =>
+        parseChainTimestamp(codec, `timestamp.now for block ${hash}`)
+      ),
     ]);
 
     return {
-      signedBlock,
-      events: eventsCodec as unknown as EventRecord[],
-      timestamp,
+      fetchedBlock: {
+        requestedHash: hash,
+        signedBlock,
+        events: eventsCodec as unknown as EventRecord[],
+        timestamp: timestamp.seconds,
+      },
+      blockHex: requireCanonicalBytes
+        ? canonicalCodecHex((signedBlock as { block?: unknown })?.block, `SORA block ${hash}`)
+        : null,
+      eventsHex: requireCanonicalBytes ? canonicalCodecHex(eventsCodec, `SORA events ${hash}`) : null,
+      timestampMilliseconds: timestamp.milliseconds,
     };
   }
 
@@ -3351,31 +3901,49 @@ export class ChainIndexer {
   }
 
   private async getBlockDataApi(): Promise<ApiPromise> {
-    if (!ARCHIVE_SORA_WS_ENDPOINT && !USE_LEGACY_SORA_BLOCK_TYPES) {
+    if (!this.archiveSoraWsEndpoint && !USE_LEGACY_SORA_BLOCK_TYPES) {
       if (!this.api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
       return this.api;
     }
 
     if (this.legacyBlockApi) return this.legacyBlockApi;
 
-    const endpoint = ARCHIVE_SORA_WS_ENDPOINT || this.config.soraWsEndpoint;
-    const apiOptions = USE_LEGACY_SORA_BLOCK_TYPES ? { typesBundle: soraArchiveTypesBundle as any } : {};
-    this.legacyBlockApiPromise ??= ApiPromise.create({
-      provider: new WsProvider(endpoint),
-      ...apiOptions,
-    }).then((api) => {
-      this.legacyBlockApi = api;
-      return api;
-    });
+    if (this.legacyBlockApiPromise) return this.legacyBlockApiPromise;
 
-    return this.legacyBlockApiPromise;
+    const endpoint = this.archiveSoraWsEndpoint || this.config.soraWsEndpoint;
+    const provider = new WsProvider(endpoint);
+    const apiOptions = USE_LEGACY_SORA_BLOCK_TYPES ? { typesBundle: soraArchiveTypesBundle as any } : {};
+    let creation: Promise<ApiPromise>;
+    const connection = ApiPromise.create({ provider, ...apiOptions })
+      .then(async (api) => {
+        try {
+          await this.requireMainnetIdentity(api, 'SORA block data endpoint');
+          await this.requireReviewedMainnetAnchor(api, 'SORA block data endpoint');
+          if (this.legacyBlockApiPromise !== creation || !this.api) {
+            throw new Error('PI block data endpoint startup was cancelled');
+          }
+          this.legacyBlockApi = api;
+          return api;
+        } catch (error) {
+          await disconnectRpcEndpoint(api).catch(() => undefined);
+          throw error;
+        }
+      });
+    creation = withTimeout(connection, 'SORA block data endpoint connection')
+      .catch(async (error: unknown) => {
+        await disconnectRpcEndpoint(provider).catch(() => undefined);
+        if (this.legacyBlockApiPromise === creation) this.legacyBlockApiPromise = null;
+        throw error;
+      });
+    this.legacyBlockApiPromise = creation;
+    return creation;
   }
 
   private async getIndexableFinalizedBlock(): Promise<number> {
     if (!this.api) throw new Error('Cannot read finalized SORA block before the chain API is initialized');
 
     const localFinalizedBlock = await this.getFinalizedBlock(this.api, 'chain');
-    if (!ARCHIVE_SORA_WS_ENDPOINT) return localFinalizedBlock;
+    if (!this.archiveSoraWsEndpoint) return localFinalizedBlock;
 
     const blockDataApi = await this.getBlockDataApi();
     const blockDataFinalizedBlock = await this.getFinalizedBlock(blockDataApi, 'block data endpoint');
@@ -3390,14 +3958,39 @@ export class ChainIndexer {
 
   private async getFinalizedBlock(api: ApiPromise, label: string): Promise<number> {
     const finalizedHash = await withTimeout(api.rpc.chain.getFinalizedHead(), `${label}.getFinalizedHead()`);
-    const finalizedHeader = await withTimeout(api.rpc.chain.getHeader(finalizedHash), `${label}.getHeader(${finalizedHash.toString()})`);
-    return finalizedHeader.number.toNumber();
+    const finalizedHashText = finalizedHash?.toString?.().toLowerCase() ?? '';
+    if (!isNonzeroCanonicalSubstrateHash(finalizedHashText)) {
+      throw new Error(`${label} returned a malformed finalized hash`);
+    }
+    const finalizedHeader = await withTimeout(api.rpc.chain.getHeader(finalizedHash), `${label}.getHeader(${finalizedHashText})`);
+    const height = this.validatedFinalizedHeaderHeight(finalizedHeader, label);
+    if (finalizedHeader.hash.toString().toLowerCase() !== finalizedHashText) {
+      throw new Error(`${label} finalized header does not match its requested hash`);
+    }
+    return height;
   }
 
-  private async indexFetchedBlock({ signedBlock, events, timestamp }: FetchedBlock, options: IndexBlockOptions = {}): Promise<void> {
+  private validatedFinalizedHeaderHeight(
+    header: { number: { toNumber: () => number }; hash: { toString: () => string } },
+    label: string
+  ): number {
+    const height = header?.number?.toNumber?.();
+    const hash = header?.hash?.toString?.().toLowerCase() ?? '';
+    if (!Number.isSafeInteger(height) || Number(height) < SORA_LEGACY_IDENTITY_ANCHOR.block ||
+        Number(height) > SORA_MAX_BLOCK_NUMBER ||
+        !isNonzeroCanonicalSubstrateHash(hash)) {
+      throw new Error(`${label} returned a malformed finalized header`);
+    }
+    return Number(height);
+  }
+
+  private async indexFetchedBlock({ requestedHash, signedBlock, events, timestamp }: FetchedBlock, options: IndexBlockOptions = {}): Promise<void> {
     const eventsByExtrinsic = groupEventsByExtrinsic(events);
     const blockHeight = signedBlock.block.header.number.toNumber();
-    const blockHash = signedBlock.block.header.hash.toString();
+    const blockHash = signedBlock.block.header.hash.toString().toLowerCase();
+    if (!isNonzeroCanonicalSubstrateHash(blockHash) || blockHash !== requestedHash) {
+      throw new Error(`SORA block data endpoint returned a block that does not match requested hash ${requestedHash}`);
+    }
     const documents: IndexerDocument[] = [];
     const touchedAccounts = new Set<string>();
     let totalFees = 0n;
@@ -3521,7 +4114,7 @@ export class ChainIndexer {
       },
     });
 
-    documents.push(this.createChainStateDocument(blockHeight));
+    documents.push(this.createChainStateDocument(blockHeight, blockHash, timestamp));
     await this.repository.upsertMany(await this.prepareReferrerRewardDocuments(documents));
 
     if ((options.refreshDerivedState ?? true) && shouldRefreshPolkamarktState) {
@@ -3852,15 +4445,14 @@ export class ChainIndexer {
     }
 
     const codec = await withTimeout(timestampNow(), `timestamp.now(${blockHeight})`);
-    const timestampMs = Number((codec as CodecLike | undefined)?.toString?.() ?? codec);
-    if (!Number.isFinite(timestampMs)) {
-      throw new Error(`Invalid timestamp.now value for historical SORA block ${blockHeight}`);
-    }
-
-    return Math.floor(timestampMs / 1000);
+    return parseChainTimestampSeconds(codec, `timestamp.now for historical SORA block ${blockHeight}`);
   }
 
   private async fetchBlockTimestamp(hash: string, api = this.api): Promise<number> {
+    return (await this.fetchBlockTimestampIdentity(hash, api)).seconds;
+  }
+
+  private async fetchBlockTimestampIdentity(hash: string, api = this.api): Promise<ParsedChainTimestamp> {
     if (!this.api) throw new Error('Cannot index a block before the chain API is initialized');
     if (!api) throw new Error('Cannot index a block before the chain API is initialized');
 
@@ -3870,13 +4462,8 @@ export class ChainIndexer {
       throw new Error('timestamp.now.at is required to index block timestamps');
     }
 
-    const codec = await at.call(timestampNow, hash);
-    const timestampMs = Number(codec?.toString?.() ?? codec);
-    if (!Number.isFinite(timestampMs)) {
-      throw new Error(`Invalid timestamp.now value for block ${hash}`);
-    }
-
-    return Math.floor(timestampMs / 1000);
+    const codec = await withTimeout(at.call(timestampNow, hash), `timestamp.now.at(${hash})`);
+    return parseChainTimestamp(codec, `timestamp.now for block ${hash}`);
   }
 
   private extractVolumeUSD(data: unknown): bigint {

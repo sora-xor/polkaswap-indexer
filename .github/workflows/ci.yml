@@ -19,10 +19,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Branch flow audit
+        run: |
+          bash scripts/test-branch-flow-audit.sh
+          bash scripts/audit-branch-flow.sh
+
+      - name: Audit public artifacts
+        run: |
+          bash scripts/test-public-artifacts-audit.sh
+          bash scripts/audit-public-artifacts.sh
+
+      - name: TODO debt audit
+        run: |
+          bash scripts/test-todo-debt-audit.sh
+          bash scripts/audit-todo-debt.sh
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
 
@@ -33,7 +48,7 @@ jobs:
         run: yarn install --immutable
 
       - name: Audit production dependencies
-        run: yarn npm audit --environment production
+        run: yarn audit:dependencies:production
 
       - name: Run deployment evidence audit tests
         run: |
@@ -41,6 +56,9 @@ jobs:
           yarn generate:deployment-evidence-template --output build/reports/production-deployment-evidence-template.json
           yarn test:deployment-evidence-audit
           yarn audit:deployment-evidence
+
+      - name: Run deployment manifest contract tests
+        run: yarn test:deployment-manifest
 
       - name: Run production smoke contract tests
         run: yarn test:production-smoke
@@ -51,10 +69,10 @@ jobs:
     needs: validate
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
 
@@ -69,3 +87,24 @@ jobs:
 
       - name: Test
         run: yarn test
+
+      - name: Build production Docker image
+        run: docker build -t polkaswap-indexer:ci .
+
+      - name: Verify production image dependency and user contract
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' polkaswap-indexer:ci)" = "node"
+          docker run --rm --entrypoint node polkaswap-indexer:ci -e '
+            for (const name of ["graphql", "pg", "@polkadot/api"]) {
+              require.resolve(name);
+            }
+            for (const name of ["typescript", "vitest", "tsx"]) {
+              try {
+                require.resolve(name);
+                console.error(`Development-only dependency leaked into runtime image: ${name}`);
+                process.exitCode = 1;
+              } catch (error) {
+                if (error?.code !== "MODULE_NOT_FOUND") throw error;
+              }
+            }
+          '

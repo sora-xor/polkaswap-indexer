@@ -51,12 +51,12 @@ const repositoryWithoutQuery = (items: Awaited<ReturnType<IndexerRepository['lis
 });
 
 describe('Polkaswap indexer schema', () => {
-  it('exposes a repository-backed health resolver', async () => {
+  it('reports unhealthy until an exact mainnet identity and fresh checkpoint exist', async () => {
     const schema = createSchema();
     const healthField = schema.getQueryType()?.getFields()._health;
 
     await expect(healthField?.resolve?.({}, {}, { repository: new MemoryRepository() }, {} as never)).resolves.toEqual({
-      ok: true,
+      ok: false,
       service: 'polkaswap-indexer',
       serviceId: 'pi.soramitsu.io',
       schemaVersion: 1,
@@ -65,6 +65,10 @@ describe('Polkaswap indexer schema', () => {
       network: 'mainnet',
       publicBaseUrl: 'https://pi.soramitsu.io/graphql',
       readOnly: true,
+      genesisHash: null,
+      latestIndexedBlock: null,
+      latestIndexedBlockHash: null,
+      latestIndexedAt: null,
     });
   });
 
@@ -86,6 +90,10 @@ describe('Polkaswap indexer schema', () => {
       network: 'mainnet',
       publicBaseUrl: 'https://pi.soramitsu.io/graphql',
       readOnly: true,
+      genesisHash: null,
+      latestIndexedBlock: null,
+      latestIndexedBlockHash: null,
+      latestIndexedAt: null,
     });
   });
 

@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const WORKER_ENV_KEYS = [
   'CHAIN_BACKFILL_PREFETCH_CONCURRENCY',
   'CHAIN_FINALIZED_CATCHUP_PREFETCH_CONCURRENCY',
+  'CHAIN_LEGACY_SORA_BLOCK_TYPES',
+  'SORA_ARCHIVE_WS_ENDPOINT',
 ] as const;
 
 const originalEnv = new Map(WORKER_ENV_KEYS.map((key) => [key, process.env[key]]));
@@ -102,4 +104,21 @@ describe('chain worker environment parsing', () => {
     expect(indexer.indexBlockByNumber).toHaveBeenNthCalledWith(1, 1);
     expect(indexer.indexBlockByNumber).toHaveBeenNthCalledWith(2, 2);
   });
+
+  it.each(['', '2', 'on', 'truthy', 'null'])('fails closed for invalid legacy-codec boolean %j', async (value) => {
+    process.env.CHAIN_LEGACY_SORA_BLOCK_TYPES = value;
+
+    await expect(loadWorkerModules()).rejects.toThrow(
+      'CHAIN_LEGACY_SORA_BLOCK_TYPES must be one of true, false, 1, 0, yes, or no',
+    );
+  });
+
+  it.each(['true', 'TRUE', ' yes ', '1', 'false', 'FALSE', ' no ', '0'])(
+    'accepts strict legacy-codec boolean %j',
+    async (value) => {
+      process.env.CHAIN_LEGACY_SORA_BLOCK_TYPES = value;
+      await expect(loadWorkerModules()).resolves.toBeDefined();
+    },
+  );
+
 });

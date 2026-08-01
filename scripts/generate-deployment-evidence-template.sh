@@ -11,7 +11,10 @@ Usage: scripts/generate-deployment-evidence-template.sh [--evidence <path>] [--o
 
 Generates a fill-in-ready PI deployment evidence manifest. The generated
 template intentionally contains TODO placeholders and must fail the release-ready
-audit until a real deployment and live production smoke result are recorded.
+audit until an operator attests the real deployment and its successful live
+production smoke result, exact SORA mainnet genesis and indexed checkpoint,
+independent verifying RPC controls, plus the delegated TLS-edge client-IP
+HTTP/WebSocket controls.
 USAGE
 }
 
@@ -50,6 +53,8 @@ const path = require('path');
 
 const [evidenceFile, outputFile] = process.argv.slice(2);
 const errors = [];
+const SORA_MAINNET_GENESIS_HASH =
+  '0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5';
 const contract = {
   scope: 'polkaswap-indexer-production-deployment-readiness',
   serviceId: 'pi.soramitsu.io',
@@ -69,7 +74,33 @@ const contract = {
     chainId: 'sora:mainnet',
     network: 'mainnet',
     publicBaseUrl: 'https://pi.soramitsu.io/graphql',
-    readOnly: true
+    readOnly: true,
+    genesisHash: SORA_MAINNET_GENESIS_HASH,
+    latestIndexedBlock: 'TODO_POSITIVE_SAFE_INTEGER_INDEXED_BLOCK',
+    latestIndexedBlockHash: 'TODO_0X_64_LOWERCASE_HEX_INDEXED_BLOCK_HASH',
+    latestIndexedAt: 'TODO_UNIX_SECONDS_WITHIN_300_BEFORE_OR_30_AFTER_SMOKE'
+  },
+  soraRpcControls: {
+    primaryEndpoint: 'TODO_CANONICAL_WSS_LOCALLY_CONTROLLED_PRIMARY_RPC_ENDPOINT',
+    archiveEndpoint: 'TODO_CANONICAL_WSS_INDEPENDENT_ARCHIVE_RPC_ENDPOINT',
+    primaryNodeControl: 'locally-controlled-verifying-archive',
+    archiveNodeControl: 'independently-operated-verifying-archive',
+    distinctHosts: true,
+    exactIdentityPreflight: true,
+    rawPayloadAgreement: 'height-hash-scale-block-events-timestamp'
+  },
+  tlsEdgeControls: {
+    tlsTermination: true,
+    forwardedClientIpHeaders: 'overwrite',
+    httpClientIpRateLimit: {
+      windowMs: 60000,
+      maxRequests: 600
+    },
+    webSocketClientIpLimits: {
+      windowMs: 60000,
+      maxUpgrades: 600,
+      maxConcurrentConnections: 16
+    }
   }
 };
 const requiredEvidenceFields = [
@@ -81,6 +112,8 @@ const requiredEvidenceFields = [
   'deployedAt',
   'smokePassedAt',
   'healthInfo',
+  'soraRpcControls',
+  'tlsEdgeControls',
   'operator'
 ];
 const allowedManifestFields = [
@@ -122,6 +155,27 @@ function requireArray(value, name) {
     return [];
   }
   return value;
+}
+
+function requireExactArray(value, expected, name) {
+  const values = requireArray(value, name);
+  const expectedSet = new Set(expected);
+  const seen = new Set();
+  for (const expectedValue of expected) {
+    if (!values.includes(expectedValue)) {
+      fail(`${name} missing ${expectedValue}`);
+    }
+  }
+  for (const item of values) {
+    if (seen.has(item)) {
+      fail(`${name} contains duplicate ${item}`);
+    }
+    seen.add(item);
+    if (!expectedSet.has(item)) {
+      fail(`${name} contains unexpected ${item}`);
+    }
+  }
+  return values;
 }
 
 function secretLikeKeyReason(value, currentPath = '$') {
@@ -175,11 +229,7 @@ if (manifest) {
   if (manifest.baseUrl !== contract.baseUrl) fail(`baseUrl must be ${contract.baseUrl}`);
   if (manifest.smokeCommand !== contract.smokeCommand) fail(`smokeCommand must be ${contract.smokeCommand}`);
   if (manifest.dockerBuildCommand !== contract.dockerBuildCommand) fail(`dockerBuildCommand must be ${contract.dockerBuildCommand}`);
-  for (const blocker of contract.requiredBlockers) {
-    if (!requireArray(manifest.blockers, 'blockers').includes(blocker)) {
-      fail(`blockers missing ${blocker}`);
-    }
-  }
+  requireExactArray(manifest.blockers, contract.requiredBlockers, 'blockers');
   for (const field of requiredEvidenceFields) {
     if (!requireArray(manifest.requiredEvidenceFields, 'requiredEvidenceFields').includes(field)) {
       fail(`requiredEvidenceFields missing ${field}`);
@@ -228,6 +278,8 @@ const template = {
       deployedAt: 'TODO_UTC_DEPLOYED_AT_SECONDS',
       smokePassedAt: 'TODO_UTC_SMOKE_TIMESTAMP_SECONDS',
       healthInfo: contract.healthInfo,
+      soraRpcControls: contract.soraRpcControls,
+      tlsEdgeControls: contract.tlsEdgeControls,
       operator: 'TODO_RELEASE_OPERATOR'
     }
   ]

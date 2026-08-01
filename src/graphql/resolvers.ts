@@ -9,6 +9,12 @@ import { metrics } from '../metrics.js';
 import { matchesFilter, sortDocuments } from './filter.js';
 import { CursorScalar, FilterScalars, JSONScalar, OrderByScalar } from './scalars.js';
 import { typeDefs } from './schema.js';
+import {
+  parseStoredSoraChainIdentity,
+  parseStoredSoraChainState,
+  SORA_LEGACY_IDENTITY_ANCHOR,
+  SORA_MAINNET_GENESIS_HASH,
+} from '../soraIdentity.js';
 
 import type { IndexerCollection, IndexerDocument, IndexerRepository, RepositoryQueryArgs } from '../repository/types.js';
 import type { GraphQLResolveInfo, GraphQLSchema, SelectionNode } from 'graphql';
@@ -972,9 +978,49 @@ const pollingSubscription = (collectionName: IndexerCollection) => ({
 
 const POLKASWAP_SERVICE_ID = 'pi.soramitsu.io';
 const POLKASWAP_PUBLIC_BASE_URL = 'https://pi.soramitsu.io/graphql';
+const MAX_HEALTH_AGE_SECONDS = 300;
+const MAX_HEALTH_FUTURE_SKEW_SECONDS = 30;
+
+const parsedUpdateStreamData = (document: IndexerDocument | null, expectedId: string): unknown | null => {
+  if (!document || document.collection !== 'updatesStreams' || document.id !== expectedId ||
+      Object.keys(document.data).sort().join(',') !== 'block,data,id' ||
+      document.data.id !== expectedId || typeof document.data.data !== 'string') return null;
+  try {
+    return JSON.parse(document.data.data);
+  } catch {
+    return null;
+  }
+};
 
 const healthResolver = async (_parent: unknown, _args: unknown, context: Context) => {
-  const ok = context.repository.healthCheck ? await context.repository.healthCheck().catch(() => false) : true;
+  const [repositoryReady, identityDocument, stateDocument] = await Promise.all([
+    context.repository.healthCheck ? context.repository.healthCheck().catch(() => false) : Promise.resolve(false),
+    context.repository.get('updatesStreams', 'chainIdentity').catch(() => null),
+    context.repository.get('updatesStreams', 'chainState').catch(() => null),
+  ]);
+  const identity = parseStoredSoraChainIdentity(parsedUpdateStreamData(identityDocument, 'chainIdentity'));
+  const state = parseStoredSoraChainState(parsedUpdateStreamData(stateDocument, 'chainState'));
+  const identityValid = identity !== null && identityDocument !== null &&
+    identityDocument.data.block === identity.verificationBlock &&
+    identityDocument.blockHeight === identity.verificationBlock &&
+    identityDocument.timestamp === identity.verificationBlockTimestamp &&
+    (identity.migration !== 'legacy-production-anchor-v1' ||
+      (identity.verificationBlock === SORA_LEGACY_IDENTITY_ANCHOR.block &&
+       identity.verificationBlockHash === SORA_LEGACY_IDENTITY_ANCHOR.hash &&
+       identity.verificationBlockTimestamp === SORA_LEGACY_IDENTITY_ANCHOR.timestamp));
+  const stateValid = state !== null && stateDocument !== null &&
+    stateDocument.data.block === state.lastIndexedBlock &&
+    stateDocument.blockHeight === state.lastIndexedBlock &&
+    Number.isSafeInteger(stateDocument.timestamp) && Number(stateDocument.timestamp) > 0;
+  const latestIndexedBlock = stateValid ? state.lastIndexedBlock : null;
+  const latestIndexedAt = stateValid ? state.blockTimestamp : null;
+  const latestIndexedBlockHash = stateValid ? state.blockHash : null;
+  const stateAge = latestIndexedAt === null ? Number.POSITIVE_INFINITY : Math.floor(Date.now() / 1000) - latestIndexedAt;
+  const checkpointCoherent = identityValid && stateValid &&
+    state.lastIndexedBlock >= identity.verificationBlock &&
+    state.blockTimestamp >= identity.verificationBlockTimestamp;
+  const checkpointFresh = stateAge >= -MAX_HEALTH_FUTURE_SKEW_SECONDS && stateAge <= MAX_HEALTH_AGE_SECONDS;
+  const ok = repositoryReady && checkpointCoherent && checkpointFresh;
 
   return {
     ok,
@@ -986,6 +1032,10 @@ const healthResolver = async (_parent: unknown, _args: unknown, context: Context
     network: 'mainnet',
     publicBaseUrl: POLKASWAP_PUBLIC_BASE_URL,
     readOnly: true,
+    genesisHash: identityValid ? SORA_MAINNET_GENESIS_HASH : null,
+    latestIndexedBlock,
+    latestIndexedBlockHash,
+    latestIndexedAt,
   };
 };
 
