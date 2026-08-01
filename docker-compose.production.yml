@@ -1,0 +1,101 @@
+x-bounded-logging: &bounded-logging
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-runtime-security: &runtime-security
+  image: "${POLKASWAP_INDEXER_IMAGE_REPOSITORY:?Set the reviewed image repository}@sha256:${POLKASWAP_INDEXER_IMAGE_DIGEST:?Set the reviewed 64-hex image digest}"
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 4m
+  read_only: true
+  user: "node"
+  logging: *bounded-logging
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 128
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=16m
+
+services:
+  migrate:
+    <<: *runtime-security
+    restart: "no"
+    command: ["node", "dist/src/scripts/production-migrate.js"]
+    healthcheck:
+      disable: true
+    environment:
+      NODE_ENV: production
+      STORAGE_ENGINE: postgres
+      DATABASE_URL: "${POLKASWAP_MIGRATION_OWNER_DATABASE_URL:?Set the separately managed PostgreSQL migration-owner URL}"
+      POLKASWAP_API_DATABASE_URL: "${POLKASWAP_API_DATABASE_URL:?Set the separately managed PostgreSQL API runtime URL}"
+      POLKASWAP_WORKER_DATABASE_URL: "${POLKASWAP_WORKER_DATABASE_URL:?Set the separately managed PostgreSQL worker runtime URL}"
+      POSTGRES_MIGRATION_QUERY_TIMEOUT_MS: "${POLKASWAP_POSTGRES_MIGRATION_QUERY_TIMEOUT_MS:-0}"
+      POSTGRES_MIGRATION_STATEMENT_TIMEOUT_MS: "${POLKASWAP_POSTGRES_MIGRATION_STATEMENT_TIMEOUT_MS:-0}"
+  api:
+    <<: *runtime-security
+    command: ["node", "dist/src/index.js"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:4350:4350"
+    environment:
+      NODE_ENV: production
+      STORAGE_ENGINE: postgres
+      DATABASE_URL: "${POLKASWAP_API_DATABASE_URL:?Set the separately managed PostgreSQL API runtime URL}"
+      SKIP_POSTGRES_MIGRATION: "true"
+      HOST: 0.0.0.0
+      PORT: "4350"
+      GRAPHQL_PATH: /graphql
+      GRAPHQL_HTTP_MAX_BODY_BYTES: "65536"
+      GRAPHQL_HTTP_MAX_IN_FLIGHT: "100"
+      HTTP_MAX_HEADER_BYTES: "16384"
+      HTTP_MAX_CONNECTIONS: "2048"
+      HTTP_MAX_REQUESTS_PER_SOCKET: "1000"
+      RATE_LIMIT_WINDOW_MS: "60000"
+      RATE_LIMIT_MAX: "50000"
+      RATE_LIMIT_MAX_KEYS: "20000"
+      RATE_LIMIT_GLOBAL_WINDOW_MS: "60000"
+      RATE_LIMIT_GLOBAL_MAX: "50000"
+      GRAPHQL_MAX_DEPTH: "12"
+      GRAPHQL_MAX_DOCUMENT_NODES: "2000"
+      GRAPHQL_MAX_FIELDS: "300"
+      GRAPHQL_MAX_ALIASES: "50"
+      GRAPHQL_MAX_FRAGMENT_SPREADS: "100"
+      GRAPHQL_MAX_OPERATION_COST: "100000"
+      GRAPHQL_ALLOW_INTROSPECTION: "false"
+      GRAPHQL_WS_MAX_PAYLOAD_BYTES: "65536"
+      GRAPHQL_WS_MAX_CONNECTIONS: "512"
+      GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT: "512"
+      GRAPHQL_WS_MAX_OPERATIONS: "1024"
+      GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION: "32"
+      GRAPHQL_WS_MAX_PENDING_MESSAGES_PER_CONNECTION: "64"
+      GRAPHQL_WS_CONNECTION_INIT_TIMEOUT_MS: "10000"
+  worker:
+    <<: *runtime-security
+    command: ["node", "dist/src/worker/index.js"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "dist/src/scripts/worker-health.js"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    environment:
+      NODE_ENV: production
+      STORAGE_ENGINE: postgres
+      DATABASE_URL: "${POLKASWAP_WORKER_DATABASE_URL:?Set the separately managed PostgreSQL worker runtime URL}"
+      SKIP_POSTGRES_MIGRATION: "true"
+      SORA_WS_ENDPOINT: "${POLKASWAP_SORA_WS_ENDPOINT:?Set the reviewed SORA mainnet WSS endpoint}"
+      SORA_ARCHIVE_WS_ENDPOINT: "${POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT:?Set an independently reviewed SORA mainnet archive WSS endpoint}"
+      CHAIN_START_BLOCK: "${POLKASWAP_CHAIN_START_BLOCK:?Set the reviewed first SORA block to index}"
+      PI_WORKER_HEALTH_TIMEOUT_MS: "4000"
+      CHAIN_BATCH_SIZE: "25"
+      CHAIN_STATE_REFRESH_INTERVAL_BLOCKS: "25"
+      CHAIN_SNAPSHOT_INTERVAL_BLOCKS: "25"

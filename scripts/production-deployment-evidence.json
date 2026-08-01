@@ -5,7 +5,7 @@
   "baseUrl": "https://pi.soramitsu.io/graphql",
   "status": "blocked",
   "releaseEnabled": false,
-  "lastReviewed": "2026-07-01",
+  "lastReviewed": "2026-07-13",
   "blockers": [
     "production-deployment-evidence-missing",
     "live-production-smoke-failing"
@@ -29,6 +29,8 @@
     "deployedAt",
     "smokePassedAt",
     "healthInfo",
+    "soraRpcControls",
+    "tlsEdgeControls",
     "operator"
   ],
   "deploymentEvidence": []

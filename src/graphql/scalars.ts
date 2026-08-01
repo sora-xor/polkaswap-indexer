@@ -1,4 +1,6 @@
-import { GraphQLScalarType, Kind, type ValueNode } from 'graphql';
+import { GraphQLError, GraphQLScalarType, Kind, type ValueNode } from 'graphql';
+
+import { MAX_REPOSITORY_CURSOR_LENGTH } from '../repository/cursor.js';
 
 type ScalarVariables = Record<string, unknown> | null | undefined;
 
@@ -44,7 +46,25 @@ const opaqueScalar = (name: string, description: string) =>
     parseLiteral: parseObjectLiteral,
   });
 
-export const CursorScalar = opaqueScalar('Cursor', 'Opaque pagination cursor.');
+const parseCursor = (value: unknown): string => {
+  if (typeof value !== 'string') throw new GraphQLError('Cursor must be an opaque string');
+  // SubQuery clients use the empty string as their first-page sentinel.
+  if (value.length > MAX_REPOSITORY_CURSOR_LENGTH) {
+    throw new GraphQLError(`Cursor must contain at most ${MAX_REPOSITORY_CURSOR_LENGTH} characters`);
+  }
+  return value;
+};
+
+export const CursorScalar = new GraphQLScalarType({
+  name: 'Cursor',
+  description: 'Opaque, connection-scoped keyset pagination cursor.',
+  serialize: parseCursor,
+  parseValue: parseCursor,
+  parseLiteral: (ast) => {
+    if (ast.kind !== Kind.STRING) throw new GraphQLError('Cursor literal must be a string');
+    return parseCursor(ast.value);
+  },
+});
 export const OrderByScalar = opaqueScalar('OrderBy', 'SubQuery-compatible order-by token.');
 
 export const FilterScalars = {
