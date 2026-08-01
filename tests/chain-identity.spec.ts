@@ -8,7 +8,7 @@ import {
   SORA_MAINNET_GENESIS_HASH,
 } from '../src/soraIdentity.js';
 
-import type { IndexerDocument } from '../src/repository/types.js';
+import type { IndexerDocument, IndexerRepository } from '../src/repository/types.js';
 
 const config = {
   host: '0.0.0.0',
@@ -50,8 +50,25 @@ type TestIndexer = {
   indexFetchedBlock: (fetched: unknown) => Promise<void>;
 };
 
-const testIndexer = (repository = new MemoryRepository()): TestIndexer =>
+const testIndexer = (repository: IndexerRepository = new MemoryRepository()): TestIndexer =>
   new ChainIndexer(config, repository) as unknown as TestIndexer;
+
+const withDocumentReadOverride = (
+  repository: MemoryRepository,
+  document: IndexerDocument,
+): IndexerRepository => new Proxy(repository, {
+  get(target, property) {
+    if (property === 'get') {
+      return async (collection: IndexerDocument['collection'], id: string) => {
+        if (collection === document.collection && id === document.id) return structuredClone(document);
+        return target.get(collection, id);
+      };
+    }
+
+    const value = Reflect.get(target, property, target) as unknown;
+    return typeof value === 'function' ? value.bind(target) : value;
+  },
+});
 
 const codec = (value: unknown) => ({ toString: () => String(value) });
 
@@ -489,9 +506,10 @@ describe('PI worker exact SORA mainnet identity', () => {
     if (mutation.snapshot) Object.assign(snapshot, mutation.snapshot);
     if (mutation.snapshotData) Object.assign(snapshot.data, mutation.snapshotData);
     const documents = [chainIdentityDocument(), currentChainStateDocument()];
-    if (!mutation.omitSnapshot) documents.push(snapshot);
     await repository.upsertMany(documents);
-    const indexer = testIndexer(repository);
+    const indexer = testIndexer(
+      mutation.omitSnapshot ? repository : withDocumentReadOverride(repository, snapshot),
+    );
     indexer.api = liveApiForIdentityAndState({
       stateHash: mutation.stateHash ?? STATE_HASH,
       stateTimestamp: mutation.stateTimestamp ?? STATE_TIMESTAMP,
@@ -640,16 +658,18 @@ describe('PI worker exact SORA mainnet identity', () => {
         data: JSON.stringify({ lastIndexedBlock: stateBlock }),
       },
     });
-    if (!mutation.omitSnapshot) {
-      await repository.upsert({
+    const snapshot = mutation.omitSnapshot
+      ? null
+      : {
         collection: 'networkSnapshots',
         id: `block-${SORA_LEGACY_IDENTITY_ANCHOR.block}`,
         blockHeight: snapshotBlock,
         timestamp: snapshotTimestamp,
         data: { id: snapshotId, type: snapshotType, timestamp: snapshotTimestamp },
-      });
-    }
-    const indexer = testIndexer(repository);
+      } satisfies IndexerDocument;
+    const indexer = testIndexer(
+      snapshot === null ? repository : withDocumentReadOverride(repository, snapshot),
+    );
     indexer.api = liveApiForCheckpoint(
       SORA_LEGACY_IDENTITY_ANCHOR.block,
       mutation.liveHash ?? SORA_LEGACY_IDENTITY_ANCHOR.hash,

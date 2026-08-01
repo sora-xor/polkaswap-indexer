@@ -31,6 +31,7 @@ type GraphQlResponse = {
 
 type HealthInfo = {
   ok?: unknown;
+  repositoryReady?: unknown;
   service?: unknown;
   serviceId?: unknown;
   schemaVersion?: unknown;
@@ -43,6 +44,17 @@ type HealthInfo = {
   latestIndexedBlock?: unknown;
   latestIndexedBlockHash?: unknown;
   latestIndexedAt?: unknown;
+  workerAvailable?: unknown;
+  workerReady?: unknown;
+  workerReadinessReason?: unknown;
+  workerLifecycle?: unknown;
+  workerStartupComplete?: unknown;
+  workerLatestFinalizedBlock?: unknown;
+  workerLatestIndexedBlock?: unknown;
+  workerLag?: unknown;
+  workerLastSuccessfulIndexTimestamp?: unknown;
+  workerLastError?: unknown;
+  workerLastErrorTimestamp?: unknown;
   lastMasterSeqno?: unknown;
 };
 
@@ -75,6 +87,7 @@ const PRODUCTION_SMOKE_QUERY = /* GraphQL */ `
   query PolkaswapProductionSmoke {
     _health {
       ok
+      repositoryReady
       service
       serviceId
       schemaVersion
@@ -87,6 +100,17 @@ const PRODUCTION_SMOKE_QUERY = /* GraphQL */ `
       latestIndexedBlock
       latestIndexedBlockHash
       latestIndexedAt
+      workerAvailable
+      workerReady
+      workerReadinessReason
+      workerLifecycle
+      workerStartupComplete
+      workerLatestFinalizedBlock
+      workerLatestIndexedBlock
+      workerLag
+      workerLastSuccessfulIndexTimestamp
+      workerLastError
+      workerLastErrorTimestamp
     }
     chainIdentity: updatesStream(id: "chainIdentity") {
       id
@@ -351,9 +375,11 @@ async function fetchGraphQl(
         method: 'POST',
         headers: {
           accept: 'application/graphql-response+json, application/json',
+          'cache-control': 'no-store',
           'content-type': 'application/json',
         },
         body: JSON.stringify({ query: PRODUCTION_SMOKE_QUERY }),
+        cache: 'no-store',
         redirect: 'manual',
         signal: controller.signal,
       });
@@ -427,7 +453,7 @@ function assertHealthContract(health: HealthInfo): void {
       `PI production health is not ready: expected ok=true, received keys ${objectKeys(health)}. ${PI_HEALTH_DEPLOYMENT_HINT}`
     );
   }
-
+  assertHealthField(health.repositoryReady, true, 'health repositoryReady must be true');
   assertHealthField(health.service, 'polkaswap-indexer', 'health service must be polkaswap-indexer');
   assertHealthField(health.serviceId, 'pi.soramitsu.io', 'health serviceId must be pi.soramitsu.io');
   assertHealthField(health.schemaVersion, 1, 'health schemaVersion must be 1');
@@ -441,6 +467,46 @@ function assertHealthContract(health: HealthInfo): void {
     SORA_MAINNET_GENESIS_HASH,
     `health genesisHash must be the reviewed SORA mainnet genesis ${SORA_MAINNET_GENESIS_HASH}`,
   );
+  assertHealthField(health.workerAvailable, true, 'production health must expose a shared worker status');
+  assertHealthField(health.workerReady, true, 'available worker must be ready');
+  assertHealthField(health.workerReadinessReason, null, 'ready worker must not have a readiness failure reason');
+  assertHealthField(health.workerLifecycle, 'running', 'ready worker lifecycle must be running');
+  assertHealthField(health.workerStartupComplete, true, 'ready worker startup must be complete');
+
+  for (const [name, value] of [
+    ['workerLatestFinalizedBlock', health.workerLatestFinalizedBlock],
+    ['workerLatestIndexedBlock', health.workerLatestIndexedBlock],
+    ['workerLag', health.workerLag],
+    ['workerLastSuccessfulIndexTimestamp', health.workerLastSuccessfulIndexTimestamp],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || Number(value) < 0) {
+      throw new Error(`health ${name} must be a non-negative safe integer`);
+    }
+  }
+
+  if (Number(health.workerLatestIndexedBlock) > Number(health.workerLatestFinalizedBlock)) {
+    throw new Error('health workerLatestIndexedBlock must not exceed workerLatestFinalizedBlock');
+  }
+  const expectedLag = Number(health.workerLatestFinalizedBlock) - Number(health.workerLatestIndexedBlock);
+  assertHealthField(health.workerLag, expectedLag, 'health workerLag must match finalized minus indexed blocks');
+  if (Number(health.workerLastSuccessfulIndexTimestamp) === 0) {
+    throw new Error('health workerLastSuccessfulIndexTimestamp must be positive');
+  }
+  if (
+    health.workerLastError !== null &&
+    (typeof health.workerLastError !== 'string' || health.workerLastError.length > 1_000)
+  ) {
+    throw new Error('health workerLastError must be null or a string');
+  }
+  if (
+    health.workerLastErrorTimestamp !== null &&
+    (!Number.isSafeInteger(health.workerLastErrorTimestamp) || Number(health.workerLastErrorTimestamp) < 0)
+  ) {
+    throw new Error('health workerLastErrorTimestamp must be null or a non-negative safe integer');
+  }
+  if ((health.workerLastError === null) !== (health.workerLastErrorTimestamp === null)) {
+    throw new Error('health worker error and timestamp must either both be present or both be null');
+  }
 }
 
 function parseProbeJson(probe: UpdateStreamProbe, label: string): unknown {
@@ -542,7 +608,6 @@ export async function runProductionSmoke(
     state.blockTimestamp,
     'health latestIndexedAt must match chainState',
   );
-
   const latestSnapshot = payload.data.networkSnapshots?.nodes?.[0];
   if (!latestSnapshot || latestSnapshot.type !== 'BLOCK' ||
       latestSnapshot.id !== `block-${state.lastIndexedBlock}` ||

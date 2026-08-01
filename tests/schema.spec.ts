@@ -1,12 +1,25 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { GraphQLObjectType, GraphQLResolveInfo } from 'graphql';
 
-import { createSchema } from '../src/graphql/resolvers.js';
+import {
+  NETWORK_ACCOUNT_ACTIVITY_MAX_DOCUMENTS,
+  NETWORK_ACCOUNT_ACTIVITY_MAX_RANGE_SECONDS,
+  createSchema,
+  subscriptionDocumentFingerprint,
+} from '../src/graphql/resolvers.js';
 import { MemoryRepository } from '../src/repository/memory.js';
+import {
+  createRepositoryCursorScope,
+  decodeRepositoryCursor,
+  encodeRepositoryCursor,
+} from '../src/repository/cursor.js';
+import { SORA_LEGACY_IDENTITY_ANCHOR, SORA_MAINNET_GENESIS_HASH } from '../src/soraIdentity.js';
 
-import type { IndexerRepository, RepositoryQueryArgs } from '../src/repository/types.js';
+import type { IndexerDocument, IndexerRepository, RepositoryQueryArgs } from '../src/repository/types.js';
 
 type QueryFunction = NonNullable<IndexerRepository['query']>;
+
+const opaqueCursor = () => expect.stringMatching(/^psc2\./);
 
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
@@ -21,13 +34,6 @@ const ss58FixtureAccount = (index: number): string => {
 
   return encoded.padStart(48, '1');
 };
-
-const completedAccountActivityBackfillData = JSON.stringify({
-  processedDocuments: 1,
-  writtenDocuments: 1,
-  lastIndexedBlock: 1,
-  lastTimestamp: 1,
-});
 
 const repositoryWithQuery = (query: QueryFunction): IndexerRepository => ({
   list: async () => [],
@@ -50,13 +56,89 @@ const repositoryWithoutQuery = (items: Awaited<ReturnType<IndexerRepository['lis
   close: async () => undefined,
 });
 
+const VALID_CHAIN_STATE_BLOCK = SORA_LEGACY_IDENTITY_ANCHOR.block + 100;
+const VALID_CHAIN_STATE_HASH = `0x${'ab'.repeat(32)}`;
+
+const seedValidChainCheckpoint = async (repository: MemoryRepository, timestamp: number): Promise<void> => {
+  await repository.upsertMany([
+    {
+      collection: 'updatesStreams',
+      id: 'chainIdentity',
+      blockHeight: SORA_LEGACY_IDENTITY_ANCHOR.block,
+      timestamp: SORA_LEGACY_IDENTITY_ANCHOR.timestamp,
+      data: {
+        id: 'chainIdentity',
+        block: SORA_LEGACY_IDENTITY_ANCHOR.block,
+        data: JSON.stringify({
+          schemaVersion: 1,
+          genesisHash: SORA_MAINNET_GENESIS_HASH,
+          verificationBlock: SORA_LEGACY_IDENTITY_ANCHOR.block,
+          verificationBlockHash: SORA_LEGACY_IDENTITY_ANCHOR.hash,
+          verificationBlockTimestamp: SORA_LEGACY_IDENTITY_ANCHOR.timestamp,
+          migration: 'fresh-database',
+        }),
+      },
+    },
+    {
+      collection: 'updatesStreams',
+      id: 'chainState',
+      blockHeight: VALID_CHAIN_STATE_BLOCK,
+      timestamp,
+      data: {
+        id: 'chainState',
+        block: VALID_CHAIN_STATE_BLOCK,
+        data: JSON.stringify({
+          lastIndexedBlock: VALID_CHAIN_STATE_BLOCK,
+          genesisHash: SORA_MAINNET_GENESIS_HASH,
+          blockHash: VALID_CHAIN_STATE_HASH,
+          blockTimestamp: timestamp,
+        }),
+      },
+    },
+  ]);
+};
+
 describe('Polkaswap indexer schema', () => {
-  it('reports unhealthy until an exact mainnet identity and fresh checkpoint exist', async () => {
+  it('uses fixed-size polling fingerprints instead of retaining serialized subscription payloads', () => {
+    const large = { id: 'large', payload: 'x'.repeat(2 * 1_024 * 1_024) };
+    const fingerprint = subscriptionDocumentFingerprint(large);
+
+    expect(fingerprint).toHaveLength(43);
+    expect(subscriptionDocumentFingerprint(large)).toBe(fingerprint);
+    expect(subscriptionDocumentFingerprint({ ...large, id: 'changed' })).not.toBe(fingerprint);
+  });
+
+  it('keeps detailed worker health fields nullable while a heartbeat is unavailable', () => {
+    const health = createSchema().getType('Health') as GraphQLObjectType;
+
+    expect(String(health.getFields().workerAvailable?.type)).toBe('Boolean!');
+    for (const field of [
+      'genesisHash',
+      'latestIndexedBlock',
+      'latestIndexedBlockHash',
+      'latestIndexedAt',
+      'workerReady',
+      'workerReadinessReason',
+      'workerLifecycle',
+      'workerStartupComplete',
+      'workerLatestFinalizedBlock',
+      'workerLatestIndexedBlock',
+      'workerLag',
+      'workerLastSuccessfulIndexTimestamp',
+      'workerLastError',
+      'workerLastErrorTimestamp',
+    ]) {
+      expect(String(health.getFields()[field]?.type).endsWith('!')).toBe(false);
+    }
+  });
+
+  it('exposes a repository-backed health resolver', async () => {
     const schema = createSchema();
     const healthField = schema.getQueryType()?.getFields()._health;
 
     await expect(healthField?.resolve?.({}, {}, { repository: new MemoryRepository() }, {} as never)).resolves.toEqual({
       ok: false,
+      repositoryReady: true,
       service: 'polkaswap-indexer',
       serviceId: 'pi.soramitsu.io',
       schemaVersion: 1,
@@ -69,6 +151,17 @@ describe('Polkaswap indexer schema', () => {
       latestIndexedBlock: null,
       latestIndexedBlockHash: null,
       latestIndexedAt: null,
+      workerAvailable: false,
+      workerReady: false,
+      workerReadinessReason: 'status-unavailable',
+      workerLifecycle: null,
+      workerStartupComplete: null,
+      workerLatestFinalizedBlock: null,
+      workerLatestIndexedBlock: null,
+      workerLag: null,
+      workerLastSuccessfulIndexTimestamp: null,
+      workerLastError: null,
+      workerLastErrorTimestamp: null,
     });
   });
 
@@ -82,6 +175,7 @@ describe('Polkaswap indexer schema', () => {
 
     await expect(healthField?.resolve?.({}, {}, { repository }, {} as never)).resolves.toEqual({
       ok: false,
+      repositoryReady: false,
       service: 'polkaswap-indexer',
       serviceId: 'pi.soramitsu.io',
       schemaVersion: 1,
@@ -94,6 +188,102 @@ describe('Polkaswap indexer schema', () => {
       latestIndexedBlock: null,
       latestIndexedBlockHash: null,
       latestIndexedAt: null,
+      workerAvailable: false,
+      workerReady: false,
+      workerReadinessReason: 'status-unavailable',
+      workerLifecycle: null,
+      workerStartupComplete: null,
+      workerLatestFinalizedBlock: null,
+      workerLatestIndexedBlock: null,
+      workerLag: null,
+      workerLastSuccessfulIndexTimestamp: null,
+      workerLastError: null,
+      workerLastErrorTimestamp: null,
+    });
+  });
+
+  it('requires worker readiness when a combined-mode status provider is present', async () => {
+    const healthField = createSchema().getQueryType()?.getFields()._health;
+    const now = Math.floor(Date.now() / 1_000);
+    const workerStatusProvider = {
+      getStatus: () => ({
+        lifecycle: 'running' as const,
+        startupComplete: true,
+        latestFinalizedBlock: 1_000,
+        latestIndexedBlock: 900,
+        lag: 100,
+        lastSuccessfulIndexTimestamp: now,
+        lastError: null,
+        lastErrorTimestamp: null,
+      }),
+    };
+
+    await expect(
+      healthField?.resolve?.(
+        {},
+        {},
+        {
+          repository: new MemoryRepository(),
+          workerStatusProvider,
+          workerReadinessThresholds: { maxLagBlocks: 25, maxStalenessSeconds: 120 },
+        },
+        {} as never
+      )
+    ).resolves.toMatchObject({
+      ok: false,
+      repositoryReady: true,
+      workerAvailable: true,
+      workerReady: false,
+      workerReadinessReason: 'lag-exceeded',
+      workerLifecycle: 'running',
+      workerLag: 100,
+    });
+  });
+
+  it('reports detailed ready worker status when the chain checkpoint is also valid', async () => {
+    const healthField = createSchema().getQueryType()?.getFields()._health;
+    const now = Math.floor(Date.now() / 1_000);
+    const repository = new MemoryRepository();
+    await seedValidChainCheckpoint(repository, now);
+    const workerStatusProvider = {
+      getStatus: () => ({
+        lifecycle: 'running' as const,
+        startupComplete: true,
+        latestFinalizedBlock: VALID_CHAIN_STATE_BLOCK + 5,
+        latestIndexedBlock: VALID_CHAIN_STATE_BLOCK,
+        lag: 5,
+        lastSuccessfulIndexTimestamp: now,
+        lastError: null,
+        lastErrorTimestamp: null,
+      }),
+    };
+
+    await expect(
+      healthField?.resolve?.(
+        {},
+        {},
+        {
+          repository,
+          workerStatusProvider,
+          workerReadinessThresholds: { maxLagBlocks: 25, maxStalenessSeconds: 120 },
+        },
+        {} as never
+      )
+    ).resolves.toMatchObject({
+      ok: true,
+      genesisHash: SORA_MAINNET_GENESIS_HASH,
+      latestIndexedBlock: VALID_CHAIN_STATE_BLOCK,
+      latestIndexedBlockHash: VALID_CHAIN_STATE_HASH,
+      latestIndexedAt: now,
+      workerAvailable: true,
+      workerReady: true,
+      workerReadinessReason: null,
+      workerLifecycle: 'running',
+      workerStartupComplete: true,
+      workerLatestFinalizedBlock: VALID_CHAIN_STATE_BLOCK + 5,
+      workerLatestIndexedBlock: VALID_CHAIN_STATE_BLOCK,
+      workerLag: 5,
+      workerLastSuccessfulIndexTimestamp: now,
     });
   });
 
@@ -231,7 +421,7 @@ describe('Polkaswap indexer schema', () => {
 
     const markets = await marketsField?.resolve?.(
       {},
-      { first: 10, orderBy: ['VOLUME_USD_DESC'] },
+      { first: 10, orderBy: ['ID_ASC'] },
       { repository },
       {} as GraphQLResolveInfo
     );
@@ -401,6 +591,138 @@ describe('Polkaswap indexer schema', () => {
     });
   });
 
+  it('serves compact Polkamarkt signals from indexed documents', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'markets',
+        id: '1',
+        blockHeight: 10,
+        timestamp: 100,
+        data: {
+          id: '1',
+          marketId: 1,
+          title: 'Open market',
+          creator: 'alice',
+          status: 'Open',
+          liquidityUSD: '100',
+          volumeUSD: '10',
+        },
+      },
+      {
+        collection: 'markets',
+        id: '2',
+        blockHeight: 20,
+        timestamp: 200,
+        data: {
+          id: '2',
+          marketId: 2,
+          title: 'Resolved market',
+          creator: 'bob',
+          status: 'Resolved',
+          resolutionOutcome: 'Yes',
+          closeBlock: 50,
+          liquidityUSD: '0',
+          volumeUSD: '20',
+        },
+      },
+      {
+        collection: 'marketSnapshots',
+        id: 'snapshot-2-default',
+        blockHeight: 45,
+        timestamp: 150,
+        data: {
+          id: 'snapshot-2-default',
+          marketId: 2,
+          type: 'DEFAULT',
+          blockHeight: 45,
+          timestamp: 150,
+          probability: 75,
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: 'history-a',
+        timestamp: 210,
+        data: {
+          id: 'history-a',
+          module: 'polkamarkt',
+          address: 'charlie',
+          dataFrom: 'alice',
+        },
+      },
+      {
+        collection: 'networkSnapshots',
+        id: 'network-old',
+        timestamp: 100,
+        data: { id: 'network-old', type: 'DAY', timestamp: 100, accounts: 1, liquidityUSD: '50', volumeUSD: '5' },
+      },
+      {
+        collection: 'networkSnapshots',
+        id: 'network-new',
+        timestamp: 200,
+        data: { id: 'network-new', type: 'DAY', timestamp: 200, accounts: 3, liquidityUSD: '100', volumeUSD: '30' },
+      },
+    ]);
+
+    const signalsField = createSchema().getQueryType()?.getFields().polkamarktSignals;
+    const signals = await signalsField?.resolve?.({}, {}, { repository }, {} as never);
+
+    expect(signals).toMatchObject({
+      totalVolumeUsd: 30,
+      activeMarkets: 1,
+      activeAccounts: 3,
+      liquidityUsd: 100,
+      answerBreakdown: [],
+      liquiditySeries: [
+        { value: 50 },
+        { value: 100 },
+      ],
+      accuracySummary: {
+        scoredMarkets: 1,
+        resolvedMarkets: 1,
+        correctMarkets: 1,
+        accuracyPercent: 100,
+        averageConfidencePercent: 75,
+        latest: {
+          marketId: 2,
+          title: 'Resolved market',
+          outcome: 'YES',
+          predictedOutcome: 'YES',
+          confidencePercent: 75,
+          yesProbability: 75,
+          correct: true,
+        },
+      },
+      accuracySeries: [{ value: 100, correctMarkets: 1, scoredMarkets: 1 }],
+    });
+  });
+
+  it('requests Polkamarkt signal top-N documents without total counts', async () => {
+    const queryCalls: Array<{ collection: string; args: RepositoryQueryArgs }> = [];
+    const repository = repositoryWithQuery(async (collection, args) => {
+      queryCalls.push({ collection, args });
+
+      return {
+        items: [],
+        totalCount: args.includeTotalCount === false ? null : 0,
+      };
+    });
+    const signalsField = createSchema().getQueryType()?.getFields().polkamarktSignals;
+
+    await signalsField?.resolve?.({}, {}, { repository }, {} as never);
+
+    expect(queryCalls).toHaveLength(3);
+    expect(queryCalls.map((call) => call.collection)).toEqual(['markets', 'historyElements', 'networkSnapshots']);
+    expect(queryCalls.map((call) => call.args.includeTotalCount)).toEqual([false, false, false]);
+    expect(queryCalls.map((call) => call.args.first)).toEqual([1_000, 1_000, 8]);
+    expect(queryCalls.map((call) => call.args.maxBytes)).toEqual([
+      64 * 1_024 * 1_024,
+      64 * 1_024 * 1_024,
+      64 * 1_024 * 1_024,
+    ]);
+  });
+
   it('serves the stats page GraphQL data from network snapshots', async () => {
     const repository = new MemoryRepository();
     await repository.upsertMany([
@@ -496,7 +818,7 @@ describe('Polkaswap indexer schema', () => {
     expect(networkSnapshots).toMatchObject({
       edges: [
         {
-          cursor: '0',
+          cursor: opaqueCursor(),
           node: {
             id: 'network-hour',
             type: 'HOUR',
@@ -519,10 +841,10 @@ describe('Polkaswap indexer schema', () => {
       ],
       totalCount: 1,
       pageInfo: {
-        endCursor: '0',
+        endCursor: opaqueCursor(),
         hasNextPage: false,
         hasPreviousPage: false,
-        startCursor: '0',
+        startCursor: opaqueCursor(),
       },
     });
   });
@@ -566,30 +888,6 @@ describe('Polkaswap indexer schema', () => {
         timestamp: 170,
         data: { id: 'tx-f-malformed', accountId: '<script>alert(1)</script>', historyElementId: 'tx-f', timestamp: 170 },
       },
-      {
-        collection: 'historyElements',
-        id: 'legacy-carol',
-        timestamp: 180,
-        data: {
-          id: 'legacy-carol',
-          timestamp: 180,
-          address: 'carol',
-          dataFrom: '0xexternal',
-          dataTo: 'dave',
-        },
-      },
-      {
-        collection: 'historyElements',
-        id: 'legacy-malformed',
-        timestamp: 190,
-        data: {
-          id: 'legacy-malformed',
-          timestamp: 190,
-          address: 'not an account',
-          dataFrom: { account: 'eve' },
-          dataTo: '0XABCDEF',
-        },
-      },
     ]);
 
     const schema = createSchema();
@@ -599,37 +897,7 @@ describe('Polkaswap indexer schema', () => {
       id: 'network-account-activity-90-220',
       from: 90,
       to: 220,
-      activeAccounts: 4,
-    });
-  });
-
-  it('falls back to legacy history when the activity backfill marker is corrupt', async () => {
-    const repository = new MemoryRepository();
-    await repository.upsertMany([
-      {
-        collection: 'accountTransactions',
-        id: 'tx-a-alice',
-        timestamp: 100,
-        data: { id: 'tx-a-alice', accountId: 'alice', historyElementId: 'tx-a', timestamp: 100 },
-      },
-      {
-        collection: 'historyElements',
-        id: 'legacy-bob',
-        timestamp: 120,
-        data: { id: 'legacy-bob', timestamp: 120, address: 'bob', dataFrom: '0xexternal', dataTo: 'carol' },
-      },
-      {
-        collection: 'updatesStreams',
-        id: 'accountTransactionsBackfill-v1',
-        data: { id: 'accountTransactionsBackfill-v1', data: 'not-json' },
-      },
-    ]);
-
-    const schema = createSchema();
-    const activityField = schema.getQueryType()?.getFields().networkAccountActivity;
-
-    await expect(activityField?.resolve?.({}, { from: 90, to: 130 }, { repository }, {} as never)).resolves.toMatchObject({
-      activeAccounts: 3,
+      activeAccounts: 2,
     });
   });
 
@@ -667,17 +935,6 @@ describe('Polkaswap indexer schema', () => {
         id: 'paged-after-range',
         timestamp: 131,
         data: { id: 'paged-after-range', accountId: ss58FixtureAccount(1_007), historyElementId: 'paged-after-range', timestamp: 131 },
-      },
-      {
-        collection: 'historyElements',
-        id: 'legacy-ignored-after-valid-backfill',
-        timestamp: 120,
-        data: { id: 'legacy-ignored-after-valid-backfill', address: 'bob', timestamp: 120 },
-      },
-      {
-        collection: 'updatesStreams',
-        id: 'accountTransactionsBackfill-v1',
-        data: { id: 'accountTransactionsBackfill-v1', data: completedAccountActivityBackfillData },
       },
     ]);
 
@@ -718,6 +975,54 @@ describe('Polkaswap indexer schema', () => {
     expect(getSpy).not.toHaveBeenCalled();
   });
 
+  it('rejects whole-chain account activity ranges before repository access', async () => {
+    const repository = new MemoryRepository();
+    const querySpy = vi.spyOn(repository, 'query');
+    const getSpy = vi.spyOn(repository, 'get');
+    const activityField = createSchema().getQueryType()?.getFields().networkAccountActivity;
+
+    await expect(
+      activityField?.resolve?.(
+        {},
+        { from: 0, to: NETWORK_ACCOUNT_ACTIVITY_MAX_RANGE_SECONDS + 1 },
+        { repository },
+        {} as never
+      )
+    ).rejects.toThrow('range exceeds');
+    expect(querySpy).not.toHaveBeenCalled();
+    expect(getSpy).not.toHaveBeenCalled();
+  });
+
+  it('applies one document budget across seek-paginated account activity scans', async () => {
+    const pageSize = 1_000;
+    const page = Array.from({ length: pageSize }, (_item, index) => ({
+      collection: 'accountTransactions' as const,
+      id: `budget-${String(index).padStart(4, '0')}`,
+      timestamp: 100,
+      data: { id: `budget-${index}`, accountId: ss58FixtureAccount(0), timestamp: 100 },
+    }));
+    const query = vi.fn<QueryFunction>().mockResolvedValue({
+      items: page,
+      itemCursors: [],
+      totalCount: null,
+      pageStart: 0,
+      hasNextPage: true,
+      hasPreviousPage: false,
+    });
+    const repository = repositoryWithQuery(query);
+    const activityField = createSchema().getQueryType()?.getFields().networkAccountActivity;
+
+    await expect(
+      activityField?.resolve?.({}, { from: 90, to: 130 }, { repository }, {} as never)
+    ).rejects.toThrow(`${NETWORK_ACCOUNT_ACTIVITY_MAX_DOCUMENTS}-document scan budget`);
+    expect(query).toHaveBeenCalledTimes(NETWORK_ACCOUNT_ACTIVITY_MAX_DOCUMENTS / pageSize);
+    expect(query).toHaveBeenNthCalledWith(
+      1,
+      'accountTransactions',
+      expect.objectContaining({ maxBytes: 8 * 1_024 * 1_024 })
+    );
+  });
+
   it('normalizes reversed active-account ranges before cache lookup', async () => {
     const repository = new MemoryRepository();
     await repository.upsertMany([
@@ -726,11 +1031,6 @@ describe('Polkaswap indexer schema', () => {
         id: 'tx-a-alice',
         timestamp: 100,
         data: { id: 'tx-a-alice', accountId: 'alice', historyElementId: 'tx-a', timestamp: 100 },
-      },
-      {
-        collection: 'updatesStreams',
-        id: 'accountTransactionsBackfill-v1',
-        data: { id: 'accountTransactionsBackfill-v1', data: completedAccountActivityBackfillData },
       },
     ]);
     const querySpy = vi.spyOn(repository, 'query');
@@ -748,7 +1048,7 @@ describe('Polkaswap indexer schema', () => {
     expect(querySpy).toHaveBeenCalledTimes(1);
   });
 
-  it('uses account transaction rows only after the legacy activity backfill is marked complete', async () => {
+  it('uses only account transaction rows for activity', async () => {
     const repository = new MemoryRepository();
     await repository.upsertMany([
       {
@@ -756,20 +1056,6 @@ describe('Polkaswap indexer schema', () => {
         id: 'tx-a-alice',
         timestamp: 100,
         data: { id: 'tx-a-alice', accountId: 'alice', historyElementId: 'tx-a', timestamp: 100 },
-      },
-      {
-        collection: 'historyElements',
-        id: 'legacy-bob',
-        timestamp: 120,
-        data: { id: 'legacy-bob', timestamp: 120, address: 'bob', dataFrom: 'bob', dataTo: 'carol' },
-      },
-      {
-        collection: 'updatesStreams',
-        id: 'accountTransactionsBackfill-v1',
-        data: {
-          id: 'accountTransactionsBackfill-v1',
-          data: completedAccountActivityBackfillData,
-        },
       },
     ]);
 
@@ -793,6 +1079,15 @@ describe('Polkaswap indexer schema', () => {
           id: 'history-a-alice',
           accountId: 'alice',
           historyElementId: 'history-a',
+          marketId: 7,
+          side: 'buy',
+          outcome: 'YES',
+          toOutcome: 'YES',
+          collateralUsd: '5',
+          shares: '10',
+          sharesIn: '10',
+          price: '0.5',
+          blockHash: '0xabc',
           blockHeight: 12,
           timestamp: 200,
         },
@@ -845,6 +1140,7 @@ describe('Polkaswap indexer schema', () => {
     const queryFields = schema.getQueryType()?.getFields();
     const positionsField = queryFields?.accountPositions;
     const tradesField = queryFields?.accountTrades;
+    const getManySpy = vi.spyOn(repository, 'getMany');
     const accountTradeFields = (schema.getType('AccountTrade') as GraphQLObjectType | undefined)?.getFields() ?? {};
 
     expect(positionsField?.args.map((arg) => arg.name)).toContain('where');
@@ -901,6 +1197,7 @@ describe('Polkaswap indexer schema', () => {
       extrinsicHash: 'history-a',
       market: { id: '7', marketId: 7 },
     });
+    expect(getManySpy).not.toHaveBeenCalled();
   });
 
   it('merges Polkamarkt account position account aliases with caller filters', async () => {
@@ -1006,7 +1303,7 @@ describe('Polkaswap indexer schema', () => {
       totalCount: 1,
       edges: [
         {
-          cursor: '0',
+          cursor: opaqueCursor(),
           node: {
             id: 'asset-a',
             priceUSD: '2',
@@ -1016,12 +1313,219 @@ describe('Polkaswap indexer schema', () => {
         },
       ],
       pageInfo: {
-        endCursor: '0',
+        endCursor: opaqueCursor(),
         hasNextPage: false,
         hasPreviousPage: false,
-        startCursor: '0',
+        startCursor: opaqueCursor(),
       },
     });
+  });
+
+  it('emits scoped opaque keyset cursors and rejects order mismatches', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'assets',
+        id: 'asset-a',
+        timestamp: 10,
+        data: { id: 'asset-a', timestamp: 10, priceUSD: '1', liquidity: '1', liquidityBooks: '0' },
+      },
+      {
+        collection: 'assets',
+        id: 'asset-b',
+        timestamp: 20,
+        data: { id: 'asset-b', timestamp: 20, priceUSD: '2', liquidity: '1', liquidityBooks: '0' },
+      },
+    ]);
+    const query = vi.spyOn(repository, 'query');
+    const assetsField = createSchema().getQueryType()?.getFields().assets;
+    const firstPage = (await assetsField?.resolve?.(
+      {},
+      { first: 1, orderBy: ['ID_ASC'] },
+      { repository },
+      {} as never
+    )) as { edges: Array<{ cursor: string; node: { id: string } }> };
+    const cursor = firstPage.edges[0]?.cursor;
+
+    expect(cursor).toMatch(/^psc2\./);
+    expect(decodeRepositoryCursor(cursor)).toEqual({
+      scope: createRepositoryCursorScope('assets', ['ID_ASC'], undefined),
+      field: 'id',
+      direction: 'asc',
+      numeric: false,
+      value: 'asset-a',
+      id: 'asset-a',
+    });
+
+    const secondPage = (await assetsField?.resolve?.(
+      {},
+      { first: 1, after: cursor, orderBy: ['ID_ASC'] },
+      { repository },
+      {} as never
+    )) as { edges: Array<{ cursor: string; node: { id: string } }> };
+
+    expect(secondPage.edges.map((edge) => edge.node.id)).toEqual(['asset-b']);
+    expect(query.mock.calls[1]?.[1]).toMatchObject({
+      after: null,
+      keyset: {
+        scope: createRepositoryCursorScope('assets', ['ID_ASC'], undefined),
+        field: 'id',
+        direction: 'asc',
+        value: 'asset-a',
+        id: 'asset-a',
+      },
+    });
+    expect(decodeRepositoryCursor(secondPage.edges[0]?.cursor)).toMatchObject({
+      id: 'asset-b',
+      value: 'asset-b',
+    });
+
+    await expect(
+      assetsField?.resolve?.(
+        {},
+        { first: 1, after: cursor, orderBy: ['ID_DESC'] },
+        { repository },
+        {} as never
+      )
+    ).rejects.toThrow('Pagination cursor does not match the requested order');
+    await expect(
+      assetsField?.resolve?.(
+        {},
+        { first: 1, after: 'psc2.not-valid-base64', orderBy: ['ID_ASC'] },
+        { repository },
+        {} as never
+      )
+    ).rejects.toThrow('Invalid pagination cursor');
+  });
+
+  it('fails closed for cursor replay, unbounded pages, and adversarial connection inputs', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'assets',
+        id: 'asset-a',
+        timestamp: 10,
+        data: { id: 'asset-a', timestamp: 10, liquidity: '1', liquidityBooks: '0' },
+      },
+      {
+        collection: 'assets',
+        id: 'asset-b',
+        timestamp: 20,
+        data: { id: 'asset-b', timestamp: 20, liquidity: '2', liquidityBooks: '0' },
+      },
+    ]);
+    const query = vi.spyOn(repository, 'query');
+    const schema = createSchema();
+    const assetsField = schema.getQueryType()?.getFields().assets;
+    const poolsField = schema.getQueryType()?.getFields().poolXYKs;
+    const historyField = schema.getQueryType()?.getFields().historyElements;
+
+    await assetsField?.resolve?.({}, {}, { repository }, {} as never);
+    expect(query.mock.calls[0]?.[1].first).toBe(100);
+
+    const firstPage = (await assetsField?.resolve?.(
+      {},
+      {
+        first: 1,
+        orderBy: ['ID_ASC'],
+        filter: { liquidity: { greaterThan: '0' } },
+      },
+      { repository },
+      {} as never
+    )) as { edges: Array<{ cursor: string }> };
+    const cursor = firstPage.edges[0]?.cursor;
+
+    await expect(
+      assetsField?.resolve?.(
+        {},
+        {
+          first: 1,
+          after: cursor,
+          orderBy: ['ID_ASC'],
+          filter: { liquidity: { greaterThan: '1' } },
+        },
+        { repository },
+        {} as never
+      )
+    ).rejects.toThrow(/Pagination cursor does not match the requested/);
+    await expect(
+      poolsField?.resolve?.(
+        {},
+        {
+          first: 1,
+          after: cursor,
+          orderBy: ['ID_ASC'],
+        },
+        { repository },
+        {} as never
+      )
+    ).rejects.toThrow(/Pagination cursor does not match the requested/);
+
+    for (const first of [-1, 1.5, 1_001, Number.POSITIVE_INFINITY]) {
+      await expect(
+        assetsField?.resolve?.({}, { first, orderBy: ['ID_ASC'] }, { repository }, {} as never)
+      ).rejects.toThrow(/first/);
+    }
+    await expect(
+      historyField?.resolve?.(
+        {},
+        {
+          first: 1,
+          orderBy: ['TIMESTAMP_DESC'],
+          filter: {
+            or: Array.from({ length: 100 }, (_item, index) => ({
+              module: { equalTo: `module-${index}` },
+              method: { equalTo: `method-${index}` },
+              address: { equalTo: `account-${index}` },
+              dataFrom: { equalTo: `from-${index}` },
+              dataTo: { equalTo: `to-${index}` },
+            })),
+          },
+        },
+        { repository },
+        {} as never
+      )
+    ).rejects.toThrow('maximum input node count');
+    for (const after of [0, '0', 'psc1.legacy']) {
+      await expect(
+        assetsField?.resolve?.({}, { first: 1, after, orderBy: ['ID_ASC'] }, { repository }, {} as never)
+      ).rejects.toThrow(/cursor/i);
+    }
+
+    let deepFilter: Record<string, unknown> = { id: { equalTo: 'asset-a' } };
+    for (let depth = 0; depth < 10; depth += 1) deepFilter = { and: [deepFilter] };
+    await expect(
+      assetsField?.resolve?.({}, { first: 1, filter: deepFilter }, { repository }, {} as never)
+    ).rejects.toThrow(/depth/);
+    await expect(
+      assetsField?.resolve?.(
+        {},
+        { first: 1, filter: { id: { in: Array.from({ length: 101 }, (_, index) => String(index)) } } },
+        { repository },
+        {} as never
+      )
+    ).rejects.toThrow(/oversized array/);
+    await expect(
+      assetsField?.resolve?.(
+        {},
+        { first: 1, filter: Object.create({ polluted: true }) as Record<string, unknown> },
+        { repository },
+        {} as never
+      )
+    ).rejects.toThrow(/plain objects/);
+    await expect(
+      assetsField?.resolve?.(
+        {},
+        { first: 1, orderBy: ['TIMESTAMP_DESC', 'ID_ASC'] },
+        { repository },
+        {} as never
+      )
+    ).rejects.toThrow(/tie-breaker/);
+    for (const orderBy of [[{ field: 'TIMESTAMP_DESC' }], ['NOT_A_REAL_FIELD_ASC'], [`${'A'.repeat(200)}_ASC`]]) {
+      await expect(
+        assetsField?.resolve?.({}, { first: 1, orderBy }, { repository }, {} as never)
+      ).rejects.toThrow(/orderBy/);
+    }
   });
 
   it('caches repeated hot connection resolver queries within the TTL window', async () => {
@@ -1082,7 +1586,7 @@ describe('Polkaswap indexer schema', () => {
     expect(get).toHaveBeenCalledTimes(1);
   });
 
-  it('falls back to list-based filtering, sorting, and pagination when query is unavailable', async () => {
+  it('falls back to list-based filtering, sorting, and forward keyset pagination when query is unavailable', async () => {
     const repository = repositoryWithoutQuery([
       {
         collection: 'assets',
@@ -1103,23 +1607,34 @@ describe('Polkaswap indexer schema', () => {
     const schema = createSchema();
     const assetsField = schema.getQueryType()?.getFields().assets;
 
+    const firstPage = (await assetsField?.resolve?.(
+      {},
+      {
+        first: 1,
+        filter: { liquidity: { greaterThan: '0' } },
+        orderBy: ['ID_ASC'],
+      },
+      { repository },
+      {} as never
+    )) as { edges: Array<{ cursor: string; node: { id: string } }> };
+    expect(firstPage.edges.map((edge) => edge.node.id)).toEqual(['asset-b']);
+
     const result = await assetsField?.resolve?.(
       {},
       {
         first: 1,
-        offset: 1,
+        after: firstPage.edges[0]?.cursor,
         filter: { liquidity: { greaterThan: '0' } },
-        orderBy: ['TIMESTAMP_ASC'],
+        orderBy: ['ID_ASC'],
       },
       { repository },
       {} as never
     );
-
     expect(result).toMatchObject({
       totalCount: 2,
       edges: [
         {
-          cursor: '1',
+          cursor: opaqueCursor(),
           node: {
             id: 'asset-c',
             timestamp: 30,
@@ -1130,15 +1645,57 @@ describe('Polkaswap indexer schema', () => {
         },
       ],
       pageInfo: {
-        endCursor: '1',
+        endCursor: opaqueCursor(),
         hasNextPage: false,
         hasPreviousPage: true,
-        startCursor: '1',
+        startCursor: opaqueCursor(),
       },
     });
   });
 
-  it('reports stable cursors for last windows within a first page', async () => {
+  it('keeps list-fallback cursors usable after the cursor row is deleted', async () => {
+    const items: IndexerDocument[] = [
+      {
+        collection: 'assets',
+        id: 'asset-a',
+        data: { id: 'asset-a', timestamp: 10, priceUSD: '1', liquidity: '1', liquidityBooks: '0' },
+      },
+      {
+        collection: 'assets',
+        id: 'asset-b',
+        data: { id: 'asset-b', timestamp: 20, priceUSD: '2', liquidity: '2', liquidityBooks: '0' },
+      },
+      {
+        collection: 'assets',
+        id: 'asset-c',
+        data: { id: 'asset-c', timestamp: 30, priceUSD: '3', liquidity: '3', liquidityBooks: '0' },
+      },
+    ];
+    const repository = repositoryWithoutQuery(items);
+    const assetsField = createSchema().getQueryType()?.getFields().assets;
+    const first = (await assetsField?.resolve?.(
+      {},
+      { first: 1, orderBy: ['ID_ASC'] },
+      { repository },
+      {} as never
+    )) as { edges: Array<{ cursor: string }> };
+
+    items.splice(0, 1);
+    const second = await assetsField?.resolve?.(
+      {},
+      { first: 2, after: first.edges[0]?.cursor, orderBy: ['ID_ASC'] },
+      { repository },
+      {} as never
+    );
+
+    expect(second).toMatchObject({
+      totalCount: 2,
+      edges: [{ node: { id: 'asset-b' } }, { node: { id: 'asset-c' } }],
+      pageInfo: { hasNextPage: false, hasPreviousPage: true },
+    });
+  });
+
+  it('exposes only bounded forward pagination and rejects removed legacy arguments defensively', async () => {
     const repository = new MemoryRepository();
     await repository.upsertMany(
       ['asset-a', 'asset-b', 'asset-c', 'asset-d'].map((id) => ({
@@ -1155,46 +1712,16 @@ describe('Polkaswap indexer schema', () => {
 
     const schema = createSchema();
     const assetsField = schema.getQueryType()?.getFields().assets;
-    const result = await assetsField?.resolve?.(
-      {},
-      {
-        first: 3,
-        last: 2,
-        orderBy: ['ID_ASC'],
-      },
-      { repository },
-      {} as never
-    );
-
-    expect(result).toMatchObject({
-      totalCount: 4,
-      edges: [
-        {
-          cursor: '1',
-          node: {
-            id: 'asset-b',
-            priceUSD: '1',
-            liquidity: '1',
-            liquidityBooks: '0',
-          },
-        },
-        {
-          cursor: '2',
-          node: {
-            id: 'asset-c',
-            priceUSD: '1',
-            liquidity: '1',
-            liquidityBooks: '0',
-          },
-        },
-      ],
-      pageInfo: {
-        endCursor: '2',
-        hasNextPage: true,
-        hasPreviousPage: true,
-        startCursor: '1',
-      },
-    });
+    expect(assetsField?.args.map((argument) => argument.name)).toEqual(['first', 'after', 'orderBy', 'filter']);
+    await expect(
+      assetsField?.resolve?.({}, { first: 3, last: 2, orderBy: ['ID_ASC'] }, { repository }, {} as never)
+    ).rejects.toThrow('last pagination is not supported');
+    await expect(
+      assetsField?.resolve?.({}, { first: 1, offset: 100_001, orderBy: ['ID_ASC'] }, { repository }, {} as never)
+    ).rejects.toThrow('offset must be an integer');
+    await expect(
+      assetsField?.resolve?.({}, { first: 1, before: 'cursor', orderBy: ['ID_ASC'] }, { repository }, {} as never)
+    ).rejects.toThrow('before pagination is not supported');
   });
 
   it('returns empty page info for filtered-out connection results', async () => {
@@ -1214,7 +1741,7 @@ describe('Polkaswap indexer schema', () => {
     const assetsField = schema.getQueryType()?.getFields().assets;
     const result = await assetsField?.resolve?.(
       {},
-      { filter: { liquidity: { greaterThan: '0' } } },
+      { filter: { liquidity: { greaterThan: '0' } }, orderBy: ['ID_ASC'] },
       { repository },
       {} as never
     );
@@ -1265,18 +1792,39 @@ describe('Polkaswap indexer schema', () => {
     } as unknown as GraphQLResolveInfo;
     const schema = createSchema();
     const assetsField = schema.getQueryType()?.getFields().assets;
+    const after = encodeRepositoryCursor({
+      scope: createRepositoryCursorScope('assets', ['ID_ASC'], undefined),
+      field: 'id',
+      direction: 'asc',
+      numeric: false,
+      value: 'asset-b',
+      id: 'asset-b',
+    });
 
-    const result = await assetsField?.resolve?.({}, { first: 1, after: '1' }, { repository }, info);
+    const result = await assetsField?.resolve?.(
+      {},
+      { first: 1, after, orderBy: ['ID_ASC'] },
+      { repository },
+      info
+    );
 
     expect(queryArgs).toHaveLength(1);
     expect(queryArgs[0]?.includeTotalCount).toBe(false);
+    expect(queryArgs[0]).toMatchObject({
+      after: null,
+      keyset: {
+        scope: createRepositoryCursorScope('assets', ['ID_ASC'], undefined),
+        field: 'id',
+        id: 'asset-b',
+      },
+    });
     expect(result).toMatchObject({
-      edges: [{ cursor: '2', node: { id: 'asset-c' } }],
+      edges: [{ cursor: opaqueCursor(), node: { id: 'asset-c' } }],
       pageInfo: {
-        endCursor: '2',
+        endCursor: opaqueCursor(),
         hasNextPage: true,
         hasPreviousPage: true,
-        startCursor: '2',
+        startCursor: opaqueCursor(),
       },
     });
   });
@@ -1419,7 +1967,7 @@ describe('Polkaswap indexer schema', () => {
     const accountMetaField = schema.getQueryType()?.getFields().accountMeta;
     const history = await historyField?.resolve?.(
       {},
-      { orderBy: ['TIMESTAMP_DESC', 'ID_DESC'] },
+      { orderBy: ['TIMESTAMP_DESC', 'ID_DESC'], filter: { address: { equalTo: 'alice' } } },
       { repository },
       {} as never
     );
@@ -1436,7 +1984,7 @@ describe('Polkaswap indexer schema', () => {
     });
   });
 
-  it('accepts the Fearless iOS SORA history filter shape', async () => {
+  it('accepts a storage-anchored mobile history filter shape', async () => {
     const repository = new MemoryRepository();
     await repository.upsert({
       collection: 'historyElements',
@@ -1471,9 +2019,14 @@ describe('Polkaswap indexer schema', () => {
         first: 100,
         orderBy: ['TIMESTAMP_DESC'],
         filter: {
-          or: [
-            { address: 'alice', method: { notIn: ['swap', 'rewarded'] } },
-            { dataTo: 'alice', method: { notIn: ['swap', 'rewarded'] } },
+          and: [
+            { address: { equalTo: 'alice' } },
+            {
+              or: [
+                { method: { notIn: ['swap', 'rewarded'] } },
+                { dataTo: 'alice', method: { notIn: ['swap', 'rewarded'] } },
+              ],
+            },
           ],
         },
       },
@@ -1488,7 +2041,7 @@ describe('Polkaswap indexer schema', () => {
     });
   });
 
-  it('does not let adversarial filter paths match inherited Object properties', async () => {
+  it('rejects adversarial filter paths before repository access', async () => {
     Object.defineProperty(Object.prototype, 'polkaswapIndexerPolluted', {
       configurable: true,
       value: 'owned',
@@ -1504,23 +2057,19 @@ describe('Polkaswap indexer schema', () => {
 
       const schema = createSchema();
       const assetsField = schema.getQueryType()?.getFields().assets;
-      const assets = await assetsField?.resolve?.(
-        {},
-        {
-          first: 10,
-          filter: {
-            '__proto__.polkaswapIndexerPolluted': { equalTo: 'owned' },
+      await expect(
+        assetsField?.resolve?.(
+          {},
+          {
+            first: 10,
+            filter: {
+              '__proto__.polkaswapIndexerPolluted': { equalTo: 'owned' },
+            },
           },
-        },
-        { repository },
-        {} as never
-      );
-
-      expect(assets).toMatchObject({
-        totalCount: 0,
-        nodes: [],
-        edges: [],
-      });
+          { repository },
+          {} as never
+        )
+      ).rejects.toThrow('not supported by the public query plan');
     } finally {
       delete (Object.prototype as { polkaswapIndexerPolluted?: unknown }).polkaswapIndexerPolluted;
     }
@@ -1689,8 +2238,13 @@ describe('Polkaswap indexer schema', () => {
       {},
       {
         first: 1,
+        orderBy: ['TIMESTAMP_ASC'],
         filter: {
-          and: [{ dataAssets: { contains: 'xor' } }, { timestamp: { greaterThan: 1 } }],
+          and: [
+            { address: { equalTo: 'alice' } },
+            { dataAssets: { contains: 'xor' } },
+            { timestamp: { greaterThan: 1 } },
+          ],
         },
       },
       { repository },
@@ -1756,6 +2310,15 @@ describe('Polkaswap indexer schema', () => {
     expect(String(orderBookMutationType.getFields()._entity.type)).toBe('JSON!');
   });
 
+  it('rejects unscoped and oversized public subscription id sets', async () => {
+    const repository = new MemoryRepository();
+    const field = createSchema().getSubscriptionType()?.getFields().accounts;
+    for (const id of [undefined, [], Array.from({ length: 101 }, (_item, index) => `id-${index}`)]) {
+      const iterator = field?.subscribe?.({}, { id }, { repository }, {} as never) as AsyncGenerator<unknown>;
+      await expect(iterator.next()).rejects.toMatchObject({ extensions: { code: 'BAD_USER_INPUT' } });
+    }
+  });
+
   it('emits account subscription payloads with SubQuery entity field names', async () => {
     const repository = new MemoryRepository();
     const schema = createSchema();
@@ -1778,15 +2341,29 @@ describe('Polkaswap indexer schema', () => {
       data: { id: 'alice', latestHistoryElementId: 'history-a' },
     });
 
-    await expect(next).resolves.toEqual({
+    const sourceEvent = await next;
+    expect(sourceEvent).toEqual({
       done: false,
       value: {
+        collection: 'accounts',
         id: 'alice',
-        mutation_type: 'UPDATE',
-        _entity: {
-          id: 'alice',
-          latest_history_element_id: 'history-a',
-        },
+        mutationType: 'INSERT',
+      },
+    });
+    expect('data' in (sourceEvent.value as Record<string, unknown>)).toBe(false);
+    await expect(
+      accountsField?.resolve?.(
+        sourceEvent.value,
+        { id: ['alice'] },
+        { repository },
+        {} as never
+      )
+    ).resolves.toEqual({
+      id: 'alice',
+      mutation_type: 'INSERT',
+      _entity: {
+        id: 'alice',
+        latest_history_element_id: 'history-a',
       },
     });
     await iterator.return(undefined);
@@ -1817,20 +2394,96 @@ describe('Polkaswap indexer schema', () => {
       },
     });
 
-    await expect(next).resolves.toEqual({
+    const sourceEvent = await next;
+    expect(sourceEvent).toEqual({
       done: false,
       value: {
+        collection: 'orderBooks',
         id: '0-xor-kusd',
-        mutation_type: 'UPDATE',
-        _entity: {
-          price: '2',
-          price_change_day: 0.5,
-          volume_day_u_s_d: '100',
-          status: 'Trading',
-          last_deals: '[]',
-        },
+        mutationType: 'INSERT',
       },
     });
+    expect('data' in (sourceEvent.value as Record<string, unknown>)).toBe(false);
+    await expect(
+      orderBooksField?.resolve?.(
+        sourceEvent.value,
+        { id: ['0-xor-kusd'] },
+        { repository },
+        {} as never
+      )
+    ).resolves.toEqual({
+      id: '0-xor-kusd',
+      mutation_type: 'INSERT',
+      _entity: {
+        price: '2',
+        price_change_day: 0.5,
+        volume_day_u_s_d: '100',
+        status: 'Trading',
+        last_deals: '[]',
+      },
+    });
+    await iterator.return(undefined);
+  });
+
+  it('filters identity events by mutation before document materialization', async () => {
+    const repository = new MemoryRepository();
+    const field = createSchema().getSubscriptionType()?.getFields().updatesStreams;
+    const iterator = field?.subscribe?.(
+      {},
+      { id: ['price'], mutation: ['UPDATE'] },
+      { repository },
+      {} as never
+    ) as AsyncGenerator<unknown, void, unknown>;
+    const next = iterator.next();
+
+    await repository.upsert({
+      collection: 'updatesStreams',
+      id: 'price',
+      blockHeight: 1,
+      data: { id: 'price', data: 'first' },
+    });
+    await repository.upsert({
+      collection: 'updatesStreams',
+      id: 'price',
+      blockHeight: 2,
+      data: { id: 'price', data: 'second' },
+    });
+
+    await expect(next).resolves.toEqual({
+      done: false,
+      value: { collection: 'updatesStreams', id: 'price', mutationType: 'UPDATE' },
+    });
+    await iterator.return(undefined);
+  });
+
+  it('emits payload-free deletes without fetching a removed document', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert({
+      collection: 'updatesStreams',
+      id: 'price',
+      blockHeight: 1,
+      data: { id: 'price', data: 'first' },
+    });
+    const get = vi.spyOn(repository, 'get');
+    const field = createSchema().getSubscriptionType()?.getFields().updatesStreams;
+    const args = { id: ['price'], mutation: ['DELETE'] };
+    const iterator = field?.subscribe?.({}, args, { repository }, {} as never) as AsyncGenerator<unknown>;
+    const next = iterator.next();
+
+    await repository.deleteMany('updatesStreams', ['price']);
+    const source = await next;
+    expect(source).toEqual({
+      done: false,
+      value: { collection: 'updatesStreams', id: 'price', mutationType: 'DELETE' },
+    });
+    await expect(
+      field?.resolve?.(source.value, args, { repository }, {} as never)
+    ).resolves.toEqual({
+      id: 'price',
+      mutation_type: 'DELETE',
+      _entity: { id: 'price' },
+    });
+    expect(get).not.toHaveBeenCalled();
     await iterator.return(undefined);
   });
 });

@@ -8,6 +8,7 @@ import { createSchema } from '../src/graphql/resolvers.js';
 import { MemoryRepository } from '../src/repository/memory.js';
 import { normalizeGraphqlUrl, runProductionSmoke } from '../src/scripts/production-smoke.js';
 import { SORA_LEGACY_IDENTITY_ANCHOR, SORA_MAINNET_GENESIS_HASH } from '../src/soraIdentity.js';
+import { createPersistedWorkerStatusDocument } from '../src/worker/status.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const VALID_BLOCK = 30_000_000;
@@ -19,6 +20,7 @@ const IDENTITY_TIMESTAMP = SORA_LEGACY_IDENTITY_ANCHOR.timestamp;
 
 const validHealth = {
   ok: true,
+  repositoryReady: true,
   service: 'polkaswap-indexer',
   serviceId: 'pi.soramitsu.io',
   schemaVersion: 1,
@@ -31,7 +33,20 @@ const validHealth = {
   latestIndexedBlock: VALID_BLOCK,
   latestIndexedBlockHash: VALID_BLOCK_HASH,
   latestIndexedAt: VALID_TIMESTAMP,
+  workerAvailable: true,
+  workerReady: true,
+  workerReadinessReason: null,
+  workerLifecycle: 'running',
+  workerStartupComplete: true,
+  workerLatestFinalizedBlock: VALID_BLOCK + 5,
+  workerLatestIndexedBlock: VALID_BLOCK,
+  workerLag: 5,
+  workerLastSuccessfulIndexTimestamp: VALID_TIMESTAMP,
+  workerLastError: null,
+  workerLastErrorTimestamp: null,
 };
+
+const readyWorkerHealth = validHealth;
 
 const jsonResponse = (body: unknown, init: ResponseInit = {}): Response =>
   new Response(JSON.stringify(body), {
@@ -151,6 +166,9 @@ describe('Polkaswap production smoke', () => {
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [URL, RequestInit];
     expect(String(url)).toBe('https://pi.soramitsu.io/graphql');
     expect(init?.method).toBe('POST');
+    expect(init?.cache).toBe('no-store');
+    expect(init?.signal).toBeInstanceOf(AbortSignal);
+    expect((init?.headers as Record<string, string>)['cache-control']).toBe('no-store');
     expect(String(init?.body)).toContain('_health');
     expect(String(init?.body)).toContain('chainIdentity: updatesStream(id: \\"chainIdentity\\")');
     expect(String(init?.body)).toContain('chainState: updatesStream(id: \\"chainState\\")');
@@ -212,6 +230,16 @@ describe('Polkaswap production smoke', () => {
         timestamp: now,
         data: { id: `block-${VALID_BLOCK}`, type: 'BLOCK', timestamp: now },
       },
+      createPersistedWorkerStatusDocument({
+        lifecycle: 'running',
+        startupComplete: true,
+        latestFinalizedBlock: VALID_BLOCK + 5,
+        latestIndexedBlock: VALID_BLOCK,
+        lag: 5,
+        lastSuccessfulIndexTimestamp: now,
+        lastError: null,
+        lastErrorTimestamp: null,
+      }, now),
     ]);
     const schema = createSchema();
     const yoga = createYoga({
@@ -295,6 +323,82 @@ describe('Polkaswap production smoke', () => {
     ));
 
     await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).resolves.toBeUndefined();
+  });
+
+  it('validates complete ready-worker details when the deployment exposes a worker', async () => {
+    await expect(
+      runProductionSmoke('https://pi.soramitsu.io/graphql', fetchWithHealth(readyWorkerHealth))
+    ).resolves.toBeUndefined();
+  });
+
+  it('accepts a healthy persisted worker heartbeat that trails the exact chain checkpoint', async () => {
+    await expect(
+      runProductionSmoke(
+        'https://pi.soramitsu.io/graphql',
+        fetchWithHealth({
+          ...readyWorkerHealth,
+          workerLatestFinalizedBlock: VALID_BLOCK,
+          workerLatestIndexedBlock: VALID_BLOCK - 1,
+          workerLag: 1,
+          workerLastSuccessfulIndexTimestamp: VALID_TIMESTAMP - 1,
+        }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it('rejects an available worker that is not ready even if the top-level flag is inconsistent', async () => {
+    await expect(
+      runProductionSmoke(
+        'https://pi.soramitsu.io/graphql',
+        fetchWithHealth({ ...readyWorkerHealth, workerReady: false, workerReadinessReason: 'lag-exceeded' })
+      )
+    ).rejects.toThrow('available worker must be ready');
+  });
+
+  it('rejects a production API that has no shared worker heartbeat', async () => {
+    await expect(
+      runProductionSmoke(
+        'https://pi.soramitsu.io/graphql',
+        fetchWithHealth({
+          ...validHealth,
+          workerAvailable: false,
+          workerReady: null,
+          workerLifecycle: null,
+        })
+      )
+    ).rejects.toThrow('must expose a shared worker status');
+  });
+
+  it('rejects missing or internally inconsistent ready-worker checkpoints', async () => {
+    await expect(
+      runProductionSmoke(
+        'https://pi.soramitsu.io/graphql',
+        fetchWithHealth({ ...readyWorkerHealth, workerLatestIndexedBlock: null })
+      )
+    ).rejects.toThrow('workerLatestIndexedBlock must be a non-negative safe integer');
+    await expect(
+      runProductionSmoke(
+        'https://pi.soramitsu.io/graphql',
+        fetchWithHealth({ ...readyWorkerHealth, workerLag: 4 })
+      )
+    ).rejects.toThrow('workerLag must match');
+    await expect(
+      runProductionSmoke(
+        'https://pi.soramitsu.io/graphql',
+        fetchWithHealth({
+          ...readyWorkerHealth,
+          workerLatestFinalizedBlock: 1_000,
+          workerLatestIndexedBlock: 1_001,
+          workerLag: 0,
+        })
+      )
+    ).rejects.toThrow('must not exceed');
+    await expect(
+      runProductionSmoke(
+        'https://pi.soramitsu.io/graphql',
+        fetchWithHealth({ ...readyWorkerHealth, workerLastError: null, workerLastErrorTimestamp: 1_700_000_000 })
+      )
+    ).rejects.toThrow('must either both be present');
   });
 
   it('rejects GraphQL errors even when HTTP status is successful', async () => {
@@ -390,6 +494,7 @@ describe('Polkaswap production smoke', () => {
   it('rejects deployed health objects missing identity fields with a deployment hint', async () => {
     const fetchImpl = fetchWithHealth({
       ok: true,
+      repositoryReady: true,
       service: 'polkaswap-indexer',
     });
 
@@ -571,7 +676,11 @@ describe('Polkaswap production smoke', () => {
       const worker = validWorkerState(timestamp);
       const fetchImpl = vi.fn(async () => jsonResponse({
         data: {
-          _health: { ...validHealth, latestIndexedAt: timestamp },
+          _health: {
+            ...validHealth,
+            latestIndexedAt: timestamp,
+            workerLastSuccessfulIndexTimestamp: timestamp,
+          },
           ...worker,
         },
       }));
@@ -590,7 +699,11 @@ describe('Polkaswap production smoke', () => {
     const worker = validWorkerState(timestamp);
     const fetchImpl = vi.fn(async () => jsonResponse({
       data: {
-        _health: { ...validHealth, latestIndexedAt: timestamp },
+        _health: {
+          ...validHealth,
+          latestIndexedAt: timestamp,
+          workerLastSuccessfulIndexTimestamp: timestamp,
+        },
         ...worker,
       },
     }));
@@ -607,7 +720,11 @@ describe('Polkaswap production smoke', () => {
     const worker = validWorkerState(staleTimestamp);
     const fetchImpl = vi.fn(async () => jsonResponse({
       data: {
-        _health: { ...validHealth, latestIndexedAt: staleTimestamp },
+        _health: {
+          ...validHealth,
+          latestIndexedAt: staleTimestamp,
+          workerLastSuccessfulIndexTimestamp: staleTimestamp,
+        },
         ...worker,
         networkSnapshots: {
           nodes: [{ id: `block-${VALID_BLOCK + 1}`, type: 'BLOCK', timestamp: Math.floor(Date.now() / 1000) }],

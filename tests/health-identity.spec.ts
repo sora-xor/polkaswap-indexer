@@ -12,6 +12,19 @@ const VERIFICATION_BLOCK = SORA_LEGACY_IDENTITY_ANCHOR.block;
 const CHECKPOINT_HASH = `0x${'ab'.repeat(32)}`;
 const VERIFICATION_HASH = SORA_LEGACY_IDENTITY_ANCHOR.hash;
 
+const readyWorkerStatusProvider = {
+  getStatus: () => ({
+    lifecycle: 'running' as const,
+    startupComplete: true,
+    latestFinalizedBlock: CHECKPOINT_BLOCK,
+    latestIndexedBlock: CHECKPOINT_BLOCK,
+    lag: 0,
+    lastSuccessfulIndexTimestamp: NOW,
+    lastError: null,
+    lastErrorTimestamp: null,
+  }),
+};
+
 type IdentityFixtureOptions = {
   identity?: Record<string, unknown>;
   state?: Record<string, unknown>;
@@ -54,7 +67,12 @@ const identityFixture = (options: IdentityFixtureOptions = {}): IndexerDocument[
       collection: 'updatesStreams',
       id: 'chainState',
       blockHeight: CHECKPOINT_BLOCK,
-      timestamp: typeof state.blockTimestamp === 'number' ? state.blockTimestamp : NOW,
+      timestamp:
+        typeof state.blockTimestamp === 'number' &&
+        Number.isSafeInteger(state.blockTimestamp) &&
+        state.blockTimestamp >= 0
+          ? state.blockTimestamp
+          : NOW,
       data: {
         id: 'chainState',
         block: CHECKPOINT_BLOCK,
@@ -69,7 +87,12 @@ const resolveHealth = async (documents: IndexerDocument[]) => {
   const repository = new MemoryRepository();
   await repository.upsertMany(documents);
   const healthField = createSchema().getQueryType()?.getFields()._health;
-  return healthField?.resolve?.({}, {}, { repository }, {} as never);
+  return healthField?.resolve?.(
+    {},
+    {},
+    { repository, workerStatusProvider: readyWorkerStatusProvider },
+    {} as never,
+  );
 };
 
 describe('PI GraphQL mainnet identity health', () => {
@@ -80,6 +103,7 @@ describe('PI GraphQL mainnet identity health', () => {
 
     await expect(resolveHealth(identityFixture())).resolves.toEqual({
       ok: true,
+      repositoryReady: true,
       service: 'polkaswap-indexer',
       serviceId: 'pi.soramitsu.io',
       schemaVersion: 1,
@@ -92,6 +116,17 @@ describe('PI GraphQL mainnet identity health', () => {
       latestIndexedBlock: CHECKPOINT_BLOCK,
       latestIndexedBlockHash: CHECKPOINT_HASH,
       latestIndexedAt: NOW,
+      workerAvailable: true,
+      workerReady: true,
+      workerReadinessReason: null,
+      workerLifecycle: 'running',
+      workerStartupComplete: true,
+      workerLatestFinalizedBlock: CHECKPOINT_BLOCK,
+      workerLatestIndexedBlock: CHECKPOINT_BLOCK,
+      workerLag: 0,
+      workerLastSuccessfulIndexTimestamp: NOW,
+      workerLastError: null,
+      workerLastErrorTimestamp: null,
     });
   });
 
@@ -146,13 +181,18 @@ describe('PI GraphQL mainnet identity health', () => {
     IdentityFixtureOptions,
     { identityBlockHeight?: number; stateBlockHeight?: number },
   ]> = [
-    ['identity id', { identityEnvelope: { id: 'mainnet-chainIdentity' } }, {}],
     ['identity block', { identityEnvelope: { block: VERIFICATION_BLOCK + 1 } }, {}],
     ['identity document height', {}, { identityBlockHeight: VERIFICATION_BLOCK + 1 }],
-    ['checkpoint id', { stateEnvelope: { id: 'mainnet-chainState' } }, {}],
     ['checkpoint block', { stateEnvelope: { block: CHECKPOINT_BLOCK + 1 } }, {}],
     ['checkpoint document height', {}, { stateBlockHeight: CHECKPOINT_BLOCK + 1 }],
   ];
+
+  it.each([
+    ['identity id', { identityEnvelope: { id: 'mainnet-chainIdentity' } }],
+    ['checkpoint id', { stateEnvelope: { id: 'mainnet-chainState' } }],
+  ])('rejects a %s mismatch before it can be persisted', async (_label, options) => {
+    await expect(resolveHealth(identityFixture(options))).rejects.toThrow();
+  });
 
   it.each(envelopeMismatchCases)('rejects a persisted %s envelope mismatch', async (_label, options, documentMutation) => {
     vi.spyOn(Date, 'now').mockReturnValue(NOW * 1_000);
@@ -170,7 +210,12 @@ describe('PI GraphQL mainnet identity health', () => {
     vi.spyOn(repository, 'healthCheck').mockResolvedValue(false);
     const healthField = createSchema().getQueryType()?.getFields()._health;
 
-    await expect(healthField?.resolve?.({}, {}, { repository }, {} as never)).resolves.toMatchObject({
+    await expect(healthField?.resolve?.(
+      {},
+      {},
+      { repository, workerStatusProvider: readyWorkerStatusProvider },
+      {} as never,
+    )).resolves.toMatchObject({
       ok: false,
       genesisHash: SORA_MAINNET_GENESIS_HASH,
       latestIndexedBlock: CHECKPOINT_BLOCK,

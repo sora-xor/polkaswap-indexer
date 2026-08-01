@@ -241,15 +241,15 @@ describe('database-free SORA identity preflight', () => {
     const preflight = source.indexOf('await Promise.all([');
     const primary = source.indexOf('preflightSoraMainnetIdentity(config.soraWsEndpoint, { requireAnchorTimestamp: true })');
     const archive = source.indexOf('preflightSoraMainnetIdentity(archiveSoraWsEndpoint)');
-    const repository = source.indexOf('new PostgresRepository(config.databaseUrl)');
-    const migration = source.indexOf('await migrate(config.databaseUrl)');
+    const migration = source.indexOf('await migrate(config)');
+    const repository = source.indexOf('createRepository(config, {');
 
     expect(topology).toBeGreaterThan(-1);
     expect(preflight).toBeGreaterThan(-1);
     expect(preflight).toBeGreaterThan(topology);
     expect(primary).toBeGreaterThan(preflight);
     expect(archive).toBeGreaterThan(primary);
-    expect(repository).toBeGreaterThan(archive);
-    expect(migration).toBeGreaterThan(repository);
+    expect(migration).toBeGreaterThan(archive);
+    expect(repository).toBeGreaterThan(migration);
   });
 });

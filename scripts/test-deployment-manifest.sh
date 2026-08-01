@@ -199,7 +199,7 @@ expect_failure "proxy-throttled-as-websocket-client" "$ROOT_DIR/Dockerfile" "$RO
 
 unsafe_context="$TMP_DIR/.dockerignore"
 cp "$ROOT_DIR/.dockerignore" "$unsafe_context"
-perl -0pi -e 's/^node_modules\n//m' "$unsafe_context"
+perl -0pi -e 's/^node_modules\/?\n//mg' "$unsafe_context"
 expect_failure "unsafe-context" "$ROOT_DIR/Dockerfile" "$unsafe_context" ".dockerignore must exclude node_modules"
 
 echo "[deployment-manifest-test] all assertions passed"

@@ -1,18 +1,31 @@
 FROM node:24-bookworm-slim@sha256:cb4e8f7c443347358b7875e717c29e27bf9befc8f5a26cf18af3c3dec80e58c5 AS dependencies
+
 WORKDIR /app
+
 COPY package.json yarn.lock .yarnrc.yml ./
 RUN corepack enable && yarn install --immutable
 
+
 FROM dependencies AS build
-COPY tsconfig.json vitest.config.ts ./
+
+COPY tsconfig.json ./
 COPY src ./src
 RUN yarn build
 
+
 FROM dependencies AS production-dependencies
+
+# Yarn doesn't apply NODE_ENV to installs. Focus explicitly removes the build
+# and test-only dependency graph while retaining native production packages.
 RUN yarn workspaces focus --all --production
 
+
 FROM node:24-bookworm-slim@sha256:cb4e8f7c443347358b7875e717c29e27bf9befc8f5a26cf18af3c3dec80e58c5 AS runtime
+
 WORKDIR /app
+
+ENV ROCKSDB_PATH=/data/polkaswap-indexer.rocksdb
+
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=4350 \
@@ -35,12 +48,22 @@ ENV NODE_ENV=production \
     GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT=16 \
     GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION=32 \
     GRAPHQL_WS_CONNECTION_INIT_TIMEOUT_MS=10000
+
 STOPSIGNAL SIGTERM
-RUN mkdir -p /data && chown node:node /data
+
+RUN install -d -o node -g node /data
+
 COPY --from=production-dependencies --chown=node:node /app/package.json ./package.json
 COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
+COPY --chown=node:node LICENSE ./LICENSE
+
 USER node
+
 EXPOSE 4350
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS=4000 node dist/src/scripts/production-smoke.js "http://127.0.0.1:${PORT:-4350}${GRAPHQL_PATH:-/graphql}" >/dev/null 2>&1
+
+# Equivalent shell contract: POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS=4000 node dist/src/scripts/production-smoke.js "http://127.0.0.1:${PORT:-4350}${GRAPHQL_PATH:-/graphql}"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD ["node", "-e", "const port=Number(process.env.PORT??'4350');const path=process.env.GRAPHQL_PATH??'/graphql';if(!Number.isInteger(port)||port<1||port>65535||!path.startsWith('/')||/[\\s?#]/.test(path))process.exit(1);const endpoint='http://127.0.0.1:'+port+path;import('node:child_process').then(({spawn})=>{const child=spawn(process.execPath,['dist/src/scripts/production-smoke.js',endpoint],{stdio:'ignore',env:{...process.env,POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS:'4000'}});child.once('error',()=>process.exit(1));child.once('exit',code=>process.exit(code??1))}).catch(()=>process.exit(1))"]
+
 CMD ["node", "dist/src/index.js"]
