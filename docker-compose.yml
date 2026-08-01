@@ -28,6 +28,7 @@ services:
     depends_on:
       - postgres
     environment:
+      NODE_ENV: development
       DATABASE_URL: postgres://polkaswap:polkaswap@postgres:5432/polkaswap_indexer
       SORA_WS_ENDPOINT: wss://mof2.sora.org
       CHAIN_BATCH_SIZE: 25

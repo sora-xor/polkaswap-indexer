@@ -3956,6 +3956,7 @@ describe('ChainIndexer price derivation', () => {
     };
     const burnBlock = 25_043_003;
     const chainStateBlock = 26_000_000;
+    const burnBlockHash = canonicalBlockHash(`xor-burn-backfill-${burnBlock}`);
     const nexusRecipient = 'sora-nexus-account';
     const burnCall = {
       section: 'assets',
@@ -3990,9 +3991,13 @@ describe('ChainIndexer price derivation', () => {
     indexer.api = {
       rpc: {
         chain: {
-          getBlockHash: async (block: number) => `hash-${block}`,
-          getBlock: async () => ({
+          getBlockHash: async (block: number) => canonicalBlockHash(`xor-burn-backfill-${block}`),
+          getBlock: async (hash: string) => ({
             block: {
+              header: {
+                number: { toNumber: () => hash === burnBlockHash ? burnBlock : burnBlock + 1 },
+                hash: { toString: () => hash },
+              },
               extrinsics: [
                 {
                   hash: { toString: () => '0xbackfilledburn' },
@@ -4012,9 +4017,14 @@ describe('ChainIndexer price derivation', () => {
         system: {
           events: {
             at: async (hash: string) =>
-              hash === `hash-${burnBlock}`
+              hash === burnBlockHash
                 ? [eventRecord('assets', 'Burn', { address: 'alice', assetId: XOR, amount: '10000000000000000000' })]
                 : [],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000000000' }),
           },
         },
       },
@@ -4092,6 +4102,10 @@ describe('ChainIndexer price derivation', () => {
     const chainStateBlock = 26_000_000;
     const bridgeBlock = 5;
     const blockHashCalls: number[] = [];
+    const blockHashes = new Map(
+      Array.from({ length: bridgeBlock + 2 }, (_item, block) => [block, canonicalBlockHash(`bridge-backfill-${block}`)])
+    );
+    const blocksByHash = new Map([...blockHashes].map(([block, hash]) => [hash, block]));
 
     indexer.prices = new Map([[XOR, 2n * SCALE]]);
     indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
@@ -4125,15 +4139,15 @@ describe('ChainIndexer price derivation', () => {
         chain: {
           getBlockHash: async (block: number) => {
             blockHashCalls.push(block);
-            return `hash-${block}`;
+            return blockHashes.get(block);
           },
           getBlock: async (hash: string) => {
-            const block = Number(hash.replace('hash-', ''));
+            const block = blocksByHash.get(hash) ?? 0;
             return {
               block: {
                 header: {
                   number: { toNumber: () => block },
-                  hash: { toString: () => `0xblock-${block}` },
+                  hash: { toString: () => hash },
                 },
                 extrinsics:
                   block === bridgeBlock
@@ -4169,7 +4183,7 @@ describe('ChainIndexer price derivation', () => {
         query: {
           system: {
             events: async () =>
-              hash === `hash-${bridgeBlock}`
+              hash === blockHashes.get(bridgeBlock)
                 ? [eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xbridgebackfillrequest', status: 'Done' })]
                 : [],
           },
@@ -4182,7 +4196,7 @@ describe('ChainIndexer price derivation', () => {
         system: {
           events: {
             at: async (hash: string) =>
-              hash === `hash-${bridgeBlock}`
+              hash === blockHashes.get(bridgeBlock)
                 ? [eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xbridgebackfillrequest', status: 'Done' })]
                 : [],
           },
@@ -4204,7 +4218,8 @@ describe('ChainIndexer price derivation', () => {
     const chainState = await repository.get('updatesStreams', 'chainState');
     const backfillState = await repository.get('updatesStreams', 'bridgeProxyHistoryBackfill-v1');
 
-    expect(blockHashCalls).toContain(0);
+    expect(blockHashCalls).not.toContain(0);
+    expect(blockHashCalls).toContain(1);
     expect(history?.data).toMatchObject({
       module: 'bridgeProxy',
       method: 'burn',
@@ -4253,13 +4268,26 @@ describe('ChainIndexer price derivation', () => {
     indexer.api = {
       rpc: {
         chain: {
-          getBlockHash: async (block: number) => `hash-${block}`,
+          getBlockHash: async (block: number) => canonicalBlockHash(`pruned-bridge-backfill-${block}`),
+          getBlock: async (hash: string) => ({
+            block: {
+              header: {
+                number: { toNumber: () => 1 },
+                hash: { toString: () => hash },
+              },
+              extrinsics: [],
+            },
+          }),
         },
         state: {
           getMetadata: async () => {
             throw new Error('State already discarded for historical block');
           },
         },
+      },
+      query: {
+        system: { events: { at: async () => [] } },
+        timestamp: { now: { at: async () => ({ toString: () => '1700000000000' }) } },
       },
     };
     indexer.drainFinalizedHeads = vi.fn(async () => undefined);
@@ -4284,6 +4312,10 @@ describe('ChainIndexer price derivation', () => {
       drainFinalizedHeads: () => Promise<void>;
     };
     const bridgeBlock = 7;
+    const blockHashes = new Map(
+      Array.from({ length: bridgeBlock + 1 }, (_item, block) => [block, canonicalBlockHash(`incoming-backfill-${block}`)])
+    );
+    const blocksByHash = new Map([...blockHashes].map(([block, hash]) => [hash, block]));
 
     indexer.prices = new Map([[XOR, 2n * SCALE]]);
     indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
@@ -4304,14 +4336,14 @@ describe('ChainIndexer price derivation', () => {
     indexer.api = {
       rpc: {
         chain: {
-          getBlockHash: async (block: number) => `hash-${block}`,
+          getBlockHash: async (block: number) => blockHashes.get(block),
           getBlock: async (hash: string) => {
-            const block = Number(hash.replace('hash-', ''));
+            const block = blocksByHash.get(hash) ?? 0;
             return {
               block: {
                 header: {
                   number: { toNumber: () => block },
-                  hash: { toString: () => `0xblock-${block}` },
+                  hash: { toString: () => hash },
                 },
                 extrinsics:
                   block === bridgeBlock
@@ -4354,7 +4386,7 @@ describe('ChainIndexer price derivation', () => {
         query: {
           system: {
             events: async () =>
-              hash === `hash-${bridgeBlock}`
+              hash === blockHashes.get(bridgeBlock)
                 ? [
                     eventRecord('bridgeProxy', 'RequestStatusUpdate', {
                       requestHash: '0xincomingbackfillrequest',
@@ -4373,7 +4405,7 @@ describe('ChainIndexer price derivation', () => {
         system: {
           events: {
             at: async (hash: string) =>
-              hash === `hash-${bridgeBlock}`
+              hash === blockHashes.get(bridgeBlock)
                 ? [
                     eventRecord('bridgeProxy', 'RequestStatusUpdate', {
                       requestHash: '0xincomingbackfillrequest',

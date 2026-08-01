@@ -435,6 +435,143 @@ describe('PostgresRepository', () => {
     expect(result.get('asset-a')).toEqual(assetA);
   });
 
+  it('normalizes PostgreSQL bigint metadata on every document read path without changing data', async () => {
+    const data = { id: 'chainState', lastIndexedBlock: '9007199254740992' };
+    const row = {
+      collection: 'updatesStreams',
+      id: 'chainState',
+      blockHeight: '123456',
+      timestamp: '654321',
+      data,
+    };
+    mocks.pool.query.mockResolvedValue({ rows: [row] });
+    const repository = new PostgresRepository(DATABASE_URL);
+    const expected = {
+      ...row,
+      blockHeight: 123_456,
+      timestamp: 654_321,
+    };
+
+    const listed = await repository.list('updatesStreams');
+    const queried = await repository.query('updatesStreams', {
+      first: 1,
+      includeTotalCount: false,
+    });
+    const fetched = await repository.get('updatesStreams', 'chainState');
+    const fetchedMany = await repository.getMany('updatesStreams', ['chainState']);
+
+    expect(listed).toEqual([expected]);
+    expect(queried.items).toEqual([expected]);
+    expect(fetched).toEqual(expected);
+    expect(fetchedMany.get('chainState')).toEqual(expected);
+    expect(listed[0]?.data).toBe(data);
+    expect(queried.items[0]?.data).toBe(data);
+    expect(fetched?.data).toBe(data);
+    expect(fetchedMany.get('chainState')?.data).toBe(data);
+    expect(row).toEqual({
+      collection: 'updatesStreams',
+      id: 'chainState',
+      blockHeight: '123456',
+      timestamp: '654321',
+      data,
+    });
+  });
+
+  it('accepts canonical signed decimal strings, safe integers, and nullish metadata', async () => {
+    const rows = [
+      {
+        collection: 'assets',
+        id: 'bounds',
+        blockHeight: '-9007199254740991',
+        timestamp: '9007199254740991',
+        data: { id: 'bounds' },
+      },
+      {
+        collection: 'assets',
+        id: 'numbers',
+        blockHeight: Number.MIN_SAFE_INTEGER,
+        timestamp: Number.MAX_SAFE_INTEGER,
+        data: { id: 'numbers' },
+      },
+      {
+        collection: 'assets',
+        id: 'null',
+        blockHeight: null,
+        timestamp: null,
+        data: { id: 'null' },
+      },
+      {
+        collection: 'assets',
+        id: 'undefined',
+        blockHeight: undefined,
+        timestamp: undefined,
+        data: { id: 'undefined' },
+      },
+      {
+        collection: 'assets',
+        id: 'zero',
+        blockHeight: '0',
+        timestamp: 0,
+        data: { id: 'zero' },
+      },
+    ];
+    mocks.pool.query.mockResolvedValueOnce({ rows });
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    await expect(repository.list('assets')).resolves.toEqual([
+      { ...rows[0], blockHeight: Number.MIN_SAFE_INTEGER, timestamp: Number.MAX_SAFE_INTEGER },
+      rows[1],
+      rows[2],
+      rows[3],
+      { ...rows[4], blockHeight: 0 },
+    ]);
+  });
+
+  it.each([
+    ['', 'empty'],
+    ['01', 'leading zero'],
+    ['-0', 'negative zero'],
+    ['+1', 'explicit plus'],
+    [' 1', 'whitespace'],
+    ['1.0', 'fraction'],
+    ['1e3', 'exponent'],
+    ['not-a-number', 'nonnumeric'],
+    ['9007199254740992', 'unsafe positive string'],
+    ['-9007199254740992', 'unsafe negative string'],
+    [1.5, 'fractional number'],
+    [Number.POSITIVE_INFINITY, 'infinite number'],
+    [Number.MAX_SAFE_INTEGER + 1, 'unsafe number'],
+    [true, 'non-number primitive'],
+  ])('rejects %s PostgreSQL bigint metadata (%s)', async (value, _description) => {
+    mocks.pool.query.mockResolvedValueOnce({
+      rows: [{ collection: 'assets', id: 'invalid', blockHeight: value, timestamp: 1, data: { id: 'invalid' } }],
+    });
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    await expect(repository.list('assets')).rejects.toThrow(
+      'Invalid PostgreSQL blockHeight metadata: expected a canonical safe integer.'
+    );
+  });
+
+  it('rejects invalid timestamp metadata from single and batched reads', async () => {
+    const row = {
+      collection: 'assets',
+      id: 'invalid',
+      blockHeight: 1,
+      timestamp: '001',
+      data: { id: 'invalid' },
+    };
+    mocks.pool.query.mockResolvedValue({ rows: [row] });
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    await expect(repository.get('assets', 'invalid')).rejects.toThrow(
+      'Invalid PostgreSQL timestamp metadata: expected a canonical safe integer.'
+    );
+    await expect(repository.getMany('assets', ['invalid'])).rejects.toThrow(
+      'Invalid PostgreSQL timestamp metadata: expected a canonical safe integer.'
+    );
+  });
+
   it('deduplicates ids before deleting documents', async () => {
     mocks.pool.query.mockResolvedValueOnce({ rows: [] });
     const repository = new PostgresRepository(DATABASE_URL);

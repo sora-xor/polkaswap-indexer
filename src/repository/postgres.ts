@@ -15,6 +15,33 @@ import type {
 const { Pool } = pg;
 
 const NUMERIC_TEXT_PATTERN = "^-?[0-9]+(\\.[0-9]+)?$";
+const CANONICAL_INTEGER_PATTERN = /^(?:0|-?[1-9][0-9]*)$/;
+
+type PostgresDocumentRow = Omit<IndexerDocument, 'blockHeight' | 'timestamp'> & {
+  blockHeight?: unknown;
+  timestamp?: unknown;
+};
+
+const normalizeIntegerMetadata = (
+  field: 'blockHeight' | 'timestamp',
+  value: unknown
+): number | null | undefined => {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return value;
+
+  if (typeof value === 'string' && CANONICAL_INTEGER_PATTERN.test(value)) {
+    const parsed = Number(value);
+    if (Number.isSafeInteger(parsed)) return parsed;
+  }
+
+  throw new TypeError(`Invalid PostgreSQL ${field} metadata: expected a canonical safe integer.`);
+};
+
+const normalizeDocument = (row: PostgresDocumentRow): IndexerDocument => ({
+  ...row,
+  blockHeight: normalizeIntegerMetadata('blockHeight', row.blockHeight),
+  timestamp: normalizeIntegerMetadata('timestamp', row.timestamp),
+});
 
 const afterToOffset = (after: RepositoryQueryArgs['after']): number => {
   if (after === null || after === undefined || after === '') return 0;
@@ -297,7 +324,7 @@ export class PostgresRepository implements IndexerRepository {
         [collection]
       );
 
-      return result.rows;
+      return result.rows.map((row) => normalizeDocument(row as PostgresDocumentRow));
     });
   }
 
@@ -356,7 +383,7 @@ export class PostgresRepository implements IndexerRepository {
          offset $${offsetIndex}::int`,
         queryValues
       );
-      const rows = result.rows as IndexerDocument[];
+      const rows = result.rows.map((row) => normalizeDocument(row as PostgresDocumentRow));
       const requestedLimit = limit ?? rows.length;
       const hasOverfetched = shouldOverfetch && rows.length > requestedLimit;
       const windowRows = hasOverfetched ? rows.slice(0, requestedLimit) : rows;
@@ -388,7 +415,8 @@ export class PostgresRepository implements IndexerRepository {
         [collection, id]
       );
 
-      return result.rows[0] ?? null;
+      const row = result.rows[0] as PostgresDocumentRow | undefined;
+      return row === undefined ? null : normalizeDocument(row);
     });
   }
 
@@ -403,7 +431,8 @@ export class PostgresRepository implements IndexerRepository {
         [collection, [...new Set(ids)]]
       );
 
-      return new Map((result.rows as IndexerDocument[]).map((document) => [document.id, document]));
+      const documents = result.rows.map((row) => normalizeDocument(row as PostgresDocumentRow));
+      return new Map(documents.map((document) => [document.id, document]));
     });
   }
 

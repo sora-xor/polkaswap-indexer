@@ -231,6 +231,8 @@ type FetchedBlockPayload = {
   timestampMilliseconds: string;
 };
 
+type RpcExecutor = <T>(createRequest: () => Promise<T>, label: string) => Promise<T>;
+
 type DerivedStateRefreshRequest = {
   blockHeight: number;
   timestamp: number;
@@ -506,6 +508,8 @@ const withTimeout = async <T>(promise: Promise<T>, label: string, timeoutMs = CH
   }
 };
 
+const withRpcTimeout: RpcExecutor = (createRequest, label) => withTimeout(createRequest(), label);
+
 const disconnectRpcEndpoint = async (endpoint: unknown): Promise<void> => {
   const disconnect = (endpoint as { disconnect?: () => unknown } | null)?.disconnect;
   if (typeof disconnect === 'function') {
@@ -534,9 +538,6 @@ const parseChainTimestamp = (codec: unknown, label: string): ParsedChainTimestam
   }
   return { seconds: timestamp, milliseconds: text };
 };
-
-const parseChainTimestampSeconds = (codec: unknown, label: string): number =>
-  parseChainTimestamp(codec, label).seconds;
 
 const canonicalCodecHex = (codec: unknown, label: string): string => {
   const value = (codec as { toHex?: () => unknown } | null)?.toHex?.();
@@ -3230,10 +3231,9 @@ export class ChainIndexer {
 
     if (startBlock > finalizedBlock) return;
 
+    const prefetchedBlocks = new Map<number, FetchedBlock>();
     try {
-      const blockApi = await this.getBlockDataApi();
-      const startHash = await withRpcRetry(() => blockApi.rpc.chain.getBlockHash(startBlock), `chain.getBlockHash(${startBlock})`);
-      await withRpcRetry(() => (blockApi.query as any).system.events.at(startHash), `system.events.at(${startBlock})`);
+      prefetchedBlocks.set(startBlock, await this.fetchBlockByNumber(startBlock, withRpcRetry));
     } catch (error) {
       if (this.skipPrunedHistoricalBackfill('XOR burn backfill', startBlock, error)) return;
       throw error;
@@ -3242,44 +3242,28 @@ export class ChainIndexer {
     for (let block = startBlock; block <= finalizedBlock; block += XOR_BURN_BACKFILL_BATCH_SIZE) {
       await this.drainFinalizedHeads();
 
-      const blockApi = await this.getBlockDataApi();
       const batchEnd = Math.min(block + XOR_BURN_BACKFILL_BATCH_SIZE - 1, finalizedBlock);
       const blocks = Array.from({ length: batchEnd - block + 1 }, (_item, index) => block + index);
-      const blockHashes = await mapWithConcurrency(
+      const fetchedBlocks = await mapWithConcurrency(
         blocks,
         XOR_BURN_BACKFILL_RPC_CONCURRENCY,
-        (blockHeight) => withRpcRetry(() => blockApi.rpc.chain.getBlockHash(blockHeight), `chain.getBlockHash(${blockHeight})`)
+        async (blockHeight): Promise<FetchedBlock> =>
+          prefetchedBlocks.get(blockHeight) ?? this.fetchBlockByNumber(blockHeight, withRpcRetry)
       );
-      const eventsByBlock = (await mapWithConcurrency(
-        blockHashes,
-        XOR_BURN_BACKFILL_RPC_CONCURRENCY,
-        (hash, index) => withRpcRetry(() => (blockApi.query as any).system.events.at(hash), `system.events.at(${blocks[index]})`)
-      )) as EventRecord[][];
-      const burnBlockIndexes = eventsByBlock.flatMap((events, index) =>
-        events.some((event) => getXorBurnEvent(event, this.assetInfos)) ? [index] : []
+      const burnBlockIndexes = fetchedBlocks.flatMap((fetchedBlock, index) =>
+        fetchedBlock.events.some((event) => getXorBurnEvent(event, this.assetInfos)) ? [index] : []
       );
-      const signedBlocksByIndex = new Map<number, unknown>();
-
-      if (burnBlockIndexes.length) {
-        const signedBlocks = await mapWithConcurrency(
-          burnBlockIndexes,
-          XOR_BURN_BACKFILL_RPC_CONCURRENCY,
-          (index) =>
-            withRpcRetry(
-              () => this.fetchSignedBlock(blockHashes[index].toString(), blockApi),
-              `chain.getBlock(${blocks[index]})`
-            )
-        );
-        burnBlockIndexes.forEach((index, resultIndex) => {
-          signedBlocksByIndex.set(index, signedBlocks[resultIndex]);
-        });
-      }
 
       const documents = burnBlockIndexes.flatMap((index) => {
-        const signedBlock = signedBlocksByIndex.get(index);
-        if (!signedBlock) return [];
+        const fetchedBlock = fetchedBlocks[index];
 
-        return createXorBurnDocumentsFromEvents(blocks[index], null, signedBlock as any, eventsByBlock[index] ?? [], this.assetInfos);
+        return createXorBurnDocumentsFromEvents(
+          blocks[index],
+          null,
+          fetchedBlock.signedBlock,
+          fetchedBlock.events,
+          this.assetInfos
+        );
       });
 
       documents.push(this.createXorBurnBackfillStateDocument(batchEnd));
@@ -3296,10 +3280,18 @@ export class ChainIndexer {
 
     if (startBlock > finalizedBlock) return;
 
+    let blockApi: ApiPromise;
+    const prefetchedBlocks = new Map<number, FetchedBlock>();
     try {
-      const blockApi = await this.getBlockDataApi();
-      const startHash = await withTimeout(blockApi.rpc.chain.getBlockHash(startBlock), `chain.getBlockHash(${startBlock})`);
-      await this.hasBridgeProxyHistoryRuntime(startHash.toString(), startBlock, blockApi);
+      blockApi = await this.getBlockDataApi();
+      const firstPayloadBlock = Math.max(1, startBlock);
+      if (firstPayloadBlock <= finalizedBlock) {
+        prefetchedBlocks.set(firstPayloadBlock, await this.fetchBlockByNumber(firstPayloadBlock));
+      }
+      const startHash = startBlock === 0
+        ? SORA_MAINNET_GENESIS_HASH
+        : prefetchedBlocks.get(startBlock)!.requestedHash;
+      await this.hasBridgeProxyHistoryRuntime(startHash, startBlock, blockApi);
     } catch (error) {
       if (this.skipPrunedHistoricalBackfill('bridgeProxy history backfill', startBlock, error)) return;
       throw error;
@@ -3308,15 +3300,24 @@ export class ChainIndexer {
     for (let block = startBlock; block <= finalizedBlock; block += BRIDGE_PROXY_HISTORY_BACKFILL_BATCH_SIZE) {
       await this.drainFinalizedHeads();
 
-      const blockApi = await this.getBlockDataApi();
       const batchEnd = Math.min(block + BRIDGE_PROXY_HISTORY_BACKFILL_BATCH_SIZE - 1, finalizedBlock);
       const blocks = Array.from({ length: batchEnd - block + 1 }, (_item, index) => block + index);
-      const blockHashes = await mapWithConcurrency(
-        blocks,
+      const payloadBlocks = blocks.filter((blockHeight) => blockHeight > 0);
+      const fetchedBlocks = await mapWithConcurrency(
+        payloadBlocks,
         BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
-        (blockHeight) => withTimeout(blockApi.rpc.chain.getBlockHash(blockHeight), `chain.getBlockHash(${blockHeight})`)
+        async (blockHeight): Promise<FetchedBlock> =>
+          prefetchedBlocks.get(blockHeight) ?? this.fetchBlockByNumber(blockHeight)
       );
-      let scanBlockIndexes = blocks.map((_blockHeight, index) => index);
+      const fetchedBlocksByHeight = new Map(
+        payloadBlocks.map((blockHeight, index) => [blockHeight, fetchedBlocks[index]])
+      );
+      const blockHashes = blocks.map((blockHeight) =>
+        blockHeight === 0
+          ? SORA_MAINNET_GENESIS_HASH
+          : fetchedBlocksByHeight.get(blockHeight)?.requestedHash ?? ''
+      );
+      let scanBlockIndexes = blocks.flatMap((blockHeight, index) => blockHeight > 0 ? [index] : []);
 
       if (!this.bridgeProxyHistoryRuntimeAvailable) {
         const batchEndHasBridgeRuntime = await this.hasBridgeProxyHistoryRuntime(
@@ -3336,24 +3337,16 @@ export class ChainIndexer {
           BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
           (hash, index) => this.hasBridgeProxyHistoryRuntime(hash.toString(), blocks[index], blockApi)
         );
-        scanBlockIndexes = runtimeAvailability.flatMap((available, index) => (available ? [index] : []));
+        scanBlockIndexes = runtimeAvailability.flatMap((available, index) =>
+          available && blocks[index] > 0 ? [index] : []
+        );
         this.bridgeProxyHistoryRuntimeAvailable = scanBlockIndexes.length > 0;
       }
 
-      const signedBlocks = (await mapWithConcurrency(
-        scanBlockIndexes,
-        BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
-        (index) =>
-          withTimeout(
-            this.fetchSignedBlock(blockHashes[index].toString(), blockApi),
-            `chain.getBlock(${blocks[index]})`
-          )
-      )) as SignedBlockLike[];
-      const bridgeBlockIndexes = signedBlocks.flatMap((signedBlock, resultIndex) =>
-        this.hasBridgeProxyHistoryExtrinsics(signedBlock) ? [scanBlockIndexes[resultIndex]] : []
-      );
-      const signedBlocksByIndex = new Map<number, SignedBlockLike>(
-        scanBlockIndexes.map((blockIndex, resultIndex) => [blockIndex, signedBlocks[resultIndex]])
+      const bridgeBlockIndexes = scanBlockIndexes.flatMap((index) =>
+        this.hasBridgeProxyHistoryExtrinsics(
+          fetchedBlocksByHeight.get(blocks[index])!.signedBlock as SignedBlockLike
+        ) ? [index] : []
       );
       const batchDocuments: IndexerDocument[] = [];
       const accountTransactionDocuments: IndexerDocument[] = [];
@@ -3364,18 +3357,15 @@ export class ChainIndexer {
           bridgeBlockIndexes,
           BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
           async (index) => {
-            const hash = blockHashes[index]?.toString();
-            if (!hash) throw new Error(`Missing block hash for bridgeProxy history backfill block ${blocks[index]}`);
-
-            const [events, timestamp] = await Promise.all([
-              this.fetchHistoricalSystemEvents(hash, blocks[index], blockApi),
-              this.fetchHistoricalBlockTimestamp(hash, blocks[index], blockApi),
-            ]);
+            const fetchedBlock = fetchedBlocksByHeight.get(blocks[index]);
+            if (!fetchedBlock) {
+              throw new Error(`Missing verified payload for bridgeProxy history backfill block ${blocks[index]}`);
+            }
 
             return {
-              signedBlock: signedBlocksByIndex.get(index) as SignedBlockLike,
-              events,
-              timestamp,
+              signedBlock: fetchedBlock.signedBlock as SignedBlockLike,
+              events: fetchedBlock.events,
+              timestamp: fetchedBlock.timestamp,
             };
           }
         );
@@ -3780,27 +3770,30 @@ export class ChainIndexer {
     await this.indexFetchedBlock(await this.fetchBlockByHash(hash), options);
   }
 
-  private async fetchBlockByNumber(block: number): Promise<FetchedBlock> {
+  private async fetchBlockByNumber(block: number, executeRpc: RpcExecutor = withRpcTimeout): Promise<FetchedBlock> {
     if (!this.api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
     if (!Number.isSafeInteger(block) || block <= 0 || block > SORA_MAX_BLOCK_NUMBER) {
       throw new Error(`Cannot fetch invalid SORA block height ${block}`);
     }
 
     const blockApi = await this.getBlockDataApi();
-    const hash = await withTimeout(blockApi.rpc.chain.getBlockHash(block), `chain.getBlockHash(${block})`);
+    const hash = await executeRpc(() => blockApi.rpc.chain.getBlockHash(block), `chain.getBlockHash(${block})`);
     const hashText = hash?.toString?.().toLowerCase() ?? '';
     if (!isNonzeroCanonicalSubstrateHash(hashText)) {
       throw new Error(`No SORA block hash available for block ${block} from the configured block data endpoint`);
     }
     if (blockApi !== this.api) {
-      const primaryHash = await withTimeout(this.api.rpc.chain.getBlockHash(block), `primary.chain.getBlockHash(${block})`);
+      const primaryHash = await executeRpc(
+        () => this.api!.rpc.chain.getBlockHash(block),
+        `primary.chain.getBlockHash(${block})`
+      );
       const primaryHashText = primaryHash?.toString?.().toLowerCase() ?? '';
       if (!isNonzeroCanonicalSubstrateHash(primaryHashText) || primaryHashText !== hashText) {
         throw new Error(`SORA block data endpoint hash diverges from the primary endpoint at block ${block}`);
       }
     }
 
-    const fetched = await this.fetchBlockByHash(hashText);
+    const fetched = await this.fetchBlockByHash(hashText, executeRpc);
     const fetchedHeight = fetched.signedBlock?.block?.header?.number?.toNumber?.();
     if (fetchedHeight !== block) {
       throw new Error(`SORA block data endpoint returned block ${fetchedHeight} for requested height ${block}`);
@@ -3808,7 +3801,7 @@ export class ChainIndexer {
     return fetched;
   }
 
-  private async fetchBlockByHash(hash: string): Promise<FetchedBlock> {
+  private async fetchBlockByHash(hash: string, executeRpc: RpcExecutor = withRpcTimeout): Promise<FetchedBlock> {
     if (!this.api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
     const requestedHash = hash.toLowerCase();
     if (!isNonzeroCanonicalSubstrateHash(requestedHash)) {
@@ -3817,12 +3810,12 @@ export class ChainIndexer {
 
     const blockApi = await this.getBlockDataApi();
     if (blockApi === this.api) {
-      return (await this.fetchBlockPayloadFromApi(requestedHash, blockApi, false)).fetchedBlock;
+      return (await this.fetchBlockPayloadFromApi(requestedHash, blockApi, false, executeRpc)).fetchedBlock;
     }
 
     const [blockDataPayload, primaryPayload] = await Promise.all([
-      this.fetchBlockPayloadFromApi(requestedHash, blockApi, true),
-      this.fetchBlockPayloadFromApi(requestedHash, this.api, true),
+      this.fetchBlockPayloadFromApi(requestedHash, blockApi, true, executeRpc),
+      this.fetchBlockPayloadFromApi(requestedHash, this.api, true, executeRpc),
     ]);
     if (blockDataPayload.blockHex !== primaryPayload.blockHex ||
         blockDataPayload.eventsHex !== primaryPayload.eventsHex ||
@@ -3835,14 +3828,15 @@ export class ChainIndexer {
   private async fetchBlockPayloadFromApi(
     hash: string,
     blockApi: ApiPromise,
-    requireCanonicalBytes: boolean
+    requireCanonicalBytes: boolean,
+    executeRpc: RpcExecutor = withRpcTimeout
   ): Promise<FetchedBlockPayload> {
     const canFetchApiAt = typeof (blockApi as unknown as { at?: unknown }).at === 'function';
     if (!canFetchApiAt) {
       const [signedBlock, eventsCodec, timestamp] = await Promise.all([
-        withTimeout(this.fetchSignedBlock(hash, blockApi), `chain.getBlock(${hash})`),
-        withTimeout((blockApi.query as any).system.events.at(hash), `system.events.at(${hash})`),
-        withTimeout(this.fetchBlockTimestampIdentity(hash, blockApi), `timestamp.now.at(${hash})`),
+        executeRpc(() => this.fetchSignedBlock(hash, blockApi), `chain.getBlock(${hash})`),
+        executeRpc(() => (blockApi.query as any).system.events.at(hash), `system.events.at(${hash})`),
+        this.fetchBlockTimestampIdentity(hash, blockApi, executeRpc),
       ]);
 
       return {
@@ -3860,7 +3854,7 @@ export class ChainIndexer {
       };
     }
 
-    const apiAt = await this.fetchApiAtFrom(blockApi, hash, `SORA block ${hash}`);
+    const apiAt = await this.fetchApiAtFrom(blockApi, hash, `SORA block ${hash}`, executeRpc);
     const system = (apiAt.query as { system?: { events?: () => Promise<unknown> } }).system;
     const timestampNow = (apiAt.query as { timestamp?: { now?: () => Promise<unknown> } }).timestamp?.now;
     if (typeof system?.events !== 'function') {
@@ -3871,9 +3865,9 @@ export class ChainIndexer {
     }
 
     const [signedBlock, eventsCodec, timestamp] = await Promise.all([
-      withTimeout(this.fetchSignedBlock(hash, blockApi), `chain.getBlock(${hash})`),
-      withTimeout(system.events.call(system), `system.events(${hash})`),
-      withTimeout(timestampNow(), `timestamp.now(${hash})`).then((codec) =>
+      executeRpc(() => this.fetchSignedBlock(hash, blockApi), `chain.getBlock(${hash})`),
+      executeRpc(() => system.events!.call(system), `system.events(${hash})`),
+      executeRpc(() => timestampNow(), `timestamp.now(${hash})`).then((codec) =>
         parseChainTimestamp(codec, `timestamp.now for block ${hash}`)
       ),
     ]);
@@ -4414,45 +4408,29 @@ export class ChainIndexer {
     return this.fetchApiAtFrom(this.api, hash, label);
   }
 
-  private async fetchApiAtFrom(api: ApiPromise, hash: string, label: string): Promise<{ query: unknown; rpc?: unknown }> {
+  private async fetchApiAtFrom(
+    api: ApiPromise,
+    hash: string,
+    label: string,
+    executeRpc: RpcExecutor = withRpcTimeout
+  ): Promise<{ query: unknown; rpc?: unknown }> {
     const at = (api as unknown as { at?: (hash: string) => Promise<{ query: unknown }> }).at;
     if (typeof at !== 'function') {
       throw new Error('api.at is required to decode historical chain state');
     }
 
-    return withTimeout(at.call(api, hash), `api.at(${label})`);
-  }
-
-  private async fetchHistoricalSystemEvents(hash: string, blockHeight: number, api = this.api): Promise<EventRecord[]> {
-    if (!api) throw new Error('Cannot decode historical SORA events before the chain API is initialized');
-
-    const apiAt = await this.fetchApiAtFrom(api, hash, `SORA block ${blockHeight}`);
-    const system = (apiAt.query as { system?: { events?: () => Promise<unknown> } }).system;
-    if (typeof system?.events !== 'function') {
-      throw new Error(`system.events is required to decode historical SORA block ${blockHeight}`);
-    }
-
-    return (await withTimeout(system.events.call(system), `system.events(${blockHeight})`)) as EventRecord[];
-  }
-
-  private async fetchHistoricalBlockTimestamp(hash: string, blockHeight: number, api = this.api): Promise<number> {
-    if (!api) throw new Error('Cannot decode historical SORA timestamps before the chain API is initialized');
-
-    const apiAt = await this.fetchApiAtFrom(api, hash, `SORA block ${blockHeight}`);
-    const timestampNow = (apiAt.query as { timestamp?: { now?: () => Promise<unknown> } }).timestamp?.now;
-    if (typeof timestampNow !== 'function') {
-      throw new Error(`timestamp.now is required to index historical SORA block ${blockHeight}`);
-    }
-
-    const codec = await withTimeout(timestampNow(), `timestamp.now(${blockHeight})`);
-    return parseChainTimestampSeconds(codec, `timestamp.now for historical SORA block ${blockHeight}`);
+    return executeRpc(() => at.call(api, hash), `api.at(${label})`);
   }
 
   private async fetchBlockTimestamp(hash: string, api = this.api): Promise<number> {
     return (await this.fetchBlockTimestampIdentity(hash, api)).seconds;
   }
 
-  private async fetchBlockTimestampIdentity(hash: string, api = this.api): Promise<ParsedChainTimestamp> {
+  private async fetchBlockTimestampIdentity(
+    hash: string,
+    api = this.api,
+    executeRpc: RpcExecutor = withRpcTimeout
+  ): Promise<ParsedChainTimestamp> {
     if (!this.api) throw new Error('Cannot index a block before the chain API is initialized');
     if (!api) throw new Error('Cannot index a block before the chain API is initialized');
 
@@ -4462,7 +4440,7 @@ export class ChainIndexer {
       throw new Error('timestamp.now.at is required to index block timestamps');
     }
 
-    const codec = await withTimeout(at.call(timestampNow, hash), `timestamp.now.at(${hash})`);
+    const codec = await executeRpc(() => at.call(timestampNow, hash), `timestamp.now.at(${hash})`);
     return parseChainTimestamp(codec, `timestamp.now for block ${hash}`);
   }
 
