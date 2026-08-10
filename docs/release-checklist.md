@@ -7,8 +7,12 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
 
 - Confirm all release work has landed on `develop` and that `master` changes
   have been merged or cherry-picked back to `develop`.
-- Confirm the GraphQL schema, `_health` identity, production environment notes,
-  and storage compatibility are final.
+- Confirm the GraphQL schema, `_health` identity, the five `mobileConfig`
+  capability booleans, production environment notes, and storage compatibility
+  are final. The tester projection defaults to `true,false,true,false,true` for
+  Nexus, Nexus sends, Polkamarkt, Polkamarkt mutations, and Taira respectively;
+  never enable send or mutation capabilities before the candidate-bound mobile
+  release gates qualify.
 - Confirm no private tokens, database credentials, deployment keys, local
   environment files, database files, or backups are committed.
 - Confirm the deployment secret store has three distinct PostgreSQL role URLs:
@@ -109,6 +113,13 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   agree. A prior deployment passed only the static service-identity routing check on
   2026-07-10; the current endpoint does not expose the required checkpoint
   fields, and every release must pass the complete current smoke contract.
+- Confirm the same smoke response exposes boolean `nexusAvailable`,
+  `nexusSendsAvailable`, `polkamarktVisible`,
+  `polkamarktMutationsAvailable`, and `tairaDefaultVisible` fields under
+  `mobileConfig`. Nexus sends require Nexus availability, Polkamarkt mutations
+  require Polkamarkt visibility, and mobile clients independently combine the
+  Taira remote default with the Nexus kill switch. Record the exact
+  operator-selected projection; do not infer a missing value.
 - Before declaring the deployment production-ready, use the generated evidence
   template to create operator-attested evidence for the current release commit,
   immutable Docker image digest, deployment ID, UTC deployment and smoke

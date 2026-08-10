@@ -18,6 +18,7 @@ type UpdateStreamProbe = {
 type GraphQlResponse = {
   data?: {
     _health?: HealthInfo;
+    mobileConfig?: MobileCapabilityInfo;
     chainIdentity?: UpdateStreamProbe | null;
     chainState?: UpdateStreamProbe | null;
     networkSnapshots?: {
@@ -60,6 +61,14 @@ type HealthInfo = {
   lastMasterSeqno?: unknown;
 };
 
+type MobileCapabilityInfo = {
+  nexusAvailable?: unknown;
+  nexusSendsAvailable?: unknown;
+  polkamarktVisible?: unknown;
+  polkamarktMutationsAvailable?: unknown;
+  tairaDefaultVisible?: unknown;
+};
+
 type FetchLike = (input: URL, init?: RequestInit) => Promise<Response>;
 
 export type ProductionSmokeOptions = {
@@ -84,6 +93,8 @@ const PI_GRAPHQL_DEPLOYMENT_HINT =
   'Production routing must serve the polkaswap-indexer GraphQL API at https://pi.soramitsu.io/graphql. Deploy the current polkaswap-indexer image to pi.soramitsu.io/graphql.';
 const PI_HEALTH_DEPLOYMENT_HINT =
   `Deploy the current polkaswap-indexer worker and API so _health proves genesisHash=${SORA_MAINNET_GENESIS_HASH} and an exact, fresh SORA mainnet chainState checkpoint.`;
+const PI_MOBILE_CAPABILITY_DEPLOYMENT_HINT =
+  'Deploy the current polkaswap-indexer API so mobileConfig exposes the complete fail-closed SORA mobile capability contract.';
 
 const PRODUCTION_SMOKE_QUERY = /* GraphQL */ `
   query PolkaswapProductionSmoke {
@@ -113,6 +124,13 @@ const PRODUCTION_SMOKE_QUERY = /* GraphQL */ `
       workerLastSuccessfulIndexTimestamp
       workerLastError
       workerLastErrorTimestamp
+    }
+    mobileConfig {
+      nexusAvailable
+      nexusSendsAvailable
+      polkamarktVisible
+      polkamarktMutationsAvailable
+      tairaDefaultVisible
     }
     chainIdentity: updatesStream(id: "chainIdentity") {
       id
@@ -363,6 +381,20 @@ function missingHealthIdentityFields(errors: unknown): string[] {
   );
 }
 
+function missingMobileCapabilityFields(errors: unknown): string[] {
+  const messages = graphqlErrorMessages(errors);
+  const requiredFields = [
+    'nexusAvailable',
+    'nexusSendsAvailable',
+    'polkamarktVisible',
+    'polkamarktMutationsAvailable',
+    'tairaDefaultVisible',
+  ];
+  return requiredFields.filter((field) =>
+    messages.some((message) => message.includes(`Cannot query field "${field}" on type "MobileConfig"`))
+  );
+}
+
 async function fetchGraphQl(
   fetchImpl: FetchLike,
   graphqlUrl: URL,
@@ -407,6 +439,12 @@ async function fetchGraphQl(
         if (missingIdentityFields.length > 0) {
           throw new Error(
             `PI production GraphQL schema is missing _health identity fields (${missingIdentityFields.join(', ')}). ${PI_HEALTH_DEPLOYMENT_HINT}`
+          );
+        }
+        const missingCapabilityFields = missingMobileCapabilityFields(errorPayload?.errors);
+        if (missingCapabilityFields.length > 0) {
+          throw new Error(
+            `PI production GraphQL schema is missing mobile capability fields (${missingCapabilityFields.join(', ')}). ${PI_MOBILE_CAPABILITY_DEPLOYMENT_HINT}`
           );
         }
       } catch (error) {
@@ -513,6 +551,29 @@ function assertHealthContract(health: HealthInfo): void {
   }
 }
 
+function assertMobileCapabilityContract(capabilities: MobileCapabilityInfo): void {
+  const fields = [
+    'nexusAvailable',
+    'nexusSendsAvailable',
+    'polkamarktVisible',
+    'polkamarktMutationsAvailable',
+    'tairaDefaultVisible',
+  ] as const;
+  for (const field of fields) {
+    if (typeof capabilities[field] !== 'boolean') {
+      throw new Error(
+        `PI production mobile capability ${field} must be boolean; received ${formatValue(capabilities[field])}. ${PI_MOBILE_CAPABILITY_DEPLOYMENT_HINT}`
+      );
+    }
+  }
+  if (capabilities.nexusSendsAvailable && !capabilities.nexusAvailable) {
+    throw new Error(`PI production Nexus sends require Nexus availability. ${PI_MOBILE_CAPABILITY_DEPLOYMENT_HINT}`);
+  }
+  if (capabilities.polkamarktMutationsAvailable && !capabilities.polkamarktVisible) {
+    throw new Error(`PI production Polkamarkt mutations require visibility. ${PI_MOBILE_CAPABILITY_DEPLOYMENT_HINT}`);
+  }
+}
+
 function parseProbeJson(probe: UpdateStreamProbe, label: string): unknown {
   if (typeof probe.data !== 'string') {
     throw new Error(`PI production ${label} data must be JSON text. ${PI_HEALTH_DEPLOYMENT_HINT}`);
@@ -559,6 +620,12 @@ export async function runProductionSmoke(
         `PI production GraphQL schema is missing _health identity fields (${missingIdentityFields.join(', ')}). ${PI_HEALTH_DEPLOYMENT_HINT}`
       );
     }
+    const missingCapabilityFields = missingMobileCapabilityFields(payload.errors);
+    if (missingCapabilityFields.length > 0) {
+      throw new Error(
+        `PI production GraphQL schema is missing mobile capability fields (${missingCapabilityFields.join(', ')}). ${PI_MOBILE_CAPABILITY_DEPLOYMENT_HINT}`
+      );
+    }
     throw new Error(`Polkaswap GraphQL endpoint returned errors: ${bodyPreview(JSON.stringify(payload.errors))}. ${PI_GRAPHQL_DEPLOYMENT_HINT}`);
   }
   if (!payload.data?._health || typeof payload.data._health !== 'object') {
@@ -568,6 +635,12 @@ export async function runProductionSmoke(
   }
 
   assertHealthContract(payload.data._health);
+  if (!payload.data.mobileConfig || typeof payload.data.mobileConfig !== 'object') {
+    throw new Error(
+      `Polkaswap GraphQL endpoint did not return data.mobileConfig. ${PI_MOBILE_CAPABILITY_DEPLOYMENT_HINT}`
+    );
+  }
+  assertMobileCapabilityContract(payload.data.mobileConfig);
 
   const identityProbe = payload.data.chainIdentity;
   if (!identityProbe || identityProbe.id !== 'chainIdentity' ||

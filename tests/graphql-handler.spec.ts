@@ -99,6 +99,13 @@ const config: AppConfig = {
   workerMetricsHost: '127.0.0.1',
   workerMetricsPort: 9464,
   workerMetricsMaxInFlight: 10,
+  mobileCapabilities: {
+    nexusAvailable: true,
+    nexusSendsAvailable: false,
+    polkamarktVisible: true,
+    polkamarktMutationsAvailable: false,
+    tairaDefaultVisible: true,
+  },
 };
 
 const post = (
@@ -136,6 +143,32 @@ describe('production GraphQL handler', () => {
     expect(await response.json()).toMatchObject({
       data: { _health: { ok: true, serviceId: 'pi.soramitsu.io', readOnly: true } },
     });
+  });
+
+  it('projects one exact configured mobile capability snapshot through the handler', async () => {
+    const mobileCapabilities = {
+      nexusAvailable: true,
+      nexusSendsAvailable: true,
+      polkamarktVisible: true,
+      polkamarktMutationsAvailable: true,
+      tairaDefaultVisible: false,
+    };
+    const { yoga } = createGraphQLHandler(
+      { ...config, mobileCapabilities },
+      new MemoryRepository()
+    );
+    const response = await post(yoga, `{
+      mobileConfig {
+        nexusAvailable
+        nexusSendsAvailable
+        polkamarktVisible
+        polkamarktMutationsAvailable
+        tairaDefaultVisible
+      }
+    }`);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ data: { mobileConfig: mobileCapabilities } });
   });
 
   it('applies introspection, alias, and connection-cost limits before resolvers', async () => {

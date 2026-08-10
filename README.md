@@ -553,9 +553,24 @@ export POLKASWAP_WORKER_DATABASE_URL=postgresql://pi_worker:<worker-secret>@db.e
 export POLKASWAP_SORA_WS_ENDPOINT=wss://<controlled-verifying-primary>
 export POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://<independently-operated-archive>
 export POLKASWAP_CHAIN_START_BLOCK=<reviewed-first-required-block>
+export POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE=true
+export POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=false
+export POLKASWAP_MOBILE_CONFIG_POLKAMARKT_VISIBLE=true
+export POLKASWAP_MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE=false
+export POLKASWAP_MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE=true
 docker compose -f docker-compose.production.yml config --quiet
 docker compose -f docker-compose.production.yml up -d
 ```
+
+The five mobile capability values are explicit deployment inputs. Their tester
+defaults are `true,false,true,false,true` in the order shown above.
+`MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=true` requires Nexus availability, while
+Polkamarkt mutations require Polkamarkt visibility. Taira's remote default
+remains independent because each mobile client applies the Nexus kill switch to
+effective visibility. Keep send/mutation flags false until the external
+candidate-bound release admission authorizes them; the public production smoke
+validates presence, boolean shape, and these prerequisite relationships. Remote
+capabilities never replace the mobile client's local signing and rollout gates.
 
 Never run an unqualified `docker compose ... config` after exporting database
 credentials because its rendered output contains the interpolated URLs. Use

@@ -24,8 +24,9 @@ expect_failure() {
   local expected="$4"
   local compose="${5:-$ROOT_DIR/docker-compose.production.yml}"
   local readme="${6:-$ROOT_DIR/README.md}"
+  local env_example="${7:-$ROOT_DIR/.env.example}"
   local output="$TMP_DIR/$label.out"
-  if bash "$AUDIT_SCRIPT" "$dockerfile" "$dockerignore" "$compose" "$readme" >"$output" 2>&1; then
+  if bash "$AUDIT_SCRIPT" "$dockerfile" "$dockerignore" "$compose" "$readme" "$env_example" >"$output" 2>&1; then
     echo "[deployment-manifest-test][error] $label unexpectedly passed" >&2
     exit 1
   fi
@@ -165,6 +166,36 @@ api_extra_environment="$TMP_DIR/docker-compose.api-extra-environment.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$api_extra_environment"
 perl -0pi -e 's/(^  api:\n.*?^      NODE_ENV: production\n)/$1      UNREVIEWED_RUNTIME_INPUT: "1"\n/ms' "$api_extra_environment"
 expect_failure "api-extra-environment" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "resolved api environment must match its exact audited map" "$api_extra_environment"
+
+api_missing_mobile_capability="$TMP_DIR/docker-compose.api-missing-mobile-capability.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_missing_mobile_capability"
+perl -0pi -e 's/^      MOBILE_CONFIG_NEXUS_AVAILABLE:.*\n//m' "$api_missing_mobile_capability"
+expect_failure "api-missing-mobile-capability" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "Production Compose must expose MOBILE_CONFIG_NEXUS_AVAILABLE through its exact reviewed deployment input" "$api_missing_mobile_capability"
+
+api_unreviewed_mobile_default="$TMP_DIR/docker-compose.api-unreviewed-mobile-default.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$api_unreviewed_mobile_default"
+perl -0pi -e 's/POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE:-false/POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE:-true/' "$api_unreviewed_mobile_default"
+expect_failure "api-unreviewed-mobile-default" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "Production Compose must expose MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE through its exact reviewed deployment input" "$api_unreviewed_mobile_default"
+
+dockerfile_mobile_default_drift="$TMP_DIR/Dockerfile.mobile-default-drift"
+cp "$ROOT_DIR/Dockerfile" "$dockerfile_mobile_default_drift"
+perl -0pi -e 's/MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE=true/MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE=false/' "$dockerfile_mobile_default_drift"
+expect_failure "dockerfile-mobile-default-drift" "$dockerfile_mobile_default_drift" "$ROOT_DIR/.dockerignore" "runtime image must pin the reviewed MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE tester default"
+
+dockerfile_duplicate_mobile_override="$TMP_DIR/Dockerfile.duplicate-mobile-override"
+cp "$ROOT_DIR/Dockerfile" "$dockerfile_duplicate_mobile_override"
+printf '\nENV MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=true\n' >> "$dockerfile_duplicate_mobile_override"
+expect_failure "dockerfile-duplicate-mobile-override" "$dockerfile_duplicate_mobile_override" "$ROOT_DIR/.dockerignore" "runtime image must assign MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE exactly once"
+
+env_example_missing_compose_capability="$TMP_DIR/.env.example.missing-compose-capability"
+cp "$ROOT_DIR/.env.example" "$env_example_missing_compose_capability"
+perl -0pi -e 's/^POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE=.*\n//m' "$env_example_missing_compose_capability"
+expect_failure "env-example-missing-compose-capability" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" ".env.example must document the production Compose POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE tester default" "$ROOT_DIR/docker-compose.production.yml" "$ROOT_DIR/README.md" "$env_example_missing_compose_capability"
+
+worker_mobile_capability="$TMP_DIR/docker-compose.worker-mobile-capability.yml"
+cp "$ROOT_DIR/docker-compose.production.yml" "$worker_mobile_capability"
+perl -0pi -e 's/(^  worker:\n.*?^      NODE_ENV: production\n)/$1      MOBILE_CONFIG_NEXUS_AVAILABLE: "true"\n/ms' "$worker_mobile_capability"
+expect_failure "worker-mobile-capability" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "mobile capabilities must be routed only to the API service" "$worker_mobile_capability"
 
 api_extra_port="$TMP_DIR/docker-compose.api-extra-port.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$api_extra_port"

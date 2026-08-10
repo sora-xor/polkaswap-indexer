@@ -9,6 +9,38 @@ const fail = (message) => {
 const isRecord = (value) =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 
+const mobileCapabilityNames = [
+  'MOBILE_CONFIG_NEXUS_AVAILABLE',
+  'MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE',
+  'MOBILE_CONFIG_POLKAMARKT_VISIBLE',
+  'MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE',
+  'MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE',
+];
+const parseExpectedMobileCapabilities = () => {
+  if (process.argv.length === 2) return ['true', 'false', 'true', 'false', 'true'];
+  if (process.argv.length !== 4 || process.argv[2] !== '--mobile-capabilities') {
+    console.error(
+      '[deployment-manifest-resolved][error] expected no arguments or --mobile-capabilities <five comma-separated booleans>'
+    );
+    process.exit(1);
+  }
+  const values = process.argv[3].split(',');
+  if (
+    values.length !== mobileCapabilityNames.length ||
+    values.some((value) => value !== 'true' && value !== 'false')
+  ) {
+    console.error(
+      '[deployment-manifest-resolved][error] --mobile-capabilities must contain exactly five comma-separated booleans'
+    );
+    process.exit(1);
+  }
+  return values;
+};
+const expectedMobileCapabilityValues = parseExpectedMobileCapabilities();
+const expectedMobileCapabilities = Object.fromEntries(
+  mobileCapabilityNames.map((name, index) => [name, expectedMobileCapabilityValues[index]])
+);
+
 let input = '';
 for await (const chunk of process.stdin) input += chunk;
 
@@ -75,6 +107,7 @@ const expectedEnvironments = {
     HTTP_MAX_CONNECTIONS: '2048',
     HTTP_MAX_HEADER_BYTES: '16384',
     HTTP_MAX_REQUESTS_PER_SOCKET: '1000',
+    ...expectedMobileCapabilities,
     NODE_ENV: 'production',
     PORT: '4350',
     RATE_LIMIT_GLOBAL_MAX: '50000',

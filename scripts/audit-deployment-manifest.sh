@@ -6,6 +6,7 @@ DOCKERFILE="${1:-$ROOT_DIR/Dockerfile}"
 DOCKERIGNORE="${2:-$ROOT_DIR/.dockerignore}"
 PRODUCTION_COMPOSE="${3:-$ROOT_DIR/docker-compose.production.yml}"
 README_FILE="${4:-$ROOT_DIR/README.md}"
+ENV_EXAMPLE="${5:-$ROOT_DIR/.env.example}"
 RESOLVED_AUDIT_SCRIPT="$ROOT_DIR/scripts/audit-resolved-deployment-manifest.mjs"
 FAILURES=0
 NODE_IMAGE='node:24-bookworm-slim@sha256:cb4e8f7c443347358b7875e717c29e27bf9befc8f5a26cf18af3c3dec80e58c5'
@@ -88,6 +89,10 @@ require_exact_service_keys() {
   echo "[deployment-manifest][error] README missing: $README_FILE" >&2
   exit 1
 }
+[[ -f "$ENV_EXAMPLE" ]] || {
+  echo "[deployment-manifest][error] .env.example missing: $ENV_EXAMPLE" >&2
+  exit 1
+}
 [[ -f "$RESOLVED_AUDIT_SCRIPT" ]] || {
   echo "[deployment-manifest][error] Resolved Compose auditor missing: $RESOLVED_AUDIT_SCRIPT" >&2
   exit 1
@@ -124,6 +129,26 @@ require_literal "$DOCKERFILE" 'RATE_LIMIT_GLOBAL_MAX=50000' "runtime image must 
 require_literal "$DOCKERFILE" 'GRAPHQL_ALLOW_INTROSPECTION=false' "runtime image must disable production introspection"
 require_literal "$DOCKERFILE" 'GRAPHQL_WS_MAX_CONNECTIONS=512' "runtime image must bound WebSocket connections"
 require_literal "$DOCKERFILE" 'GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION=32' "runtime image must bound WebSocket operations"
+mobile_capability_suffixes=(
+  NEXUS_AVAILABLE
+  NEXUS_SENDS_AVAILABLE
+  POLKAMARKT_VISIBLE
+  POLKAMARKT_MUTATIONS_AVAILABLE
+  TAIRA_DEFAULT_VISIBLE
+)
+mobile_capability_defaults=(true false true false true)
+for index in "${!mobile_capability_suffixes[@]}"; do
+  capability="MOBILE_CONFIG_${mobile_capability_suffixes[$index]}"
+  deployment_input="POLKASWAP_${capability}"
+  capability_default="${mobile_capability_defaults[$index]}"
+  require_literal "$DOCKERFILE" "${capability}=${capability_default}" "runtime image must pin the reviewed ${capability} tester default"
+  capability_assignment_count="$({ grep -Fo "${capability}=" "$DOCKERFILE" || true; } | awk 'END { print NR }')"
+  if [[ "$capability_assignment_count" -ne 1 ]]; then
+    fail "runtime image must assign ${capability} exactly once"
+  fi
+  require_literal "$ENV_EXAMPLE" "${capability}=${capability_default}" ".env.example must document the direct-process ${capability} tester default"
+  require_literal "$ENV_EXAMPLE" "${deployment_input}=${capability_default}" ".env.example must document the production Compose ${deployment_input} tester default"
+done
 require_literal "$DOCKERFILE" 'POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS=4000' "runtime healthcheck must use a deadline shorter than its container timeout"
 require_literal "$DOCKERFILE" 'node dist/src/scripts/production-smoke.js' "runtime healthcheck must reuse the complete PI identity smoke contract"
 require_literal "$DOCKERFILE" 'http://127.0.0.1:${PORT:-4350}${GRAPHQL_PATH:-/graphql}' "runtime healthcheck must probe the loopback GraphQL endpoint"
@@ -153,6 +178,12 @@ require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_ALLOW_INTROSPECTION: "false"' "Pr
 require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_WS_MAX_CONNECTIONS: "512"' "Production Compose must bound WebSocket connections"
 require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT: "512"' "Production Compose must avoid treating the loopback proxy as one WebSocket client"
 require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION: "32"' "Production Compose must bound WebSocket operations"
+for index in "${!mobile_capability_suffixes[@]}"; do
+  capability="MOBILE_CONFIG_${mobile_capability_suffixes[$index]}"
+  deployment_input="POLKASWAP_${capability}"
+  capability_default="${mobile_capability_defaults[$index]}"
+  require_literal "$PRODUCTION_COMPOSE" "      ${capability}: \"\${${deployment_input}:-${capability_default}}\"" "Production Compose must expose ${capability} through its exact reviewed deployment input"
+done
 
 if [[ "$(grep -Fc '<<: *runtime-security' "$PRODUCTION_COMPOSE")" -ne 3 ]]; then
   fail "Production Compose must apply the hardened runtime anchor to migration, API, and worker"
@@ -218,6 +249,14 @@ else
   if [[ "$(grep -Fxc '      SKIP_POSTGRES_MIGRATION: "true"' <<<"$api_service")" -ne 1 ]]; then
     fail "api must disable in-process PostgreSQL migration"
   fi
+  for index in "${!mobile_capability_suffixes[@]}"; do
+    capability="MOBILE_CONFIG_${mobile_capability_suffixes[$index]}"
+    deployment_input="POLKASWAP_${capability}"
+    capability_default="${mobile_capability_defaults[$index]}"
+    if [[ "$(grep -Fxc "      ${capability}: \"\${${deployment_input}:-${capability_default}}\"" <<<"$api_service")" -ne 1 ]]; then
+      fail "api must expose ${capability} through its exact reviewed deployment input"
+    fi
+  done
 fi
 
 if [[ -z "$worker_service" ]]; then
@@ -258,6 +297,10 @@ else
   if [[ "$(grep -Fxc '      CHAIN_START_BLOCK: "${POLKASWAP_CHAIN_START_BLOCK:?Set the reviewed first SORA block to index}"' <<<"$worker_service")" -ne 1 ]]; then
     fail "worker must require an explicit reviewed chain start block"
   fi
+fi
+
+if grep -Fq 'MOBILE_CONFIG_' <<<"$migration_service" || grep -Fq 'MOBILE_CONFIG_' <<<"$worker_service"; then
+  fail "mobile capabilities must be routed only to the API service"
 fi
 
 for service_and_section in \
@@ -315,6 +358,12 @@ fi
 
 if [[ "${#compose_command[@]}" -gt 0 ]]; then
   if resolved_compose="$(
+    env \
+    -u POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE \
+    -u POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE \
+    -u POLKASWAP_MOBILE_CONFIG_POLKAMARKT_VISIBLE \
+    -u POLKASWAP_MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE \
+    -u POLKASWAP_MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE \
     POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.invalid/polkaswap-indexer \
     POLKASWAP_INDEXER_IMAGE_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     POLKASWAP_MIGRATION_OWNER_DATABASE_URL='postgresql://manifest_migration_owner:owner-test-only@database.invalid/polkaswap?sslmode=verify-full' \
@@ -330,6 +379,29 @@ if [[ "${#compose_command[@]}" -gt 0 ]]; then
     fi
   else
     fail "Production Compose must render successfully for resolved per-service audit"
+  fi
+
+  if resolved_override_compose="$(
+    POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.invalid/polkaswap-indexer \
+    POLKASWAP_INDEXER_IMAGE_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    POLKASWAP_MIGRATION_OWNER_DATABASE_URL='postgresql://manifest_migration_owner:owner-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_API_DATABASE_URL='postgresql://manifest_api:api-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_WORKER_DATABASE_URL='postgresql://manifest_worker:worker-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
+    POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
+    POLKASWAP_CHAIN_START_BLOCK=14000000 \
+    POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE=true \
+    POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=true \
+    POLKASWAP_MOBILE_CONFIG_POLKAMARKT_VISIBLE=true \
+    POLKASWAP_MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE=true \
+    POLKASWAP_MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE=false \
+      "${compose_command[@]}" -f "$PRODUCTION_COMPOSE" config --format json 2>/dev/null
+  )"; then
+    if ! node "$RESOLVED_AUDIT_SCRIPT" --mobile-capabilities true,true,true,true,false <<<"$resolved_override_compose"; then
+      FAILURES=1
+    fi
+  else
+    fail "Production Compose must render every explicit mobile capability override"
   fi
 fi
 

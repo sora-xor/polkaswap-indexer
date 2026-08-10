@@ -95,6 +95,11 @@ const CONFIG_ENV_KEYS = [
   'WORKER_METRICS_HOST',
   'WORKER_METRICS_PORT',
   'WORKER_METRICS_MAX_IN_FLIGHT',
+  'MOBILE_CONFIG_NEXUS_AVAILABLE',
+  'MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE',
+  'MOBILE_CONFIG_POLKAMARKT_VISIBLE',
+  'MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE',
+  'MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE',
 ] as const;
 
 const originalEnv = new Map(CONFIG_ENV_KEYS.map((key) => [key, process.env[key]]));
@@ -198,6 +203,13 @@ describe('runtime configuration', () => {
       workerMetricsHost: '127.0.0.1',
       workerMetricsPort: 9464,
       workerMetricsMaxInFlight: 10,
+      mobileCapabilities: {
+        nexusAvailable: true,
+        nexusSendsAvailable: false,
+        polkamarktVisible: true,
+        polkamarktMutationsAvailable: false,
+        tairaDefaultVisible: true,
+      },
     });
   });
 
@@ -385,6 +397,11 @@ describe('runtime configuration', () => {
       WORKER_METRICS_HOST: '::1',
       WORKER_METRICS_PORT: '9465',
       WORKER_METRICS_MAX_IN_FLIGHT: '20',
+      MOBILE_CONFIG_NEXUS_AVAILABLE: 'yes',
+      MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE: 'yes',
+      MOBILE_CONFIG_POLKAMARKT_VISIBLE: 'yes',
+      MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE: 'yes',
+      MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE: 'yes',
     });
 
     expect(readConfig()).toEqual({
@@ -470,6 +487,13 @@ describe('runtime configuration', () => {
       workerMetricsHost: '::1',
       workerMetricsPort: 9465,
       workerMetricsMaxInFlight: 20,
+      mobileCapabilities: {
+        nexusAvailable: true,
+        nexusSendsAvailable: true,
+        polkamarktVisible: true,
+        polkamarktMutationsAvailable: true,
+        tairaDefaultVisible: true,
+      },
     });
   });
 
@@ -576,6 +600,11 @@ describe('runtime configuration', () => {
     ['SKIP_POSTGRES_MIGRATION', 'sometimes', 'true, false'],
     ['GRAPHQL_ALLOW_INTROSPECTION', 'sometimes', 'true, false'],
     ['CHAIN_LEGACY_SORA_BLOCK_TYPES', 'sometimes', 'true, false'],
+    ['MOBILE_CONFIG_NEXUS_AVAILABLE', 'sometimes', 'true, false'],
+    ['MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE', 'sometimes', 'true, false'],
+    ['MOBILE_CONFIG_POLKAMARKT_VISIBLE', 'sometimes', 'true, false'],
+    ['MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE', 'sometimes', 'true, false'],
+    ['MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE', 'sometimes', 'true, false'],
   ])('rejects unsupported enum/boolean input %s=%s', (name, value, message) => {
     process.env[name] = value;
     expect(() => readConfig()).toThrow(new RegExp(`Invalid ${name}:.*${message}`));
@@ -615,11 +644,34 @@ describe('runtime configuration', () => {
       process.env.GRAPHQL_ALLOW_INTROSPECTION = value;
       process.env.SKIP_POSTGRES_MIGRATION = value;
       process.env.CHAIN_LEGACY_SORA_BLOCK_TYPES = value;
+      process.env.MOBILE_CONFIG_NEXUS_AVAILABLE = value;
+      process.env.MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE = value;
+      process.env.MOBILE_CONFIG_POLKAMARKT_VISIBLE = value;
+      process.env.MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE = value;
+      process.env.MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE = value;
       expect(readConfig().rocksdbEnableStats).toBe(false);
       expect(readConfig().graphqlAllowIntrospection).toBe(false);
       expect(readConfig().skipPostgresMigration).toBe(false);
       expect(readConfig().legacySoraBlockTypes).toBe(false);
+      expect(readConfig().mobileCapabilities).toEqual({
+        nexusAvailable: false,
+        nexusSendsAvailable: false,
+        polkamarktVisible: false,
+        polkamarktMutationsAvailable: false,
+        tairaDefaultVisible: false,
+      });
     }
+  });
+
+  it.each([
+    ['MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE', 'MOBILE_CONFIG_NEXUS_AVAILABLE'],
+    ['MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE', 'MOBILE_CONFIG_POLKAMARKT_VISIBLE'],
+  ])('rejects capability %s when prerequisite %s is disabled', (capability, prerequisite) => {
+    process.env[capability] = 'true';
+    process.env[prerequisite] = 'false';
+    expect(() => readConfig()).toThrow(
+      new RegExp(`Invalid ${capability}:.*requires ${prerequisite}=true`)
+    );
   });
 
   it('defaults finalized catch-up prefetching to the configured backfill concurrency', () => {

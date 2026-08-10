@@ -2,6 +2,14 @@ import { isIP } from 'node:net';
 
 import { findUnsafePostgresProcessEnvironmentOverride } from './postgres-session.js';
 
+export type MobileCapabilities = {
+  nexusAvailable: boolean;
+  nexusSendsAvailable: boolean;
+  polkamarktVisible: boolean;
+  polkamarktMutationsAvailable: boolean;
+  tairaDefaultVisible: boolean;
+};
+
 export type AppConfig = {
   host: string;
   port: number;
@@ -86,6 +94,8 @@ export type AppConfig = {
   workerMetricsHost: string;
   workerMetricsPort: number;
   workerMetricsMaxInFlight: number;
+  /** Public mobile capability projection. Production readConfig always supplies it. */
+  mobileCapabilities?: MobileCapabilities;
 };
 
 const DEFAULT_DATABASE_URL = 'postgres://polkaswap:polkaswap@127.0.0.1:5432/polkaswap_indexer';
@@ -383,6 +393,19 @@ export function readConfig(): AppConfig {
   if (graphqlMaxResultBytes > graphqlExecutionMemoryMaxBytes) {
     invalid('GRAPHQL_EXECUTION_MEMORY_MAX_BYTES', 'must be at least GRAPHQL_MAX_RESULT_BYTES');
   }
+  const mobileCapabilities: MobileCapabilities = {
+    nexusAvailable: readBoolean('MOBILE_CONFIG_NEXUS_AVAILABLE', true),
+    nexusSendsAvailable: readBoolean('MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE'),
+    polkamarktVisible: readBoolean('MOBILE_CONFIG_POLKAMARKT_VISIBLE', true),
+    polkamarktMutationsAvailable: readBoolean('MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE'),
+    tairaDefaultVisible: readBoolean('MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE', true),
+  };
+  if (mobileCapabilities.nexusSendsAvailable && !mobileCapabilities.nexusAvailable) {
+    invalid('MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE', 'requires MOBILE_CONFIG_NEXUS_AVAILABLE=true');
+  }
+  if (mobileCapabilities.polkamarktMutationsAvailable && !mobileCapabilities.polkamarktVisible) {
+    invalid('MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE', 'requires MOBILE_CONFIG_POLKAMARKT_VISIBLE=true');
+  }
 
   return {
     host,
@@ -595,5 +618,6 @@ export function readConfig(): AppConfig {
       minimum: 1,
       maximum: 10_000,
     }),
+    mobileCapabilities,
   };
 }
