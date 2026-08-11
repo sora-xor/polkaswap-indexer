@@ -55,15 +55,29 @@ describe('production container contract', () => {
     }
   });
 
-  it('uses the compiled identity smoke with environment-driven health routing', async () => {
+  it('uses an exec-form healthcheck with environment-driven routing', async () => {
     const dockerfile = await readProjectFile('Dockerfile');
+    const healthcheck = dockerfile
+      .split('\n')
+      .find((line) => line.trimStart().startsWith('CMD ["node", "-e"'));
 
-    expect(dockerfile).toContain('node dist/src/scripts/production-smoke.js');
-    expect(dockerfile).toContain(
-      '"http://127.0.0.1:${PORT:-4350}${GRAPHQL_PATH:-/graphql}"'
+    expect(healthcheck).toBeDefined();
+    const command = JSON.parse(healthcheck!.trimStart().slice('CMD '.length)) as string[];
+
+    expect(command.slice(0, 2)).toEqual(['node', '-e']);
+    expect(() => new Function(command[2]!)).not.toThrow();
+    expect(command[2]).toContain('process.env.PORT');
+    expect(command[2]).toContain('process.env.GRAPHQL_PATH');
+    expect(command[2]).toContain("'http://127.0.0.1:'+port+path");
+    expect(command[2]).toContain(
+      "spawn(process.execPath,['dist/src/scripts/production-smoke.js',endpoint]"
     );
-    expect(dockerfile).toContain('POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS=4000');
-    expect(dockerfile).not.toContain('http://127.0.0.1:4350/graphql');
+    expect(command[2]).toContain("stdio:'ignore'");
+    expect(command[2]).toContain("POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS:'4000'");
+    expect(command[2]).toContain("child.once('error',()=>process.exit(1))");
+    expect(command[2]).toContain("child.once('exit',code=>process.exit(code??1))");
+    expect(command[2]).toContain(".catch(()=>process.exit(1))");
+    expect(command[2]).not.toContain('http://127.0.0.1:4350/graphql');
   });
 
   it('overrides standalone worker healthchecks to use the isolated readiness listener', async () => {

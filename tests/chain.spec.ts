@@ -5,11 +5,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiPromise } from '@polkadot/api';
 import { ChainIndexer } from '../src/worker/chain.js';
 import { MemoryRepository } from '../src/repository/memory.js';
+import { SORA_LEGACY_IDENTITY_ANCHOR, SORA_MAINNET_GENESIS_HASH } from '../src/soraIdentity.js';
 import { MAX_REPOSITORY_WRITE_CALL_DOCUMENTS } from '../src/repository/validation.js';
-import {
-  SORA_LEGACY_IDENTITY_ANCHOR,
-  SORA_MAINNET_GENESIS_HASH,
-} from '../src/soraIdentity.js';
+import { createPersistedWorkerStatusDocument } from '../src/worker/status.js';
 
 import type { IndexerDocument } from '../src/repository/types.js';
 
@@ -142,7 +140,6 @@ const config = {
 const mainnetStartApi = (finalizedBlock = SORA_LEGACY_IDENTITY_ANCHOR.block + 100) => {
   const finalizedHash = canonicalBlockHash(`finalized-${finalizedBlock}`);
   return {
-    disconnect: vi.fn(async () => undefined),
     rpc: {
       chain: {
         getBlockHash: async (block: number) => ({
@@ -987,16 +984,16 @@ describe('ChainIndexer price derivation', () => {
     };
     indexer.dirtyDerivedStorageDomains.clear();
     markIndexerMainnet(indexer);
-    const requestedHash = canonicalBlockHash('storage-domains-249');
+    const blockHash = canonicalBlockHash('storage-domain-commit');
 
     await expect(
       indexer.indexFetchedBlock({
-        requestedHash,
+        requestedHash: blockHash,
         signedBlock: {
           block: {
             header: {
               number: { toNumber: () => 249 },
-              hash: { toString: () => requestedHash },
+              hash: { toString: () => blockHash },
             },
             extrinsics: [],
           },
@@ -1037,15 +1034,15 @@ describe('ChainIndexer price derivation', () => {
     };
     indexer.requestDerivedStateRefresh = requestDerivedStateRefresh;
     markIndexerMainnet(indexer);
-    const requestedHash = canonicalBlockHash('reconciliation-250');
+    const blockHash = canonicalBlockHash('full-reconciliation');
 
     await indexer.indexFetchedBlock({
-      requestedHash,
+      requestedHash: blockHash,
       signedBlock: {
         block: {
           header: {
             number: { toNumber: () => 250 },
-            hash: { toString: () => requestedHash },
+            hash: { toString: () => blockHash },
           },
           extrinsics: [],
         },
@@ -4217,6 +4214,712 @@ describe('ChainIndexer price derivation', () => {
 
 
 
+  it('backfills account transaction rows from legacy history without external hex addresses', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      backfillAccountTransactions: () => Promise<boolean>;
+    };
+
+    await repository.upsertMany([
+      {
+        collection: 'historyElements',
+        id: 'legacy-a',
+        blockHeight: 1,
+        timestamp: 100,
+        data: {
+          id: 'legacy-a',
+          blockHeight: 1,
+          timestamp: 100,
+          address: 'alice',
+          dataFrom: 'alice',
+          dataTo: '0xrecipient',
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: 'legacy-b',
+        blockHeight: 2,
+        timestamp: 200,
+        data: {
+          id: 'legacy-b',
+          blockHeight: 2,
+          timestamp: 200,
+          address: '0xbridgepeer',
+          dataFrom: '0xsender',
+          dataTo: 'bob',
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: 'legacy-c',
+        blockHeight: 0,
+        timestamp: 0,
+        data: {
+          id: 'legacy-c',
+          blockHeight: 0,
+          timestamp: 0,
+          address: ' alice ',
+          dataFrom: 'not an account',
+          dataTo: '',
+        },
+      },
+    ]);
+
+    await expect(indexer.backfillAccountTransactions()).resolves.toBe(true);
+
+    const aliceActivity = await repository.get('accountTransactions', 'legacy-a-alice');
+    const bobActivity = await repository.get('accountTransactions', 'legacy-b-bob');
+    const duplicateAliceActivity = await repository.get('accountTransactions', 'legacy-c-alice');
+    const externalRecipient = await repository.get('accountTransactions', 'legacy-a-0xrecipient');
+    const externalSender = await repository.get('accountTransactions', 'legacy-b-0xsender');
+    const malformedText = (await repository.list('accountTransactions')).find(
+      (document) => document.data.accountId === 'not an account'
+    );
+    const objectCoercion = await repository.get('accountTransactions', 'legacy-c-carol');
+    const backfillState = await repository.get('updatesStreams', 'accountTransactionsBackfill-v1');
+
+    expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: 'legacy-a', timestamp: 100 });
+    expect(bobActivity?.data).toMatchObject({ accountId: 'bob', historyElementId: 'legacy-b', timestamp: 200 });
+    expect(duplicateAliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: 'legacy-c', timestamp: 0 });
+    expect(externalRecipient).toBeNull();
+    expect(externalSender).toBeNull();
+    expect(malformedText).toBeUndefined();
+    expect(objectCoercion).toBeNull();
+    expect(backfillState?.data).toMatchObject({
+      id: 'accountTransactionsBackfill-v1',
+      block: 2,
+      data: JSON.stringify({ processedDocuments: 3, writtenDocuments: 3, lastIndexedBlock: 2, lastTimestamp: 200 }),
+    });
+    await expect(indexer.backfillAccountTransactions()).resolves.toBe(false);
+    await expect(repository.list('accountTransactions')).resolves.toHaveLength(3);
+  });
+
+  it('does not trust a corrupt account transaction backfill marker', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      backfillAccountTransactions: () => Promise<boolean>;
+    };
+
+    await repository.upsertMany([
+      {
+        collection: 'updatesStreams',
+        id: 'accountTransactionsBackfill-v1',
+        data: { id: 'accountTransactionsBackfill-v1', data: 'not-json' },
+      },
+      {
+        collection: 'historyElements',
+        id: 'legacy-corrupt-state',
+        blockHeight: 9,
+        timestamp: 900,
+        data: { id: 'legacy-corrupt-state', blockHeight: 9, timestamp: 900, address: 'bob' },
+      },
+    ]);
+
+    await expect(indexer.backfillAccountTransactions()).resolves.toBe(true);
+
+    expect(await repository.get('accountTransactions', 'legacy-corrupt-state-bob')).not.toBeNull();
+    expect((await repository.get('updatesStreams', 'accountTransactionsBackfill-v1'))?.data.data).toBe(
+      JSON.stringify({ processedDocuments: 1, writtenDocuments: 1, lastIndexedBlock: 9, lastTimestamp: 900 })
+    );
+  });
+
+  it('does not trust structurally invalid account transaction backfill markers', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      backfillAccountTransactions: () => Promise<boolean>;
+    };
+
+    await repository.upsertMany([
+      {
+        collection: 'updatesStreams',
+        id: 'accountTransactionsBackfill-v1',
+        data: {
+          id: 'accountTransactionsBackfill-v1',
+          data: JSON.stringify({
+            processedDocuments: '1',
+            writtenDocuments: 1,
+            lastIndexedBlock: -1,
+            lastTimestamp: 900,
+          }),
+        },
+      },
+      {
+        collection: 'historyElements',
+        id: 'legacy-invalid-state-shape',
+        blockHeight: 10,
+        timestamp: 1_000,
+        data: { id: 'legacy-invalid-state-shape', blockHeight: 10, timestamp: 1_000, address: 'carol' },
+      },
+    ]);
+
+    await expect(indexer.backfillAccountTransactions()).resolves.toBe(true);
+
+    expect(await repository.get('accountTransactions', 'legacy-invalid-state-shape-carol')).not.toBeNull();
+    expect((await repository.get('updatesStreams', 'accountTransactionsBackfill-v1'))?.data.data).toBe(
+      JSON.stringify({ processedDocuments: 1, writtenDocuments: 1, lastIndexedBlock: 10, lastTimestamp: 1_000 })
+    );
+  });
+
+  it('reconstructs missing legacy aggregate windows from stored block snapshots', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      backfillNetworkAggregateSnapshots: () => Promise<boolean>;
+    };
+    await repository.upsertMany([
+      createBlockNetworkSnapshot(1, 100, { transactions: 1, fees: '10', volumeUSD: '1.25' }),
+      createBlockNetworkSnapshot(2, 86_500, { transactions: 2, fees: '20', volumeUSD: '2.5' }),
+    ]);
+
+    await expect(indexer.backfillNetworkAggregateSnapshots()).resolves.toBe(true);
+
+    expect(await repository.get('networkSnapshots', 'network-all-DAY-0')).toMatchObject({
+      data: { type: 'DAY', transactions: 1, fees: '10', volumeUSD: '1.25' },
+    });
+    expect(await repository.get('networkSnapshots', 'network-all-DAY-86400')).toMatchObject({
+      data: { type: 'DAY', transactions: 3, fees: '30', volumeUSD: '3.75' },
+    });
+    expect(await repository.get('updatesStreams', 'networkAggregateSnapshotsBackfill')).not.toBeNull();
+    await expect(indexer.backfillNetworkAggregateSnapshots()).resolves.toBe(false);
+  });
+
+  it('allows worker status metadata across fresh-identity restart checks', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      chainIdentityDocument: (migration: 'fresh-database') => IndexerDocument;
+      repositoryIsEmpty: () => Promise<boolean>;
+      repositoryContainsOnlyChainIdentity: () => Promise<boolean>;
+      verifyStoredChainState: (finalizedBlock: number) => Promise<void>;
+    };
+    const workerStatus = createPersistedWorkerStatusDocument({
+      lifecycle: 'stopped',
+      startupComplete: false,
+      latestFinalizedBlock: null,
+      latestIndexedBlock: null,
+      lag: null,
+      lastSuccessfulIndexTimestamp: null,
+      lastError: null,
+      lastErrorTimestamp: null,
+    });
+
+    await repository.upsert(workerStatus);
+    await expect(indexer.repositoryIsEmpty()).resolves.toBe(true);
+    await repository.upsert(indexer.chainIdentityDocument('fresh-database'));
+    await expect(indexer.repositoryContainsOnlyChainIdentity()).resolves.toBe(true);
+    await expect(
+      indexer.verifyStoredChainState(SORA_LEGACY_IDENTITY_ANCHOR.block + 1)
+    ).resolves.toBeUndefined();
+  });
+
+  it('backfills compact XOR burn documents without rewinding chain state', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      backfillXorBurns: (finalizedBlock: number) => Promise<void>;
+      drainFinalizedHeads: () => Promise<void>;
+    };
+    const burnBlock = 25_043_003;
+    const chainStateBlock = 26_000_000;
+    const burnBlockHash = canonicalBlockHash(`xor-burn-backfill-${burnBlock}`);
+    const nexusRecipient = 'sora-nexus-account';
+    const burnCall = {
+      section: 'assets',
+      method: 'burn',
+      args: [XOR, '10000000000000000000'],
+      meta: { args: [{ name: 'assetId' }, { name: 'amount' }] },
+    };
+    const remarkCall = {
+      section: 'system',
+      method: 'remark',
+      args: [
+        `0x${Buffer.from(
+          JSON.stringify({ type: 'soraNexusXorClaim', version: 1, recipient: nexusRecipient }),
+          'utf8'
+        ).toString('hex')}`,
+      ],
+      meta: { args: [{ name: 'remark' }] },
+    };
+
+    await repository.upsert({
+      collection: 'updatesStreams',
+      id: 'chainState',
+      blockHeight: chainStateBlock,
+      timestamp: 1,
+      data: {
+        id: 'chainState',
+        block: chainStateBlock,
+        data: JSON.stringify({ lastIndexedBlock: chainStateBlock }),
+      },
+    });
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlockHash: async (block: number) => canonicalBlockHash(`xor-burn-backfill-${block}`),
+          getBlock: async (hash: string) => ({
+            block: {
+              header: {
+                number: { toNumber: () => hash === burnBlockHash ? burnBlock : burnBlock + 1 },
+                hash: { toString: () => hash },
+              },
+              extrinsics: [
+                {
+                  hash: { toString: () => '0xbackfilledburn' },
+                  method: {
+                    section: 'utility',
+                    method: 'batchAll',
+                    args: [[burnCall, remarkCall]],
+                    meta: { args: [{ name: 'calls' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: {
+          events: {
+            at: async (hash: string) =>
+              hash === burnBlockHash
+                ? [eventRecord('assets', 'Burn', { address: 'alice', assetId: XOR, amount: '10000000000000000000' })]
+                : [],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000000000' }),
+          },
+        },
+      },
+    };
+    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
+
+    await indexer.backfillXorBurns(burnBlock + 1);
+
+    const xorBurn = await repository.get('xorBurns', '0xbackfilledburn');
+    const chainState = await repository.get('updatesStreams', 'chainState');
+    const backfillState = await repository.get('updatesStreams', 'xorBurnsBackfill');
+
+    expect(xorBurn?.data).toMatchObject({
+      id: '0xbackfilledburn',
+      address: 'alice',
+      amount: '10',
+      assetId: XOR,
+      blockHeight: burnBlock,
+      txHash: '0xbackfilledburn',
+      nexusRecipient,
+    });
+    expect(chainState?.data).toMatchObject({
+      id: 'chainState',
+      block: chainStateBlock,
+      data: JSON.stringify({ lastIndexedBlock: chainStateBlock }),
+    });
+    expect(backfillState?.data).toMatchObject({
+      id: 'xorBurnsBackfill',
+      block: burnBlock + 1,
+      data: JSON.stringify({ lastIndexedBlock: burnBlock + 1 }),
+    });
+    expect(indexer.drainFinalizedHeads).toHaveBeenCalled();
+  });
+
+  it('skips compact XOR burn backfill when the node has pruned historical state', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      backfillXorBurns: (finalizedBlock: number) => Promise<void>;
+      drainFinalizedHeads: () => Promise<void>;
+    };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlockHash: async () => {
+            throw new Error('State already discarded for historical block');
+          },
+        },
+      },
+      query: { system: { events: { at: async () => [] } } },
+    };
+    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
+
+    try {
+      await expect(indexer.backfillXorBurns(25_043_010)).resolves.toBeUndefined();
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(await repository.get('updatesStreams', 'xorBurnsBackfill')).toBeNull();
+    expect(indexer.drainFinalizedHeads).not.toHaveBeenCalled();
+  });
+
+  it('backfills bridgeProxy burn history from the first block without rewinding live chain state', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer({ ...config, chainStartBlock: 123 }, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      backfillBridgeProxyHistory: (finalizedBlock: number) => Promise<void>;
+      drainFinalizedHeads: () => Promise<void>;
+    };
+    const chainStateBlock = 26_000_000;
+    const bridgeBlock = 5;
+    const blockHashCalls: number[] = [];
+    const blockHashes = new Map(
+      Array.from({ length: bridgeBlock + 2 }, (_item, block) => [block, canonicalBlockHash(`bridge-backfill-${block}`)])
+    );
+    const blocksByHash = new Map([...blockHashes].map(([block, hash]) => [hash, block]));
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    await repository.upsert({
+      collection: 'updatesStreams',
+      id: 'chainState',
+      blockHeight: chainStateBlock,
+      timestamp: 1,
+      data: {
+        id: 'chainState',
+        block: chainStateBlock,
+        data: JSON.stringify({ lastIndexedBlock: chainStateBlock }),
+      },
+    });
+    await repository.upsert({
+      collection: 'accountTransactions',
+      id: `0xbridgebackfill-${LIBERLAND_ACCOUNT}`,
+      blockHeight: bridgeBlock,
+      timestamp: 1,
+      data: {
+        id: `0xbridgebackfill-${LIBERLAND_ACCOUNT}`,
+        accountId: LIBERLAND_ACCOUNT,
+        historyElementId: '0xbridgebackfill',
+        blockHeight: bridgeBlock,
+        timestamp: 1,
+      },
+    });
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlockHash: async (block: number) => {
+            blockHashCalls.push(block);
+            return blockHashes.get(block);
+          },
+          getBlock: async (hash: string) => {
+            const block = blocksByHash.get(hash) ?? 0;
+            return {
+              block: {
+                header: {
+                  number: { toNumber: () => block },
+                  hash: { toString: () => hash },
+                },
+                extrinsics:
+                  block === bridgeBlock
+                    ? [
+                        {
+                          isSigned: true,
+                          signer: { toString: () => 'alice' },
+                          hash: { toString: () => '0xbridgebackfill' },
+                          method: {
+                            section: 'bridgeProxy',
+                            method: 'burn',
+                            args: [{ Sub: 'Liberland' }, XOR, { Liberland: LIBERLAND_ACCOUNT }, (7n * SCALE).toString()],
+                            meta: {
+                              args: [{ name: 'networkId' }, { name: 'assetId' }, { name: 'recipient' }, { name: 'amount' }],
+                            },
+                          },
+                        },
+                      ]
+                    : [],
+              },
+            };
+          },
+        },
+        state: {
+          getMetadata: async () => ({
+            asLatest: {
+              pallets: [{ name: { toString: () => 'bridgeProxy' } }],
+            },
+          }),
+        },
+      },
+      at: async (hash: string) => ({
+        query: {
+          system: {
+            events: async () =>
+              hash === blockHashes.get(bridgeBlock)
+                ? [eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xbridgebackfillrequest', status: 'Done' })]
+                : [],
+          },
+          timestamp: {
+            now: async () => ({ toString: () => '1700000002000' }),
+          },
+        },
+      }),
+      query: {
+        system: {
+          events: {
+            at: async (hash: string) =>
+              hash === blockHashes.get(bridgeBlock)
+                ? [eventRecord('bridgeProxy', 'RequestStatusUpdate', { requestHash: '0xbridgebackfillrequest', status: 'Done' })]
+                : [],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000002000' }),
+          },
+        },
+      },
+    };
+    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
+
+    await indexer.backfillBridgeProxyHistory(bridgeBlock + 1);
+
+    const history = await repository.get('historyElements', '0xbridgebackfill');
+    const aliceActivity = await repository.get('accountTransactions', '0xbridgebackfill-alice');
+    const externalActivity = await repository.get('accountTransactions', `0xbridgebackfill-${LIBERLAND_ACCOUNT}`);
+    const chainState = await repository.get('updatesStreams', 'chainState');
+    const backfillState = await repository.get('updatesStreams', 'bridgeProxyHistoryBackfill-v1');
+
+    expect(blockHashCalls).not.toContain(0);
+    expect(blockHashCalls).toContain(1);
+    expect(history?.data).toMatchObject({
+      module: 'bridgeProxy',
+      method: 'burn',
+      address: 'alice',
+      dataFrom: 'alice',
+      dataTo: LIBERLAND_ACCOUNT,
+      data: {
+        assetId: XOR,
+        amount: '7',
+        amountUSD: '14',
+        networkId: 'Liberland',
+        externalNetwork: 'Liberland',
+        externalNetworkType: 'Sub',
+        recipient: LIBERLAND_ACCOUNT,
+        requestHash: '0xbridgebackfillrequest',
+        status: 'Done',
+      },
+    });
+    expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: '0xbridgebackfill' });
+    expect(externalActivity).toBeNull();
+    await expect(repository.list('accounts')).resolves.toHaveLength(0);
+    await expect(repository.list('accountMeta')).resolves.toHaveLength(0);
+    await expect(repository.list('networkSnapshots')).resolves.toHaveLength(0);
+    expect(chainState?.data).toMatchObject({
+      id: 'chainState',
+      block: chainStateBlock,
+      data: JSON.stringify({ lastIndexedBlock: chainStateBlock }),
+    });
+    expect(backfillState?.data).toMatchObject({
+      id: 'bridgeProxyHistoryBackfill-v1',
+      block: bridgeBlock + 1,
+      data: JSON.stringify({ lastIndexedBlock: bridgeBlock + 1 }),
+    });
+    expect(indexer.drainFinalizedHeads).toHaveBeenCalled();
+  });
+
+  it('skips bridgeProxy history backfill when the node has pruned historical state', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      backfillBridgeProxyHistory: (finalizedBlock: number) => Promise<void>;
+      drainFinalizedHeads: () => Promise<void>;
+    };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlockHash: async (block: number) => canonicalBlockHash(`pruned-bridge-backfill-${block}`),
+          getBlock: async (hash: string) => ({
+            block: {
+              header: {
+                number: { toNumber: () => 1 },
+                hash: { toString: () => hash },
+              },
+              extrinsics: [],
+            },
+          }),
+        },
+        state: {
+          getMetadata: async () => {
+            throw new Error('State already discarded for historical block');
+          },
+        },
+      },
+      query: {
+        system: { events: { at: async () => [] } },
+        timestamp: { now: { at: async () => ({ toString: () => '1700000000000' }) } },
+      },
+    };
+    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
+
+    try {
+      await expect(indexer.backfillBridgeProxyHistory(10)).resolves.toBeUndefined();
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(await repository.get('updatesStreams', 'bridgeProxyHistoryBackfill-v1')).toBeNull();
+    expect(indexer.drainFinalizedHeads).not.toHaveBeenCalled();
+  });
+
+  it('backfills completed incoming bridgeProxy mint history without indexing the external Liberland account', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      backfillBridgeProxyHistory: (finalizedBlock: number) => Promise<void>;
+      drainFinalizedHeads: () => Promise<void>;
+    };
+    const bridgeBlock = 7;
+    const blockHashes = new Map(
+      Array.from({ length: bridgeBlock + 1 }, (_item, block) => [block, canonicalBlockHash(`incoming-backfill-${block}`)])
+    );
+    const blocksByHash = new Map([...blockHashes].map(([block, hash]) => [hash, block]));
+
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.assetInfos = new Map([[XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }]]);
+    await repository.upsert({
+      collection: 'accountTransactions',
+      id: `0xincomingbackfillrequest-mint-${LIBERLAND_ACCOUNT}`,
+      blockHeight: bridgeBlock,
+      timestamp: 1,
+      data: {
+        id: `0xincomingbackfillrequest-mint-${LIBERLAND_ACCOUNT}`,
+        accountId: LIBERLAND_ACCOUNT,
+        historyElementId: '0xincomingbackfillrequest-mint',
+        blockHeight: bridgeBlock,
+        timestamp: 1,
+      },
+    });
+
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlockHash: async (block: number) => blockHashes.get(block),
+          getBlock: async (hash: string) => {
+            const block = blocksByHash.get(hash) ?? 0;
+            return {
+              block: {
+                header: {
+                  number: { toNumber: () => block },
+                  hash: { toString: () => hash },
+                },
+                extrinsics:
+                  block === bridgeBlock
+                    ? [
+                        {
+                          isSigned: true,
+                          signer: { toString: () => 'relayer' },
+                          hash: { toString: () => '0xincomingbackfillsubmit' },
+                          method: {
+                            section: 'bridgeChannelInbound',
+                            method: 'submit',
+                            args: [
+                              { Sub: 'Liberland' },
+                              {
+                                source: { Liberland: LIBERLAND_ACCOUNT },
+                                dest: { Sora: 'alice' },
+                                assetId: XOR,
+                              },
+                            ],
+                            meta: {
+                              args: [{ name: 'networkId' }, { name: 'message' }],
+                            },
+                          },
+                        },
+                      ]
+                    : [],
+              },
+            };
+          },
+        },
+        state: {
+          getMetadata: async () => ({
+            asLatest: {
+              pallets: [{ name: { toString: () => 'bridgeChannelInbound' } }],
+            },
+          }),
+        },
+      },
+      at: async (hash: string) => ({
+        query: {
+          system: {
+            events: async () =>
+              hash === blockHashes.get(bridgeBlock)
+                ? [
+                    eventRecord('bridgeProxy', 'RequestStatusUpdate', {
+                      requestHash: '0xincomingbackfillrequest',
+                      status: 'Done',
+                    }),
+                    eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: (4n * SCALE).toString() }),
+                  ]
+                : [],
+          },
+          timestamp: {
+            now: async () => ({ toString: () => '1700000003000' }),
+          },
+        },
+      }),
+      query: {
+        system: {
+          events: {
+            at: async (hash: string) =>
+              hash === blockHashes.get(bridgeBlock)
+                ? [
+                    eventRecord('bridgeProxy', 'RequestStatusUpdate', {
+                      requestHash: '0xincomingbackfillrequest',
+                      status: 'Done',
+                    }),
+                    eventRecord('assets', 'Issued', { assetId: XOR, owner: 'alice', amount: (4n * SCALE).toString() }),
+                  ]
+                : [],
+          },
+        },
+        timestamp: {
+          now: {
+            at: async () => ({ toString: () => '1700000003000' }),
+          },
+        },
+      },
+    };
+    indexer.drainFinalizedHeads = vi.fn(async () => undefined);
+
+    await indexer.backfillBridgeProxyHistory(bridgeBlock);
+
+    const original = await repository.get('historyElements', '0xincomingbackfillsubmit');
+    const history = await repository.get('historyElements', '0xincomingbackfillrequest-mint');
+    const aliceActivity = await repository.get('accountTransactions', '0xincomingbackfillrequest-mint-alice');
+    const externalActivity = await repository.get('accountTransactions', `0xincomingbackfillrequest-mint-${LIBERLAND_ACCOUNT}`);
+
+    expect(original).toBeNull();
+    expect(history?.data).toMatchObject({
+      module: 'bridgeProxy',
+      method: 'mint',
+      address: 'relayer',
+      dataFrom: 'alice',
+      dataTo: LIBERLAND_ACCOUNT,
+      data: {
+        assetId: XOR,
+        amount: '4',
+        amountUSD: '8',
+        networkId: 'Liberland',
+        externalNetwork: 'Liberland',
+        externalNetworkType: 'Sub',
+        recipient: 'alice',
+        sender: LIBERLAND_ACCOUNT,
+        requestHash: '0xincomingbackfillrequest',
+        status: 'Done',
+      },
+    });
+    expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: '0xincomingbackfillrequest-mint' });
+    expect(externalActivity).toBeNull();
+  });
+
+
   it('publishes current-state maintenance before subscribing to finalized heads', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
@@ -4296,7 +4999,7 @@ describe('ChainIndexer price derivation', () => {
     expect(refreshDerivedState).toHaveBeenCalledWith(100, expect.any(Number), true, true);
   });
 
-  it('starts a fresh chain after genesis and rejects malformed persisted chain state', async () => {
+  it('treats genesis as the fresh checkpoint and rejects malformed persisted chain state', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
       getLastIndexedBlock: () => Promise<number>;
@@ -4395,6 +5098,7 @@ describe('ChainIndexer price derivation', () => {
       repository
     ) as unknown as {
       api: unknown;
+      getIndexableFinalizedBlock: () => Promise<number>;
       backfill: () => Promise<boolean>;
       indexBlockByNumber: (block: number, options?: { refreshDerivedState?: boolean }) => Promise<void>;
       initializeHistoricalValuationState: (startBlock: number) => Promise<unknown>;
@@ -4450,12 +5154,12 @@ describe('ChainIndexer price derivation', () => {
     indexer.api = {
       rpc: {
         chain: {
-          getBlockHash: async () => ({ toString: () => requestedHash }),
+          getBlockHash: async () => ({ toString: () => canonicalBlockHash('block') }),
           getBlock: async () => ({
             block: {
               header: {
                 number: { toNumber: () => 10 },
-                hash: { toString: () => requestedHash },
+                hash: { toString: () => canonicalBlockHash('block') },
               },
               extrinsics: [],
             },
@@ -4481,6 +5185,7 @@ describe('ChainIndexer price derivation', () => {
     };
 
     try {
+      markIndexerMainnet(indexer);
       await indexer.indexBlockByNumber(10);
 
       expect((await repository.get('updatesStreams', 'chainState'))?.data.block).toBe(10);
@@ -7567,14 +8272,14 @@ describe('ChainIndexer price derivation', () => {
     const windows = indexer.createNetworkBackfillWindows();
     markIndexerMainnet(indexer);
     const fetchedBlock = (blockHeight: number, timestamp: number) => {
-      const requestedHash = canonicalBlockHash(`network-aggregate-${blockHeight}`);
+      const blockHash = canonicalBlockHash(`network-aggregate-${blockHeight}`);
       return {
-        requestedHash,
+        requestedHash: blockHash,
         signedBlock: {
           block: {
             header: {
               number: { toNumber: () => blockHeight },
-              hash: { toString: () => requestedHash },
+              hash: { toString: () => blockHash },
             },
             extrinsics: [],
           },
@@ -7710,6 +8415,7 @@ describe('ChainIndexer price derivation', () => {
     const indexer = new ChainIndexer(config, repository) as unknown as {
       indexFetchedBlock: (block: unknown, options?: { refreshDerivedState?: boolean }) => Promise<void>;
     };
+    markIndexerMainnet(indexer);
     const extrinsics = Array.from({ length: 3_334 }, (_item, index) => ({
       isSigned: true,
       signer: { toString: () => 'alice' },
@@ -7721,22 +8427,23 @@ describe('ChainIndexer price derivation', () => {
         meta: { args: [{ name: 'assetId' }, { name: 'to' }, { name: 'amount' }] },
       },
     }));
-    markIndexerMainnet(indexer);
-    const requestedHash = canonicalBlockHash('oversized-finalized-block');
-    const fetchedBlock = (selectedExtrinsics: unknown[]) => ({
-      requestedHash,
-      signedBlock: {
-        block: {
-          header: {
-            number: { toNumber: () => 42 },
-            hash: { toString: () => requestedHash },
+    const fetchedBlock = (selectedExtrinsics: unknown[]) => {
+      const blockHash = canonicalBlockHash('oversized-finalized-block');
+      return {
+        requestedHash: blockHash,
+        signedBlock: {
+          block: {
+            header: {
+              number: { toNumber: () => 42 },
+              hash: { toString: () => blockHash },
+            },
+            extrinsics: selectedExtrinsics,
           },
-          extrinsics: selectedExtrinsics,
         },
-      },
-      events: [eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 0)],
-      timestamp: 1_700_000_000,
-    });
+        events: [eventRecord('xorFee', 'FeeWithdrawn', { amount: SCALE.toString() }, 0)],
+        timestamp: 1_700_000_000,
+      };
+    };
 
     await expect(
       indexer.indexFetchedBlock(fetchedBlock(extrinsics), { refreshDerivedState: false })

@@ -13,10 +13,7 @@ import {
   decodeRepositoryCursor,
   encodeRepositoryCursor,
 } from '../src/repository/cursor.js';
-import {
-  createHealthIdentityDocuments,
-  HEALTH_TEST_STATE_BLOCK,
-} from './sora-health-fixture.js';
+import { SORA_LEGACY_IDENTITY_ANCHOR, SORA_MAINNET_GENESIS_HASH } from '../src/soraIdentity.js';
 
 import type { IndexerDocument, IndexerRepository, RepositoryQueryArgs } from '../src/repository/types.js';
 
@@ -59,6 +56,48 @@ const repositoryWithoutQuery = (items: Awaited<ReturnType<IndexerRepository['lis
   close: async () => undefined,
 });
 
+const VALID_CHAIN_STATE_BLOCK = SORA_LEGACY_IDENTITY_ANCHOR.block + 100;
+const VALID_CHAIN_STATE_HASH = `0x${'ab'.repeat(32)}`;
+
+const seedValidChainCheckpoint = async (repository: MemoryRepository, timestamp: number): Promise<void> => {
+  await repository.upsertMany([
+    {
+      collection: 'updatesStreams',
+      id: 'chainIdentity',
+      blockHeight: SORA_LEGACY_IDENTITY_ANCHOR.block,
+      timestamp: SORA_LEGACY_IDENTITY_ANCHOR.timestamp,
+      data: {
+        id: 'chainIdentity',
+        block: SORA_LEGACY_IDENTITY_ANCHOR.block,
+        data: JSON.stringify({
+          schemaVersion: 1,
+          genesisHash: SORA_MAINNET_GENESIS_HASH,
+          verificationBlock: SORA_LEGACY_IDENTITY_ANCHOR.block,
+          verificationBlockHash: SORA_LEGACY_IDENTITY_ANCHOR.hash,
+          verificationBlockTimestamp: SORA_LEGACY_IDENTITY_ANCHOR.timestamp,
+          migration: 'fresh-database',
+        }),
+      },
+    },
+    {
+      collection: 'updatesStreams',
+      id: 'chainState',
+      blockHeight: VALID_CHAIN_STATE_BLOCK,
+      timestamp,
+      data: {
+        id: 'chainState',
+        block: VALID_CHAIN_STATE_BLOCK,
+        data: JSON.stringify({
+          lastIndexedBlock: VALID_CHAIN_STATE_BLOCK,
+          genesisHash: SORA_MAINNET_GENESIS_HASH,
+          blockHash: VALID_CHAIN_STATE_HASH,
+          blockTimestamp: timestamp,
+        }),
+      },
+    },
+  ]);
+};
+
 describe('Polkaswap indexer schema', () => {
   it('uses fixed-size polling fingerprints instead of retaining serialized subscription payloads', () => {
     const large = { id: 'large', payload: 'x'.repeat(2 * 1_024 * 1_024) };
@@ -74,6 +113,10 @@ describe('Polkaswap indexer schema', () => {
 
     expect(String(health.getFields().workerAvailable?.type)).toBe('Boolean!');
     for (const field of [
+      'genesisHash',
+      'latestIndexedBlock',
+      'latestIndexedBlockHash',
+      'latestIndexedAt',
       'workerReady',
       'workerReadinessReason',
       'workerLifecycle',
@@ -197,17 +240,17 @@ describe('Polkaswap indexer schema', () => {
     });
   });
 
-  it('reports detailed ready worker status in combined mode', async () => {
+  it('reports detailed ready worker status when the chain checkpoint is also valid', async () => {
     const healthField = createSchema().getQueryType()?.getFields()._health;
     const now = Math.floor(Date.now() / 1_000);
     const repository = new MemoryRepository();
-    await repository.upsertMany(createHealthIdentityDocuments(now));
+    await seedValidChainCheckpoint(repository, now);
     const workerStatusProvider = {
       getStatus: () => ({
         lifecycle: 'running' as const,
         startupComplete: true,
-        latestFinalizedBlock: HEALTH_TEST_STATE_BLOCK + 5,
-        latestIndexedBlock: HEALTH_TEST_STATE_BLOCK,
+        latestFinalizedBlock: VALID_CHAIN_STATE_BLOCK + 5,
+        latestIndexedBlock: VALID_CHAIN_STATE_BLOCK,
         lag: 5,
         lastSuccessfulIndexTimestamp: now,
         lastError: null,
@@ -228,13 +271,17 @@ describe('Polkaswap indexer schema', () => {
       )
     ).resolves.toMatchObject({
       ok: true,
+      genesisHash: SORA_MAINNET_GENESIS_HASH,
+      latestIndexedBlock: VALID_CHAIN_STATE_BLOCK,
+      latestIndexedBlockHash: VALID_CHAIN_STATE_HASH,
+      latestIndexedAt: now,
       workerAvailable: true,
       workerReady: true,
       workerReadinessReason: null,
       workerLifecycle: 'running',
       workerStartupComplete: true,
-      workerLatestFinalizedBlock: HEALTH_TEST_STATE_BLOCK + 5,
-      workerLatestIndexedBlock: HEALTH_TEST_STATE_BLOCK,
+      workerLatestFinalizedBlock: VALID_CHAIN_STATE_BLOCK + 5,
+      workerLatestIndexedBlock: VALID_CHAIN_STATE_BLOCK,
       workerLag: 5,
       workerLastSuccessfulIndexTimestamp: now,
     });

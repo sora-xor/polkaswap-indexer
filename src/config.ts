@@ -72,6 +72,8 @@ export type AppConfig = {
   rocksdbQueryMaxScannedRows: number;
   rocksdbCompactionMinFreeGb: number;
   soraWsEndpoint: string;
+  /** Compatibility alias used by the independently verified archive path. */
+  soraArchiveWsEndpoint?: string | null;
   chainStartBlock: number;
   chainBatchSize: number;
   stateRefreshIntervalBlocks: number;
@@ -98,6 +100,32 @@ export type AppConfig = {
   mobileCapabilities?: MobileCapabilities;
 };
 
+export type RuntimeSecurityConfig = {
+  httpMaxBodyBytes: number;
+  httpMaxHeaderBytes: number;
+  httpListenBacklog: number;
+  httpShutdownTimeoutMs: number;
+  httpKeepAliveTimeoutMs: number;
+  httpHeadersTimeoutMs: number;
+  httpRequestTimeoutMs: number;
+  httpMaxConnections: number;
+  httpMaxRequestsPerSocket: number;
+  rateLimitWindowMs: number;
+  rateLimitMax: number;
+  rateLimitMaxKeys: number;
+  rateLimitGlobalWindowMs: number;
+  rateLimitGlobalMax: number;
+  graphqlMaxDepth: number;
+  graphqlMaxFields: number;
+  graphqlMaxAliases: number;
+  graphqlAllowIntrospection: boolean;
+  graphqlWsMaxPayloadBytes: number;
+  graphqlWsMaxConnections: number;
+  graphqlWsMaxConnectionsPerClient: number;
+  graphqlWsMaxOperationsPerConnection: number;
+  graphqlWsConnectionInitTimeoutMs: number;
+};
+
 const DEFAULT_DATABASE_URL = 'postgres://polkaswap:polkaswap@127.0.0.1:5432/polkaswap_indexer';
 const NODE_ENVIRONMENTS = new Set(['development', 'test', 'production']);
 
@@ -105,11 +133,26 @@ const invalid = (name: string, reason: string): never => {
   throw new Error(`Invalid ${name}: ${reason}`);
 };
 
+const readNodeEnvironment = (): string => {
+  const value = process.env.NODE_ENV ?? 'development';
+  if (!NODE_ENVIRONMENTS.has(value)) {
+    return invalid('NODE_ENV', 'NODE_ENV must be development, test, or production');
+  }
+  return value;
+};
+
 const readString = (name: string, fallback: string): string => {
   const value = process.env[name];
   if (value === undefined) return fallback;
-  if (value.trim() === '') return invalid(name, 'must not be empty');
+  if (value.trim() === '' || /[\u0000-\u001f\u007f]/.test(value)) {
+    return invalid(name, `${name} must be a non-empty single-line value; must not be empty`);
+  }
   return value;
+};
+
+const readOptionalString = (name: string): string | undefined => {
+  if (process.env[name] === undefined) return undefined;
+  return readString(name, '').trim();
 };
 
 const readInteger = (
@@ -117,24 +160,37 @@ const readInteger = (
   fallback: number,
   { minimum, maximum }: { minimum: number; maximum?: number }
 ): number => {
-  const value = process.env[name];
-  if (value === undefined) return fallback;
-  if (!/^-?\d+$/.test(value.trim())) return invalid(name, 'must be an integer');
+  const configured = process.env[name];
+  if (configured === undefined) return fallback;
+  const value = configured.trim();
   const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed)) return invalid(name, 'must be a safe integer');
-  if (parsed < minimum) return invalid(name, `must be at least ${minimum}`);
-  if (maximum !== undefined && parsed > maximum) return invalid(name, `must be at most ${maximum}`);
+
+  if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+    if (/^-[0-9]+$/.test(value) && Number.isSafeInteger(parsed) && parsed < minimum) {
+      return invalid(name, `${name} must be an integer; must be at least ${minimum}`);
+    }
+    return invalid(name, `${name} must be an integer`);
+  }
+  if (!Number.isSafeInteger(parsed)) {
+    return invalid(name, `${name} must be an integer and a safe integer`);
+  }
+  if (parsed < minimum) {
+    return invalid(name, `${name} must be an integer; must be at least ${minimum}`);
+  }
+  if (maximum !== undefined && parsed > maximum) {
+    return invalid(name, `${name} must be an integer; must be at most ${maximum}`);
+  }
   return parsed;
 };
 
 const readNumber = (name: string, fallback: number, minimum: number): number => {
   const value = process.env[name];
   if (value === undefined) return fallback;
-  if (value.trim() === '') return invalid(name, 'must not be empty');
+  if (value.trim() === '') return invalid(name, `${name} must not be empty`);
 
   const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return invalid(name, 'must be a finite number');
-  if (parsed < minimum) return invalid(name, `must be at least ${minimum}`);
+  if (!Number.isFinite(parsed)) return invalid(name, `${name} must be a finite number`);
+  if (parsed < minimum) return invalid(name, `${name} must be at least ${minimum}`);
   return parsed;
 };
 
@@ -145,7 +201,7 @@ const readBoolean = (name: string, fallback = false): boolean => {
   const normalized = value.trim().toLowerCase();
   if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
   if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
-  return invalid(name, 'must be one of true, false, 1, 0, yes, no, on, or off');
+  return invalid(name, `${name} must be one of true, false, 1, 0, yes, no, on, or off`);
 };
 
 const readEnum = <T extends string>(name: string, fallback: T, values: readonly T[]): T => {
@@ -154,18 +210,33 @@ const readEnum = <T extends string>(name: string, fallback: T, values: readonly 
 
   const normalized = value.trim().toLowerCase() as T;
   if (values.includes(normalized)) return normalized;
-  return invalid(name, `must be one of ${values.join(', ')}`);
+  return invalid(name, `${name} must be one of ${values.join(', ')}`);
 };
 
-const validateUrl = (name: string, value: string, protocols: readonly string[]): string => {
+const validateUrl = (
+  name: string,
+  value: string,
+  protocols: readonly string[],
+  { secureRpc = false }: { secureRpc?: boolean } = {}
+): string => {
   let parsed: URL;
   try {
     parsed = new URL(value);
   } catch {
-    return invalid(name, 'must be an absolute URL');
+    return invalid(name, `${name} must be a valid URL and an absolute URL`);
   }
-  if (!protocols.includes(parsed.protocol)) return invalid(name, `must use ${protocols.join(' or ')}`);
-  if (!parsed.hostname) return invalid(name, 'must include a host');
+  if (!protocols.includes(parsed.protocol) || !parsed.hostname) {
+    return invalid(name, `${name} uses an unsupported URL scheme; must use ${protocols.join(' or ')}`);
+  }
+  if (parsed.hash) return invalid(name, `${name} must not contain a URL fragment`);
+  if (secureRpc && (parsed.username || parsed.password || parsed.search)) {
+    return invalid(name, `${name} must not contain URL credentials or a query string`);
+  }
+  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const localhost = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+  if (secureRpc && !localhost && parsed.protocol !== 'wss:') {
+    return invalid(name, `${name} must use TLS outside localhost`);
+  }
   return value;
 };
 
@@ -201,22 +272,20 @@ const validateProductionDatabaseUrl = (value: string, nodeEnvironment: string): 
   return value;
 };
 
-const readNodeEnvironment = (): string => {
-  const value = process.env.NODE_ENV ?? 'development';
-  if (!NODE_ENVIRONMENTS.has(value)) {
-    return invalid('NODE_ENV', 'must be development, test, or production');
-  }
-  return value;
-};
-
 const validateSoraWsUrl = (name: string, value: string): string => {
   if (value !== value.trim() || /[\u0000-\u001f\u007f]/.test(value)) {
-    return invalid(name, 'must be a non-empty single-line URL without surrounding whitespace');
+    return invalid(name, 'must be a non-empty single-line value without surrounding whitespace');
   }
   validateUrl(name, value, ['ws:', 'wss:']);
   const parsed = new URL(value);
-  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
-    return invalid(name, 'must not contain credentials, a query string, or a fragment');
+  if (parsed.username || parsed.password) {
+    return invalid(name, 'must not contain URL credentials');
+  }
+  if (parsed.search) {
+    return invalid(name, 'must not contain URL credentials or a query string');
+  }
+  if (parsed.hash) {
+    return invalid(name, 'must not contain a URL fragment');
   }
   const hostname = parsed.hostname.toLowerCase();
   if (hostname.endsWith('.')) {
@@ -228,17 +297,6 @@ const validateSoraWsUrl = (name: string, value: string): string => {
   }
   return value;
 };
-
-export function readSoraArchiveWsEndpoint(requireConfigured = false): string | null {
-  const value = process.env.SORA_ARCHIVE_WS_ENDPOINT;
-  if (value === undefined || value === '') {
-    if (requireConfigured) {
-      return invalid('SORA_ARCHIVE_WS_ENDPOINT', 'is required for the production worker');
-    }
-    return null;
-  }
-  return validateSoraWsUrl('SORA_ARCHIVE_WS_ENDPOINT', value);
-}
 
 /**
  * Production workers must not silently inherit development chain inputs.
@@ -254,31 +312,39 @@ export function assertExplicitProductionWorkerChainInputs(): void {
   }
 }
 
-export function assertIndependentSoraRpcEndpoints(primary: string, archive: string): void {
-  const canonicalHostname = (value: string): string =>
-    new URL(value).hostname.toLowerCase().replace(/\.$/, '');
-  if (canonicalHostname(primary) === canonicalHostname(archive)) {
-    throw new Error('SORA primary and archive endpoints must use different reviewed hosts.');
-  }
-}
-
 const validateGraphqlPath = (value: string): string => {
-  if (!value.startsWith('/')) return invalid('GRAPHQL_PATH', 'must start with /');
-  if (value.startsWith('//')) return invalid('GRAPHQL_PATH', 'must not be protocol-relative');
-  if (value === '/metrics') return invalid('GRAPHQL_PATH', 'must not use the reserved /metrics route');
+  if (!value.startsWith('/')) {
+    return invalid('GRAPHQL_PATH', 'GRAPHQL_PATH must be an absolute URL path and start with /');
+  }
+  if (value.startsWith('//')) {
+    return invalid('GRAPHQL_PATH', 'GRAPHQL_PATH must be an absolute URL path, not a protocol-relative path');
+  }
+  if (value === '/metrics') {
+    return invalid('GRAPHQL_PATH', 'GRAPHQL_PATH must be an absolute URL path and must not use the reserved /metrics route');
+  }
   if (value.includes('?') || value.includes('#') || /\s/.test(value)) {
-    return invalid('GRAPHQL_PATH', 'must be a URL path without whitespace, query, or fragment');
+    return invalid(
+      'GRAPHQL_PATH',
+      'GRAPHQL_PATH must be an absolute URL path without whitespace, query, or fragment'
+    );
   }
   if (new URL(value, 'http://localhost').pathname !== value) {
-    return invalid('GRAPHQL_PATH', 'must be a canonical URL path without backslashes or dot segments');
+    return invalid(
+      'GRAPHQL_PATH',
+      'GRAPHQL_PATH must be an absolute URL path and a canonical URL path without backslashes or dot segments'
+    );
   }
   return value;
 };
 
 const validateNetworkHost = (name: string, value: string): string => {
-  if (/\s/.test(value)) return invalid(name, 'must not contain whitespace');
+  if (/\s/.test(value)) {
+    return invalid(name, `${name} must be a hostname or IP address without whitespace`);
+  }
   if (isIP(value)) return value;
-  if (value.length > 253) return invalid(name, 'must be a valid IP address or hostname');
+  if (value.length > 253) {
+    return invalid(name, `${name} must be a valid IP address or hostname`);
+  }
   const labels = value.split('.');
   if (
     labels.some(
@@ -290,14 +356,49 @@ const validateNetworkHost = (name: string, value: string): string => {
         label.endsWith('-')
     )
   ) {
-    return invalid(name, 'must be a valid IP address or hostname');
+    return invalid(name, `${name} must be a valid IP address or hostname`);
   }
   return value;
 };
 
+const readDatabaseUrl = (nodeEnvironment: string, storageEngine: 'postgres' | 'rocksdb'): string => {
+  const configured = readOptionalString('DATABASE_URL');
+  if (!configured && nodeEnvironment === 'production' && storageEngine === 'postgres') {
+    return invalid('DATABASE_URL', 'DATABASE_URL is required when NODE_ENV=production');
+  }
+  const value = configured ?? DEFAULT_DATABASE_URL;
+  const validated = validateUrl('DATABASE_URL', value, ['postgres:', 'postgresql:']);
+  if (new URL(validated).pathname.length <= 1) {
+    return invalid('DATABASE_URL', 'DATABASE_URL must include a database name');
+  }
+  return storageEngine === 'postgres'
+    ? validateProductionDatabaseUrl(validated, nodeEnvironment)
+    : validated;
+};
+
+export function readSoraArchiveWsEndpoint(requireConfigured = false): string | null {
+  const configured = process.env.SORA_ARCHIVE_WS_ENDPOINT;
+  if (configured === undefined || configured === '') {
+    if (requireConfigured) {
+      return invalid('SORA_ARCHIVE_WS_ENDPOINT', 'is required for the production worker');
+    }
+    return null;
+  }
+  return validateSoraWsUrl('SORA_ARCHIVE_WS_ENDPOINT', configured);
+}
+
+export function assertIndependentSoraRpcEndpoints(primary: string, archive: string): void {
+  const canonicalHostname = (value: string): string =>
+    new URL(value).hostname.toLowerCase().replace(/\.$/, '');
+  if (canonicalHostname(primary) === canonicalHostname(archive)) {
+    throw new Error('SORA primary and archive endpoints must use different reviewed hosts.');
+  }
+}
+
 /** Reads and strictly validates all long-lived runtime configuration. */
 export function readConfig(): AppConfig {
   const nodeEnvironment = readNodeEnvironment();
+  const storageEngine = readEnum('STORAGE_ENGINE', 'postgres', ['postgres', 'rocksdb']);
   if (nodeEnvironment === 'production') {
     const override = findUnsafePostgresProcessEnvironmentOverride(process.env);
     if (override !== null) {
@@ -312,21 +413,12 @@ export function readConfig(): AppConfig {
     'WORKER_METRICS_HOST',
     readString('WORKER_METRICS_HOST', '127.0.0.1')
   );
-
-  if (nodeEnvironment === 'production' && process.env.DATABASE_URL === undefined) {
-    invalid('DATABASE_URL', 'is required when NODE_ENV=production');
-  }
-  const databaseUrl = validateProductionDatabaseUrl(
-    validateUrl('DATABASE_URL', readString('DATABASE_URL', DEFAULT_DATABASE_URL), [
-      'postgres:',
-      'postgresql:',
-    ]),
-    nodeEnvironment
-  );
+  const databaseUrl = readDatabaseUrl(nodeEnvironment, storageEngine);
   const soraWsEndpoint = validateSoraWsUrl(
     'SORA_WS_ENDPOINT',
     readString('SORA_WS_ENDPOINT', 'wss://mof2.sora.org')
   );
+  const soraArchiveWsEndpoint = readSoraArchiveWsEndpoint();
   const httpKeepAliveTimeoutMs = readInteger('HTTP_KEEP_ALIVE_TIMEOUT_MS', 75_000, {
     minimum: 1,
     maximum: 3_600_000,
@@ -518,7 +610,7 @@ export function readConfig(): AppConfig {
     }),
     graphqlMaxResultBytes,
     graphqlExecutionMemoryMaxBytes,
-    storageEngine: readEnum('STORAGE_ENGINE', 'postgres', ['postgres', 'rocksdb']),
+    storageEngine,
     databaseUrl,
     skipPostgresMigration: readBoolean('SKIP_POSTGRES_MIGRATION'),
     postgresPoolMax: readInteger('POSTGRES_POOL_MAX', 20, { minimum: 1, maximum: 1_000 }),
@@ -575,6 +667,7 @@ export function readConfig(): AppConfig {
     }),
     rocksdbCompactionMinFreeGb: readNumber('ROCKSDB_COMPACTION_MIN_FREE_GB', 10, 0),
     soraWsEndpoint,
+    soraArchiveWsEndpoint,
     chainStartBlock: readInteger('CHAIN_START_BLOCK', 0, { minimum: 0 }),
     chainBatchSize: readInteger('CHAIN_BATCH_SIZE', 25, { minimum: 1, maximum: 1_000 }),
     stateRefreshIntervalBlocks: readInteger('CHAIN_STATE_REFRESH_INTERVAL_BLOCKS', 25, { minimum: 1 }),
@@ -607,7 +700,7 @@ export function readConfig(): AppConfig {
       maximum: 10_000_000,
     }),
     legacySoraBlockTypes: readBoolean('CHAIN_LEGACY_SORA_BLOCK_TYPES'),
-    archiveSoraWsEndpoint: readSoraArchiveWsEndpoint() ?? '',
+    archiveSoraWsEndpoint: soraArchiveWsEndpoint ?? '',
     workerReadinessMaxLagBlocks: readInteger('WORKER_READINESS_MAX_LAG_BLOCKS', 25, { minimum: 0 }),
     workerReadinessMaxStalenessSeconds: readInteger('WORKER_READINESS_MAX_STALENESS_SECONDS', 120, {
       minimum: 30,
@@ -619,5 +712,84 @@ export function readConfig(): AppConfig {
       maximum: 10_000,
     }),
     mobileCapabilities,
+  };
+}
+
+/** Reads fail-closed HTTP, GraphQL, WebSocket, and abuse-control limits. */
+export function readRuntimeSecurityConfig(): RuntimeSecurityConfig {
+  const nodeEnvironment = readNodeEnvironment();
+  const httpKeepAliveTimeoutMs = readInteger('HTTP_KEEP_ALIVE_TIMEOUT_MS', 75_000, {
+    minimum: 1_000,
+    maximum: 300_000,
+  });
+  return {
+    httpMaxBodyBytes: readInteger('GRAPHQL_HTTP_MAX_BODY_BYTES', 64 * 1_024, {
+      minimum: 1_024,
+      maximum: 1_024 * 1_024,
+    }),
+    httpMaxHeaderBytes: readInteger('HTTP_MAX_HEADER_BYTES', 16 * 1_024, {
+      minimum: 1_024,
+      maximum: 64 * 1_024,
+    }),
+    httpListenBacklog: readInteger('HTTP_LISTEN_BACKLOG', 4_096, { minimum: 16, maximum: 65_535 }),
+    httpShutdownTimeoutMs: readInteger('HTTP_SHUTDOWN_TIMEOUT_MS', 30_000, {
+      minimum: 1_000,
+      maximum: 300_000,
+    }),
+    httpKeepAliveTimeoutMs,
+    httpHeadersTimeoutMs: readInteger('HTTP_HEADERS_TIMEOUT_MS', httpKeepAliveTimeoutMs + 5_000, {
+      minimum: httpKeepAliveTimeoutMs + 1,
+      maximum: 310_000,
+    }),
+    httpRequestTimeoutMs: readInteger('HTTP_REQUEST_TIMEOUT_MS', 30_000, {
+      minimum: 1_000,
+      maximum: 300_000,
+    }),
+    httpMaxConnections: readInteger('HTTP_MAX_CONNECTIONS', 2_048, {
+      minimum: 1,
+      maximum: 100_000,
+    }),
+    httpMaxRequestsPerSocket: readInteger('HTTP_MAX_REQUESTS_PER_SOCKET', 1_000, {
+      minimum: 1,
+      maximum: 100_000,
+    }),
+    rateLimitWindowMs: readInteger('RATE_LIMIT_WINDOW_MS', 60_000, {
+      minimum: 1_000,
+      maximum: 3_600_000,
+    }),
+    rateLimitMax: readInteger('RATE_LIMIT_MAX', 600, { minimum: 1, maximum: 1_000_000 }),
+    rateLimitMaxKeys: readInteger('RATE_LIMIT_MAX_KEYS', 20_000, { minimum: 1, maximum: 1_000_000 }),
+    rateLimitGlobalWindowMs: readInteger('RATE_LIMIT_GLOBAL_WINDOW_MS', 60_000, {
+      minimum: 1_000,
+      maximum: 3_600_000,
+    }),
+    rateLimitGlobalMax: readInteger('RATE_LIMIT_GLOBAL_MAX', 50_000, {
+      minimum: 1,
+      maximum: 10_000_000,
+    }),
+    graphqlMaxDepth: readInteger('GRAPHQL_MAX_DEPTH', 12, { minimum: 1, maximum: 100 }),
+    graphqlMaxFields: readInteger('GRAPHQL_MAX_FIELDS', 300, { minimum: 1, maximum: 10_000 }),
+    graphqlMaxAliases: readInteger('GRAPHQL_MAX_ALIASES', 50, { minimum: 0, maximum: 10_000 }),
+    graphqlAllowIntrospection: readBoolean('GRAPHQL_ALLOW_INTROSPECTION', nodeEnvironment !== 'production'),
+    graphqlWsMaxPayloadBytes: readInteger('GRAPHQL_WS_MAX_PAYLOAD_BYTES', 64 * 1_024, {
+      minimum: 1_024,
+      maximum: 1_024 * 1_024,
+    }),
+    graphqlWsMaxConnections: readInteger('GRAPHQL_WS_MAX_CONNECTIONS', 512, {
+      minimum: 1,
+      maximum: 100_000,
+    }),
+    graphqlWsMaxConnectionsPerClient: readInteger('GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT', 16, {
+      minimum: 1,
+      maximum: 10_000,
+    }),
+    graphqlWsMaxOperationsPerConnection: readInteger('GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION', 32, {
+      minimum: 1,
+      maximum: 10_000,
+    }),
+    graphqlWsConnectionInitTimeoutMs: readInteger('GRAPHQL_WS_CONNECTION_INIT_TIMEOUT_MS', 10_000, {
+      minimum: 1_000,
+      maximum: 120_000,
+    }),
   };
 }

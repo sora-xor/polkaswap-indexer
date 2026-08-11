@@ -74,6 +74,6 @@ USER node
 EXPOSE 4350
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS=4000 node dist/src/scripts/production-smoke.js "http://127.0.0.1:${PORT:-4350}${GRAPHQL_PATH:-/graphql}" >/dev/null 2>&1
+  CMD ["node", "-e", "const port=Number(process.env.PORT??'4350');const path=process.env.GRAPHQL_PATH??'/graphql';if(!Number.isInteger(port)||port<1||port>65535||!path.startsWith('/')||/[\\s?#]/.test(path))process.exit(1);const endpoint='http://127.0.0.1:'+port+path;import('node:child_process').then(({spawn})=>{const child=spawn(process.execPath,['dist/src/scripts/production-smoke.js',endpoint],{stdio:'ignore',env:{...process.env,POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS:'4000'}});child.once('error',()=>process.exit(1));child.once('exit',code=>process.exit(code??1))}).catch(()=>process.exit(1))"]
 
 CMD ["node", "dist/src/index.js"]

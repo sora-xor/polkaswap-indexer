@@ -25,6 +25,14 @@ require_literal() {
   fi
 }
 
+require_healthcheck_literal() {
+  local literal="$1"
+  local label="$2"
+  if [[ "$RUNTIME_HEALTHCHECK_SOURCE" != *"$literal"* ]]; then
+    fail "$label"
+  fi
+}
+
 service_section() {
   local service="$1"
   awk -v service="$service" '
@@ -123,6 +131,43 @@ if [[ "$(grep -Fxc 'CMD ["node", "dist/src/index.js"]' "$DOCKERFILE")" -ne 1 ]] 
    [[ "$(grep -Ec '^CMD ' "$DOCKERFILE")" -ne 1 ]]; then
   fail "runtime image must use exactly the compiled API default command"
 fi
+RUNTIME_HEALTHCHECK_SOURCE=''
+if ! RUNTIME_HEALTHCHECK_SOURCE="$(node - "$DOCKERFILE" <<'NODE'
+const fs = require('node:fs');
+
+const lines = fs.readFileSync(process.argv[2], 'utf8').split(/\r?\n/);
+const healthcheckIndexes = lines
+  .map((line, index) => line.startsWith('HEALTHCHECK ') ? index : -1)
+  .filter((index) => index >= 0);
+if (healthcheckIndexes.length !== 1) process.exit(1);
+
+const commandLine = lines[healthcheckIndexes[0] + 1]?.trimStart() ?? '';
+if (!commandLine.startsWith('CMD [')) process.exit(1);
+
+let command;
+try {
+  command = JSON.parse(commandLine.slice('CMD '.length));
+} catch {
+  process.exit(1);
+}
+if (
+  !Array.isArray(command) ||
+  command.length !== 3 ||
+  command[0] !== 'node' ||
+  command[1] !== '-e' ||
+  typeof command[2] !== 'string'
+) process.exit(1);
+
+try {
+  new Function(command[2]);
+} catch {
+  process.exit(1);
+}
+process.stdout.write(command[2]);
+NODE
+)"; then
+  fail "runtime healthcheck must use exactly one syntactically valid JSON exec-form Node command"
+fi
 require_literal "$DOCKERFILE" 'GRAPHQL_HTTP_MAX_BODY_BYTES=65536' "runtime image must default to a bounded GraphQL HTTP body"
 require_literal "$DOCKERFILE" 'RATE_LIMIT_MAX_KEYS=20000' "runtime image must bound rate-limit identities"
 require_literal "$DOCKERFILE" 'RATE_LIMIT_GLOBAL_MAX=50000' "runtime image must enable the global rate bucket"
@@ -149,9 +194,15 @@ for index in "${!mobile_capability_suffixes[@]}"; do
   require_literal "$ENV_EXAMPLE" "${capability}=${capability_default}" ".env.example must document the direct-process ${capability} tester default"
   require_literal "$ENV_EXAMPLE" "${deployment_input}=${capability_default}" ".env.example must document the production Compose ${deployment_input} tester default"
 done
-require_literal "$DOCKERFILE" 'POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS=4000' "runtime healthcheck must use a deadline shorter than its container timeout"
-require_literal "$DOCKERFILE" 'node dist/src/scripts/production-smoke.js' "runtime healthcheck must reuse the complete PI identity smoke contract"
-require_literal "$DOCKERFILE" 'http://127.0.0.1:${PORT:-4350}${GRAPHQL_PATH:-/graphql}' "runtime healthcheck must probe the loopback GraphQL endpoint"
+require_healthcheck_literal "spawn(process.execPath,['dist/src/scripts/production-smoke.js',endpoint]" "runtime healthcheck must reuse the complete PI identity smoke contract"
+require_healthcheck_literal "stdio:'ignore'" "runtime healthcheck must isolate smoke output from container health status"
+require_healthcheck_literal "POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS:'4000'" "runtime healthcheck must use a deadline shorter than its container timeout"
+require_healthcheck_literal "process.env.PORT??'4350'" "runtime healthcheck must derive its port from the runtime environment"
+require_healthcheck_literal "process.env.GRAPHQL_PATH??'/graphql'" "runtime healthcheck must derive its GraphQL path from the runtime environment"
+require_healthcheck_literal "const endpoint='http://127.0.0.1:'+port+path" "runtime healthcheck must probe the loopback GraphQL endpoint"
+require_healthcheck_literal "child.once('error',()=>process.exit(1))" "runtime healthcheck must fail closed when the smoke child cannot start"
+require_healthcheck_literal "child.once('exit',code=>process.exit(code??1))" "runtime healthcheck must propagate the smoke child exit status"
+require_healthcheck_literal ".catch(()=>process.exit(1))" "runtime healthcheck must fail closed when healthcheck setup fails"
 
 require_literal "$PRODUCTION_COMPOSE" 'image: "${POLKASWAP_INDEXER_IMAGE_REPOSITORY:?' "Production Compose must require an external image repository"
 require_literal "$PRODUCTION_COMPOSE" '@sha256:${POLKASWAP_INDEXER_IMAGE_DIGEST:?' "Production Compose must require an immutable image digest"

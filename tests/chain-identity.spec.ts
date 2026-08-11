@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiPromise } from '@polkadot/api';
-import { readConfig } from '../src/config.js';
 import { ChainIndexer } from '../src/worker/chain.js';
 import { MemoryRepository } from '../src/repository/memory.js';
 import {
@@ -9,16 +8,14 @@ import {
   SORA_MAINNET_GENESIS_HASH,
 } from '../src/soraIdentity.js';
 
-import type { IndexerDocument } from '../src/repository/types.js';
+import type { IndexerDocument, IndexerRepository } from '../src/repository/types.js';
 
 const config = {
-  ...readConfig(),
   host: '0.0.0.0',
   port: 4350,
   graphqlPath: '/graphql',
   databaseUrl: '',
   soraWsEndpoint: 'wss://this-hostname-claims-mainnet.invalid',
-  archiveSoraWsEndpoint: '',
   chainStartBlock: 0,
   chainBatchSize: 25,
   stateRefreshIntervalBlocks: 250,
@@ -53,8 +50,25 @@ type TestIndexer = {
   indexFetchedBlock: (fetched: unknown) => Promise<void>;
 };
 
-const testIndexer = (repository = new MemoryRepository()): TestIndexer =>
+const testIndexer = (repository: IndexerRepository = new MemoryRepository()): TestIndexer =>
   new ChainIndexer(config, repository) as unknown as TestIndexer;
+
+const withDocumentReadOverride = (
+  repository: MemoryRepository,
+  document: IndexerDocument,
+): IndexerRepository => new Proxy(repository, {
+  get(target, property) {
+    if (property === 'get') {
+      return async (collection: IndexerDocument['collection'], id: string) => {
+        if (collection === document.collection && id === document.id) return structuredClone(document);
+        return target.get(collection, id);
+      };
+    }
+
+    const value = Reflect.get(target, property, target) as unknown;
+    return typeof value === 'function' ? value.bind(target) : value;
+  },
+});
 
 const codec = (value: unknown) => ({ toString: () => String(value) });
 
@@ -351,7 +365,7 @@ describe('PI worker exact SORA mainnet identity', () => {
     const indexer = testIndexer(repository);
     stubPostPreflightWork(indexer);
 
-    await expect(indexer.start()).rejects.toThrow('finalized header does not match its requested hash');
+    await expect(indexer.start()).rejects.toThrow('malformed finalized block identity');
     expect(get).not.toHaveBeenCalled();
   });
 
@@ -491,16 +505,11 @@ describe('PI worker exact SORA mainnet identity', () => {
     const snapshot = blockSnapshotDocument();
     if (mutation.snapshot) Object.assign(snapshot, mutation.snapshot);
     if (mutation.snapshotData) Object.assign(snapshot.data, mutation.snapshotData);
-    await repository.upsertMany([chainIdentityDocument(), currentChainStateDocument()]);
-    if (!mutation.omitSnapshot) {
-      const actualGet = repository.get.bind(repository);
-      vi.spyOn(repository, 'get').mockImplementation(async (collectionName, id) =>
-        collectionName === 'networkSnapshots' && id === `block-${STATE_BLOCK}`
-          ? snapshot
-          : actualGet(collectionName, id)
-      );
-    }
-    const indexer = testIndexer(repository);
+    const documents = [chainIdentityDocument(), currentChainStateDocument()];
+    await repository.upsertMany(documents);
+    const indexer = testIndexer(
+      mutation.omitSnapshot ? repository : withDocumentReadOverride(repository, snapshot),
+    );
     indexer.api = liveApiForIdentityAndState({
       stateHash: mutation.stateHash ?? STATE_HASH,
       stateTimestamp: mutation.stateTimestamp ?? STATE_TIMESTAMP,
@@ -649,23 +658,18 @@ describe('PI worker exact SORA mainnet identity', () => {
         data: JSON.stringify({ lastIndexedBlock: stateBlock }),
       },
     });
-    if (!mutation.omitSnapshot) {
-      const injectedSnapshot: IndexerDocument = {
+    const snapshot = mutation.omitSnapshot
+      ? null
+      : {
         collection: 'networkSnapshots',
         id: `block-${SORA_LEGACY_IDENTITY_ANCHOR.block}`,
         blockHeight: snapshotBlock,
         timestamp: snapshotTimestamp,
         data: { id: snapshotId, type: snapshotType, timestamp: snapshotTimestamp },
-      };
-      const actualGet = repository.get.bind(repository);
-      vi.spyOn(repository, 'get').mockImplementation(async (collectionName, id) =>
-        collectionName === 'networkSnapshots' &&
-        id === `block-${SORA_LEGACY_IDENTITY_ANCHOR.block}`
-          ? injectedSnapshot
-          : actualGet(collectionName, id)
-      );
-    }
-    const indexer = testIndexer(repository);
+      } satisfies IndexerDocument;
+    const indexer = testIndexer(
+      snapshot === null ? repository : withDocumentReadOverride(repository, snapshot),
+    );
     indexer.api = liveApiForCheckpoint(
       SORA_LEGACY_IDENTITY_ANCHOR.block,
       mutation.liveHash ?? SORA_LEGACY_IDENTITY_ANCHOR.hash,
@@ -827,10 +831,6 @@ describe('PI worker exact SORA mainnet identity', () => {
 
 describe('PI archive endpoint identity', () => {
   const originalArchiveEndpoint = process.env.SORA_ARCHIVE_WS_ENDPOINT;
-  const archiveConfig = {
-    ...config,
-    archiveSoraWsEndpoint: 'wss://archive-mainnet-label.invalid',
-  };
 
   afterEach(() => {
     vi.useRealTimers();
@@ -856,7 +856,7 @@ describe('PI archive endpoint identity', () => {
     const { RuntimeApiPromise, RuntimeChainIndexer, RuntimeMemoryRepository } = await loadArchiveWorker();
     const archiveApi = { rpc: { chain: { getBlockHash: vi.fn(async () => codec(hash('4'))) } } };
     vi.spyOn(RuntimeApiPromise, 'create').mockResolvedValue(archiveApi as never);
-    const indexer = new RuntimeChainIndexer(archiveConfig, new RuntimeMemoryRepository()) as unknown as TestIndexer;
+    const indexer = new RuntimeChainIndexer(config, new RuntimeMemoryRepository()) as unknown as TestIndexer;
     indexer.api = {};
 
     await expect(indexer.getBlockDataApi()).rejects.toThrow('does not match the reviewed SORA mainnet identity');
@@ -882,7 +882,7 @@ describe('PI archive endpoint identity', () => {
       },
     };
     vi.spyOn(RuntimeApiPromise, 'create').mockResolvedValue(archiveApi as never);
-    const indexer = new RuntimeChainIndexer(archiveConfig, new RuntimeMemoryRepository()) as unknown as TestIndexer;
+    const indexer = new RuntimeChainIndexer(config, new RuntimeMemoryRepository()) as unknown as TestIndexer;
     indexer.api = {};
 
     await expect(indexer.getBlockDataApi()).rejects.toThrow('does not contain the reviewed SORA mainnet history anchor');
@@ -902,7 +902,7 @@ describe('PI archive endpoint identity', () => {
       },
     };
     vi.spyOn(RuntimeApiPromise, 'create').mockResolvedValue(archiveApi as never);
-    const indexer = new RuntimeChainIndexer(archiveConfig, new RuntimeMemoryRepository()) as unknown as TestIndexer;
+    const indexer = new RuntimeChainIndexer(config, new RuntimeMemoryRepository()) as unknown as TestIndexer;
     indexer.api = {};
 
     await expect(indexer.getBlockDataApi()).resolves.toBe(archiveApi);
@@ -918,7 +918,7 @@ describe('PI archive endpoint identity', () => {
     const archiveHash = hash('6');
     const primary = { rpc: { chain: { getBlockHash: vi.fn(async () => codec(primaryHash)) } } };
     const archive = { rpc: { chain: { getBlockHash: vi.fn(async () => codec(archiveHash)) } } };
-    const indexer = new RuntimeChainIndexer(archiveConfig, new RuntimeMemoryRepository()) as unknown as TestIndexer;
+    const indexer = new RuntimeChainIndexer(config, new RuntimeMemoryRepository()) as unknown as TestIndexer;
     indexer.api = primary;
     indexer.legacyBlockApi = archive;
 

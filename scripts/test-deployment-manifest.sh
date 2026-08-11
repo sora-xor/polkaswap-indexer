@@ -124,18 +124,30 @@ expect_failure "shell-runtime-command" "$shell_runtime_command" "$ROOT_DIR/.dock
 
 weak_health_identity="$TMP_DIR/Dockerfile.weak-health-identity"
 cp "$ROOT_DIR/Dockerfile" "$weak_health_identity"
-perl -0pi -e 's#node dist/src/scripts/production-smoke\.js#node dist/src/index.js#' "$weak_health_identity"
+perl -0pi -e 's#dist/src/scripts/production-smoke\.js#dist/src/index.js#' "$weak_health_identity"
 expect_failure "weak-health-identity" "$weak_health_identity" "$ROOT_DIR/.dockerignore" "runtime healthcheck must reuse the complete PI identity smoke contract"
 
 unbounded_health="$TMP_DIR/Dockerfile.unbounded-health"
 cp "$ROOT_DIR/Dockerfile" "$unbounded_health"
-perl -0pi -e 's/POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS=4000 //' "$unbounded_health"
+perl -0pi -e "s/POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS:'4000'/POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS:'5000'/" "$unbounded_health"
 expect_failure "unbounded-health" "$unbounded_health" "$ROOT_DIR/.dockerignore" "runtime healthcheck must use a deadline shorter than its container timeout"
 
 remote_health="$TMP_DIR/Dockerfile.remote-health"
 cp "$ROOT_DIR/Dockerfile" "$remote_health"
 perl -0pi -e 's#http://127\.0\.0\.1:#https://attacker.invalid:#' "$remote_health"
 expect_failure "remote-health" "$remote_health" "$ROOT_DIR/.dockerignore" "runtime healthcheck must probe the loopback GraphQL endpoint"
+
+shell_health="$TMP_DIR/Dockerfile.shell-health"
+cp "$ROOT_DIR/Dockerfile" "$shell_health"
+sed -i.bak '/^  CMD \["node", "-e"/c\
+  CMD node dist/src/scripts/production-smoke.js http://127.0.0.1:4350/graphql' "$shell_health"
+rm "$shell_health.bak"
+expect_failure "shell-health" "$shell_health" "$ROOT_DIR/.dockerignore" "runtime healthcheck must use exactly one syntactically valid JSON exec-form Node command"
+
+ignored_health_exit="$TMP_DIR/Dockerfile.ignored-health-exit"
+cp "$ROOT_DIR/Dockerfile" "$ignored_health_exit"
+perl -0pi -e "s/child\.once\('exit',code=>process\.exit\(code\?\?1\)\)/child.once('exit',()=>process.exit(0))/" "$ignored_health_exit"
+expect_failure "ignored-health-exit" "$ignored_health_exit" "$ROOT_DIR/.dockerignore" "runtime healthcheck must propagate the smoke child exit status"
 
 dockerfile_tls_override="$TMP_DIR/Dockerfile.tls-override"
 cp "$ROOT_DIR/Dockerfile" "$dockerfile_tls_override"
@@ -514,7 +526,7 @@ expect_failure "proxy-throttled-as-websocket-client" "$ROOT_DIR/Dockerfile" "$RO
 
 unsafe_context="$TMP_DIR/.dockerignore"
 cp "$ROOT_DIR/.dockerignore" "$unsafe_context"
-perl -0pi -e 's#^node_modules/?\n##m' "$unsafe_context"
+perl -0pi -e 's#^node_modules/?\n##mg' "$unsafe_context"
 expect_failure "unsafe-context" "$ROOT_DIR/Dockerfile" "$unsafe_context" ".dockerignore must exclude node_modules"
 
 credential_leaking_instructions="$TMP_DIR/README.credential-leaking.md"

@@ -54,6 +54,7 @@ export type LegacyGraphqlWebSocketOptions = {
   maxOperationsPerConnection: number;
   maxPendingMessagesPerConnection: number;
   maxResultBytes: number;
+  admitOperation?: (request: IncomingMessage) => true | GraphQLError;
   acquireOperation?: (operation: object) => boolean | GraphQLError;
   releaseOperation?: (operation: object) => void;
   context: (request: IncomingMessage, connectionParams: Record<string, unknown>) => unknown | Promise<unknown>;
@@ -226,6 +227,12 @@ const startOperation = async (
   const id = operationId(message.id);
   if (!connection.initialized) {
     await sendOperationError(connection.socket, id, [new Error('GraphQL connection has not been initialized')]);
+    return;
+  }
+
+  const admission = options.admitOperation?.(connection.request) ?? true;
+  if (admission !== true) {
+    await sendOperationError(connection.socket, id, [admission]);
     return;
   }
 

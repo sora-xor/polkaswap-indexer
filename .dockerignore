@@ -1,5 +1,6 @@
 # Dependency trees and package-manager state generated on the host. Keep
 # tracked Yarn releases/plugins/patches available if the project adds them.
+node_modules
 node_modules/
 .pnp.*
 .yarn/*
@@ -21,6 +22,7 @@ node_modules/
 # Environment files, credentials, and common private-key formats.
 .env
 .env.*
+!.env.example
 *.key
 *.pem
 *.p12

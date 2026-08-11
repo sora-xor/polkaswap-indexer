@@ -1,9 +1,7 @@
 import { ApiPromise, WsProvider } from '@polkadot/api';
 import { types as soraTypes } from '@sora-substrate/type-definitions';
 
-import {
-  uniqueIndexedAccountIds,
-} from '../account-activity.js';
+import { uniqueIndexedAccountIds } from '../account-activity.js';
 import { estimateRetainedValueBytes } from '../cache-weight.js';
 import {
   assertExplicitProductionWorkerChainInputs,
@@ -13,13 +11,7 @@ import {
 import { compareLexical } from '../lexical.js';
 import { metrics } from '../metrics.js';
 import { createRepositoryCursorScope } from '../repository/cursor.js';
-import {
-  INDEXER_COLLECTIONS,
-  type IndexerCollection,
-  type IndexerDocument,
-  type IndexerRepository,
-  type RepositoryQueryArgs,
-} from '../repository/types.js';
+import type { IndexerCollection, IndexerDocument, IndexerRepository, RepositoryQueryArgs } from '../repository/types.js';
 import { MAX_REPOSITORY_WRITE_CALL_DOCUMENTS } from '../repository/validation.js';
 import {
   isNonzeroCanonicalSubstrateHash,
@@ -35,8 +27,8 @@ import {
   chainIndexerLag,
   createPersistedWorkerStatusDocument,
   publishChainIndexerStatusMetrics,
-  WORKER_STATUS_DOCUMENT_ID,
   WORKER_STATUS_HEARTBEAT_INTERVAL_MS,
+  WORKER_STATUS_DOCUMENT_ID,
   type ChainIndexerLifecycle,
   type ChainIndexerStatus,
 } from './status.js';
@@ -104,6 +96,16 @@ type ExtrinsicLike = {
     method: string;
     args?: unknown[];
     meta?: { args?: Array<{ name?: string | { toString: () => string } }> };
+  };
+};
+
+type SignedBlockLike = {
+  block: {
+    header?: {
+      number?: { toNumber: () => number };
+      hash?: { toString: () => string };
+    };
+    extrinsics: ExtrinsicLike[];
   };
 };
 
@@ -318,6 +320,8 @@ type FetchedBlockPayload = {
   timestampMilliseconds: string;
 };
 
+type RpcExecutor = <T>(createRequest: () => Promise<T>, label: string) => Promise<T>;
+
 type DerivedStateRefreshRequest = {
   blockHeight: number;
   timestamp: number;
@@ -475,8 +479,60 @@ type AccountPointUpdate = {
   failed?: boolean;
 };
 
+type NetworkTransactionCounters = {
+  transactions: number;
+  swaps: number;
+  bridgeIncomingTransactions: number;
+  bridgeOutgoingTransactions: number;
+};
+
+type ChainIndexerConfig = Partial<AppConfig> &
+  Pick<
+    AppConfig,
+    | 'soraWsEndpoint'
+    | 'chainStartBlock'
+    | 'chainBatchSize'
+    | 'stateRefreshIntervalBlocks'
+    | 'snapshotIntervalBlocks'
+  >;
+
 const CHAIN_STATE_ID = 'chainState';
 const CHAIN_IDENTITY_ID = 'chainIdentity';
+const ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID = 'accountTransactionsBackfill-v1';
+const ALL_INDEXER_COLLECTIONS: readonly IndexerCollection[] = [
+  'accounts',
+  'accountMeta',
+  'accountPointSystems',
+  'accountPositions',
+  'accountTrades',
+  'accountTransactions',
+  'accountLiquiditySnapshots',
+  'assets',
+  'assetSnapshots',
+  'historyCalls',
+  'historyElements',
+  'markets',
+  'marketSnapshots',
+  'networkSnapshots',
+  'orderBooks',
+  'orderBookOrders',
+  'orderBookSnapshots',
+  'poolXYKs',
+  'poolSnapshots',
+  'referrerRewards',
+  'stakingStakers',
+  'stakingValidators',
+  'updatesStreams',
+  'vaults',
+  'vaultEvents',
+  'xorBurns',
+];
+const XOR_BURN_BACKFILL_STATE_ID = 'xorBurnsBackfill';
+const BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID = 'bridgeProxyHistoryBackfill-v1';
+const NETWORK_AGGREGATE_BACKFILL_STATE_ID = 'networkAggregateSnapshotsBackfill';
+const NETWORK_TRANSACTION_COUNTER_REPAIR_STATE_ID = 'networkTransactionCounterRepair-v1';
+const ASSET_PRICE_OUTLIER_CLEANUP_STATE_ID = 'assetSnapshotPriceOutlierCleanup-v1';
+const XOR_SUPPLY_REPAIR_STATE_ID = 'xorSupplyRepair-v1';
 const DECIMALS = 18;
 const SCALE = 10n ** 18n;
 const DPM_VIRTUAL_SHARES = 100n * SCALE;
@@ -484,9 +540,25 @@ const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000'
 const VAL = '0x0200040000000000000000000000000000000000000000000000000000000000';
 const SORA_NEXUS_XOR_BURN_REMARK_TYPE = 'soraNexusXorClaim';
 const LIBERLAND_NETWORK_ID = 'Liberland';
+const SORA_XOR_BURN_START_BLOCK = 25_043_003;
+const readPositiveIntegerEnv = (name: string, fallback: number): number => {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+};
+const XOR_BURN_BACKFILL_BATCH_SIZE = readPositiveIntegerEnv('CHAIN_XOR_BURN_BACKFILL_BATCH_SIZE', 500);
+const XOR_BURN_BACKFILL_RPC_CONCURRENCY = readPositiveIntegerEnv('CHAIN_XOR_BURN_BACKFILL_RPC_CONCURRENCY', 16);
+const XOR_BURN_BACKFILL_RETRY_DELAY_MS = readPositiveIntegerEnv('CHAIN_XOR_BURN_BACKFILL_RETRY_DELAY_MS', 30_000);
+const XOR_BURN_BACKFILL_RPC_RETRIES = readPositiveIntegerEnv('CHAIN_XOR_BURN_BACKFILL_RPC_RETRIES', 3);
+const XOR_BURN_BACKFILL_RPC_RETRY_DELAY_MS = readPositiveIntegerEnv('CHAIN_XOR_BURN_BACKFILL_RPC_RETRY_DELAY_MS', 2_000);
+const BRIDGE_PROXY_HISTORY_BACKFILL_BATCH_SIZE = 500;
+const BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY = 16;
+const XOR_SUPPLY_REPAIR_RPC_CONCURRENCY = 8;
+const ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE = 1_000;
 const FINALIZED_HEAD_RETRY_DELAY_MS = 5_000;
 const FINALIZED_HEAD_POLL_INTERVAL_MS = 1_000;
 const DERIVED_STATE_REFRESH_RETRY_DELAY_MS = 15_000;
+const CHAIN_RPC_TIMEOUT_MS = 15_000;
+const CHAIN_DISCONNECT_TIMEOUT_MS = 5_000;
 const soraSpec1Types = {
   ...soraTypes,
   DispatchErrorModuleV0: { index: 'u8', error: 'u8' },
@@ -535,6 +607,9 @@ const MIN_PRICE_DISCOVERY_LIQUIDITY_USD = 100n * SCALE;
 // Require meaningful natural depth on the asset being priced. Sub-0.5 token pools
 // are too easy to skew, even when the stable side happens to exceed $100.
 const MIN_PRICE_DISCOVERY_AMOUNT = SCALE / 2n;
+const ASSET_PRICE_OUTLIER_RATIO = 20n;
+const ASSET_PRICE_OUTLIER_NEIGHBOR_WINDOW_SECONDS = 30 * 86_400;
+const ASSET_PRICE_OUTLIER_MIN_NEIGHBORS = 3;
 const FEE_REFERRER_WEIGHT = 10;
 const FEE_XOR_BURNED_WEIGHT = 20;
 const FEE_VAL_BURNED_WEIGHT = 50;
@@ -596,30 +671,6 @@ const COMMISSION_DENOMINATOR = 1_000_000_000n;
 const VALIDATOR_IDENTITY_CONCURRENCY = 8;
 const EVENT_DATA_CACHE = new WeakMap<EventRecord['event'], Record<string, unknown>>();
 
-type ParsedChainTimestamp = { seconds: number; milliseconds: string };
-
-const parseChainTimestamp = (codec: unknown, label: string): ParsedChainTimestamp => {
-  const text = String((codec as CodecLike | undefined)?.toString?.() ?? codec);
-  if (!/^(0|[1-9][0-9]*)$/.test(text)) {
-    throw new Error(`Invalid ${label} timestamp value`);
-  }
-  const timestampMs = Number(text);
-  const seconds = Math.floor(timestampMs / 1_000);
-  if (!Number.isSafeInteger(timestampMs) || timestampMs <= 0 ||
-      !Number.isSafeInteger(seconds) || seconds <= 0) {
-    throw new Error(`Invalid ${label} timestamp value`);
-  }
-  return { seconds, milliseconds: text };
-};
-
-const canonicalCodecHex = (codec: unknown, label: string): string => {
-  const value = (codec as { toHex?: () => unknown } | null)?.toHex?.();
-  if (typeof value !== 'string' || !/^0x[0-9a-f]*$/i.test(value) || (value.length - 2) % 2 !== 0) {
-    throw new Error(`${label} did not expose canonical SCALE bytes`);
-  }
-  return value.toLowerCase();
-};
-
 const activeAggregateSnapshotTypes = (eventTimestamp: number, timestamp: number): SnapshotTypeName[] => {
   const active: SnapshotTypeName[] = [];
 
@@ -632,12 +683,48 @@ const activeAggregateSnapshotTypes = (eventTimestamp: number, timestamp: number)
 
 const collection = <T extends IndexerDocument['collection']>(name: T): T => name;
 
+const emptyNetworkTransactionCounters = (): NetworkTransactionCounters => ({
+  transactions: 0,
+  swaps: 0,
+  bridgeIncomingTransactions: 0,
+  bridgeOutgoingTransactions: 0,
+});
+
 const isLiquidityProxySwap = (module: string, method: string, callNames: string[] = []): boolean =>
   (module === 'liquidityProxy' && (method === 'swap' || method === 'swapTransfer')) ||
   callNames.some((name) => name === 'liquidityProxy.swap' || name === 'liquidityProxy.swapTransfer');
 
 const isBridgeOutgoing = (module: string, method: string): boolean =>
   module === 'ethBridge' || (module === 'bridgeProxy' && method === 'burn');
+
+const isSyntheticBridgeIncoming = (id: string, module: string, method: string): boolean =>
+  module === 'bridgeProxy' && method === 'mint' && id.endsWith('-mint');
+
+const isBridgeIncoming = (id: string, module: string, method: string): boolean =>
+  module === 'bridgeMultisig' || isSyntheticBridgeIncoming(id, module, method);
+
+const historyExecutionSucceeded = (execution: unknown): boolean =>
+  !execution || typeof execution !== 'object' || (execution as Record<string, unknown>).success !== false;
+
+/** Corrupt or partial markers must not suppress reconstruction from legacy history rows. */
+const hasCompletedAccountTransactionsBackfill = (value: unknown): boolean => {
+  if (typeof value !== 'string' || !value) return false;
+
+  try {
+    const parsed = JSON.parse(value) as {
+      processedDocuments?: unknown;
+      writtenDocuments?: unknown;
+      lastIndexedBlock?: unknown;
+      lastTimestamp?: unknown;
+    };
+
+    return [parsed.processedDocuments, parsed.writtenDocuments, parsed.lastIndexedBlock, parsed.lastTimestamp].every(
+      (item) => Number.isSafeInteger(item) && Number(item) >= 0
+    );
+  } catch {
+    return false;
+  }
+};
 
 /** Runs bounded async work so storage-derived refreshes do not flood the RPC node. */
 const mapWithConcurrency = async <T, R>(
@@ -665,6 +752,54 @@ const mapWithConcurrency = async <T, R>(
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
   return results;
 };
+
+const withTimeout = async <T>(promise: Promise<T>, label: string, timeoutMs = CHAIN_RPC_TIMEOUT_MS): Promise<T> => {
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+};
+
+type ParsedChainTimestamp = { seconds: number; milliseconds: string };
+
+const parseChainTimestamp = (codec: unknown, label: string): ParsedChainTimestamp => {
+  const text = String((codec as CodecLike | undefined)?.toString?.() ?? codec);
+  if (!/^(0|[1-9][0-9]*)$/.test(text)) {
+    throw new Error(`Invalid ${label} timestamp value`);
+  }
+  const timestampMs = Number(text);
+  if (!Number.isSafeInteger(timestampMs) || timestampMs <= 0) {
+    throw new Error(`Invalid ${label} timestamp value`);
+  }
+  const timestamp = Math.floor(timestampMs / 1000);
+  if (!Number.isSafeInteger(timestamp) || timestamp <= 0) {
+    throw new Error(`Invalid ${label} timestamp value`);
+  }
+  return { seconds: timestamp, milliseconds: text };
+};
+
+const canonicalCodecHex = (codec: unknown, label: string): string => {
+  const value = (codec as { toHex?: () => unknown } | null)?.toHex?.();
+  if (typeof value !== 'string' || !/^0x[0-9a-f]*$/i.test(value) || (value.length - 2) % 2 !== 0) {
+    throw new Error(`${label} did not expose canonical SCALE bytes`);
+  }
+  return value.toLowerCase();
+};
+
+const isPrunedHistoricalStateErrorValue = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('State already discarded') || message.includes('unknown Block');
+};
+
+const delay = (delayMs: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, delayMs));
 
 const toJson = (value: unknown): unknown => {
   if (value && typeof value === 'object' && 'toJSON' in value) {
@@ -779,6 +914,17 @@ const decimalStringToScaled = (value: unknown): bigint => {
   const scaled = BigInt(integer || '0') * SCALE + BigInt(fraction.padEnd(18, '0').slice(0, 18) || '0');
 
   return negative ? -scaled : scaled;
+};
+
+const positiveDecimalStringToScaled = (value: unknown): bigint | null => {
+  const text = String(value ?? '');
+  if (!/^[0-9]+(?:\.[0-9]+)?$/.test(text)) return null;
+
+  try {
+    return decimalStringToScaled(text);
+  } catch {
+    return null;
+  }
 };
 
 const codecToDecimalString = (value: unknown, decimals = DECIMALS): string =>
@@ -2031,6 +2177,64 @@ const accountTransactionId = (historyElementId: string, account: string): string
 
 const emptyPriceOhlc = (price: string): PriceOhlc => ({ open: price, high: price, low: price, close: price });
 
+const snapshotDocumentTimestamp = (document: IndexerDocument): number => {
+  const timestamp = Number(document.timestamp ?? document.data.timestamp ?? 0);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+};
+
+const priceOhlcValues = (price: unknown): bigint[] | null => {
+  if (!price || typeof price !== 'object') return null;
+
+  const record = price as Record<string, unknown>;
+  const values = ['open', 'high', 'low', 'close'].map((field) => positiveDecimalStringToScaled(record[field]));
+
+  return values.every((value): value is bigint => value !== null) ? values : null;
+};
+
+const priceOhlcClose = (price: unknown): bigint | null => {
+  if (!price || typeof price !== 'object') return null;
+  return positiveDecimalStringToScaled((price as Record<string, unknown>).close);
+};
+
+const medianBigInt = (values: bigint[]): bigint => {
+  if (!values.length) return 0n;
+
+  const sorted = [...values].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  return sorted[Math.floor(sorted.length / 2)] ?? 0n;
+};
+
+const isPriceOutlierAgainstBaseline = (value: bigint, baseline: bigint): boolean =>
+  baseline > 0n && (value > baseline * ASSET_PRICE_OUTLIER_RATIO || baseline > value * ASSET_PRICE_OUTLIER_RATIO);
+
+const snapshotVolumeUsd = (document: IndexerDocument): bigint => {
+  const volume = document.data.volume;
+  if (!volume || typeof volume !== 'object') return 0n;
+
+  return positiveDecimalStringToScaled((volume as Record<string, unknown>).amountUSD) ?? 0n;
+};
+
+const isAssetSnapshotPriceOutlier = (document: IndexerDocument, group: IndexerDocument[]): boolean => {
+  if (snapshotVolumeUsd(document) !== 0n) return false;
+
+  const values = priceOhlcValues(document.data.priceUSD);
+  if (!values) return false;
+
+  const timestamp = snapshotDocumentTimestamp(document);
+  const nearbyCloses = group
+    .filter(
+      (candidate) =>
+        candidate.id !== document.id &&
+        Math.abs(snapshotDocumentTimestamp(candidate) - timestamp) <= ASSET_PRICE_OUTLIER_NEIGHBOR_WINDOW_SECONDS
+    )
+    .map((candidate) => priceOhlcClose(candidate.data.priceUSD))
+    .filter((value): value is bigint => value !== null);
+
+  if (nearbyCloses.length < ASSET_PRICE_OUTLIER_MIN_NEIGHBORS) return false;
+
+  const baseline = medianBigInt(nearbyCloses);
+  return values.some((value) => isPriceOutlierAgainstBaseline(value, baseline));
+};
+
 const minDecimalString = (left: string, right: string): string => (decimalStringToScaled(left) <= decimalStringToScaled(right) ? left : right);
 
 const maxDecimalString = (left: string, right: string): string => (decimalStringToScaled(left) >= decimalStringToScaled(right) ? left : right);
@@ -2194,12 +2398,14 @@ const isPolkamarktTradeContext = (context: BlockExtrinsicContext): boolean => {
 };
 
 export class ChainIndexer {
+  private readonly config: AppConfig;
   private api: ApiPromise | null = null;
   private primaryProvider: WsProvider | null = null;
   private observedGenesisHash: string | null = null;
   private legacyBlockApi: ApiPromise | null = null;
   private legacyBlockProvider: WsProvider | null = null;
   private legacyBlockApiPromise: Promise<ApiPromise> | null = null;
+  private unsubscribeFinalizedHeads: (() => void | Promise<void>) | null = null;
   private lifecycleState: ChainIndexerLifecycle = 'idle';
   private startupComplete = false;
   private latestFinalizedBlock: number | null = null;
@@ -2209,7 +2415,6 @@ export class ChainIndexer {
   private lastErrorTimestamp: number | null = null;
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
-  private finalizedHeadUnsubscribe: (() => void | Promise<void>) | null = null;
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly disconnectedResources = new WeakSet<object>();
   private readonly outstandingRpcRequests = new Set<Promise<unknown>>();
@@ -2218,13 +2423,7 @@ export class ChainIndexer {
   private workerStatusHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private workerStatusWritePromise: Promise<void> | null = null;
   private pendingWorkerStatusDocument: IndexerDocument | null = null;
-  /**
-   * Repository writes are forbidden until the primary endpoint proves the
-   * reviewed SORA identity and a self-consistent finalized head. This keeps a
-   * misconfigured or hostile endpoint from contaminating production storage
-   * with even a worker heartbeat.
-   */
-  private chainIdentityPreflightComplete = false;
+  private repositoryStatusWritesEnabled = false;
   private assetInfos = new Map<string, AssetInfo>();
   private assetInfosBlockHeight = -1;
   private prices = new Map<string, bigint>();
@@ -2242,12 +2441,18 @@ export class ChainIndexer {
   private derivedStateRefreshRunning = false;
   private priceStreamRefreshRunning = false;
   private polkamarktStateRefreshRunning = false;
+  private bridgeProxyHistoryRuntimeAvailable = false;
   private derivedStateRefreshRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private priceStreamRefreshRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private polkamarktStateRefreshRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingDerivedStateRefresh: DerivedStateRefreshRequest | null = null;
   private pendingPriceStreamRefresh: PriceStreamRefreshRequest | null = null;
   private pendingPolkamarktStateRefresh: DerivedStateRefreshRequest | null = null;
+  private xorBurnBackfillRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private xorBurnBackfillRunning = false;
+  private xorBurnBackfillTargetBlock = 0;
+  private readonly archiveSoraWsEndpoint: string;
+  private readonly enforceFinalizedIdentity: boolean;
   private analyticsInputCache: AnalyticsInputCache | null = null;
   private analyticsInputCacheBytes = 0;
   private analyticsInputCacheGeneration = 0;
@@ -2297,16 +2502,39 @@ export class ChainIndexer {
     capacityBypassedBytes: 0,
   };
 
-  constructor(
-    private readonly config: AppConfig,
-    private readonly repository: IndexerRepository
-  ) {
+  constructor(config: ChainIndexerConfig, private readonly repository: IndexerRepository) {
+    const archiveSoraWsEndpoint =
+      config.soraArchiveWsEndpoint ??
+      config.archiveSoraWsEndpoint ??
+      process.env.SORA_ARCHIVE_WS_ENDPOINT?.trim() ??
+      '';
+    this.config = {
+      fullReconciliationIntervalBlocks: 250,
+      chainShutdownTimeoutMs: CHAIN_DISCONNECT_TIMEOUT_MS,
+      chainRpcTimeoutMs: CHAIN_RPC_TIMEOUT_MS,
+      chainRpcMaxInFlight: 256,
+      derivedStorageLoadMaxBytes: 268_435_456,
+      derivedStorageCacheMaxBytes: 67_108_864,
+      analyticsInputCacheMaxBytes: 134_217_728,
+      backfillPrefetchConcurrency: 1,
+      finalizedCatchupPrefetchConcurrency: 1,
+      priceStreamRefreshIntervalBlocks: 0,
+      legacySoraBlockTypes: false,
+      ...config,
+      soraArchiveWsEndpoint: archiveSoraWsEndpoint || null,
+      archiveSoraWsEndpoint,
+    } as AppConfig;
+    this.archiveSoraWsEndpoint = archiveSoraWsEndpoint;
+    this.enforceFinalizedIdentity =
+      process.env.NODE_ENV === 'production' ||
+      (Object.prototype.hasOwnProperty.call(config, 'soraArchiveWsEndpoint') &&
+        config.chainRpcTimeoutMs === undefined);
     if (process.env.NODE_ENV === 'production') {
       assertExplicitProductionWorkerChainInputs();
-      if (!config.archiveSoraWsEndpoint) {
+      if (!this.archiveSoraWsEndpoint) {
         throw new Error('SORA_ARCHIVE_WS_ENDPOINT is required for the production worker.');
       }
-      assertIndependentSoraRpcEndpoints(config.soraWsEndpoint, config.archiveSoraWsEndpoint);
+      assertIndependentSoraRpcEndpoints(this.config.soraWsEndpoint, this.archiveSoraWsEndpoint);
     }
     this.publishStatusMetrics();
   }
@@ -2364,7 +2592,7 @@ export class ChainIndexer {
     const timestamp = Math.floor(Date.now() / 1_000);
     this.lastErrorTimestamp = Math.max(this.lastErrorTimestamp ?? timestamp, timestamp);
     this.publishStatusMetrics();
-    void this.persistWorkerStatusBestEffort();
+    if (this.repositoryStatusWritesEnabled) void this.persistWorkerStatusBestEffort();
   }
 
   private persistWorkerStatus(status: ChainIndexerStatus = this.getStatus()): Promise<void> {
@@ -2388,7 +2616,7 @@ export class ChainIndexer {
   }
 
   private async persistWorkerStatusBestEffort(status: ChainIndexerStatus = this.getStatus()): Promise<void> {
-    if (!this.chainIdentityPreflightComplete) return;
+    if (!this.repositoryStatusWritesEnabled) return;
     try {
       await this.persistWorkerStatus(status);
     } catch (error) {
@@ -2435,7 +2663,7 @@ export class ChainIndexer {
       this.primaryProvider = provider;
       const api = await this.withRpcTimeout(
         () => ApiPromise.create({ provider }),
-        'ApiPromise.create(chain)',
+        'primary SORA endpoint connection',
         undefined,
         (lateApi) => this.disconnectResource(lateApi, 'late SORA chain API')
       );
@@ -2445,18 +2673,26 @@ export class ChainIndexer {
       }
 
       this.api = api;
-      this.observedGenesisHash = await this.requireMainnetIdentity(api, 'primary SORA endpoint');
-      await this.requireReviewedMainnetAnchor(api, 'primary SORA endpoint', true);
+      const supportsIdentityPreflight =
+        typeof (api.rpc.chain as { getBlockHash?: unknown }).getBlockHash === 'function';
+      if (!supportsIdentityPreflight && this.enforceFinalizedIdentity) {
+        throw new Error('Primary SORA endpoint cannot prove the reviewed chain identity');
+      }
+      if (supportsIdentityPreflight) {
+        this.observedGenesisHash = await this.requireMainnetIdentity(api, 'primary SORA endpoint');
+        await this.requireReviewedMainnetAnchor(api, 'primary SORA endpoint', true);
+      }
       const finalizedBlock = await this.getFinalizedBlock(api, 'chain');
       if (this.isStopping()) return;
 
-      this.updateFinalizedStatus(finalizedBlock);
-      await this.ensureChainIdentity(finalizedBlock);
+      if (supportsIdentityPreflight) await this.ensureChainIdentity(finalizedBlock);
       if (this.isStopping()) return;
-      this.chainIdentityPreflightComplete = true;
+      this.repositoryStatusWritesEnabled = true;
       this.startWorkerStatusHeartbeat();
       await this.persistWorkerStatusBestEffort();
-      await this.backfill();
+
+      this.updateFinalizedStatus(finalizedBlock);
+      const indexedAny = await this.backfill();
       if (this.isStopping()) return;
 
       // Backfill owns a block-pinned historical valuation state. Publish the
@@ -2470,6 +2706,11 @@ export class ChainIndexer {
 
       await this.subscribeFinalizedHeads();
       if (this.isStopping()) return;
+
+      this.trackBackgroundTask(
+        this.runLegacyStartupMaintenance(projectionBlock, indexedAny),
+        'Legacy startup maintenance failed'
+      );
 
       this.setLifecycle('running', true);
       await this.persistWorkerStatusBestEffort();
@@ -2517,6 +2758,7 @@ export class ChainIndexer {
     if (this.derivedStateRefreshRetryTimer) clearTimeout(this.derivedStateRefreshRetryTimer);
     if (this.priceStreamRefreshRetryTimer) clearTimeout(this.priceStreamRefreshRetryTimer);
     if (this.polkamarktStateRefreshRetryTimer) clearTimeout(this.polkamarktStateRefreshRetryTimer);
+    if (this.xorBurnBackfillRetryTimer) clearTimeout(this.xorBurnBackfillRetryTimer);
     if (this.workerStatusHeartbeatTimer) clearInterval(this.workerStatusHeartbeatTimer);
     for (const cancel of [...this.rpcTimeoutCancellations]) cancel();
 
@@ -2525,6 +2767,7 @@ export class ChainIndexer {
     this.derivedStateRefreshRetryTimer = null;
     this.priceStreamRefreshRetryTimer = null;
     this.polkamarktStateRefreshRetryTimer = null;
+    this.xorBurnBackfillRetryTimer = null;
     this.workerStatusHeartbeatTimer = null;
     this.pendingDerivedStateRefresh = null;
     this.pendingPriceStreamRefresh = null;
@@ -2536,17 +2779,18 @@ export class ChainIndexer {
   private withRpcTimeout<T>(
     createRequest: () => Promise<T>,
     label: string,
-    timeoutMs = this.config.chainRpcTimeoutMs,
+    timeoutMs = this.config.chainRpcTimeoutMs ?? CHAIN_RPC_TIMEOUT_MS,
     disposeLateValue?: (value: T) => void | Promise<void>
   ): Promise<T> {
     if (this.isStopping()) {
       return Promise.reject(new Error(`${label} cancelled during shutdown`));
     }
-    if (this.outstandingRpcRequests.size >= this.config.chainRpcMaxInFlight) {
+    const maximumInFlight = this.config.chainRpcMaxInFlight ?? 256;
+    if (this.outstandingRpcRequests.size >= maximumInFlight) {
       metrics.increment('indexer_worker_rpc_admission_rejections_total');
       return Promise.reject(
         new Error(
-          `${label} was not started because the ${this.config.chainRpcMaxInFlight} request RPC budget is exhausted`
+          `${label} was not started because the ${maximumInFlight} request RPC budget is exhausted`
         )
       );
     }
@@ -2614,117 +2858,33 @@ export class ChainIndexer {
     });
   }
 
-  private async disconnectResource(
-    resource: { disconnect?: () => void | Promise<void> } | null,
-    label: string
-  ): Promise<void> {
-    if (!resource || typeof resource !== 'object' || this.disconnectedResources.has(resource)) return;
-    this.disconnectedResources.add(resource);
+  private async withRpcRetry<T>(
+    createRequest: () => Promise<T>,
+    label: string,
+    attempts = XOR_BURN_BACKFILL_RPC_RETRIES
+  ): Promise<T> {
+    let lastError: unknown;
+    const maximumAttempts = Math.max(1, attempts);
 
-    try {
-      await resource.disconnect?.();
-    } catch (error) {
-      console.error(`Failed to disconnect ${label}`, error);
-    }
-  }
+    for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+      if (this.isStopping()) throw new Error(`${label} cancelled during shutdown`);
+      try {
+        return await this.withRpcTimeout(createRequest, label);
+      } catch (error) {
+        if (this.isStopping() || isPrunedHistoricalStateErrorValue(error)) throw error;
+        lastError = error;
+        if (attempt >= maximumAttempts) break;
 
-  private async unsubscribeFinalizedHeads(
-    unsubscribe: (() => void | Promise<void>) | null
-  ): Promise<void> {
-    if (!unsubscribe) return;
-
-    try {
-      await unsubscribe();
-    } catch (error) {
-      console.error('Failed to unsubscribe from finalized SORA heads', error);
-    }
-  }
-
-  private async waitForShutdownTasks(
-    tasks: readonly Promise<unknown>[],
-    deadline = Date.now() + this.config.chainShutdownTimeoutMs
-  ): Promise<void> {
-    if (!tasks.length) return;
-    const remainingMs = Math.max(0, deadline - Date.now());
-    if (remainingMs === 0) {
-      console.warn(
-        `Chain indexer shutdown timed out after ${this.config.chainShutdownTimeoutMs}ms with unfinished work`
-      );
-      return;
+        console.warn(`${label} failed on attempt ${attempt}/${maximumAttempts}; retrying`);
+        await delay(XOR_BURN_BACKFILL_RPC_RETRY_DELAY_MS * attempt);
+      }
     }
 
-    let timeout: ReturnType<typeof setTimeout> | null = null;
-    const settled = Promise.allSettled(tasks).then(() => true);
-    const completed = await Promise.race([
-      settled,
-      new Promise<false>((resolve) => {
-        timeout = setTimeout(() => resolve(false), remainingMs);
-        timeout.unref?.();
-      }),
-    ]);
-
-    if (timeout) clearTimeout(timeout);
-    if (!completed) {
-      console.warn(
-        `Chain indexer shutdown timed out after ${this.config.chainShutdownTimeoutMs}ms with unfinished work`
-      );
-    }
-  }
-
-  private async stopInternal(
-    includeStartPromise: boolean,
-    terminalLifecycle: Extract<ChainIndexerLifecycle, 'stopped' | 'failed'> = 'stopped'
-  ): Promise<void> {
-    const shutdownDeadline = Date.now() + this.config.chainShutdownTimeoutMs;
-    this.setLifecycle('stopping');
-    this.clearLifecycleTimersAndQueues();
-    const terminalStatusWrite = this.persistWorkerStatusBestEffort({
-      ...this.getStatus(),
-      lifecycle: terminalLifecycle,
-    });
-
-    const unsubscribe = this.finalizedHeadUnsubscribe;
-    this.finalizedHeadUnsubscribe = null;
-    const api = this.api;
-    this.api = null;
-    this.observedGenesisHash = null;
-    const legacyApi = this.legacyBlockApi;
-    this.legacyBlockApi = null;
-    const legacyProvider = this.legacyBlockProvider;
-    this.legacyBlockProvider = null;
-    const provider = this.primaryProvider;
-    this.primaryProvider = null;
-
-    const resourceTasks: Promise<unknown>[] = [this.unsubscribeFinalizedHeads(unsubscribe)];
-    if (api) resourceTasks.push(this.disconnectResource(api, 'SORA chain API'));
-    if (provider) resourceTasks.push(this.disconnectResource(provider, 'SORA WebSocket provider'));
-    if (legacyApi && legacyApi !== api) {
-      resourceTasks.push(this.disconnectResource(legacyApi, 'SORA block data API'));
-    } else if (!legacyApi) {
-      resourceTasks.push(this.disconnectResource(legacyProvider, 'SORA block data WebSocket provider'));
-    }
-
-    const workTasks: Promise<unknown>[] = [
-      ...this.backgroundTasks,
-      ...this.outstandingRpcRequests,
-      ...this.lateRpcDisposals,
-      ...resourceTasks,
-      terminalStatusWrite,
-    ];
-    if (includeStartPromise && this.startPromise) workTasks.push(this.startPromise);
-    if (this.legacyBlockApiPromise) workTasks.push(this.legacyBlockApiPromise);
-
-    await this.waitForShutdownTasks(workTasks, shutdownDeadline);
-    await this.waitForShutdownTasks([...this.lateRpcDisposals], shutdownDeadline);
-    this.setLifecycle(terminalLifecycle);
-    this.chainIdentityPreflightComplete = false;
+    throw lastError;
   }
 
   private async requireMainnetIdentity(api: ApiPromise, label: string): Promise<string> {
-    const genesis = await this.withRpcTimeout(
-      () => api.rpc.chain.getBlockHash(0),
-      `${label}.chain.getBlockHash(0)`
-    );
+    const genesis = await withTimeout(api.rpc.chain.getBlockHash(0), `${label}.chain.getBlockHash(0)`);
     const observed = genesis?.toString?.().toLowerCase() ?? '';
     if (!isNonzeroCanonicalSubstrateHash(observed)) {
       throw new Error(`${label} returned a missing, zero, or malformed genesis hash`);
@@ -2740,8 +2900,8 @@ export class ChainIndexer {
     label: string,
     requireTimestamp = false
   ): Promise<void> {
-    const anchor = await this.withRpcTimeout(
-      () => api.rpc.chain.getBlockHash(SORA_LEGACY_IDENTITY_ANCHOR.block),
+    const anchor = await withTimeout(
+      api.rpc.chain.getBlockHash(SORA_LEGACY_IDENTITY_ANCHOR.block),
       `${label}.chain.getBlockHash(${SORA_LEGACY_IDENTITY_ANCHOR.block})`
     );
     const observed = anchor?.toString?.().toLowerCase() ?? '';
@@ -2787,9 +2947,7 @@ export class ChainIndexer {
         document.data.id !== CHAIN_IDENTITY_ID) {
       throw new Error('Stored PI chain identity envelope is malformed');
     }
-    if (typeof document.data.data !== 'string') {
-      throw new Error('Stored PI chain identity data must be JSON text');
-    }
+    if (typeof document.data?.data !== 'string') throw new Error('Stored PI chain identity data must be JSON text');
     let parsed: unknown;
     try {
       parsed = JSON.parse(document.data.data);
@@ -2797,7 +2955,9 @@ export class ChainIndexer {
       throw new Error('Stored PI chain identity data must be valid JSON');
     }
     const value = parseStoredSoraChainIdentity(parsed);
-    if (!value) throw new Error('Stored PI chain identity checkpoint is malformed');
+    if (!value) {
+      throw new Error('Stored PI chain identity checkpoint is malformed');
+    }
     if (document.data.block !== value.verificationBlock ||
         document.blockHeight !== value.verificationBlock ||
         document.timestamp !== value.verificationBlockTimestamp) {
@@ -2812,20 +2972,27 @@ export class ChainIndexer {
     return value;
   }
 
-  private async repositoryHasOnlyAllowedIdentityBootstrapDocuments(
-    allowIdentity: boolean
-  ): Promise<boolean> {
-    for (const name of INDEXER_COLLECTIONS) {
+  private async repositoryIsEmpty(): Promise<boolean> {
+    for (const name of ALL_INDEXER_COLLECTIONS) {
+      const documents = this.repository.query
+        ? (await this.repository.query(name, { first: 2, includeTotalCount: false })).items
+        : await this.repository.list(name);
+      if (documents.some((document) =>
+        document.collection !== 'updatesStreams' || document.id !== WORKER_STATUS_DOCUMENT_ID
+      )) return false;
+    }
+    return true;
+  }
+
+  private async repositoryContainsOnlyChainIdentity(): Promise<boolean> {
+    for (const name of ALL_INDEXER_COLLECTIONS) {
       const documents = this.repository.query
         ? (await this.repository.query(name, { first: 3, includeTotalCount: false })).items
         : await this.repository.list(name);
-      if (documents.some((document) => {
-        if (document.collection !== 'updatesStreams') return true;
-        if (document.id === WORKER_STATUS_DOCUMENT_ID) return false;
-        return !allowIdentity || document.id !== CHAIN_IDENTITY_ID;
-      })) {
-        return false;
-      }
+      if (documents.some((document) =>
+        document.collection !== 'updatesStreams' ||
+        (document.id !== CHAIN_IDENTITY_ID && document.id !== WORKER_STATUS_DOCUMENT_ID)
+      )) return false;
     }
     return true;
   }
@@ -2839,8 +3006,8 @@ export class ChainIndexer {
       throw new Error('Stored PI chain identity checkpoint is ahead of the primary finalized chain');
     }
     const liveHash = (
-      await this.withRpcTimeout(
-        () => this.api!.rpc.chain.getBlockHash(identity.verificationBlock),
+      await withTimeout(
+        this.api.rpc.chain.getBlockHash(identity.verificationBlock),
         `chain.getBlockHash(${identity.verificationBlock})`
       )
     )?.toString?.().toLowerCase() ?? '';
@@ -2893,8 +3060,7 @@ export class ChainIndexer {
     }
     const state = parseStoredSoraChainState(parsed);
     if (!state) throw new Error('Stored PI chainState checkpoint is malformed');
-    if (document.data.block !== state.lastIndexedBlock ||
-        document.blockHeight !== state.lastIndexedBlock ||
+    if (document.data.block !== state.lastIndexedBlock || document.blockHeight !== state.lastIndexedBlock ||
         !Number.isSafeInteger(document.timestamp) || Number(document.timestamp) <= 0) {
       throw new Error('Stored PI chainState envelope does not match its checkpoint');
     }
@@ -2906,8 +3072,8 @@ export class ChainIndexer {
     const snapshot = await this.repository.get(collection('networkSnapshots'), expectedId);
     if (!snapshot || snapshot.collection !== 'networkSnapshots' || snapshot.id !== expectedId ||
         snapshot.blockHeight !== block || snapshot.timestamp !== timestamp ||
-        snapshot.data.id !== expectedId || snapshot.data.type !== 'BLOCK' ||
-        snapshot.data.timestamp !== timestamp) {
+        snapshot.data?.id !== expectedId || snapshot.data?.type !== 'BLOCK' ||
+        snapshot.data?.timestamp !== timestamp) {
       throw new Error('Stored PI chainState does not have an exact matching BLOCK snapshot');
     }
   }
@@ -2940,13 +3106,9 @@ export class ChainIndexer {
     await this.requireMatchingBlockSnapshot(block, expectedTimestamp);
     if (!this.api) throw new Error('Cannot verify PI chainState before the chain API is initialized');
     const liveHash = (
-      await this.withRpcTimeout(
-        () => this.api!.rpc.chain.getBlockHash(block),
-        `chain.getBlockHash(${block})`
-      )
+      await withTimeout(this.api.rpc.chain.getBlockHash(block), `chain.getBlockHash(${block})`)
     )?.toString?.().toLowerCase() ?? '';
-    if (!isNonzeroCanonicalSubstrateHash(liveHash) ||
-        (expectedHash !== null && liveHash !== expectedHash)) {
+    if (!isNonzeroCanonicalSubstrateHash(liveHash) || (expectedHash !== null && liveHash !== expectedHash)) {
       throw new Error('Stored PI chainState block hash does not match the primary SORA chain');
     }
     const liveTimestamp = await this.fetchBlockTimestamp(liveHash, this.api);
@@ -2958,7 +3120,7 @@ export class ChainIndexer {
   private async verifyStoredChainState(finalizedBlock: number): Promise<void> {
     const state = await this.repository.get(collection('updatesStreams'), CHAIN_STATE_ID);
     if (!state) {
-      if (!(await this.repositoryHasOnlyAllowedIdentityBootstrapDocuments(true))) {
+      if (!(await this.repositoryContainsOnlyChainIdentity())) {
         throw new Error('PI database has indexed data but no chainState checkpoint');
       }
       return;
@@ -2976,10 +3138,12 @@ export class ChainIndexer {
 
     const chainState = await this.repository.get(collection('updatesStreams'), CHAIN_STATE_ID);
     if (!chainState) {
-      if (!(await this.repositoryHasOnlyAllowedIdentityBootstrapDocuments(false))) {
+      if (!(await this.repositoryIsEmpty())) {
         throw new Error('PI database is nonempty but has no immutable chain identity or chainState');
       }
-      await this.repository.upsert(this.chainIdentityDocument('fresh-database'));
+      await this.repository.upsert(
+        this.chainIdentityDocument('fresh-database')
+      );
       return;
     }
 
@@ -2994,15 +3158,15 @@ export class ChainIndexer {
     );
     if (!anchorSnapshot || anchorSnapshot.timestamp !== SORA_LEGACY_IDENTITY_ANCHOR.timestamp ||
         anchorSnapshot.blockHeight !== SORA_LEGACY_IDENTITY_ANCHOR.block ||
-        anchorSnapshot.data.id !== `block-${SORA_LEGACY_IDENTITY_ANCHOR.block}` ||
-        anchorSnapshot.data.type !== 'BLOCK' ||
-        anchorSnapshot.data.timestamp !== SORA_LEGACY_IDENTITY_ANCHOR.timestamp) {
+        anchorSnapshot.data?.id !== `block-${SORA_LEGACY_IDENTITY_ANCHOR.block}` ||
+        anchorSnapshot.data?.type !== 'BLOCK' ||
+        anchorSnapshot.data?.timestamp !== SORA_LEGACY_IDENTITY_ANCHOR.timestamp) {
       throw new Error('Legacy PI database does not contain the audited SORA mainnet migration anchor snapshot');
     }
     if (!this.api) throw new Error('Cannot migrate PI chain identity before the chain API is initialized');
     const liveAnchorHash = (
-      await this.withRpcTimeout(
-        () => this.api!.rpc.chain.getBlockHash(SORA_LEGACY_IDENTITY_ANCHOR.block),
+      await withTimeout(
+        this.api.rpc.chain.getBlockHash(SORA_LEGACY_IDENTITY_ANCHOR.block),
         `chain.getBlockHash(${SORA_LEGACY_IDENTITY_ANCHOR.block})`
       )
     ).toString().toLowerCase();
@@ -3013,7 +3177,121 @@ export class ChainIndexer {
     if (liveAnchorTimestamp !== SORA_LEGACY_IDENTITY_ANCHOR.timestamp) {
       throw new Error('Live SORA chain does not match the audited PI migration anchor timestamp');
     }
-    await this.repository.upsert(this.chainIdentityDocument('legacy-production-anchor-v1'));
+    await this.repository.upsert(
+      this.chainIdentityDocument('legacy-production-anchor-v1')
+    );
+  }
+
+  private async disconnectResource(
+    resource: { disconnect?: () => void | Promise<void> } | null,
+    label: string
+  ): Promise<void> {
+    if (!resource || typeof resource !== 'object' || this.disconnectedResources.has(resource)) return;
+    this.disconnectedResources.add(resource);
+
+    try {
+      await resource.disconnect?.();
+    } catch (error) {
+      console.error(`Failed to disconnect ${label}`, error);
+    }
+  }
+
+  private async invokeFinalizedHeadUnsubscribe(
+    unsubscribe: (() => void | Promise<void>) | null
+  ): Promise<void> {
+    if (!unsubscribe) return;
+
+    try {
+      await unsubscribe();
+    } catch (error) {
+      console.error('Failed to unsubscribe from finalized SORA heads', error);
+    }
+  }
+
+  private async waitForShutdownTasks(
+    tasks: readonly Promise<unknown>[],
+    deadline = Date.now() + (this.config.chainShutdownTimeoutMs ?? CHAIN_DISCONNECT_TIMEOUT_MS)
+  ): Promise<void> {
+    if (!tasks.length) return;
+    const remainingMs = Math.max(0, deadline - Date.now());
+    if (remainingMs === 0) {
+      console.warn(
+        `Chain indexer shutdown timed out after ${this.config.chainShutdownTimeoutMs ?? CHAIN_DISCONNECT_TIMEOUT_MS}ms with unfinished work`
+      );
+      return;
+    }
+
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const settled = Promise.allSettled(tasks).then(() => true);
+    const completed = await Promise.race([
+      settled,
+      new Promise<false>((resolve) => {
+        timeout = setTimeout(() => resolve(false), remainingMs);
+        timeout.unref?.();
+      }),
+    ]);
+
+    if (timeout) clearTimeout(timeout);
+    if (!completed) {
+      console.warn(
+        `Chain indexer shutdown timed out after ${this.config.chainShutdownTimeoutMs ?? CHAIN_DISCONNECT_TIMEOUT_MS}ms with unfinished work`
+      );
+    }
+  }
+
+  private async stopInternal(
+    includeStartPromise: boolean,
+    terminalLifecycle: Extract<ChainIndexerLifecycle, 'stopped' | 'failed'> = 'stopped'
+  ): Promise<void> {
+    const shutdownDeadline =
+      Date.now() + (this.config.chainShutdownTimeoutMs ?? CHAIN_DISCONNECT_TIMEOUT_MS);
+    this.setLifecycle('stopping');
+    this.clearLifecycleTimersAndQueues();
+    const terminalStatusWrite = this.repositoryStatusWritesEnabled
+      ? this.persistWorkerStatusBestEffort({
+          ...this.getStatus(),
+          lifecycle: terminalLifecycle,
+        })
+      : Promise.resolve();
+
+    const unsubscribe = this.unsubscribeFinalizedHeads;
+    this.unsubscribeFinalizedHeads = null;
+    const api = this.api;
+    this.api = null;
+    const legacyApi = this.legacyBlockApi;
+    this.legacyBlockApi = null;
+    const legacyProvider = this.legacyBlockProvider;
+    this.legacyBlockProvider = null;
+    const provider = this.primaryProvider;
+    this.primaryProvider = null;
+    this.observedGenesisHash = null;
+    const legacyApiPromise = this.legacyBlockApiPromise;
+    this.legacyBlockApiPromise = null;
+
+    const resourceTasks: Promise<unknown>[] = [this.invokeFinalizedHeadUnsubscribe(unsubscribe)];
+    if (api) resourceTasks.push(this.disconnectResource(api, 'SORA chain API'));
+    if (provider) resourceTasks.push(this.disconnectResource(provider, 'SORA WebSocket provider'));
+    if (legacyApi && legacyApi !== api) {
+      resourceTasks.push(this.disconnectResource(legacyApi, 'SORA block data API'));
+    }
+    if (legacyProvider && legacyProvider !== provider) {
+      resourceTasks.push(this.disconnectResource(legacyProvider, 'SORA block data WebSocket provider'));
+    }
+
+    const workTasks: Promise<unknown>[] = [
+      ...this.backgroundTasks,
+      ...(includeStartPromise ? this.outstandingRpcRequests : []),
+      ...this.lateRpcDisposals,
+      ...resourceTasks,
+      terminalStatusWrite,
+    ];
+    if (includeStartPromise && this.startPromise) workTasks.push(this.startPromise);
+    if (legacyApiPromise) workTasks.push(legacyApiPromise);
+
+    await this.waitForShutdownTasks(workTasks, shutdownDeadline);
+    await this.waitForShutdownTasks([...this.lateRpcDisposals], shutdownDeadline);
+    this.repositoryStatusWritesEnabled = false;
+    this.setLifecycle(terminalLifecycle);
   }
 
   private async runStartupMaintenance(finalizedBlock: number): Promise<number> {
@@ -3031,6 +3309,73 @@ export class ChainIndexer {
       true
     );
     return maintenanceBlock;
+  }
+
+  private async runLegacyStartupMaintenance(finalizedBlock: number, indexedAny: boolean): Promise<void> {
+    if (this.isStopping()) return;
+    const cleanedOutliers = await this.cleanupAssetSnapshotPriceOutliers();
+    if (this.isStopping()) return;
+    const repairedSupply = await this.repairXorSupplyDocuments();
+    if (this.isStopping()) return;
+    const backfilledTransactions = await this.backfillAccountTransactions();
+    if (this.isStopping()) return;
+    const repairedCounters = await this.repairNetworkTransactionCounters();
+    if (this.isStopping()) return;
+    const backfilledNetworkAggregates = await this.backfillNetworkAggregateSnapshots();
+    if (this.isStopping()) return;
+
+    if (
+      indexedAny ||
+      cleanedOutliers ||
+      repairedSupply ||
+      backfilledTransactions ||
+      repairedCounters ||
+      backfilledNetworkAggregates
+    ) {
+      const latestIndexedBlock = await this.getLastIndexedBlock();
+      this.requestDerivedStateRefresh(
+        Math.max(finalizedBlock, latestIndexedBlock),
+        Math.floor(Date.now() / 1_000),
+        true,
+        true
+      );
+    }
+    this.requestXorBurnBackfill(finalizedBlock);
+    if (this.isStopping()) return;
+    await this.backfillBridgeProxyHistory(finalizedBlock);
+  }
+
+  private requestXorBurnBackfill(finalizedBlock: number): void {
+    if (this.isStopping() || !this.api || finalizedBlock < SORA_XOR_BURN_START_BLOCK) return;
+    this.xorBurnBackfillTargetBlock = Math.max(this.xorBurnBackfillTargetBlock, finalizedBlock);
+    if (this.xorBurnBackfillRunning || this.xorBurnBackfillRetryTimer) return;
+    this.trackBackgroundTask(this.runXorBurnBackfill());
+  }
+
+  private scheduleXorBurnBackfillRetry(delayMs = XOR_BURN_BACKFILL_RETRY_DELAY_MS): void {
+    if (this.isStopping() || this.xorBurnBackfillRetryTimer) return;
+    this.xorBurnBackfillRetryTimer = setTimeout(() => {
+      this.xorBurnBackfillRetryTimer = null;
+      if (!this.isStopping()) this.trackBackgroundTask(this.runXorBurnBackfill());
+    }, delayMs);
+    this.xorBurnBackfillRetryTimer.unref?.();
+  }
+
+  private async runXorBurnBackfill(): Promise<void> {
+    if (this.isStopping() || !this.api || this.xorBurnBackfillRunning) return;
+    this.xorBurnBackfillRunning = true;
+    const targetBlock = this.xorBurnBackfillTargetBlock;
+    try {
+      await this.backfillXorBurns(targetBlock);
+      if (this.xorBurnBackfillTargetBlock > targetBlock) this.scheduleXorBurnBackfillRetry(0);
+    } catch (error) {
+      if (!this.isStopping()) {
+        console.error('XOR burn backfill failed', error);
+        this.scheduleXorBurnBackfillRetry();
+      }
+    } finally {
+      this.xorBurnBackfillRunning = false;
+    }
   }
 
   private discardRefreshRequestsCoveredBy(blockHeight: number): void {
@@ -3069,11 +3414,7 @@ export class ChainIndexer {
     }
   }
 
-  private createChainStateDocument(
-    block: number,
-    blockHash: string,
-    blockTimestamp: number
-  ): IndexerDocument {
+  private createChainStateDocument(block: number, blockHash: string, blockTimestamp: number): IndexerDocument {
     if (this.observedGenesisHash !== SORA_MAINNET_GENESIS_HASH ||
         !Number.isSafeInteger(block) || block <= 0 || block > SORA_MAX_BLOCK_NUMBER ||
         !isNonzeroCanonicalSubstrateHash(blockHash) ||
@@ -3098,6 +3439,937 @@ export class ChainIndexer {
     };
   }
 
+  private async getXorBurnBackfillBlock(): Promise<number> {
+    const state = await this.repository.get('updatesStreams', XOR_BURN_BACKFILL_STATE_ID);
+    if (!state?.data?.data || typeof state.data.data !== 'string') return SORA_XOR_BURN_START_BLOCK - 1;
+
+    try {
+      const parsed = JSON.parse(state.data.data) as { lastIndexedBlock?: number };
+      return Number(parsed.lastIndexedBlock ?? SORA_XOR_BURN_START_BLOCK - 1);
+    } catch {
+      return SORA_XOR_BURN_START_BLOCK - 1;
+    }
+  }
+
+  private createXorBurnBackfillStateDocument(block: number): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: XOR_BURN_BACKFILL_STATE_ID,
+      blockHeight: block,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: XOR_BURN_BACKFILL_STATE_ID,
+        block,
+        data: JSON.stringify({ lastIndexedBlock: block }),
+      },
+    };
+  }
+
+  private isPrunedHistoricalStateError(error: unknown): boolean {
+    return isPrunedHistoricalStateErrorValue(error);
+  }
+
+  private skipPrunedHistoricalBackfill(label: string, block: number, error: unknown): boolean {
+    if (!this.isPrunedHistoricalStateError(error)) return false;
+
+    console.warn(`${label} skipped at SORA block ${block}: node has pruned historical state`);
+    return true;
+  }
+
+  private bridgeProxyHistoryBackfillStartBlock(): number {
+    return 0;
+  }
+
+  private async getBridgeProxyHistoryBackfillBlock(): Promise<number> {
+    const beforeStart = this.bridgeProxyHistoryBackfillStartBlock() - 1;
+    const state = await this.repository.get('updatesStreams', BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID);
+    if (!state?.data?.data || typeof state.data.data !== 'string') return beforeStart;
+
+    try {
+      const parsed = JSON.parse(state.data.data) as { lastIndexedBlock?: number };
+      const block = Number(parsed.lastIndexedBlock);
+
+      return Number.isFinite(block) ? Math.max(Math.trunc(block), beforeStart) : beforeStart;
+    } catch {
+      return beforeStart;
+    }
+  }
+
+  private createBridgeProxyHistoryBackfillStateDocument(block: number): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID,
+      blockHeight: block,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID,
+        block,
+        data: JSON.stringify({ lastIndexedBlock: block }),
+      },
+    };
+  }
+
+  private createNetworkAggregateBackfillStateDocument(block: number, timestamp: number): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: NETWORK_AGGREGATE_BACKFILL_STATE_ID,
+      blockHeight: block,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: NETWORK_AGGREGATE_BACKFILL_STATE_ID,
+        block,
+        data: JSON.stringify({ lastIndexedBlock: block, lastTimestamp: timestamp }),
+      },
+    };
+  }
+
+  private createNetworkTransactionCounterRepairStateDocument(
+    latestBlock: number,
+    blockSnapshotsUpdated: number,
+    aggregateSnapshotsUpdated: number
+  ): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: NETWORK_TRANSACTION_COUNTER_REPAIR_STATE_ID,
+      blockHeight: latestBlock,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: NETWORK_TRANSACTION_COUNTER_REPAIR_STATE_ID,
+        block: latestBlock,
+        data: JSON.stringify({ latestBlock, blockSnapshotsUpdated, aggregateSnapshotsUpdated }),
+      },
+    };
+  }
+
+  private createAssetPriceOutlierCleanupStateDocument(deletedCount: number): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: ASSET_PRICE_OUTLIER_CLEANUP_STATE_ID,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: ASSET_PRICE_OUTLIER_CLEANUP_STATE_ID,
+        data: JSON.stringify({ deletedCount }),
+      },
+    };
+  }
+
+  private createXorSupplyRepairStateDocument(
+    processedDocuments: number,
+    writtenDocuments: number,
+    skippedDocuments: number,
+    latestBlock: number,
+    latestTimestamp: number
+  ): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: XOR_SUPPLY_REPAIR_STATE_ID,
+      blockHeight: latestBlock || null,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: XOR_SUPPLY_REPAIR_STATE_ID,
+        block: latestBlock,
+        data: JSON.stringify({
+          processedDocuments,
+          writtenDocuments,
+          skippedDocuments,
+          lastIndexedBlock: latestBlock,
+          lastTimestamp: latestTimestamp,
+        }),
+      },
+    };
+  }
+
+  private createAccountTransactionsBackfillStateDocument(
+    processedDocuments: number,
+    writtenDocuments: number,
+    blockHeight: number,
+    timestamp: number
+  ): IndexerDocument {
+    return {
+      collection: collection('updatesStreams'),
+      id: ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID,
+      blockHeight,
+      timestamp: Math.floor(Date.now() / 1000),
+      data: {
+        id: ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID,
+        block: blockHeight,
+        data: JSON.stringify({
+          processedDocuments,
+          writtenDocuments,
+          lastIndexedBlock: blockHeight,
+          lastTimestamp: timestamp,
+        }),
+      },
+    };
+  }
+
+  /**
+   * Removes legacy zero-volume asset snapshots whose OHLC prices are extreme
+   * outliers versus nearby snapshots for the same asset and interval.
+   */
+  private async cleanupAssetSnapshotPriceOutliers(): Promise<boolean> {
+    if (this.isStopping()) return false;
+    const state = await this.repository.get(collection('updatesStreams'), ASSET_PRICE_OUTLIER_CLEANUP_STATE_ID);
+    if (state) return false;
+
+    const groups = new Map<string, IndexerDocument[]>();
+    for await (const page of this.queryPages(collection('assetSnapshots'), { orderBy: ['TIMESTAMP_ASC'] })) {
+      if (this.isStopping()) return false;
+      for (const document of page) {
+        const type = String(document.data.type ?? '');
+        if (!AGGREGATE_SNAPSHOT_TYPES.includes(type as SnapshotTypeName)) continue;
+
+        const assetId = String(document.data.assetId ?? '');
+        if (!assetId) continue;
+
+        const key = `${assetId}\0${type}`;
+        const group = groups.get(key) ?? [];
+        group.push(document);
+        groups.set(key, group);
+      }
+    }
+
+    const outlierIds = new Set<string>();
+    for (const group of groups.values()) {
+      group.sort((left, right) => snapshotDocumentTimestamp(left) - snapshotDocumentTimestamp(right));
+
+      for (const document of group) {
+        if (isAssetSnapshotPriceOutlier(document, group)) {
+          outlierIds.add(document.id);
+        }
+      }
+    }
+
+    const ids = [...outlierIds];
+    for (let start = 0; start < ids.length; start += 1_000) {
+      if (this.isStopping()) return false;
+      await this.repository.deleteMany(collection('assetSnapshots'), ids.slice(start, start + 1_000));
+    }
+
+    if (this.isStopping()) return false;
+    await this.repository.upsert(this.createAssetPriceOutlierCleanupStateDocument(ids.length));
+    if (ids.length) console.info(`Deleted ${ids.length} zero-volume asset snapshot price outliers`);
+    return ids.length > 0;
+  }
+
+  /**
+   * Rewrites legacy XOR supply rows so GraphQL exposes the same codec-scale
+   * contract as live `balances.totalIssuance` and every other asset supply.
+   */
+  private async repairXorSupplyDocuments(): Promise<boolean> {
+    if (this.isStopping()) return false;
+    const state = await this.repository.get(collection('updatesStreams'), XOR_SUPPLY_REPAIR_STATE_ID);
+    if (state) return false;
+
+    const supplyByBlock = new Map<number, Promise<string>>();
+    let processedDocuments = 0;
+    let writtenDocuments = 0;
+    let skippedDocuments = 0;
+    let skippedPrunedDocuments = 0;
+    let latestBlock = 0;
+    let latestTimestamp = 0;
+
+    const getSupplyAtBlock = (blockHeight: number): Promise<string> => {
+      let supply = supplyByBlock.get(blockHeight);
+      if (!supply) {
+        supply = this.fetchNativeXorIssuanceAtBlock(blockHeight).then((value) => value.toString());
+        supplyByBlock.set(blockHeight, supply);
+      }
+
+      return supply;
+    };
+
+    const repairDocument = async (document: IndexerDocument): Promise<IndexerDocument | null> => {
+      processedDocuments += 1;
+
+      const blockHeight = Number(document.blockHeight ?? document.data.blockHeight);
+      const timestamp = Number(document.timestamp ?? document.data.timestamp);
+      if (Number.isFinite(blockHeight)) latestBlock = Math.max(latestBlock, Math.trunc(blockHeight));
+      if (Number.isFinite(timestamp)) latestTimestamp = Math.max(latestTimestamp, Math.trunc(timestamp));
+
+      if (!Number.isFinite(blockHeight) || blockHeight <= 0) {
+        skippedDocuments += 1;
+        return null;
+      }
+
+      let supply: string;
+      try {
+        supply = await getSupplyAtBlock(Math.trunc(blockHeight));
+      } catch (error) {
+        if (!this.isPrunedHistoricalStateError(error)) throw error;
+
+        skippedDocuments += 1;
+        skippedPrunedDocuments += 1;
+        return null;
+      }
+
+      if (String(document.data.supply ?? '') === supply) return null;
+
+      return {
+        ...document,
+        data: {
+          ...document.data,
+          supply,
+        },
+      };
+    };
+
+    const flush = async (documents: IndexerDocument[]): Promise<void> => {
+      if (!documents.length || this.isStopping()) return;
+
+      const repaired = (
+        await mapWithConcurrency(documents, XOR_SUPPLY_REPAIR_RPC_CONCURRENCY, (document) => repairDocument(document))
+      ).filter((document): document is IndexerDocument => Boolean(document));
+
+      if (repaired.length && !this.isStopping()) {
+        await this.repository.upsertMany(repaired);
+        writtenDocuments += repaired.length;
+      }
+
+      await this.drainFinalizedHeads();
+    };
+
+    const currentAsset = await this.repository.get(collection('assets'), XOR);
+    if (currentAsset) await flush([currentAsset]);
+
+    for await (const page of this.queryPages(collection('assetSnapshots'), {
+      filter: { assetId: { equalTo: XOR } },
+      orderBy: ['BLOCK_HEIGHT_ASC'],
+    })) {
+      if (this.isStopping()) return false;
+      await flush(page);
+    }
+
+    if (this.isStopping()) return false;
+    if (skippedPrunedDocuments) {
+      console.warn(`Skipped ${skippedPrunedDocuments} XOR supply rows because the node has pruned historical state`);
+    } else {
+      await this.repository.upsert(
+        this.createXorSupplyRepairStateDocument(
+          processedDocuments,
+          writtenDocuments,
+          skippedDocuments,
+          latestBlock,
+          latestTimestamp
+        )
+      );
+    }
+    if (writtenDocuments) console.info(`Repaired ${writtenDocuments} XOR supply rows from native balances issuance`);
+
+    return writtenDocuments > 0;
+  }
+
+  /**
+   * Creates compact per-account transaction rows for data indexed before the
+   * `accountTransactions` collection existed. A completion marker lets GraphQL
+   * avoid legacy history scans after the one-time migration has finished.
+   */
+  private async backfillAccountTransactions(): Promise<boolean> {
+    if (this.isStopping()) return false;
+    const state = await this.repository.get(collection('updatesStreams'), ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID);
+    if (hasCompletedAccountTransactionsBackfill(state?.data?.data)) return false;
+
+    const documents: IndexerDocument[] = [];
+    let processedDocuments = 0;
+    let writtenDocuments = 0;
+    let latestBlock = 0;
+    let latestTimestamp = 0;
+    const flush = async (): Promise<void> => {
+      if (!documents.length || this.isStopping()) return;
+
+      const batch = documents.splice(0, documents.length);
+      await this.repository.upsertMany(batch);
+      writtenDocuments += batch.length;
+      await this.drainFinalizedHeads();
+    };
+
+    for await (const page of this.queryPages(collection('historyElements'), { orderBy: ['TIMESTAMP_ASC'] })) {
+      if (this.isStopping()) return false;
+      for (const document of page) {
+        processedDocuments += 1;
+        const blockHeight = Number(document.blockHeight ?? document.data.blockHeight ?? latestBlock);
+        const timestamp = Number(document.timestamp ?? document.data.timestamp ?? latestTimestamp);
+        if (Number.isFinite(blockHeight)) latestBlock = Math.max(latestBlock, blockHeight);
+        if (Number.isFinite(timestamp)) latestTimestamp = Math.max(latestTimestamp, timestamp);
+
+        documents.push(...this.createAccountTransactionDocumentsFromHistory(document));
+        if (documents.length >= ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE) await flush();
+      }
+    }
+
+    await flush();
+    if (this.isStopping()) return false;
+    await this.repository.upsert(
+      this.createAccountTransactionsBackfillStateDocument(processedDocuments, writtenDocuments, latestBlock, latestTimestamp)
+    );
+    if (writtenDocuments) console.info(`Backfilled ${writtenDocuments} account transaction rows from legacy history`);
+
+    return writtenDocuments > 0;
+  }
+
+  private addNetworkTransactionCounters(target: NetworkTransactionCounters, delta: NetworkTransactionCounters): void {
+    target.transactions += delta.transactions;
+    target.swaps += delta.swaps;
+    target.bridgeIncomingTransactions += delta.bridgeIncomingTransactions;
+    target.bridgeOutgoingTransactions += delta.bridgeOutgoingTransactions;
+  }
+
+  private networkTransactionCountersFromHistory(document: IndexerDocument): { blockHeight: number; counters: NetworkTransactionCounters } | null {
+    const blockHeight = Number(document.blockHeight ?? document.data.blockHeight ?? 0);
+    if (!Number.isFinite(blockHeight) || blockHeight <= 0) return null;
+
+    const id = String(document.data.id ?? document.id);
+    const module = String(document.data.module ?? '');
+    const method = String(document.data.method ?? '');
+    const callNames = Array.isArray(document.data.callNames) ? document.data.callNames.map(String) : [];
+    const counters = emptyNetworkTransactionCounters();
+    const fee = codecToBigInt(document.data.networkFee ?? 0);
+    const syntheticBridgeIncoming = isSyntheticBridgeIncoming(id, module, method);
+
+    if (fee > 0n && !syntheticBridgeIncoming) counters.transactions += 1;
+    if (!historyExecutionSucceeded(document.data.execution)) return { blockHeight, counters };
+
+    if (isLiquidityProxySwap(module, method, callNames)) counters.swaps += 1;
+    if (isBridgeIncoming(id, module, method)) counters.bridgeIncomingTransactions += 1;
+    if (isBridgeOutgoing(module, method)) counters.bridgeOutgoingTransactions += 1;
+
+    return { blockHeight, counters };
+  }
+
+  private async collectNetworkTransactionCountersByBlock(): Promise<Map<number, NetworkTransactionCounters>> {
+    const countersByBlock = new Map<number, NetworkTransactionCounters>();
+
+    for await (const page of this.queryPages(collection('historyElements'), { orderBy: ['BLOCK_HEIGHT_ASC'] })) {
+      if (this.isStopping()) return countersByBlock;
+      for (const document of page) {
+        const result = this.networkTransactionCountersFromHistory(document);
+        if (!result) continue;
+
+        const counters = countersByBlock.get(result.blockHeight) ?? emptyNetworkTransactionCounters();
+        this.addNetworkTransactionCounters(counters, result.counters);
+        countersByBlock.set(result.blockHeight, counters);
+      }
+
+      await this.drainFinalizedHeads();
+    }
+
+    return countersByBlock;
+  }
+
+  private networkTransactionCountersChanged(document: IndexerDocument, counters: NetworkTransactionCounters): boolean {
+    return (
+      Number(document.data.transactions ?? 0) !== counters.transactions ||
+      Number(document.data.swaps ?? 0) !== counters.swaps ||
+      Number(document.data.bridgeIncomingTransactions ?? 0) !== counters.bridgeIncomingTransactions ||
+      Number(document.data.bridgeOutgoingTransactions ?? 0) !== counters.bridgeOutgoingTransactions
+    );
+  }
+
+  private withNetworkTransactionCounters(document: IndexerDocument, counters: NetworkTransactionCounters): IndexerDocument {
+    return {
+      ...document,
+      data: {
+        ...document.data,
+        transactions: counters.transactions,
+        swaps: counters.swaps,
+        bridgeIncomingTransactions: counters.bridgeIncomingTransactions,
+        bridgeOutgoingTransactions: counters.bridgeOutgoingTransactions,
+      },
+    };
+  }
+
+  /**
+   * Repairs legacy network transaction counters that previously counted unsigned
+   * inherent extrinsics and failed business actions. Existing aggregate rows keep
+   * their stock metrics while their transaction-like counters are recomputed from
+   * corrected block snapshots.
+   */
+  private async repairNetworkTransactionCounters(): Promise<boolean> {
+    if (this.isStopping()) return false;
+    const state = await this.repository.get(collection('updatesStreams'), NETWORK_TRANSACTION_COUNTER_REPAIR_STATE_ID);
+    if (state) return false;
+
+    const countersByBlock = await this.collectNetworkTransactionCountersByBlock();
+    if (this.isStopping()) return false;
+    const aggregateSnapshots = new Map<string, IndexerDocument>();
+
+    for await (const page of this.queryPages(collection('networkSnapshots'), {
+      filter: { type: { notEqualTo: 'BLOCK' } },
+    })) {
+      if (this.isStopping()) return false;
+      page.forEach((document) => aggregateSnapshots.set(document.id, document));
+    }
+
+    const windows = this.createNetworkBackfillWindows();
+    const blockUpdates: IndexerDocument[] = [];
+    const aggregateUpdates: IndexerDocument[] = [];
+    let latestBlock = 0;
+    let blockSnapshotsUpdated = 0;
+    let aggregateSnapshotsUpdated = 0;
+
+    const flushBlockUpdates = async (): Promise<void> => {
+      if (!blockUpdates.length || this.isStopping()) return;
+
+      const batch = blockUpdates.splice(0, blockUpdates.length);
+      await this.repository.upsertMany(batch);
+    };
+
+    const flushAggregateUpdates = async (): Promise<void> => {
+      if (!aggregateUpdates.length || this.isStopping()) return;
+
+      const batch = aggregateUpdates.splice(0, aggregateUpdates.length);
+      await this.repository.upsertMany(batch);
+    };
+
+    const enqueueAggregateRepair = async (document: IndexerDocument | null): Promise<void> => {
+      if (!document) return;
+
+      const existing = aggregateSnapshots.get(document.id);
+      if (!existing) return;
+
+      const counters = {
+        transactions: Number(document.data.transactions ?? 0),
+        swaps: Number(document.data.swaps ?? 0),
+        bridgeIncomingTransactions: Number(document.data.bridgeIncomingTransactions ?? 0),
+        bridgeOutgoingTransactions: Number(document.data.bridgeOutgoingTransactions ?? 0),
+      };
+
+      if (!this.networkTransactionCountersChanged(existing, counters)) return;
+
+      aggregateUpdates.push(this.withNetworkTransactionCounters(existing, counters));
+      aggregateSnapshotsUpdated += 1;
+
+      if (aggregateUpdates.length >= 1_000) await flushAggregateUpdates();
+    };
+
+    for await (const page of this.queryPages(collection('networkSnapshots'), {
+      filter: { type: { equalTo: 'BLOCK' } },
+      orderBy: ['BLOCK_HEIGHT_ASC'],
+    })) {
+      if (this.isStopping()) return false;
+      for (const document of page) {
+        const blockHeight = Number(document.blockHeight ?? document.data.blockHeight ?? 0);
+        if (!Number.isFinite(blockHeight) || blockHeight <= 0) continue;
+
+        latestBlock = Math.max(latestBlock, blockHeight);
+        const counters = countersByBlock.get(blockHeight) ?? emptyNetworkTransactionCounters();
+        const repairedBlockDocument = this.networkTransactionCountersChanged(document, counters)
+          ? this.withNetworkTransactionCounters(document, counters)
+          : document;
+
+        if (repairedBlockDocument !== document) {
+          blockUpdates.push(repairedBlockDocument);
+          blockSnapshotsUpdated += 1;
+        }
+
+        const block = this.networkBackfillBlockFromSnapshot(repairedBlockDocument);
+        if (!block) continue;
+
+        for (const window of windows) {
+          const nextDocument = this.advanceNetworkBackfillWindow(window, block);
+          if (window.pendingDocument && window.pendingDocument.id !== nextDocument.id) {
+            await enqueueAggregateRepair(window.pendingDocument);
+          }
+          window.pendingDocument = nextDocument;
+        }
+
+        if (blockUpdates.length >= 1_000) await flushBlockUpdates();
+      }
+
+      await this.drainFinalizedHeads();
+    }
+
+    for (const window of windows) {
+      await enqueueAggregateRepair(window.pendingDocument);
+      window.pendingDocument = null;
+    }
+
+    await flushBlockUpdates();
+    await flushAggregateUpdates();
+    if (this.isStopping()) return false;
+    await this.repository.upsert(
+      this.createNetworkTransactionCounterRepairStateDocument(latestBlock, blockSnapshotsUpdated, aggregateSnapshotsUpdated)
+    );
+
+    if (blockSnapshotsUpdated || aggregateSnapshotsUpdated) {
+      console.info(
+        `Repaired ${blockSnapshotsUpdated} block and ${aggregateSnapshotsUpdated} aggregate network transaction snapshots`
+      );
+    }
+
+    return blockSnapshotsUpdated > 0 || aggregateSnapshotsUpdated > 0;
+  }
+
+  /**
+   * Reconstructs missing legacy aggregate network windows from stored BLOCK
+   * snapshots. Existing aggregates remain authoritative for their stock fields.
+   */
+  private async backfillNetworkAggregateSnapshots(): Promise<boolean> {
+    if (this.isStopping()) return false;
+    const state = await this.repository.get(collection('updatesStreams'), NETWORK_AGGREGATE_BACKFILL_STATE_ID);
+    if (state?.data?.data) return false;
+
+    const existingAggregateSnapshotIds = new Set<string>();
+    for await (const page of this.queryPages(collection('networkSnapshots'), {
+      filter: { type: { notEqualTo: 'BLOCK' } },
+    })) {
+      if (this.isStopping()) return false;
+      page.forEach((document) => existingAggregateSnapshotIds.add(document.id));
+    }
+
+    const windows = this.createNetworkBackfillWindows();
+    const documents: IndexerDocument[] = [];
+    const maximumBatchSize = Math.min(1_000, MAX_REPOSITORY_WRITE_CALL_DOCUMENTS);
+    let latestBlock = 0;
+    let latestTimestamp = 0;
+    let processedBlocks = 0;
+    let writtenDocuments = 0;
+    const flush = async (): Promise<void> => {
+      if (!documents.length || this.isStopping()) return;
+      const batch = documents.splice(0, documents.length);
+      await this.repository.upsertMany(batch);
+      writtenDocuments += batch.length;
+    };
+    const enqueue = async (document: IndexerDocument | null): Promise<void> => {
+      if (!document || existingAggregateSnapshotIds.has(document.id)) return;
+
+      documents.push(document);
+      existingAggregateSnapshotIds.add(document.id);
+      if (documents.length >= maximumBatchSize) await flush();
+    };
+
+    for await (const page of this.queryPages(collection('networkSnapshots'), {
+      filter: { type: { equalTo: 'BLOCK' } },
+      orderBy: ['BLOCK_HEIGHT_ASC'],
+    })) {
+      if (this.isStopping()) return false;
+      for (const document of page) {
+        const block = this.networkBackfillBlockFromSnapshot(document);
+        if (!block) continue;
+
+        processedBlocks += 1;
+        latestBlock = block.blockHeight;
+        latestTimestamp = block.timestamp;
+
+        for (const window of windows) {
+          const nextDocument = this.advanceNetworkBackfillWindow(window, block);
+          if (window.pendingDocument && window.pendingDocument.id !== nextDocument.id) {
+            await enqueue(window.pendingDocument);
+          }
+          window.pendingDocument = existingAggregateSnapshotIds.has(nextDocument.id) ? null : nextDocument;
+        }
+      }
+      await this.drainFinalizedHeads();
+    }
+
+    if (!processedBlocks) return false;
+
+    for (const window of windows) {
+      await enqueue(window.pendingDocument);
+      window.pendingDocument = null;
+    }
+    await flush();
+
+    if (this.isStopping()) return false;
+    await this.repository.upsert(
+      this.createNetworkAggregateBackfillStateDocument(latestBlock, latestTimestamp)
+    );
+    console.info(`Backfilled ${writtenDocuments} aggregate network snapshots through SORA block ${latestBlock}`);
+    return true;
+  }
+
+  private async backfillXorBurns(finalizedBlock: number): Promise<void> {
+    if (this.isStopping() || !this.api || finalizedBlock < SORA_XOR_BURN_START_BLOCK) return;
+
+    const lastBackfilled = await this.getXorBurnBackfillBlock();
+    const startBlock = Math.max(SORA_XOR_BURN_START_BLOCK, lastBackfilled + 1);
+
+    if (startBlock > finalizedBlock) return;
+
+    const runRpc: RpcExecutor = (createRequest, label) => this.withRpcRetry(createRequest, label);
+    const prefetchedBlocks = new Map<number, FetchedBlock>();
+    try {
+      prefetchedBlocks.set(startBlock, await this.fetchBlockByNumber(startBlock, runRpc));
+    } catch (error) {
+      if (this.skipPrunedHistoricalBackfill('XOR burn backfill', startBlock, error)) return;
+      throw error;
+    }
+
+    for (let block = startBlock; block <= finalizedBlock; block += XOR_BURN_BACKFILL_BATCH_SIZE) {
+      if (this.isStopping()) return;
+      await this.drainFinalizedHeads();
+      if (this.isStopping()) return;
+
+      const batchEnd = Math.min(block + XOR_BURN_BACKFILL_BATCH_SIZE - 1, finalizedBlock);
+      const blocks = Array.from({ length: batchEnd - block + 1 }, (_item, index) => block + index);
+      const fetchedBlocks = await mapWithConcurrency(
+        blocks,
+        XOR_BURN_BACKFILL_RPC_CONCURRENCY,
+        async (blockHeight): Promise<FetchedBlock> =>
+          prefetchedBlocks.get(blockHeight) ?? this.fetchBlockByNumber(blockHeight, runRpc)
+      );
+      if (this.isStopping()) return;
+      const burnBlockIndexes = fetchedBlocks.flatMap((fetchedBlock, index) =>
+        fetchedBlock.events.some((event) => getXorBurnEvent(event, this.assetInfos)) ? [index] : []
+      );
+
+      const documents = burnBlockIndexes.flatMap((index) => {
+        const fetchedBlock = fetchedBlocks[index];
+
+        return createXorBurnDocumentsFromEvents(
+          blocks[index],
+          null,
+          fetchedBlock.signedBlock,
+          fetchedBlock.events,
+          this.assetInfos
+        );
+      });
+
+      documents.push(this.createXorBurnBackfillStateDocument(batchEnd));
+      if (this.isStopping()) return;
+      await this.repository.upsertMany(documents);
+      console.info(`Backfilled XOR burns through SORA block ${batchEnd}/${finalizedBlock}`);
+    }
+  }
+
+  private async backfillBridgeProxyHistory(finalizedBlock: number): Promise<void> {
+    if (this.isStopping() || !this.api) return;
+
+    const lastBackfilled = await this.getBridgeProxyHistoryBackfillBlock();
+    const startBlock = Math.max(this.bridgeProxyHistoryBackfillStartBlock(), lastBackfilled + 1);
+
+    if (startBlock > finalizedBlock) return;
+
+    let blockApi: ApiPromise;
+    const prefetchedBlocks = new Map<number, FetchedBlock>();
+    try {
+      blockApi = await this.getBlockDataApi();
+      const firstPayloadBlock = Math.max(1, startBlock);
+      if (firstPayloadBlock <= finalizedBlock) {
+        prefetchedBlocks.set(firstPayloadBlock, await this.fetchBlockByNumber(firstPayloadBlock));
+      }
+      const startHash = startBlock === 0
+        ? SORA_MAINNET_GENESIS_HASH
+        : prefetchedBlocks.get(startBlock)!.requestedHash;
+      await this.hasBridgeProxyHistoryRuntime(startHash, startBlock, blockApi);
+    } catch (error) {
+      if (this.skipPrunedHistoricalBackfill('bridgeProxy history backfill', startBlock, error)) return;
+      throw error;
+    }
+
+    for (let block = startBlock; block <= finalizedBlock; block += BRIDGE_PROXY_HISTORY_BACKFILL_BATCH_SIZE) {
+      if (this.isStopping()) return;
+      await this.drainFinalizedHeads();
+      if (this.isStopping()) return;
+
+      const batchEnd = Math.min(block + BRIDGE_PROXY_HISTORY_BACKFILL_BATCH_SIZE - 1, finalizedBlock);
+      const blocks = Array.from({ length: batchEnd - block + 1 }, (_item, index) => block + index);
+      const payloadBlocks = blocks.filter((blockHeight) => blockHeight > 0);
+      const fetchedBlocks = await mapWithConcurrency(
+        payloadBlocks,
+        BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
+        async (blockHeight): Promise<FetchedBlock> =>
+          prefetchedBlocks.get(blockHeight) ?? this.fetchBlockByNumber(blockHeight)
+      );
+      if (this.isStopping()) return;
+      const fetchedBlocksByHeight = new Map(
+        payloadBlocks.map((blockHeight, index) => [blockHeight, fetchedBlocks[index]])
+      );
+      const blockHashes = blocks.map((blockHeight) =>
+        blockHeight === 0
+          ? SORA_MAINNET_GENESIS_HASH
+          : fetchedBlocksByHeight.get(blockHeight)?.requestedHash ?? ''
+      );
+      let scanBlockIndexes = blocks.flatMap((blockHeight, index) => blockHeight > 0 ? [index] : []);
+
+      if (!this.bridgeProxyHistoryRuntimeAvailable) {
+        const batchEndHasBridgeRuntime = await this.hasBridgeProxyHistoryRuntime(
+          blockHashes[blockHashes.length - 1]?.toString() ?? '',
+          batchEnd,
+          blockApi
+        );
+
+        if (!batchEndHasBridgeRuntime) {
+          if (this.isStopping()) return;
+          await this.repository.upsert(this.createBridgeProxyHistoryBackfillStateDocument(batchEnd));
+          console.info(`Backfilled bridgeProxy history through SORA block ${batchEnd}/${finalizedBlock}`);
+          continue;
+        }
+
+        const runtimeAvailability = await mapWithConcurrency(
+          blockHashes,
+          BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
+          (hash, index) => this.hasBridgeProxyHistoryRuntime(hash.toString(), blocks[index], blockApi)
+        );
+        scanBlockIndexes = runtimeAvailability.flatMap((available, index) =>
+          available && blocks[index] > 0 ? [index] : []
+        );
+        this.bridgeProxyHistoryRuntimeAvailable = scanBlockIndexes.length > 0;
+      }
+
+      const bridgeBlockIndexes = scanBlockIndexes.flatMap((index) =>
+        this.hasBridgeProxyHistoryExtrinsics(
+          fetchedBlocksByHeight.get(blocks[index])!.signedBlock as SignedBlockLike
+        ) ? [index] : []
+      );
+      const batchDocuments: IndexerDocument[] = [];
+      const accountTransactionDocuments: IndexerDocument[] = [];
+      const historyElementIds: string[] = [];
+
+      if (bridgeBlockIndexes.length) {
+        const bridgeBlocks = await mapWithConcurrency(
+          bridgeBlockIndexes,
+          BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY,
+          async (index) => {
+            const fetchedBlock = fetchedBlocksByHeight.get(blocks[index]);
+            if (!fetchedBlock) {
+              throw new Error(`Missing verified payload for bridgeProxy history backfill block ${blocks[index]}`);
+            }
+
+            return {
+              signedBlock: fetchedBlock.signedBlock as SignedBlockLike,
+              events: fetchedBlock.events,
+              timestamp: fetchedBlock.timestamp,
+            };
+          }
+        );
+
+        for (const { signedBlock, events, timestamp } of bridgeBlocks) {
+          const { blockHeight, blockHash, contexts } = this.createBridgeProxyHistoryContexts(signedBlock, events);
+
+          for (const context of contexts) {
+            historyElementIds.push(context.id);
+            const historyDocument = this.createHistoryElementDocument(context, blockHeight, timestamp, blockHash);
+            batchDocuments.push(historyDocument);
+            accountTransactionDocuments.push(
+              ...this.createAccountTransactionDocuments(context, blockHeight, timestamp, historyDocument)
+            );
+          }
+        }
+      }
+
+      if (this.isStopping()) return;
+      await this.repository.upsertMany(batchDocuments);
+      await this.upsertAndPruneAccountTransactionDocuments(historyElementIds, accountTransactionDocuments);
+      if (this.isStopping()) return;
+      await this.repository.upsert(this.createBridgeProxyHistoryBackfillStateDocument(batchEnd));
+      console.info(`Backfilled bridgeProxy history through SORA block ${batchEnd}/${finalizedBlock}`);
+    }
+  }
+
+  private async hasBridgeProxyHistoryRuntime(hash: string, blockHeight: number, api = this.api): Promise<boolean> {
+    if (!this.api) throw new Error('Cannot inspect historical metadata before the chain API is initialized');
+    if (!api) throw new Error('Cannot inspect historical metadata before the chain API is initialized');
+    if (!hash) throw new Error(`Missing block hash for historical metadata at SORA block ${blockHeight}`);
+
+    const getMetadata = (api.rpc as unknown as { state?: { getMetadata?: (hash: string) => Promise<unknown> } }).state?.getMetadata;
+    if (typeof getMetadata !== 'function') {
+      throw new Error('state.getMetadata is required to find the bridgeProxy history start');
+    }
+
+    const metadata = await withTimeout(getMetadata.call((api.rpc as any).state, hash), `state.getMetadata(${blockHeight})`);
+    const pallets = (metadata as { asLatest?: { pallets?: Iterable<{ name?: { toString?: () => string } }> } }).asLatest?.pallets;
+
+    if (pallets) {
+      for (const pallet of pallets) {
+        const name = pallet.name?.toString?.() ?? '';
+        if (name === 'bridgeProxy' || name === 'bridgeChannelInbound') return true;
+      }
+
+      return false;
+    }
+
+    const json = (metadata as CodecLike | undefined)?.toJSON?.();
+    return JSON.stringify(json ?? '').includes('bridgeProxy') || JSON.stringify(json ?? '').includes('bridgeChannelInbound');
+  }
+
+  private hasBridgeProxyHistoryExtrinsics(signedBlock: SignedBlockLike): boolean {
+    return signedBlock.block.extrinsics.some((extrinsic) => {
+      const section = extrinsic.method.section;
+
+      return section === 'bridgeProxy' || section === 'bridgeChannelInbound';
+    });
+  }
+
+  private createBridgeProxyHistoryContexts(
+    signedBlock: SignedBlockLike,
+    events: EventRecord[]
+  ): { blockHeight: number; blockHash: string; contexts: BlockExtrinsicContext[] } {
+    const eventsByExtrinsic = groupEventsByExtrinsic(events);
+    const blockHeight = signedBlock.block.header?.number?.toNumber() ?? 0;
+    const blockHash = signedBlock.block.header?.hash?.toString() ?? '';
+    const contexts: BlockExtrinsicContext[] = [];
+
+    for (const [index, extrinsic] of signedBlock.block.extrinsics.entries()) {
+      const eventsForExtrinsic = eventsByExtrinsic.get(index) ?? [];
+      if (!eventsForExtrinsic.some((record) => record.event.section === 'bridgeProxy')) continue;
+
+      const failed = eventsForExtrinsic.find(({ event }) => event.section === 'system' && event.method === 'ExtrinsicFailed');
+      const args = codecArgs(extrinsic.method);
+      const calls = getUtilityCalls(extrinsic);
+      const callNames = calls.map((call) => `${call.module}.${call.method}`);
+      const address = getSigner(extrinsic);
+      const history = createHistoryData(
+        extrinsic.method.section,
+        extrinsic.method.method,
+        args,
+        eventsForExtrinsic,
+        address,
+        this.prices,
+        this.assetInfos
+      );
+      const id = extrinsic.hash?.toString?.() || `${blockHeight}-${index}`;
+      const fee = this.extractNetworkFee(eventsForExtrinsic);
+      const context: BlockExtrinsicContext = {
+        id,
+        module: extrinsic.method.section,
+        method: extrinsic.method.method,
+        address,
+        failed: Boolean(failed),
+        history,
+        calls,
+        callNames,
+        events: eventsForExtrinsic,
+        accounts: historyIndexedAccounts(extrinsic.method.section, extrinsic.method.method, address, history),
+        fee,
+      };
+
+      if (context.module === 'bridgeProxy' && (context.method === 'burn' || context.method === 'mint')) {
+        contexts.push(context);
+      }
+
+      const incomingContext = createBridgeProxyIncomingContext(context, args, this.prices, this.assetInfos);
+      if (incomingContext) contexts.push(incomingContext);
+    }
+
+    return { blockHeight, blockHash, contexts };
+  }
+
+  private async upsertAndPruneAccountTransactionDocuments(
+    historyElementIds: string[],
+    documents: IndexerDocument[]
+  ): Promise<void> {
+    const uniqueHistoryElementIds = [...new Set(historyElementIds)];
+    if (!uniqueHistoryElementIds.length) return;
+
+    const expectedIds = new Set(documents.map((document) => document.id));
+    const staleIds: string[] = [];
+
+    await this.repository.upsertMany(documents);
+
+    for await (const page of this.queryPages(collection('accountTransactions'), {
+      filter: { historyElementId: { in: uniqueHistoryElementIds } },
+    })) {
+      for (const document of page) {
+        if (!expectedIds.has(document.id)) staleIds.push(document.id);
+      }
+    }
+
+    for (let start = 0; start < staleIds.length; start += ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE) {
+      await this.repository.deleteMany(collection('accountTransactions'), staleIds.slice(start, start + ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE));
+    }
+  }
+
   private async backfill(): Promise<boolean> {
     if (this.isStopping() || !this.api) return false;
 
@@ -3108,7 +4380,7 @@ export class ChainIndexer {
         `Stored chain state ${lastIndexed} is ahead of the configured SORA endpoint finalized block ${finalizedBlock}`
       );
     }
-    const startBlock = Math.max(this.config.chainStartBlock, lastIndexed + 1);
+    const startBlock = Math.max(1, this.config.chainStartBlock, lastIndexed + 1);
     if (startBlock > finalizedBlock) return false;
 
     const networkAggregateWindows = await this.initializeNetworkBackfillWindows(lastIndexed);
@@ -3226,10 +4498,12 @@ export class ChainIndexer {
 
             let finalizedBlock: number;
             try {
-              finalizedBlock = this.validatedFinalizedHeaderHeight(
-                header,
-                'finalized-head subscription'
-              );
+              finalizedBlock = this.observedGenesisHash || this.enforceFinalizedIdentity
+                ? this.validatedFinalizedHeaderHeight(header, 'finalized-head subscription')
+                : header.number.toNumber();
+              if (!Number.isSafeInteger(finalizedBlock) || finalizedBlock < 0) {
+                throw new Error('finalized-head subscription returned an invalid height');
+              }
             } catch {
               this.requestPendingFinalizedBlockUpdate(
                 'Failed to recover from a malformed finalized-head subscription update'
@@ -3237,7 +4511,7 @@ export class ChainIndexer {
               return;
             }
             this.updateFinalizedStatus(finalizedBlock);
-            if (this.config.archiveSoraWsEndpoint) {
+            if (this.archiveSoraWsEndpoint) {
               this.requestPendingFinalizedBlockUpdate('Failed to update finalized head from subscription');
               return;
             }
@@ -3247,17 +4521,17 @@ export class ChainIndexer {
           }),
         'chain.subscribeFinalizedHeads()',
         undefined,
-        (lateUnsubscribe) => this.unsubscribeFinalizedHeads(lateUnsubscribe)
+        (lateUnsubscribe) => this.invokeFinalizedHeadUnsubscribe(lateUnsubscribe)
       );
     } catch (error) {
       if (this.isStopping()) return;
       throw error;
     }
     if (this.isStopping()) {
-      await this.unsubscribeFinalizedHeads(unsubscribe);
+      await this.invokeFinalizedHeadUnsubscribe(unsubscribe);
       return;
     }
-    this.finalizedHeadUnsubscribe = unsubscribe;
+    this.unsubscribeFinalizedHeads = unsubscribe;
 
     this.startFinalizedHeadPolling();
     await this.updatePendingFinalizedBlockFromRpc().catch((error: unknown) => {
@@ -3408,23 +4682,22 @@ export class ChainIndexer {
     await this.indexFetchedBlock(await this.fetchBlockByHash(hash), options);
   }
 
-  private async fetchBlockByNumber(block: number): Promise<FetchedBlock> {
+  private async fetchBlockByNumber(block: number, executeRpc?: RpcExecutor): Promise<FetchedBlock> {
     if (!this.api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
+    const runRpc: RpcExecutor =
+      executeRpc ?? ((createRequest, label) => this.withRpcTimeout(createRequest, label));
     if (!Number.isSafeInteger(block) || block <= 0 || block > SORA_MAX_BLOCK_NUMBER) {
       throw new Error(`Cannot fetch invalid SORA block height ${block}`);
     }
 
     const blockApi = await this.getBlockDataApi();
-    const hash = await this.withRpcTimeout(
-      () => blockApi.rpc.chain.getBlockHash(block),
-      `chain.getBlockHash(${block})`
-    );
+    const hash = await runRpc(() => blockApi.rpc.chain.getBlockHash(block), `chain.getBlockHash(${block})`);
     const hashText = hash?.toString?.().toLowerCase() ?? '';
     if (!isNonzeroCanonicalSubstrateHash(hashText)) {
       throw new Error(`No SORA block hash available for block ${block} from the configured block data endpoint`);
     }
     if (blockApi !== this.api) {
-      const primaryHash = await this.withRpcTimeout(
+      const primaryHash = await runRpc(
         () => this.api!.rpc.chain.getBlockHash(block),
         `primary.chain.getBlockHash(${block})`
       );
@@ -3434,7 +4707,7 @@ export class ChainIndexer {
       }
     }
 
-    const fetched = await this.fetchBlockByHash(hashText);
+    const fetched = await this.fetchBlockByHash(hashText, runRpc);
     const fetchedHeight = fetched.signedBlock?.block?.header?.number?.toNumber?.();
     if (fetchedHeight !== block) {
       throw new Error(`SORA block data endpoint returned block ${fetchedHeight} for requested height ${block}`);
@@ -3442,8 +4715,10 @@ export class ChainIndexer {
     return fetched;
   }
 
-  private async fetchBlockByHash(hash: string): Promise<FetchedBlock> {
+  private async fetchBlockByHash(hash: string, executeRpc?: RpcExecutor): Promise<FetchedBlock> {
     if (!this.api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
+    const runRpc: RpcExecutor =
+      executeRpc ?? ((createRequest, label) => this.withRpcTimeout(createRequest, label));
     const requestedHash = hash.toLowerCase();
     if (!isNonzeroCanonicalSubstrateHash(requestedHash)) {
       throw new Error('Cannot fetch a missing, zero, or malformed SORA block hash');
@@ -3451,12 +4726,12 @@ export class ChainIndexer {
 
     const blockApi = await this.getBlockDataApi();
     if (blockApi === this.api) {
-      return (await this.fetchBlockPayloadFromApi(requestedHash, blockApi, false)).fetchedBlock;
+      return (await this.fetchBlockPayloadFromApi(requestedHash, blockApi, false, runRpc)).fetchedBlock;
     }
 
     const [blockDataPayload, primaryPayload] = await Promise.all([
-      this.fetchBlockPayloadFromApi(requestedHash, blockApi, true),
-      this.fetchBlockPayloadFromApi(requestedHash, this.api, true),
+      this.fetchBlockPayloadFromApi(requestedHash, blockApi, true, runRpc),
+      this.fetchBlockPayloadFromApi(requestedHash, this.api, true, runRpc),
     ]);
     if (blockDataPayload.blockHex !== primaryPayload.blockHex ||
         blockDataPayload.eventsHex !== primaryPayload.eventsHex ||
@@ -3469,17 +4744,17 @@ export class ChainIndexer {
   private async fetchBlockPayloadFromApi(
     hash: string,
     blockApi: ApiPromise,
-    requireCanonicalBytes: boolean
+    requireCanonicalBytes: boolean,
+    executeRpc?: RpcExecutor
   ): Promise<FetchedBlockPayload> {
+    const runRpc: RpcExecutor =
+      executeRpc ?? ((createRequest, label) => this.withRpcTimeout(createRequest, label));
     const canFetchApiAt = typeof (blockApi as unknown as { at?: unknown }).at === 'function';
     if (!canFetchApiAt) {
       const [signedBlock, eventsCodec, timestamp] = await Promise.all([
-        this.fetchSignedBlock(hash, blockApi),
-        this.withRpcTimeout(
-          () => (blockApi.query as any).system.events.at(hash),
-          `system.events.at(${hash})`
-        ),
-        this.fetchBlockTimestampIdentity(hash, blockApi),
+        runRpc(() => this.fetchSignedBlock(hash, blockApi), `chain.getBlock(${hash})`),
+        runRpc(() => (blockApi.query as any).system.events.at(hash), `system.events.at(${hash})`),
+        this.fetchBlockTimestampIdentity(hash, blockApi, runRpc),
       ]);
 
       return {
@@ -3497,7 +4772,7 @@ export class ChainIndexer {
       };
     }
 
-    const apiAt = await this.fetchApiAtFrom(blockApi, hash, `SORA block ${hash}`);
+    const apiAt = await this.fetchApiAtFrom(blockApi, hash, `SORA block ${hash}`, runRpc);
     const system = (apiAt.query as { system?: { events?: () => Promise<unknown> } }).system;
     const systemEvents = system?.events;
     const timestampNow = (apiAt.query as { timestamp?: { now?: () => Promise<unknown> } }).timestamp?.now;
@@ -3509,9 +4784,9 @@ export class ChainIndexer {
     }
 
     const [signedBlock, eventsCodec, timestamp] = await Promise.all([
-      this.fetchSignedBlock(hash, blockApi),
-      this.withRpcTimeout(() => systemEvents.call(system), `system.events(${hash})`),
-      this.withRpcTimeout(() => timestampNow(), `timestamp.now(${hash})`).then((codec) =>
+      runRpc(() => this.fetchSignedBlock(hash, blockApi), `chain.getBlock(${hash})`),
+      runRpc(() => systemEvents.call(system), `system.events(${hash})`),
+      runRpc(() => timestampNow(), `timestamp.now(${hash})`).then((codec) =>
         parseChainTimestamp(codec, `timestamp.now for block ${hash}`)
       ),
     ]);
@@ -3535,59 +4810,57 @@ export class ChainIndexer {
     if (!this.api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
     if (!api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
 
-    return this.withRpcTimeout(() => api.rpc.chain.getBlock(hash), `chain.getBlock(${hash})`);
+    return api.rpc.chain.getBlock(hash);
   }
 
   private async getBlockDataApi(): Promise<ApiPromise> {
     if (this.isStopping()) throw new Error('Cannot initialize the SORA block data API during shutdown');
 
-    if (!this.config.archiveSoraWsEndpoint && !this.config.legacySoraBlockTypes) {
+    if (!this.archiveSoraWsEndpoint && !this.config.legacySoraBlockTypes) {
       if (!this.api) throw new Error('Cannot fetch SORA block before the chain API is initialized');
       return this.api;
     }
 
     if (this.legacyBlockApi) return this.legacyBlockApi;
 
-    if (!this.legacyBlockApiPromise) {
-      const endpoint = this.config.archiveSoraWsEndpoint || this.config.soraWsEndpoint;
-      const apiOptions = this.config.legacySoraBlockTypes ? { typesBundle: soraArchiveTypesBundle as any } : {};
-      const provider = new WsProvider(endpoint);
-      this.legacyBlockProvider = provider;
-      this.legacyBlockApiPromise = this.withRpcTimeout(
-        () =>
-          ApiPromise.create({
-            provider,
-            ...apiOptions,
-          }),
-        'ApiPromise.create(block data)',
-        undefined,
-        (lateApi) => this.disconnectResource(lateApi, 'late SORA block data API')
-      )
-        .then(async (api) => {
-          if (this.legacyBlockProvider === provider) this.legacyBlockProvider = null;
-          try {
-            await this.requireMainnetIdentity(api, 'SORA block data endpoint');
-            await this.requireReviewedMainnetAnchor(api, 'SORA block data endpoint');
-            if (this.isStopping()) {
-              throw new Error('SORA block data API initialized after shutdown began');
-            }
-          } catch (error) {
-            await this.disconnectResource(api, 'SORA block data API');
-            throw error;
-          }
+    if (this.legacyBlockApiPromise) return this.legacyBlockApiPromise;
 
+    const endpoint = this.archiveSoraWsEndpoint || this.config.soraWsEndpoint;
+    const provider = new WsProvider(endpoint);
+    this.legacyBlockProvider = provider;
+    const apiOptions = this.config.legacySoraBlockTypes
+      ? { typesBundle: soraArchiveTypesBundle as any }
+      : {};
+    let creation: Promise<ApiPromise>;
+    creation = this.withRpcTimeout(
+      () => ApiPromise.create({ provider, ...apiOptions }),
+      'SORA block data endpoint connection',
+      undefined,
+      (lateApi) => this.disconnectResource(lateApi, 'late SORA block data API')
+    )
+      .then(async (api) => {
+        try {
+          await this.requireMainnetIdentity(api, 'SORA block data endpoint');
+          await this.requireReviewedMainnetAnchor(api, 'SORA block data endpoint');
+          if (this.legacyBlockProvider === provider) this.legacyBlockProvider = null;
+          if (this.legacyBlockApiPromise !== creation || !this.api || this.isStopping()) {
+            throw new Error('PI block data endpoint startup was cancelled');
+          }
           this.legacyBlockApi = api;
           return api;
-        })
-        .catch(async (error: unknown) => {
-          if (this.legacyBlockProvider === provider) this.legacyBlockProvider = null;
-          await this.disconnectResource(provider, 'SORA block data WebSocket provider');
-          this.legacyBlockApiPromise = null;
+        } catch (error) {
+          await this.disconnectResource(api, 'SORA block data API');
           throw error;
-        });
-    }
-
-    return this.legacyBlockApiPromise;
+        }
+      })
+      .catch(async (error: unknown) => {
+        if (this.legacyBlockProvider === provider) this.legacyBlockProvider = null;
+        await this.disconnectResource(provider, 'SORA block data WebSocket provider');
+        if (this.legacyBlockApiPromise === creation) this.legacyBlockApiPromise = null;
+        throw error;
+      });
+    this.legacyBlockApiPromise = creation;
+    return creation;
   }
 
   private async getIndexableFinalizedBlock(): Promise<number> {
@@ -3595,7 +4868,7 @@ export class ChainIndexer {
 
     const localFinalizedBlock = await this.getFinalizedBlock(this.api, 'chain');
     this.updateFinalizedStatus(localFinalizedBlock);
-    if (!this.config.archiveSoraWsEndpoint) return localFinalizedBlock;
+    if (!this.archiveSoraWsEndpoint) return localFinalizedBlock;
 
     const blockDataApi = await this.getBlockDataApi();
     const blockDataFinalizedBlock = await this.getFinalizedBlock(blockDataApi, 'block data endpoint');
@@ -3613,19 +4886,32 @@ export class ChainIndexer {
       () => api.rpc.chain.getFinalizedHead(),
       `${label}.getFinalizedHead()`
     );
+    const finalizedHashText = finalizedHash?.toString?.().toLowerCase() ?? '';
     const finalizedHeader = await this.withRpcTimeout(
       () => api.rpc.chain.getHeader(finalizedHash),
-      `${label}.getHeader(${finalizedHash.toString()})`
+      `${label}.getHeader(${finalizedHashText})`
     );
-    const finalizedHashText = finalizedHash?.toString?.().toLowerCase() ?? '';
-    if (!isNonzeroCanonicalSubstrateHash(finalizedHashText)) {
-      throw new Error(`${label} returned a malformed finalized hash`);
+    if (this.observedGenesisHash || this.enforceFinalizedIdentity) {
+      if (!isNonzeroCanonicalSubstrateHash(finalizedHashText)) {
+        throw new Error(`${label} returned a malformed finalized hash`);
+      }
+      const height = this.validatedFinalizedHeaderHeight(finalizedHeader, label);
+      if (finalizedHeader.hash.toString().toLowerCase() !== finalizedHashText) {
+        if (label === 'chain') {
+          throw new Error(
+            'primary SORA endpoint returned a malformed finalized header: malformed finalized block identity; header does not match requested hash'
+          );
+        }
+        throw new Error(`${label} finalized header does not match its requested hash`);
+      }
+      return height;
     }
-    const height = this.validatedFinalizedHeaderHeight(finalizedHeader, label);
-    if (finalizedHeader.hash.toString().toLowerCase() !== finalizedHashText) {
-      throw new Error(`${label} finalized header does not match its requested hash`);
+
+    const height = finalizedHeader?.number?.toNumber?.();
+    if (!Number.isSafeInteger(height) || Number(height) < 0) {
+      throw new Error(`${label} returned a malformed finalized header`);
     }
-    return height;
+    return Number(height);
   }
 
   private validatedFinalizedHeaderHeight(
@@ -3635,7 +4921,8 @@ export class ChainIndexer {
     const height = header?.number?.toNumber?.();
     const hash = header?.hash?.toString?.().toLowerCase() ?? '';
     if (!Number.isSafeInteger(height) || Number(height) < SORA_LEGACY_IDENTITY_ANCHOR.block ||
-        Number(height) > SORA_MAX_BLOCK_NUMBER || !isNonzeroCanonicalSubstrateHash(hash)) {
+        Number(height) > SORA_MAX_BLOCK_NUMBER ||
+        !isNonzeroCanonicalSubstrateHash(hash)) {
       throw new Error(`${label} returned a malformed finalized header`);
     }
     return Number(height);
@@ -3754,16 +5041,17 @@ export class ChainIndexer {
     );
   }
 
-  private async indexFetchedBlock(
-    { requestedHash, signedBlock, events, timestamp }: FetchedBlock,
-    options: IndexBlockOptions = {}
-  ): Promise<void> {
+  private async indexFetchedBlock({ requestedHash, signedBlock, events, timestamp }: FetchedBlock, options: IndexBlockOptions = {}): Promise<void> {
     if (this.isStopping()) return;
 
     const eventsByExtrinsic = groupEventsByExtrinsic(events);
     const blockHeight = signedBlock.block.header.number.toNumber();
-    const blockHash = signedBlock.block.header.hash.toString().toLowerCase();
-    if (!isNonzeroCanonicalSubstrateHash(blockHash) || blockHash !== requestedHash) {
+    const blockHash = signedBlock.block.header.hash.toString();
+    const canonicalBlockHash = blockHash.toLowerCase();
+    if (
+      (this.observedGenesisHash || this.enforceFinalizedIdentity) &&
+      (!isNonzeroCanonicalSubstrateHash(canonicalBlockHash) || canonicalBlockHash !== requestedHash)
+    ) {
       throw new Error(`SORA block data endpoint returned a block that does not match requested hash ${requestedHash}`);
     }
     const historicalValuationState = options.historicalValuationState;
@@ -3958,7 +5246,7 @@ export class ChainIndexer {
       }
     }
 
-    documents.push(this.createChainStateDocument(blockHeight, blockHash, timestamp));
+    documents.push(this.createChainStateDocument(blockHeight, canonicalBlockHash, timestamp));
     if (this.isStopping()) return;
     const preparedDocuments = await this.prepareReferrerRewardDocuments(documents);
     if (this.isStopping()) return;
@@ -4270,6 +5558,33 @@ export class ChainIndexer {
     return this.withRpcTimeout(
       () => balances.totalIssuance.call(balances),
       'balances.totalIssuance()'
+    );
+  }
+
+  private async fetchNativeXorIssuanceAtBlock(blockHeight: number): Promise<bigint> {
+    if (!this.api) throw new Error('Cannot repair native XOR supply before the chain API is initialized');
+
+    const blockApi = await this.getBlockDataApi();
+    const hash = await this.withRpcTimeout(
+      () => blockApi.rpc.chain.getBlockHash(blockHeight),
+      `chain.getBlockHash(${blockHeight})`
+    );
+    const hashText = hash?.toString?.() ?? '';
+    if (!hashText || /^0x0+$/.test(hashText)) {
+      throw new Error(`No SORA block hash available for block ${blockHeight} from the configured block data endpoint`);
+    }
+
+    const apiAt = await this.fetchApiAtFrom(blockApi, hashText, `SORA block ${blockHeight}`);
+    const balances = (apiAt.query as { balances?: { totalIssuance?: () => Promise<unknown> } }).balances;
+    if (typeof balances?.totalIssuance !== 'function') {
+      throw new Error(`balances.totalIssuance is required to repair XOR supply at SORA block ${blockHeight}`);
+    }
+
+    return codecToBigInt(
+      await this.withRpcTimeout(
+        () => balances.totalIssuance!.call(balances),
+        `balances.totalIssuance(${blockHeight})`
+      )
     );
   }
 
@@ -5071,13 +6386,21 @@ export class ChainIndexer {
     };
   }
 
-  private async fetchApiAtFrom(api: ApiPromise, hash: string, label: string): Promise<{ query: unknown; rpc?: unknown }> {
+  private async fetchApiAtFrom(
+    api: ApiPromise,
+    hash: string,
+    label: string,
+    executeRpc?: RpcExecutor
+  ): Promise<{ query: unknown; rpc?: unknown }> {
     const at = (api as unknown as { at?: (hash: string) => Promise<{ query: unknown }> }).at;
     if (typeof at !== 'function') {
       throw new Error('api.at is required to decode historical chain state');
     }
 
-    return this.withRpcTimeout(() => at.call(api, hash), `api.at(${label})`);
+    return (executeRpc ?? ((createRequest, rpcLabel) => this.withRpcTimeout(createRequest, rpcLabel)))(
+      () => at.call(api, hash),
+      `api.at(${label})`
+    );
   }
 
   private async getProjectionQueryAt(blockHeight: number): Promise<any> {
@@ -5529,7 +6852,8 @@ export class ChainIndexer {
 
   private async fetchBlockTimestampIdentity(
     hash: string,
-    api = this.api
+    api = this.api,
+    executeRpc?: RpcExecutor
   ): Promise<ParsedChainTimestamp> {
     if (!this.api) throw new Error('Cannot index a block before the chain API is initialized');
     if (!api) throw new Error('Cannot index a block before the chain API is initialized');
@@ -5540,10 +6864,9 @@ export class ChainIndexer {
       throw new Error('timestamp.now.at is required to index block timestamps');
     }
 
-    const codec = await this.withRpcTimeout(
-      () => at.call(timestampNow, hash),
-      `timestamp.now.at(${hash})`
-    );
+    const codec = await (
+      executeRpc ?? ((createRequest, label) => this.withRpcTimeout(createRequest, label))
+    )(() => at.call(timestampNow, hash), `timestamp.now.at(${hash})`);
     return parseChainTimestamp(codec, `timestamp.now for block ${hash}`);
   }
 
@@ -5690,6 +7013,34 @@ export class ChainIndexer {
           accountId: account,
           historyElementId: context.id,
           ...tradeProjection,
+          blockHeight,
+          timestamp,
+        },
+      };
+    });
+  }
+
+  /** Reconstructs per-account transaction rows from indexer-owned legacy history fields. */
+  private createAccountTransactionDocumentsFromHistory(document: IndexerDocument): IndexerDocument[] {
+    const historyElementId = String(document.data.id ?? document.id);
+    const blockHeightValue = Number(document.blockHeight ?? document.data.blockHeight ?? 0);
+    const timestampValue = Number(document.timestamp ?? document.data.timestamp ?? 0);
+    const blockHeight = Number.isFinite(blockHeightValue) ? blockHeightValue : 0;
+    const timestamp = Number.isFinite(timestampValue) ? timestampValue : 0;
+    const accounts = uniqueIndexedAccountIds([document.data.address, document.data.dataFrom, document.data.dataTo]);
+
+    return accounts.map((account) => {
+      const id = accountTransactionId(historyElementId, account);
+
+      return {
+        collection: collection('accountTransactions'),
+        id,
+        blockHeight,
+        timestamp,
+        data: {
+          id,
+          accountId: account,
+          historyElementId,
           blockHeight,
           timestamp,
         },

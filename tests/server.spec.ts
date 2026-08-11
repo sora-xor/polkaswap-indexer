@@ -10,7 +10,7 @@ import {
   startServer,
 } from '../src/server.js';
 
-import type { AppConfig } from '../src/config.js';
+import type { AppConfig, RuntimeSecurityConfig } from '../src/config.js';
 
 vi.mock('../src/db/migrate.js', () => ({
   migrate: vi.fn().mockResolvedValue(undefined),
@@ -101,6 +101,35 @@ const baseConfig = (port: number): AppConfig => ({
   workerMetricsHost: '127.0.0.1',
   workerMetricsPort: 9464,
   workerMetricsMaxInFlight: 10,
+});
+
+const baseSecurity = (
+  overrides: Partial<RuntimeSecurityConfig> = {}
+): RuntimeSecurityConfig => ({
+  httpMaxBodyBytes: 65_536,
+  httpMaxHeaderBytes: 16_384,
+  httpListenBacklog: 4_096,
+  httpShutdownTimeoutMs: 30_000,
+  httpKeepAliveTimeoutMs: 75_000,
+  httpHeadersTimeoutMs: 80_000,
+  httpRequestTimeoutMs: 30_000,
+  httpMaxConnections: 2_048,
+  httpMaxRequestsPerSocket: 1_000,
+  rateLimitWindowMs: 60_000,
+  rateLimitMax: 600,
+  rateLimitMaxKeys: 20_000,
+  rateLimitGlobalWindowMs: 60_000,
+  rateLimitGlobalMax: 50_000,
+  graphqlMaxDepth: 12,
+  graphqlMaxFields: 300,
+  graphqlMaxAliases: 50,
+  graphqlAllowIntrospection: false,
+  graphqlWsMaxPayloadBytes: 65_536,
+  graphqlWsMaxConnections: 512,
+  graphqlWsMaxConnectionsPerClient: 16,
+  graphqlWsMaxOperationsPerConnection: 32,
+  graphqlWsConnectionInitTimeoutMs: 10_000,
+  ...overrides,
 });
 
 const listenOnEphemeralPort = async (): Promise<{ port: number; close: () => Promise<void> }> => {
@@ -199,6 +228,26 @@ const openWebSocket = (url: string, protocol: string): Promise<WebSocket> =>
     };
     socket.once('open', onOpen);
     socket.once('error', onError);
+  });
+
+const rejectedWebSocketStatus = (url: string, protocol: string): Promise<number> =>
+  new Promise<number>((resolve, reject) => {
+    const socket = new WebSocket(url, protocol);
+    const timeout = setTimeout(() => {
+      socket.terminate();
+      reject(new Error('Timed out waiting for rejected WebSocket upgrade'));
+    }, 2_000);
+    socket.once('unexpected-response', (_request, response) => {
+      clearTimeout(timeout);
+      response.resume();
+      resolve(response.statusCode ?? 0);
+    });
+    socket.once('open', () => {
+      clearTimeout(timeout);
+      socket.close();
+      reject(new Error('WebSocket upgrade unexpectedly succeeded'));
+    });
+    socket.once('error', () => undefined);
   });
 
 describe('startServer', () => {
@@ -504,13 +553,13 @@ describe('startServer', () => {
     }
   });
 
-  it('ignores spoofed forwarding headers and enforces bounded raw-peer request rates', async ({ skip }) => {
+  it('rate-limits HTTP by raw peer identity and emits no-sniff and bounded-rate headers', async ({ skip }) => {
     let reservation: Awaited<ReturnType<typeof listenOnEphemeralPort>>;
     try {
       reservation = await listenOnEphemeralPort();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EPERM') {
-        skip('The execution sandbox does not permit loopback listeners; CI runs this edge-limit assertion.');
+        skip('The execution sandbox does not permit loopback listeners; CI runs this socket-level assertion.');
         return;
       }
       throw error;
@@ -518,46 +567,45 @@ describe('startServer', () => {
     const port = reservation.port;
     await reservation.close();
     const server = await startServer(
-      {
-        ...baseConfig(port),
-        rateLimitMax: 1,
-        rateLimitGlobalMax: 10,
-      },
+      baseConfig(port),
       new MemoryRepository(),
-      readyWorker()
+      readyWorker(),
+      baseSecurity({ rateLimitMax: 1 })
     );
 
     try {
-      const request = (spoofedClient: string) =>
+      const request = (forwardedFor: string) =>
         fetch(`http://127.0.0.1:${port}/graphql`, {
           method: 'POST',
           headers: {
             'content-type': 'application/json',
-            'x-forwarded-for': spoofedClient,
-            forwarded: `for=${spoofedClient}`,
+            'x-forwarded-for': forwardedFor,
           },
           body: JSON.stringify({ query: '{ _health { ok } }' }),
         });
-      expect((await request('198.51.100.1')).status).toBe(200);
+      const admitted = await request('198.51.100.1');
+      expect(admitted.status).toBe(200);
+      expect(admitted.headers.get('x-content-type-options')).toBe('nosniff');
+      expect(admitted.headers.get('x-ratelimit-limit')).toBe('1');
+      expect(admitted.headers.get('x-ratelimit-remaining')).toBe('0');
+
       const rejected = await request('198.51.100.2');
       expect(rejected.status).toBe(429);
-      expect(rejected.headers.get('retry-after')).toBe('60');
-      expect(rejected.headers.get('x-ratelimit-remaining')).toBe('0');
-      await expect(rejected.json()).resolves.toMatchObject({
-        errors: [{ message: 'Too many requests.' }],
-      });
+      expect(rejected.headers.get('retry-after')).toBeTruthy();
+      expect(rejected.headers.get('access-control-allow-origin')).toBe('*');
+      await expect(rejected.text()).resolves.toContain('Too many requests');
     } finally {
       await server.stop();
     }
   });
 
-  it('bounds concurrent WebSockets per raw peer independently of spoofed headers', async ({ skip }) => {
+  it('enforces the configured HTTP header ceiling before request handling', async ({ skip }) => {
     let reservation: Awaited<ReturnType<typeof listenOnEphemeralPort>>;
     try {
       reservation = await listenOnEphemeralPort();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EPERM') {
-        skip('The execution sandbox does not permit loopback listeners; CI runs this edge-limit assertion.');
+        skip('The execution sandbox does not permit loopback listeners; CI runs this socket-level assertion.');
         return;
       }
       throw error;
@@ -565,67 +613,155 @@ describe('startServer', () => {
     const port = reservation.port;
     await reservation.close();
     const server = await startServer(
-      {
-        ...baseConfig(port),
-        graphqlWsMaxConnectionsPerClient: 1,
-      },
+      baseConfig(port),
       new MemoryRepository(),
-      readyWorker()
+      readyWorker(),
+      baseSecurity({ httpMaxHeaderBytes: 1_024 })
+    );
+
+    try {
+      const rejected = await fetch(`http://127.0.0.1:${port}/metrics`, {
+        headers: { 'x-padding': 'x'.repeat(2_048) },
+      });
+      expect(rejected.status).toBe(431);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('rate-limits WebSocket handshake churn by raw peer identity', async ({ skip }) => {
+    let reservation: Awaited<ReturnType<typeof listenOnEphemeralPort>>;
+    try {
+      reservation = await listenOnEphemeralPort();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') {
+        skip('The execution sandbox does not permit loopback listeners; CI runs this socket-level assertion.');
+        return;
+      }
+      throw error;
+    }
+    const port = reservation.port;
+    await reservation.close();
+    const server = await startServer(
+      baseConfig(port),
+      new MemoryRepository(),
+      readyWorker(),
+      baseSecurity({ rateLimitMax: 1 })
     );
     let first: WebSocket | null = null;
 
     try {
-      first = await openWebSocket(
-        `ws://127.0.0.1:${port}/graphql`,
-        'graphql-transport-ws'
-      );
-      const rejectedStatus = await new Promise<number>((resolve, reject) => {
-        const second = new WebSocket(
-          `ws://127.0.0.1:${port}/graphql`,
-          'graphql-transport-ws',
-          { headers: { 'x-forwarded-for': '198.51.100.99' } }
-        );
-        second.once('unexpected-response', (_request, response) => {
-          response.resume();
-          resolve(response.statusCode ?? 0);
-        });
-        second.once('open', () => reject(new Error('second WebSocket unexpectedly opened')));
-        second.once('error', () => undefined);
-      });
-      expect(rejectedStatus).toBe(503);
+      first = await openWebSocket(`ws://127.0.0.1:${port}/graphql`, 'graphql-transport-ws');
+      await expect(
+        rejectedWebSocketStatus(`ws://127.0.0.1:${port}/graphql`, 'graphql-transport-ws')
+      ).resolves.toBe(429);
     } finally {
       first?.close();
       await server.stop();
     }
   });
 
-  it('rejects WebSocket upgrades that do not offer a supported GraphQL protocol', async ({ skip }) => {
+  it('rate-limits operation churn across modern and legacy WebSocket protocols', async ({ skip }) => {
     let reservation: Awaited<ReturnType<typeof listenOnEphemeralPort>>;
     try {
       reservation = await listenOnEphemeralPort();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EPERM') {
-        skip('The execution sandbox does not permit loopback listeners; CI runs this protocol assertion.');
+        skip('The execution sandbox does not permit loopback listeners; CI runs this socket-level assertion.');
         return;
       }
       throw error;
     }
     const port = reservation.port;
     await reservation.close();
-    const server = await startServer(baseConfig(port), new MemoryRepository(), readyWorker());
+    const server = await startServer(
+      baseConfig(port),
+      new MemoryRepository(),
+      readyWorker(),
+      baseSecurity({ rateLimitMax: 4 })
+    );
+    let modern: WebSocket | null = null;
+    let legacy: WebSocket | null = null;
 
     try {
-      const rejectedStatus = await new Promise<number>((resolve, reject) => {
-        const socket = new WebSocket(`ws://127.0.0.1:${port}/graphql`, 'unsupported-protocol');
-        socket.once('unexpected-response', (_request, response) => {
-          response.resume();
-          resolve(response.statusCode ?? 0);
-        });
-        socket.once('open', () => reject(new Error('unsupported WebSocket protocol unexpectedly opened')));
-        socket.once('error', () => undefined);
-      });
-      expect(rejectedStatus).toBe(404);
+      modern = await openWebSocket(`ws://127.0.0.1:${port}/graphql`, 'graphql-transport-ws');
+      legacy = await openWebSocket(`ws://127.0.0.1:${port}/graphql`, LEGACY_GRAPHQL_WS_PROTOCOL);
+      const modernAck = waitForWebSocketMessage(modern, (message) => message.type === 'connection_ack');
+      const legacyAck = waitForWebSocketMessage(legacy, (message) => message.type === 'connection_ack');
+      modern.send(JSON.stringify({ type: 'connection_init' }));
+      legacy.send(JSON.stringify({ type: 'connection_init' }));
+      await Promise.all([modernAck, legacyAck]);
+
+      modern.send(JSON.stringify({
+        id: 'modern-first',
+        type: 'subscribe',
+        payload: { query: 'subscription { updatesStreams(id: ["price"]) { id } }' },
+      }));
+      legacy.send(JSON.stringify({
+        id: 'legacy-first',
+        type: 'start',
+        payload: { query: 'subscription { updatesStreams(id: ["price"]) { id } }' },
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const modernRejected = waitForWebSocketMessage(
+        modern,
+        (message) => message.id === 'modern-second' && message.type === 'error'
+      );
+      const legacyRejected = waitForWebSocketMessage(
+        legacy,
+        (message) => message.id === 'legacy-second' && message.type === 'error'
+      );
+      modern.send(JSON.stringify({
+        id: 'modern-second',
+        type: 'subscribe',
+        payload: { query: 'subscription { updatesStreams(id: ["apy"]) { id } }' },
+      }));
+      legacy.send(JSON.stringify({
+        id: 'legacy-second',
+        type: 'start',
+        payload: { query: 'subscription { updatesStreams(id: ["apy"]) { id } }' },
+      }));
+
+      for (const message of await Promise.all([modernRejected, legacyRejected])) {
+        const payload = message.payload as Array<{ extensions?: { code?: string } }>;
+        expect(payload[0]?.extensions?.code).toBe('GRAPHQL_WS_RATE_LIMITED');
+      }
     } finally {
+      modern?.close();
+      legacy?.close();
+      await server.stop();
+    }
+  });
+
+  it('rejects a peer above its WebSocket cap before the global connection cap', async ({ skip }) => {
+    let reservation: Awaited<ReturnType<typeof listenOnEphemeralPort>>;
+    try {
+      reservation = await listenOnEphemeralPort();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') {
+        skip('The execution sandbox does not permit loopback listeners; CI runs this socket-level assertion.');
+        return;
+      }
+      throw error;
+    }
+    const port = reservation.port;
+    await reservation.close();
+    const server = await startServer(
+      { ...baseConfig(port), graphqlWsMaxConnections: 10 },
+      new MemoryRepository(),
+      readyWorker(),
+      baseSecurity({ graphqlWsMaxConnectionsPerClient: 1 })
+    );
+    let first: WebSocket | null = null;
+
+    try {
+      first = await openWebSocket(`ws://127.0.0.1:${port}/graphql`, 'graphql-transport-ws');
+      await expect(
+        rejectedWebSocketStatus(`ws://127.0.0.1:${port}/graphql`, 'graphql-transport-ws')
+      ).resolves.toBe(503);
+    } finally {
+      first?.close();
       await server.stop();
     }
   });

@@ -1,5 +1,4 @@
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { readConfig } from '../src/config.js';
 
 const polkadotMocks = vi.hoisted(() => ({
   create: vi.fn(),
@@ -31,30 +30,28 @@ const [
 ]);
 
 const config = {
-  ...readConfig(),
   host: '0.0.0.0',
   port: 4350,
   graphqlPath: '/graphql',
   databaseUrl: '',
   soraWsEndpoint: 'wss://primary.sora.invalid',
-  archiveSoraWsEndpoint: 'wss://archive.sora.invalid',
   chainStartBlock: 0,
   chainBatchSize: 25,
   stateRefreshIntervalBlocks: 250,
   snapshotIntervalBlocks: 250,
-  chainShutdownTimeoutMs: 5_000,
 };
 
 type TimeoutIndexer = {
   api: unknown;
   primaryProvider: unknown;
   legacyBlockApi: unknown;
-  finalizedHeadUnsubscribe: (() => void) | null;
+  unsubscribeFinalizedHeads: (() => void) | null;
   finalizedHeadRetryTimer: ReturnType<typeof setTimeout> | null;
   finalizedHeadPollTimer: ReturnType<typeof setInterval> | null;
   derivedStateRefreshRetryTimer: ReturnType<typeof setTimeout> | null;
   priceStreamRefreshRetryTimer: ReturnType<typeof setTimeout> | null;
   polkamarktStateRefreshRetryTimer: ReturnType<typeof setTimeout> | null;
+  xorBurnBackfillRetryTimer: ReturnType<typeof setTimeout> | null;
   start: () => Promise<void>;
   stop: () => Promise<void>;
   refreshIndexingState: () => Promise<void>;
@@ -93,9 +90,8 @@ describe('PI chain API connection deadlines', () => {
     indexer.runStartupMaintenance = vi.fn(async () => undefined);
 
     const startup = indexer.start();
-    const rejection = expect(startup).rejects.toThrow('ApiPromise.create(chain) timed out after 15000ms');
+    const rejection = expect(startup).rejects.toThrow('primary SORA endpoint connection timed out after 15000ms');
     await vi.advanceTimersByTimeAsync(15_000);
-    await vi.advanceTimersByTimeAsync(5_000);
     await rejection;
     expect(polkadotMocks.providers[0].disconnect).toHaveBeenCalledOnce();
 
@@ -121,7 +117,7 @@ describe('PI chain API connection deadlines', () => {
     indexer.api = {};
 
     const request = indexer.getBlockDataApi();
-    const rejection = expect(request).rejects.toThrow('ApiPromise.create(block data) timed out after 15000ms');
+    const rejection = expect(request).rejects.toThrow('SORA block data endpoint connection timed out after 15000ms');
     await vi.advanceTimersByTimeAsync(15_000);
     await rejection;
     expect(polkadotMocks.providers[0].disconnect).toHaveBeenCalledOnce();
@@ -174,24 +170,26 @@ describe('PI chain API connection deadlines', () => {
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as TimeoutIndexer;
     indexer.api = primary;
     indexer.primaryProvider = provider;
-    indexer.finalizedHeadUnsubscribe = unsubscribe;
+    indexer.unsubscribeFinalizedHeads = unsubscribe;
     indexer.finalizedHeadRetryTimer = setTimeout(() => undefined, 60_000);
     indexer.finalizedHeadPollTimer = setInterval(() => undefined, 60_000);
     indexer.derivedStateRefreshRetryTimer = setTimeout(() => undefined, 60_000);
     indexer.priceStreamRefreshRetryTimer = setTimeout(() => undefined, 60_000);
     indexer.polkamarktStateRefreshRetryTimer = setTimeout(() => undefined, 60_000);
+    indexer.xorBurnBackfillRetryTimer = setTimeout(() => undefined, 60_000);
 
     await expect(indexer.stop()).resolves.toBeUndefined();
 
     expect(unsubscribe).toHaveBeenCalledOnce();
     expect(primary.disconnect).toHaveBeenCalledOnce();
     expect(provider.disconnect).toHaveBeenCalledOnce();
-    expect(indexer.finalizedHeadUnsubscribe).toBeNull();
+    expect(indexer.unsubscribeFinalizedHeads).toBeNull();
     expect(indexer.finalizedHeadRetryTimer).toBeNull();
     expect(indexer.finalizedHeadPollTimer).toBeNull();
     expect(indexer.derivedStateRefreshRetryTimer).toBeNull();
     expect(indexer.priceStreamRefreshRetryTimer).toBeNull();
     expect(indexer.polkamarktStateRefreshRetryTimer).toBeNull();
+    expect(indexer.xorBurnBackfillRetryTimer).toBeNull();
     expect(vi.getTimerCount()).toBe(0);
   });
 });

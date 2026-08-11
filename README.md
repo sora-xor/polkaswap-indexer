@@ -50,6 +50,16 @@ both complete profiles together because they intentionally publish the same
 host port.
 
 By default the worker reads finalized SORA blocks from `wss://mof2.sora.org`.
+Before it constructs or migrates the database, startup proves both the reviewed
+SORA mainnet genesis
+`0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5`
+and audited history anchor block `26872383` with hash
+`0x28dd415867e637e5c70056a564cfa4e81f0f3df3a18d1132ccc61fe5025c762c`.
+The worker repeats that proof before any repository read, persists the fixed
+audited anchor as an immutable `chainIdentity` checkpoint, and validates every
+configured archive endpoint independently. There is no environment override or
+skip switch for this proof.
+
 The direct `@babel/runtime` dependency is intentional: the published
 `@sora-substrate/type-definitions` CommonJS build imports Babel helpers at
 runtime without declaring that package itself.
@@ -187,7 +197,10 @@ The one-shot `dist/src/scripts/production-migrate.js` wrapper validates the URL
 topology, all three live database session identities, and pre-DDL role
 privileges, then invokes the PostgreSQL schema migration with the owner
 configuration, atomically applies the exact per-table runtime grants, and
-verifies them. The migration uses
+verifies them. Storage-derived analytics still treat the reviewed primary RPC
+as a trusted input, so operators must use a locally controlled verifying primary
+and an independently operated archival endpoint rather than public convenience
+RPCs for release evidence. The migration uses
 `POSTGRES_MIGRATION_QUERY_TIMEOUT_MS` and
 `POSTGRES_MIGRATION_STATEMENT_TIMEOUT_MS`, both defaulting to `0` (unlimited),
 instead of the bounded runtime query deadlines. Check constraints are installed
@@ -582,7 +595,6 @@ the one-shot credential preflight is the fail-closed URL and live-session role
 and privilege check and runs before every schema migration.
 Production services retain four minutes of graceful-stop time—longer than the
 internal 30-second shutdown deadline—and use bounded local log rotation.
-
 The production worker overrides the image's API healthcheck with
 `dist/src/scripts/worker-health.js`. This probe has no HTTP or API-container
 dependency. It uses the worker's existing `DATABASE_URL` to require the exact
@@ -626,6 +638,21 @@ The smoke query requires `_health` to identify this service as
 route points at the TON or Solana indexer contracts. Production smoke always
 requires an available, ready, running, startup-complete worker with internally
 consistent finalized, indexed, lag, heartbeat, and commit-time details.
+
+The same request requires the exact reviewed genesis in `_health`, a strictly
+shaped immutable `chainIdentity`, and a `chainState` containing the same genesis,
+a positive block height, its nonzero lowercase 32-byte hash, and its chain
+timestamp. `_health` must reproduce that checkpoint exactly, and the latest
+filtered `BLOCK` snapshot must have ID `block-<height>` and the same timestamp.
+The checkpoint may be at most 300 seconds old or 30 seconds ahead of the smoke
+clock. Static `chainId`/`network` labels alone never satisfy the contract. The
+client refuses
+redirects, uses a 10-second total deadline, accepts exact JSON media types
+(including `application/graphql-response+json`), and caps decoded responses at
+1 MiB. Diagnostic overrides are bounded by 60 seconds, 5 MiB, and one hour via
+`POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS`,
+`POLKASWAP_INDEXER_SMOKE_MAX_RESPONSE_BYTES`, and
+`POLKASWAP_INDEXER_SMOKE_MAX_INDEXER_AGE_SEC`.
 
 Production release evidence is tracked in
 `scripts/production-deployment-evidence.json`. The committed manifest must stay

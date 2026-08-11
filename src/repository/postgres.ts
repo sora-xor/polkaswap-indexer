@@ -44,7 +44,6 @@ import type { AppConfig } from '../config.js';
 const { Pool } = pg;
 
 const NUMERIC_TEXT_PATTERN = "^-?[0-9]+(\\.[0-9]+)?$";
-
 const afterToOffset = (after: RepositoryQueryArgs['after']): number => {
   if (after === null || after === undefined || after === '') return 0;
 

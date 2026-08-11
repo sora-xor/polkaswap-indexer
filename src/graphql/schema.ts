@@ -58,9 +58,9 @@ export const typeDefs = /* GraphQL */ `
     publicBaseUrl: String!
     readOnly: Boolean!
     genesisHash: String
-    latestIndexedBlock: Int
+    latestIndexedBlock: Float
     latestIndexedBlockHash: String
-    latestIndexedAt: Int
+    latestIndexedAt: Float
     workerAvailable: Boolean!
     workerReady: Boolean
     workerReadinessReason: String
