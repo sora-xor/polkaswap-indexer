@@ -1,0 +1,18 @@
+# Owners must have write access to this repository.
+
+* @takemiyamakoto
+
+/.github/ @takemiyamakoto
+/CONTRIBUTING.md @takemiyamakoto
+/README.md @takemiyamakoto
+/docs/ @takemiyamakoto
+/Dockerfile @takemiyamakoto
+/docker-compose*.yml @takemiyamakoto
+/scripts/ @takemiyamakoto
+
+/src/config.ts @takemiyamakoto
+/src/index.ts @takemiyamakoto
+/src/server.ts @takemiyamakoto
+/src/graphql/ @takemiyamakoto
+/src/repository/ @takemiyamakoto
+/src/worker/ @takemiyamakoto

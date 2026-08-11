@@ -48,6 +48,7 @@ export const typeDefs = /* GraphQL */ `
 
   type Health {
     ok: Boolean!
+    repositoryReady: Boolean!
     service: String!
     serviceId: String!
     schemaVersion: Int!
@@ -56,6 +57,21 @@ export const typeDefs = /* GraphQL */ `
     network: String!
     publicBaseUrl: String!
     readOnly: Boolean!
+    genesisHash: String
+    latestIndexedBlock: Int
+    latestIndexedBlockHash: String
+    latestIndexedAt: Int
+    workerAvailable: Boolean!
+    workerReady: Boolean
+    workerReadinessReason: String
+    workerLifecycle: String
+    workerStartupComplete: Boolean
+    workerLatestFinalizedBlock: Float
+    workerLatestIndexedBlock: Float
+    workerLag: Float
+    workerLastSuccessfulIndexTimestamp: Float
+    workerLastError: String
+    workerLastErrorTimestamp: Float
   }
 
   type MobileChainNode {
@@ -68,6 +84,11 @@ export const typeDefs = /* GraphQL */ `
     substrateTypesUrl: String
     soracard: Boolean!
     nodes: [MobileChainNode!]!
+    nexusAvailable: Boolean!
+    nexusSendsAvailable: Boolean!
+    polkamarktVisible: Boolean!
+    polkamarktMutationsAvailable: Boolean!
+    tairaDefaultVisible: Boolean!
   }
 
   type PageInfo {
@@ -321,6 +342,55 @@ export const typeDefs = /* GraphQL */ `
     updatedAtTimestamp: Int
   }
 
+  type PolkamarktSignalPoint {
+    label: String!
+    value: Float!
+  }
+
+  type PolkamarktSignalAnswerBreakdown {
+    answer: String!
+    volumeUsd: Float!
+    markets: Int!
+  }
+
+  type PolkamarktSignalAccuracyMarket {
+    marketId: Int!
+    title: String!
+    outcome: String!
+    predictedOutcome: String!
+    confidencePercent: Float!
+    yesProbability: Float!
+    correct: Boolean!
+    label: String!
+  }
+
+  type PolkamarktSignalAccuracySummary {
+    scoredMarkets: Int!
+    resolvedMarkets: Int!
+    correctMarkets: Int!
+    accuracyPercent: Float!
+    averageConfidencePercent: Float!
+    latest: PolkamarktSignalAccuracyMarket
+  }
+
+  type PolkamarktSignalAccuracyPoint {
+    label: String!
+    value: Float!
+    correctMarkets: Int!
+    scoredMarkets: Int!
+  }
+
+  type PolkamarktSignals {
+    totalVolumeUsd: Float!
+    activeMarkets: Int!
+    activeAccounts: Int!
+    liquidityUsd: Float!
+    liquiditySeries: [PolkamarktSignalPoint!]!
+    answerBreakdown: [PolkamarktSignalAnswerBreakdown!]!
+    accuracySummary: PolkamarktSignalAccuracySummary
+    accuracySeries: [PolkamarktSignalAccuracyPoint!]!
+  }
+
   type AccountPosition {
     id: String!
     account: String
@@ -331,6 +401,8 @@ export const typeDefs = /* GraphQL */ `
     noShares: String
     netCollateralPaid: String
     costBasisUsd: String
+    yesCostBasisUsd: String
+    noCostBasisUsd: String
     marketValueUsd: String
     realizedPnlUsd: String
     unrealizedPnlUsd: String
@@ -787,32 +859,33 @@ export const typeDefs = /* GraphQL */ `
     _health: Health!
     mobileConfig: MobileConfig!
     account(id: String!): JSON
-    assets(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AssetFilter): AssetConnection!
-    assetSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AssetSnapshotFilter): AssetSnapshotConnection!
-    accountLiquiditySnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountLiquiditySnapshotFilter): AccountLiquiditySnapshotConnection!
+    assets(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AssetFilter): AssetConnection!
+    assetSnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AssetSnapshotFilter): AssetSnapshotConnection!
+    accountLiquiditySnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AccountLiquiditySnapshotFilter): AccountLiquiditySnapshotConnection!
     market(id: String!): Market
-    markets(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: MarketFilter): MarketConnection!
-    marketSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: MarketSnapshotFilter): MarketSnapshotConnection!
-    networkSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: NetworkSnapshotFilter): NetworkSnapshotConnection!
-    poolXYKs(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: PoolXYKFilter): PoolXYKConnection!
-    poolSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: PoolSnapshotFilter): PoolSnapshotConnection!
+    markets(first: Int, after: Cursor, orderBy: [OrderBy!], filter: MarketFilter): MarketConnection!
+    marketSnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: MarketSnapshotFilter): MarketSnapshotConnection!
+    networkSnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: NetworkSnapshotFilter): NetworkSnapshotConnection!
+    poolXYKs(first: Int, after: Cursor, orderBy: [OrderBy!], filter: PoolXYKFilter): PoolXYKConnection!
+    poolSnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: PoolSnapshotFilter): PoolSnapshotConnection!
     orderBook(id: String!): OrderBook
-    orderBooks(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: OrderBookFilter): OrderBookConnection!
-    orderBookOrders(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: OrderBookOrderFilter): OrderBookOrderConnection!
-    orderBookSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: OrderBookSnapshotFilter): OrderBookSnapshotConnection!
-    historyElements(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [HistoryElementsOrderBy!], filter: HistoryElementFilter): HistoryElementConnection!
-    xorBurns(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [HistoryElementsOrderBy!], filter: XorBurnFilter): XorBurnConnection!
-    referrerRewards(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: ReferrerRewardFilter): ReferrerRewardConnection!
-    stakingStakers(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountFilter): StakingStakerConnection!
-    stakingValidators(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: StakingValidatorFilter): StakingValidatorConnection!
-    vaults(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: VaultFilter): VaultConnection!
-    vaultEvents(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: VaultEventFilter): VaultEventConnection!
+    orderBooks(first: Int, after: Cursor, orderBy: [OrderBy!], filter: OrderBookFilter): OrderBookConnection!
+    orderBookOrders(first: Int, after: Cursor, orderBy: [OrderBy!], filter: OrderBookOrderFilter): OrderBookOrderConnection!
+    orderBookSnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: OrderBookSnapshotFilter): OrderBookSnapshotConnection!
+    historyElements(first: Int, last: Int, offset: Int, before: Cursor, after: Cursor, orderBy: [HistoryElementsOrderBy!], filter: HistoryElementFilter): HistoryElementConnection!
+    xorBurns(first: Int, after: Cursor, orderBy: [HistoryElementsOrderBy!], filter: XorBurnFilter): XorBurnConnection!
+    referrerRewards(first: Int, after: Cursor, orderBy: [OrderBy!], filter: ReferrerRewardFilter): ReferrerRewardConnection!
+    stakingStakers(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AccountFilter): StakingStakerConnection!
+    stakingValidators(first: Int, after: Cursor, orderBy: [OrderBy!], filter: StakingValidatorFilter): StakingValidatorConnection!
+    vaults(first: Int, after: Cursor, orderBy: [OrderBy!], filter: VaultFilter): VaultConnection!
+    vaultEvents(first: Int, offset: Int, after: Cursor, orderBy: [OrderBy!], filter: VaultEventFilter): VaultEventConnection!
     updatesStream(id: String!): UpdatesStream
     accountMeta(id: String!): AccountMeta
-    accountPointSystems(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountFilter): AccountPointSystemConnection!
-    accountPositions(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountPositionFilter, where: AccountPositionFilter): AccountPositionConnection!
-    accountTrades(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountTradeFilter, where: AccountTradeFilter): AccountTradeConnection!
+    accountPointSystems(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AccountFilter): AccountPointSystemConnection!
+    accountPositions(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AccountPositionFilter, where: AccountPositionFilter): AccountPositionConnection!
+    accountTrades(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AccountTradeFilter, where: AccountTradeFilter): AccountTradeConnection!
     exploreStats: ExploreStats!
+    polkamarktSignals: PolkamarktSignals!
     networkAccountActivity(from: Int!, to: Int!): NetworkAccountActivity!
   }
 

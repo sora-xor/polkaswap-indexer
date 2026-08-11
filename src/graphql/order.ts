@@ -65,6 +65,7 @@ export const NUMERIC_ORDER_FIELDS = new Set([
   'chameleonAssetReserves',
   'poolTokenSupply',
   'supply',
+  'strategicBonusApy',
 ]);
 
 const snakeToCamel = (value: string): string => {

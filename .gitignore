@@ -14,6 +14,17 @@ coverage/
 .playwright-cli*
 *.tsbuildinfo
 
+# Runtime databases, migration artifacts, backups, and generated output
+/data/
+/rocksdb/
+/backups/
+/checkpoints/
+/output/
+*.rocksdb
+*.rocksdb/
+**/*-backups/
+**/*-checkpoints/
+
 # Local environment files
 .env
 .env.*
