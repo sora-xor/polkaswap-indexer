@@ -22,10 +22,11 @@ describe('production container contract', () => {
     expect(dockerfile).toContain('yarn workspaces focus --all --production');
     expect(dockerfile).toContain('COPY --from=production-dependencies --chown=node:node /app/node_modules');
     expect(dockerfile).toContain('RUN install -d -o node -g node /data');
-    expect(dockerfile).toContain('ENV ROCKSDB_PATH=/data/polkaswap-indexer.rocksdb');
+    expect(dockerfile).toContain('ROCKSDB_PATH=/data/polkaswap-indexer.rocksdb');
     expect(dockerfile).toContain('COPY --chown=node:node LICENSE ./LICENSE');
     expect(dockerfile).toMatch(/\nUSER node\n/);
     expect(dockerfile).toContain('STOPSIGNAL SIGTERM');
+    expect(dockerfile).toContain('ENTRYPOINT ["docker-entrypoint.sh"]');
     expect(dockerfile).toContain('CMD ["node", "dist/src/index.js"]');
   });
 
@@ -35,6 +36,7 @@ describe('production container contract', () => {
     };
     const expectedScripts = [
       'db:migrate:dist',
+      'db:migrate:production:dist',
       'storage:migrate:postgres-to-rocksdb:dist',
       'storage:verify:rocksdb:dist',
       'storage:backup:rocksdb:dist',
@@ -67,6 +69,14 @@ describe('production container contract', () => {
     expect(command[2]).toContain('process.env.PORT');
     expect(command[2]).toContain('process.env.GRAPHQL_PATH');
     expect(command[2]).toContain("'http://127.0.0.1:'+port+path");
+    expect(command[2]).toContain(
+      "spawn(process.execPath,['dist/src/scripts/production-smoke.js',endpoint]"
+    );
+    expect(command[2]).toContain("stdio:'ignore'");
+    expect(command[2]).toContain("POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS:'4000'");
+    expect(command[2]).toContain("child.once('error',()=>process.exit(1))");
+    expect(command[2]).toContain("child.once('exit',code=>process.exit(code??1))");
+    expect(command[2]).toContain(".catch(()=>process.exit(1))");
     expect(command[2]).not.toContain('http://127.0.0.1:4350/graphql');
   });
 
@@ -102,6 +112,54 @@ describe('production container contract', () => {
 
     expect(composeService(compose, 'api')).toContain('POSTGRES_API_DATABASE_URL');
     expect(composeService(compose, 'worker')).toContain('POSTGRES_WORKER_DATABASE_URL');
+  });
+
+  it('isolates the production migration owner from migration-disabled runtime roles', async () => {
+    const compose = await readProjectFile('docker-compose.production.yml');
+    const migration = composeService(compose, 'migrate');
+    const api = composeService(compose, 'api');
+    const worker = composeService(compose, 'worker');
+
+    expect(compose.match(/<<: \*runtime-security/g)).toHaveLength(3);
+    expect(migration).toContain('restart: "no"');
+    expect(migration).toContain('["node", "dist/src/scripts/production-migrate.js"]');
+    expect(migration).toContain('POLKASWAP_MIGRATION_OWNER_DATABASE_URL:?');
+    expect(migration).toContain('POLKASWAP_API_DATABASE_URL:?');
+    expect(migration).toContain('POLKASWAP_WORKER_DATABASE_URL:?');
+    expect(migration).toContain('disable: true');
+    expect(migration).not.toContain('SKIP_POSTGRES_MIGRATION');
+    expect(migration).not.toContain('ports:');
+
+    for (const service of [api, worker]) {
+      expect(service).toContain('depends_on:\n      migrate:\n        condition: service_completed_successfully');
+      expect(service).toContain('SKIP_POSTGRES_MIGRATION: "true"');
+      expect(service).not.toContain('POLKASWAP_MIGRATION_OWNER_DATABASE_URL');
+    }
+
+    expect(api).toContain('POLKASWAP_API_DATABASE_URL:?');
+    expect(api).not.toContain('POLKASWAP_WORKER_DATABASE_URL');
+    expect(api).toContain('command: ["node", "dist/src/index.js"]');
+    expect(api).not.toContain('entrypoint:');
+    expect(api).not.toContain('dist/src/db/migrate.js');
+    expect(worker).toContain('POLKASWAP_WORKER_DATABASE_URL:?');
+    expect(worker).not.toContain('POLKASWAP_API_DATABASE_URL');
+    expect(worker).toContain('command: ["node", "dist/src/worker/index.js"]');
+    expect(worker).not.toContain('entrypoint:');
+    expect(worker).not.toContain('dist/src/db/migrate.js');
+    expect(compose).not.toContain('POLKASWAP_DATABASE_URL');
+  });
+
+  it('keeps production shutdown and logs bounded without documenting credential-rendering validation', async () => {
+    const compose = await readProjectFile('docker-compose.production.yml');
+    const readme = await readProjectFile('README.md');
+
+    expect(compose).toContain('stop_grace_period: 4m');
+    expect(compose).toContain('logging: *bounded-logging');
+    expect(compose).toContain('max-size: "10m"');
+    expect(compose).toContain('max-file: "5"');
+    expect(readme).toContain('docker compose -f docker-compose.production.yml config --quiet');
+    expect(readme).toContain('docker compose -f docker-compose.production.yml config --no-interpolate');
+    expect(readme).not.toMatch(/docker compose -f docker-compose\.production\.yml config\s*\n/);
   });
 
   it('keeps the PostgreSQL and RocksDB Compose profiles mutually exclusive', async () => {

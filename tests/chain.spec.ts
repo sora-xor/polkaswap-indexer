@@ -62,6 +62,13 @@ const config = {
   httpHeadersTimeoutMs: 80_000,
   httpRequestTimeoutMs: 120_000,
   httpMaxConnections: 10_000,
+  httpMaxHeaderBytes: 16_384,
+  httpMaxRequestsPerSocket: 1_000,
+  rateLimitWindowMs: 60_000,
+  rateLimitMax: 600,
+  rateLimitMaxKeys: 20_000,
+  rateLimitGlobalWindowMs: 60_000,
+  rateLimitGlobalMax: 50_000,
   graphqlHttpMaxBodyBytes: 262_144,
   graphqlHttpMaxInFlight: 100,
   graphqlMaxDepth: 12,
@@ -74,6 +81,7 @@ const config = {
   graphqlWsMaxPayloadBytes: 65_536,
   graphqlWsConnectionInitTimeoutMs: 30_000,
   graphqlWsMaxConnections: 1_000,
+  graphqlWsMaxConnectionsPerClient: 16,
   graphqlWsMaxOperations: 2_000,
   graphqlWsMaxOperationsPerConnection: 20,
   graphqlWsMaxPendingMessagesPerConnection: 64,
@@ -4925,15 +4933,7 @@ describe('ChainIndexer price derivation', () => {
     const order: string[] = [];
     let finishBackfill: (() => void) | undefined;
     let finishMaintenance: (() => void) | undefined;
-    const apiCreate = vi.spyOn(ApiPromise, 'create').mockResolvedValue({
-      disconnect: vi.fn(async () => undefined),
-      rpc: {
-        chain: {
-          getFinalizedHead: async () => '0xfinal',
-          getHeader: async () => ({ number: { toNumber: () => 25_900_000 } }),
-        },
-      },
-    } as never);
+    const apiCreate = vi.spyOn(ApiPromise, 'create').mockResolvedValue(mainnetStartApi() as never);
 
     indexer.backfill = async () => {
       order.push('normal-backfill-start');
@@ -5020,7 +5020,9 @@ describe('ChainIndexer price derivation', () => {
           },
         }) as IndexerDocument
     );
-    await expect(indexer.getLastIndexedBlock()).rejects.toThrow('Stored chainState document is malformed');
+    await expect(indexer.getLastIndexedBlock()).rejects.toThrow(
+      'Stored PI chainState checkpoint is malformed'
+    );
   });
 
 
@@ -5083,8 +5085,16 @@ describe('ChainIndexer price derivation', () => {
 
   it('skips expensive derived-state refreshes while backfilling historical blocks', async () => {
     const repository = new MemoryRepository();
+    const startBlock = SORA_LEGACY_IDENTITY_ANCHOR.block;
+    const finalizedBlock = startBlock + 3;
+    const finalizedHash = canonicalBlockHash(`finalized-${finalizedBlock}`);
     const indexer = new ChainIndexer(
-      { ...config, stateRefreshIntervalBlocks: 1, snapshotIntervalBlocks: 1 },
+      {
+        ...config,
+        chainStartBlock: startBlock,
+        stateRefreshIntervalBlocks: 1,
+        snapshotIntervalBlocks: 1,
+      },
       repository
     ) as unknown as {
       api: unknown;
@@ -5100,8 +5110,11 @@ describe('ChainIndexer price derivation', () => {
     indexer.api = {
       rpc: {
         chain: {
-          getFinalizedHead: async () => '0xfinal',
-          getHeader: async () => ({ number: { toNumber: () => 3 } }),
+          getFinalizedHead: async () => ({ toString: () => finalizedHash }),
+          getHeader: async () => ({
+            number: { toNumber: () => finalizedBlock },
+            hash: { toString: () => finalizedHash },
+          }),
         },
       },
     };
@@ -5116,9 +5129,10 @@ describe('ChainIndexer price derivation', () => {
     await indexer.backfill();
 
     expect(indexedBlocks).toEqual([
-      { block: 1, refreshDerivedState: false },
-      { block: 2, refreshDerivedState: false },
-      { block: 3, refreshDerivedState: false },
+      { block: startBlock, refreshDerivedState: false },
+      { block: startBlock + 1, refreshDerivedState: false },
+      { block: startBlock + 2, refreshDerivedState: false },
+      { block: finalizedBlock, refreshDerivedState: false },
     ]);
     expect(refreshes).toEqual([]);
   });
@@ -5135,6 +5149,7 @@ describe('ChainIndexer price derivation', () => {
     };
     const failure = new Error('refresh query timeout');
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const requestedHash = canonicalBlockHash('scheduled-refresh-10');
 
     indexer.api = {
       rpc: {
@@ -5164,6 +5179,7 @@ describe('ChainIndexer price derivation', () => {
         },
       },
     };
+    markIndexerMainnet(indexer);
     indexer.refreshDerivedState = async () => {
       throw failure;
     };

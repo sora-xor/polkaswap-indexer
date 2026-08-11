@@ -5,6 +5,9 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DOCKERFILE="${1:-$ROOT_DIR/Dockerfile}"
 DOCKERIGNORE="${2:-$ROOT_DIR/.dockerignore}"
 PRODUCTION_COMPOSE="${3:-$ROOT_DIR/docker-compose.production.yml}"
+README_FILE="${4:-$ROOT_DIR/README.md}"
+ENV_EXAMPLE="${5:-$ROOT_DIR/.env.example}"
+RESOLVED_AUDIT_SCRIPT="$ROOT_DIR/scripts/audit-resolved-deployment-manifest.mjs"
 FAILURES=0
 NODE_IMAGE='node:24-bookworm-slim@sha256:cb4e8f7c443347358b7875e717c29e27bf9befc8f5a26cf18af3c3dec80e58c5'
 
@@ -22,6 +25,62 @@ require_literal() {
   fi
 }
 
+require_healthcheck_literal() {
+  local literal="$1"
+  local label="$2"
+  if [[ "$RUNTIME_HEALTHCHECK_SOURCE" != *"$literal"* ]]; then
+    fail "$label"
+  fi
+}
+
+service_section() {
+  local service="$1"
+  awk -v service="$service" '
+    $0 == "  " service ":" { in_service = 1 }
+    in_service && /^  [A-Za-z0-9_-]+:$/ && $0 != "  " service ":" { exit }
+    in_service { print }
+  ' "$PRODUCTION_COMPOSE"
+}
+
+require_exact_migration_dependency() {
+  local service="$1"
+  local section="$2"
+  local dependency_block
+  local expected
+  dependency_block="$(awk '
+    /^    depends_on:$/ { in_dependencies = 1 }
+    in_dependencies && /^    [A-Za-z0-9_-]+:$/ && $0 != "    depends_on:" { exit }
+    in_dependencies { print }
+  ' <<<"$section")"
+  expected=$'    depends_on:\n      migrate:\n        condition: service_completed_successfully'
+  if [[ "$dependency_block" != "$expected" ]]; then
+    fail "$service must depend exactly on successful completion of the one-shot migration"
+  fi
+}
+
+require_exact_service_keys() {
+  local service="$1"
+  local section="$2"
+  local expected="$3"
+  local actual
+  actual="$(
+    awk '
+      /^    <<:/ {
+        print "<<"
+        next
+      }
+      /^    [A-Za-z0-9_-]+:/ {
+        key = $1
+        sub(/:$/, "", key)
+        print key
+      }
+    ' <<<"$section" | LC_ALL=C sort | paste -sd, -
+  )"
+  if [[ "$actual" != "$expected" ]]; then
+    fail "$service must contain only its exact audited top-level service keys"
+  fi
+}
+
 [[ -f "$DOCKERFILE" ]] || {
   echo "[deployment-manifest][error] Dockerfile missing: $DOCKERFILE" >&2
   exit 1
@@ -34,9 +93,26 @@ require_literal() {
   echo "[deployment-manifest][error] Production Compose missing: $PRODUCTION_COMPOSE" >&2
   exit 1
 }
+[[ -f "$README_FILE" ]] || {
+  echo "[deployment-manifest][error] README missing: $README_FILE" >&2
+  exit 1
+}
+[[ -f "$ENV_EXAMPLE" ]] || {
+  echo "[deployment-manifest][error] .env.example missing: $ENV_EXAMPLE" >&2
+  exit 1
+}
+[[ -f "$RESOLVED_AUDIT_SCRIPT" ]] || {
+  echo "[deployment-manifest][error] Resolved Compose auditor missing: $RESOLVED_AUDIT_SCRIPT" >&2
+  exit 1
+}
 
 if grep -Eq '\|\|[[:space:]]*yarn[[:space:]]+install' "$DOCKERFILE"; then
   fail "Dockerfile must not fall back to a mutable yarn install"
+fi
+
+if grep -Eq '^[[:space:]]*(ENV[[:space:]]+)?(NODE_OPTIONS|NODE_TLS_REJECT_UNAUTHORIZED|PG[A-Z0-9_]*)([=:[:space:]]|$)' \
+  "$DOCKERFILE" "$PRODUCTION_COMPOSE"; then
+  fail "production image and Compose must not set Node or PostgreSQL process overrides"
 fi
 
 require_literal "$DOCKERFILE" "FROM $NODE_IMAGE AS dependencies" "Dockerfile must pin the dependency-stage Node image by digest"
@@ -47,15 +123,86 @@ require_literal "$DOCKERFILE" "FROM $NODE_IMAGE AS runtime" "Dockerfile must pin
 require_literal "$DOCKERFILE" 'COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules' "runtime must copy only production-focused node_modules"
 require_literal "$DOCKERFILE" 'COPY --from=build --chown=node:node /app/dist ./dist' "runtime must copy compiled output from the build stage"
 require_literal "$DOCKERFILE" 'USER node' "runtime must use the non-root node user"
+if [[ "$(grep -Fxc 'ENTRYPOINT ["docker-entrypoint.sh"]' "$DOCKERFILE")" -ne 1 ]] ||
+   [[ "$(grep -Ec '^ENTRYPOINT ' "$DOCKERFILE")" -ne 1 ]]; then
+  fail "runtime image must use exactly the pinned Node exec entrypoint"
+fi
+if [[ "$(grep -Fxc 'CMD ["node", "dist/src/index.js"]' "$DOCKERFILE")" -ne 1 ]] ||
+   [[ "$(grep -Ec '^CMD ' "$DOCKERFILE")" -ne 1 ]]; then
+  fail "runtime image must use exactly the compiled API default command"
+fi
+RUNTIME_HEALTHCHECK_SOURCE=''
+if ! RUNTIME_HEALTHCHECK_SOURCE="$(node - "$DOCKERFILE" <<'NODE'
+const fs = require('node:fs');
+
+const lines = fs.readFileSync(process.argv[2], 'utf8').split(/\r?\n/);
+const healthcheckIndexes = lines
+  .map((line, index) => line.startsWith('HEALTHCHECK ') ? index : -1)
+  .filter((index) => index >= 0);
+if (healthcheckIndexes.length !== 1) process.exit(1);
+
+const commandLine = lines[healthcheckIndexes[0] + 1]?.trimStart() ?? '';
+if (!commandLine.startsWith('CMD [')) process.exit(1);
+
+let command;
+try {
+  command = JSON.parse(commandLine.slice('CMD '.length));
+} catch {
+  process.exit(1);
+}
+if (
+  !Array.isArray(command) ||
+  command.length !== 3 ||
+  command[0] !== 'node' ||
+  command[1] !== '-e' ||
+  typeof command[2] !== 'string'
+) process.exit(1);
+
+try {
+  new Function(command[2]);
+} catch {
+  process.exit(1);
+}
+process.stdout.write(command[2]);
+NODE
+)"; then
+  fail "runtime healthcheck must use exactly one syntactically valid JSON exec-form Node command"
+fi
 require_literal "$DOCKERFILE" 'GRAPHQL_HTTP_MAX_BODY_BYTES=65536' "runtime image must default to a bounded GraphQL HTTP body"
 require_literal "$DOCKERFILE" 'RATE_LIMIT_MAX_KEYS=20000' "runtime image must bound rate-limit identities"
 require_literal "$DOCKERFILE" 'RATE_LIMIT_GLOBAL_MAX=50000' "runtime image must enable the global rate bucket"
 require_literal "$DOCKERFILE" 'GRAPHQL_ALLOW_INTROSPECTION=false' "runtime image must disable production introspection"
 require_literal "$DOCKERFILE" 'GRAPHQL_WS_MAX_CONNECTIONS=512' "runtime image must bound WebSocket connections"
 require_literal "$DOCKERFILE" 'GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION=32' "runtime image must bound WebSocket operations"
-require_literal "$DOCKERFILE" 'POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS=4000' "runtime healthcheck must use a deadline shorter than its container timeout"
-require_literal "$DOCKERFILE" 'node dist/src/scripts/production-smoke.js' "runtime healthcheck must reuse the complete PI identity smoke contract"
-require_literal "$DOCKERFILE" 'http://127.0.0.1:${PORT:-4350}${GRAPHQL_PATH:-/graphql}' "runtime healthcheck must probe the loopback GraphQL endpoint"
+mobile_capability_suffixes=(
+  NEXUS_AVAILABLE
+  NEXUS_SENDS_AVAILABLE
+  POLKAMARKT_VISIBLE
+  POLKAMARKT_MUTATIONS_AVAILABLE
+  TAIRA_DEFAULT_VISIBLE
+)
+mobile_capability_defaults=(true false true false true)
+for index in "${!mobile_capability_suffixes[@]}"; do
+  capability="MOBILE_CONFIG_${mobile_capability_suffixes[$index]}"
+  deployment_input="POLKASWAP_${capability}"
+  capability_default="${mobile_capability_defaults[$index]}"
+  require_literal "$DOCKERFILE" "${capability}=${capability_default}" "runtime image must pin the reviewed ${capability} tester default"
+  capability_assignment_count="$({ grep -Fo "${capability}=" "$DOCKERFILE" || true; } | awk 'END { print NR }')"
+  if [[ "$capability_assignment_count" -ne 1 ]]; then
+    fail "runtime image must assign ${capability} exactly once"
+  fi
+  require_literal "$ENV_EXAMPLE" "${capability}=${capability_default}" ".env.example must document the direct-process ${capability} tester default"
+  require_literal "$ENV_EXAMPLE" "${deployment_input}=${capability_default}" ".env.example must document the production Compose ${deployment_input} tester default"
+done
+require_healthcheck_literal "spawn(process.execPath,['dist/src/scripts/production-smoke.js',endpoint]" "runtime healthcheck must reuse the complete PI identity smoke contract"
+require_healthcheck_literal "stdio:'ignore'" "runtime healthcheck must isolate smoke output from container health status"
+require_healthcheck_literal "POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS:'4000'" "runtime healthcheck must use a deadline shorter than its container timeout"
+require_healthcheck_literal "process.env.PORT??'4350'" "runtime healthcheck must derive its port from the runtime environment"
+require_healthcheck_literal "process.env.GRAPHQL_PATH??'/graphql'" "runtime healthcheck must derive its GraphQL path from the runtime environment"
+require_healthcheck_literal "const endpoint='http://127.0.0.1:'+port+path" "runtime healthcheck must probe the loopback GraphQL endpoint"
+require_healthcheck_literal "child.once('error',()=>process.exit(1))" "runtime healthcheck must fail closed when the smoke child cannot start"
+require_healthcheck_literal "child.once('exit',code=>process.exit(code??1))" "runtime healthcheck must propagate the smoke child exit status"
+require_healthcheck_literal ".catch(()=>process.exit(1))" "runtime healthcheck must fail closed when healthcheck setup fails"
 
 require_literal "$PRODUCTION_COMPOSE" 'image: "${POLKASWAP_INDEXER_IMAGE_REPOSITORY:?' "Production Compose must require an external image repository"
 require_literal "$PRODUCTION_COMPOSE" '@sha256:${POLKASWAP_INDEXER_IMAGE_DIGEST:?' "Production Compose must require an immutable image digest"
@@ -66,7 +213,11 @@ require_literal "$PRODUCTION_COMPOSE" '    - ALL' "Production Compose must drop 
 require_literal "$PRODUCTION_COMPOSE" 'no-new-privileges:true' "Production Compose must prevent privilege escalation"
 require_literal "$PRODUCTION_COMPOSE" 'pids_limit: 128' "Production Compose must bound process IDs"
 require_literal "$PRODUCTION_COMPOSE" '/tmp:rw,noexec,nosuid,nodev,size=16m' "Production Compose must use a bounded no-exec tmpfs"
-require_literal "$PRODUCTION_COMPOSE" 'DATABASE_URL: "${POLKASWAP_DATABASE_URL:?' "Production Compose must require an external database URL"
+require_literal "$PRODUCTION_COMPOSE" 'stop_grace_period: 4m' "Production Compose must allow the runtime shutdown deadline to drain"
+require_literal "$PRODUCTION_COMPOSE" 'logging: *bounded-logging' "Production Compose must apply bounded logging to every service"
+require_literal "$PRODUCTION_COMPOSE" 'driver: local' "Production Compose must use the bounded local logging driver"
+require_literal "$PRODUCTION_COMPOSE" 'max-size: "10m"' "Production Compose must bound each log file"
+require_literal "$PRODUCTION_COMPOSE" 'max-file: "5"' "Production Compose must bound retained log files"
 require_literal "$PRODUCTION_COMPOSE" 'SORA_WS_ENDPOINT: "${POLKASWAP_SORA_WS_ENDPOINT:?' "Production Compose must require an external SORA endpoint"
 require_literal "$PRODUCTION_COMPOSE" 'SORA_ARCHIVE_WS_ENDPOINT: "${POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT:?' "Production Compose must require an independently reviewed SORA archive endpoint"
 require_literal "$PRODUCTION_COMPOSE" 'CHAIN_START_BLOCK: "${POLKASWAP_CHAIN_START_BLOCK:?' "Production Compose must require an explicit reviewed chain start block"
@@ -78,23 +229,104 @@ require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_ALLOW_INTROSPECTION: "false"' "Pr
 require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_WS_MAX_CONNECTIONS: "512"' "Production Compose must bound WebSocket connections"
 require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT: "512"' "Production Compose must avoid treating the loopback proxy as one WebSocket client"
 require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION: "32"' "Production Compose must bound WebSocket operations"
+for index in "${!mobile_capability_suffixes[@]}"; do
+  capability="MOBILE_CONFIG_${mobile_capability_suffixes[$index]}"
+  deployment_input="POLKASWAP_${capability}"
+  capability_default="${mobile_capability_defaults[$index]}"
+  require_literal "$PRODUCTION_COMPOSE" "      ${capability}: \"\${${deployment_input}:-${capability_default}}\"" "Production Compose must expose ${capability} through its exact reviewed deployment input"
+done
 
-if [[ "$(grep -Fc '<<: *runtime-security' "$PRODUCTION_COMPOSE")" -ne 2 ]]; then
-  fail "Production Compose must apply the hardened runtime anchor to both API and worker"
+if [[ "$(grep -Fc '<<: *runtime-security' "$PRODUCTION_COMPOSE")" -ne 3 ]]; then
+  fail "Production Compose must apply the hardened runtime anchor to migration, API, and worker"
 fi
 
-if [[ "$(grep -Fxc '  worker:' "$PRODUCTION_COMPOSE")" -ne 1 ]]; then
-  fail "Production Compose must define the worker service exactly once"
+for service in migrate api worker; do
+  if [[ "$(grep -Fxc "  $service:" "$PRODUCTION_COMPOSE")" -ne 1 ]]; then
+    fail "Production Compose must define the $service service exactly once"
+  fi
+done
+
+migration_service="$(service_section migrate)"
+api_service="$(service_section api)"
+worker_service="$(service_section worker)"
+require_exact_service_keys "migration" "$migration_service" "<<,command,environment,healthcheck,restart"
+require_exact_service_keys "api" "$api_service" "<<,command,depends_on,environment,ports"
+require_exact_service_keys "worker" "$worker_service" "<<,command,depends_on,environment,healthcheck"
+
+if [[ -z "$migration_service" ]]; then
+  fail "Production Compose must define a one-shot migration service"
+else
+  if [[ "$(grep -Fxc '    restart: "no"' <<<"$migration_service")" -ne 1 ]]; then
+    fail "migration must be a restart-disabled one-shot service"
+  fi
+  if [[ "$(grep -Fxc '    command: ["node", "dist/src/scripts/production-migrate.js"]' <<<"$migration_service")" -ne 1 ]]; then
+    fail "migration must run the credential-preflight schema migration command exactly once"
+  fi
+  if [[ "$(grep -Fxc '      disable: true' <<<"$migration_service")" -ne 1 ]]; then
+    fail "migration must disable the inherited long-running service healthcheck"
+  fi
+  if [[ "$(grep -Fxc '      DATABASE_URL: "${POLKASWAP_MIGRATION_OWNER_DATABASE_URL:?Set the separately managed PostgreSQL migration-owner URL}"' <<<"$migration_service")" -ne 1 ]]; then
+    fail "migration must require its separate migration-owner database URL"
+  fi
+  if [[ "$(grep -Ec '^      DATABASE_URL:' <<<"$migration_service")" -ne 1 ]]; then
+    fail "migration must receive exactly one database URL"
+  fi
+  if [[ "$(grep -Fxc '      POLKASWAP_API_DATABASE_URL: "${POLKASWAP_API_DATABASE_URL:?Set the separately managed PostgreSQL API runtime URL}"' <<<"$migration_service")" -ne 1 ]] ||
+     [[ "$(grep -Fxc '      POLKASWAP_WORKER_DATABASE_URL: "${POLKASWAP_WORKER_DATABASE_URL:?Set the separately managed PostgreSQL worker runtime URL}"' <<<"$migration_service")" -ne 1 ]]; then
+    fail "migration preflight must receive the exact API and worker runtime credentials"
+  fi
+  if grep -Fq 'SKIP_POSTGRES_MIGRATION' <<<"$migration_service"; then
+    fail "migration must not disable its own schema migration"
+  fi
+  if grep -Fq 'ports:' <<<"$migration_service"; then
+    fail "migration must not publish any port"
+  fi
 fi
 
-worker_service="$(awk '
-  /^  worker:$/ { in_worker = 1 }
-  in_worker && /^  [A-Za-z0-9_-]+:$/ && $0 != "  worker:" { exit }
-  in_worker { print }
-' "$PRODUCTION_COMPOSE")"
+if [[ -z "$api_service" ]]; then
+  fail "Production Compose must define a standalone API service"
+else
+  require_exact_migration_dependency "api" "$api_service"
+  if [[ "$(grep -Fxc '    command: ["node", "dist/src/index.js"]' <<<"$api_service")" -ne 1 ]]; then
+    fail "api must run only the exact compiled API command"
+  fi
+  if grep -Eq '^    (entrypoint|healthcheck|post_start|pre_stop):|dist/src/(db/migrate|scripts/production-migrate)\.js|db:migrate' <<<"$api_service"; then
+    fail "api must not override its entrypoint or invoke any migration executable"
+  fi
+  if [[ "$(grep -Fxc '      DATABASE_URL: "${POLKASWAP_API_DATABASE_URL:?Set the separately managed PostgreSQL API runtime URL}"' <<<"$api_service")" -ne 1 ]] ||
+     [[ "$(grep -Ec '^      DATABASE_URL:' <<<"$api_service")" -ne 1 ]]; then
+    fail "api must require only its separate runtime database URL"
+  fi
+  if [[ "$(grep -Fxc '      SKIP_POSTGRES_MIGRATION: "true"' <<<"$api_service")" -ne 1 ]]; then
+    fail "api must disable in-process PostgreSQL migration"
+  fi
+  for index in "${!mobile_capability_suffixes[@]}"; do
+    capability="MOBILE_CONFIG_${mobile_capability_suffixes[$index]}"
+    deployment_input="POLKASWAP_${capability}"
+    capability_default="${mobile_capability_defaults[$index]}"
+    if [[ "$(grep -Fxc "      ${capability}: \"\${${deployment_input}:-${capability_default}}\"" <<<"$api_service")" -ne 1 ]]; then
+      fail "api must expose ${capability} through its exact reviewed deployment input"
+    fi
+  done
+fi
+
 if [[ -z "$worker_service" ]]; then
   fail "Production Compose must define a standalone worker service"
 else
+  require_exact_migration_dependency "worker" "$worker_service"
+  if [[ "$(grep -Fxc '    command: ["node", "dist/src/worker/index.js"]' <<<"$worker_service")" -ne 1 ]]; then
+    fail "worker must run only the exact compiled worker command"
+  fi
+  if grep -Eq '^    (entrypoint|post_start|pre_stop):|dist/src/(db/migrate|scripts/production-migrate)\.js|db:migrate' <<<"$worker_service"; then
+    fail "worker must not override its entrypoint or invoke any migration executable"
+  fi
+  if [[ "$(grep -Fxc '      DATABASE_URL: "${POLKASWAP_WORKER_DATABASE_URL:?Set the separately managed PostgreSQL worker runtime URL}"' <<<"$worker_service")" -ne 1 ]] ||
+     [[ "$(grep -Ec '^      DATABASE_URL:' <<<"$worker_service")" -ne 1 ]]; then
+    fail "worker must require only its separate runtime database URL"
+  fi
+  if [[ "$(grep -Fxc '      SKIP_POSTGRES_MIGRATION: "true"' <<<"$worker_service")" -ne 1 ]]; then
+    fail "worker must disable in-process PostgreSQL migration"
+  fi
   if [[ "$(grep -Fxc '    healthcheck:' <<<"$worker_service")" -ne 1 ]]; then
     fail "worker must override the inherited API healthcheck"
   fi
@@ -118,6 +350,33 @@ else
   fi
 fi
 
+if grep -Fq 'MOBILE_CONFIG_' <<<"$migration_service" || grep -Fq 'MOBILE_CONFIG_' <<<"$worker_service"; then
+  fail "mobile capabilities must be routed only to the API service"
+fi
+
+for service_and_section in \
+  "migration"$'\037'"$migration_service" \
+  "api"$'\037'"$api_service" \
+  "worker"$'\037'"$worker_service"; do
+  service="${service_and_section%%$'\037'*}"
+  section="${service_and_section#*$'\037'}"
+  if grep -Eq '^    (stop_grace_period|logging):' <<<"$section"; then
+    fail "$service must inherit the audited shutdown and logging contract without per-service overrides"
+  fi
+done
+
+if grep -Fq 'POLKASWAP_DATABASE_URL' "$PRODUCTION_COMPOSE"; then
+  fail "Production Compose must not reuse one shared database URL across privileged and runtime services"
+fi
+if [[ "$(grep -Fc 'POLKASWAP_MIGRATION_OWNER_DATABASE_URL' "$PRODUCTION_COMPOSE")" -ne 1 ]]; then
+  fail "Production Compose must consume POLKASWAP_MIGRATION_OWNER_DATABASE_URL exactly once"
+fi
+for database_input in POLKASWAP_API_DATABASE_URL POLKASWAP_WORKER_DATABASE_URL; do
+  if [[ "$(grep -Fc "$database_input" "$PRODUCTION_COMPOSE")" -ne 2 ]]; then
+    fail "Production Compose must consume $database_input exactly in preflight and its runtime"
+  fi
+done
+
 runtime_stage="$(awk -v image="$NODE_IMAGE" '$0 == "FROM " image " AS runtime" { in_runtime = 1 } in_runtime { print }' "$DOCKERFILE")"
 if [[ -z "$runtime_stage" ]]; then
   fail "runtime stage could not be inspected"
@@ -129,8 +388,76 @@ for ignored in node_modules dist build coverage .env data '*.rocksdb'; do
   require_literal "$DOCKERIGNORE" "$ignored" ".dockerignore must exclude $ignored"
 done
 
+require_literal "$README_FILE" 'docker compose -f docker-compose.production.yml config --quiet' "Production instructions must validate Compose without printing interpolated credentials"
+require_literal "$README_FILE" 'docker compose -f docker-compose.production.yml config --no-interpolate' "Production instructions must provide a non-interpolated manifest review command"
+require_literal "$README_FILE" 'sslmode=verify-full' "Production instructions must require hostname-verified PostgreSQL TLS"
+if grep -Eq 'sslmode=(disable|prefer|require|verify-ca|no-verify)' "$README_FILE"; then
+  fail "Production instructions must not allow plaintext, downgrade, or hostname-unverified PostgreSQL TLS"
+fi
+if grep -Eq 'docker compose -f docker-compose\.production\.yml config[[:space:]]*$' "$README_FILE"; then
+  fail "Production instructions must not print interpolated database credentials"
+fi
+
+compose_command=()
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  compose_command=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  compose_command=(docker-compose)
+else
+  fail "Docker Compose is required to audit resolved per-service production values"
+fi
+
+if [[ "${#compose_command[@]}" -gt 0 ]]; then
+  if resolved_compose="$(
+    env \
+    -u POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE \
+    -u POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE \
+    -u POLKASWAP_MOBILE_CONFIG_POLKAMARKT_VISIBLE \
+    -u POLKASWAP_MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE \
+    -u POLKASWAP_MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE \
+    POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.invalid/polkaswap-indexer \
+    POLKASWAP_INDEXER_IMAGE_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    POLKASWAP_MIGRATION_OWNER_DATABASE_URL='postgresql://manifest_migration_owner:owner-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_API_DATABASE_URL='postgresql://manifest_api:api-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_WORKER_DATABASE_URL='postgresql://manifest_worker:worker-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
+    POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
+    POLKASWAP_CHAIN_START_BLOCK=14000000 \
+      "${compose_command[@]}" -f "$PRODUCTION_COMPOSE" config --format json 2>/dev/null
+  )"; then
+    if ! node "$RESOLVED_AUDIT_SCRIPT" <<<"$resolved_compose"; then
+      FAILURES=1
+    fi
+  else
+    fail "Production Compose must render successfully for resolved per-service audit"
+  fi
+
+  if resolved_override_compose="$(
+    POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.invalid/polkaswap-indexer \
+    POLKASWAP_INDEXER_IMAGE_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    POLKASWAP_MIGRATION_OWNER_DATABASE_URL='postgresql://manifest_migration_owner:owner-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_API_DATABASE_URL='postgresql://manifest_api:api-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_WORKER_DATABASE_URL='postgresql://manifest_worker:worker-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
+    POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
+    POLKASWAP_CHAIN_START_BLOCK=14000000 \
+    POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE=true \
+    POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=true \
+    POLKASWAP_MOBILE_CONFIG_POLKAMARKT_VISIBLE=true \
+    POLKASWAP_MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE=true \
+    POLKASWAP_MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE=false \
+      "${compose_command[@]}" -f "$PRODUCTION_COMPOSE" config --format json 2>/dev/null
+  )"; then
+    if ! node "$RESOLVED_AUDIT_SCRIPT" --mobile-capabilities true,true,true,true,false <<<"$resolved_override_compose"; then
+      FAILURES=1
+    fi
+  else
+    fail "Production Compose must render every explicit mobile capability override"
+  fi
+fi
+
 if [[ "$FAILURES" -ne 0 ]]; then
   exit 1
 fi
 
-echo "[deployment-manifest] Docker production dependency contract passed."
+echo "[deployment-manifest] Docker production deployment contract passed."

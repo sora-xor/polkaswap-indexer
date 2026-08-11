@@ -8,7 +8,6 @@ import { WebSocketServer } from 'ws';
 
 import {
   readConfig,
-  readRuntimeSecurityConfig,
   type AppConfig,
   type RuntimeSecurityConfig,
 } from './config.js';
@@ -318,6 +317,32 @@ export const createGraphQLHandler = (
   return { schema, queryLimits, yoga };
 };
 
+const runtimeSecurityFromAppConfig = (config: AppConfig): RuntimeSecurityConfig => ({
+  httpMaxBodyBytes: config.graphqlHttpMaxBodyBytes,
+  httpMaxHeaderBytes: config.httpMaxHeaderBytes,
+  httpListenBacklog: config.httpListenBacklog,
+  httpShutdownTimeoutMs: config.httpShutdownTimeoutMs,
+  httpKeepAliveTimeoutMs: config.httpKeepAliveTimeoutMs,
+  httpHeadersTimeoutMs: config.httpHeadersTimeoutMs,
+  httpRequestTimeoutMs: config.httpRequestTimeoutMs,
+  httpMaxConnections: config.httpMaxConnections,
+  httpMaxRequestsPerSocket: config.httpMaxRequestsPerSocket,
+  rateLimitWindowMs: config.rateLimitWindowMs,
+  rateLimitMax: config.rateLimitMax,
+  rateLimitMaxKeys: config.rateLimitMaxKeys,
+  rateLimitGlobalWindowMs: config.rateLimitGlobalWindowMs,
+  rateLimitGlobalMax: config.rateLimitGlobalMax,
+  graphqlMaxDepth: config.graphqlMaxDepth,
+  graphqlMaxFields: config.graphqlMaxFields,
+  graphqlMaxAliases: config.graphqlMaxAliases,
+  graphqlAllowIntrospection: config.graphqlAllowIntrospection,
+  graphqlWsMaxPayloadBytes: config.graphqlWsMaxPayloadBytes,
+  graphqlWsMaxConnections: config.graphqlWsMaxConnections,
+  graphqlWsMaxConnectionsPerClient: config.graphqlWsMaxConnectionsPerClient,
+  graphqlWsMaxOperationsPerConnection: config.graphqlWsMaxOperationsPerConnection,
+  graphqlWsConnectionInitTimeoutMs: config.graphqlWsConnectionInitTimeoutMs,
+});
+
 /**
  * Starts the Polkaswap indexer GraphQL API.
  */
@@ -325,19 +350,20 @@ export async function startServer(
   config: AppConfig = readConfig(),
   repository: IndexerRepository = createRepository(config),
   workerStatusProvider?: ChainIndexerStatusProvider,
-  security: RuntimeSecurityConfig = readRuntimeSecurityConfig()
+  security?: RuntimeSecurityConfig
 ): Promise<ServerHandle> {
   if (!config.skipPostgresMigration && shouldRunPostgresMigration(config)) await migrate(config);
   await repository.prepare?.();
 
+  const runtimeSecurity = security ?? runtimeSecurityFromAppConfig(config);
   const { schema, queryLimits, yoga } = createGraphQLHandler(config, repository, workerStatusProvider);
   const httpRequestLimiter = new HttpRequestLimiter<ServerResponse>(config.graphqlHttpMaxInFlight);
   const abuseLimiter = new AbuseLimiter({
-    windowMs: security.rateLimitWindowMs,
-    max: security.rateLimitMax,
-    maxKeys: security.rateLimitMaxKeys,
-    globalWindowMs: security.rateLimitGlobalWindowMs,
-    globalMax: security.rateLimitGlobalMax,
+    windowMs: runtimeSecurity.rateLimitWindowMs,
+    max: runtimeSecurity.rateLimitMax,
+    maxKeys: runtimeSecurity.rateLimitMaxKeys,
+    globalWindowMs: runtimeSecurity.rateLimitGlobalWindowMs,
+    globalMax: runtimeSecurity.rateLimitGlobalMax,
   });
   const checkWebSocketRate = (request: IncomingMessage) =>
     abuseLimiter.check(`ws:${request.socket.remoteAddress ?? 'unknown'}`);
@@ -385,7 +411,7 @@ export async function startServer(
 
     const now = Date.now();
     const client = request.socket.remoteAddress ?? 'unknown';
-    const limited = abuseLimiter.check(client, now);
+    const limited = abuseLimiter.check(`http:${client}`, now);
     response.setHeader('x-ratelimit-limit', String(limited.limit));
     response.setHeader('x-ratelimit-remaining', String(limited.remaining));
     response.setHeader('x-ratelimit-reset', String(Math.ceil(limited.resetAt / 1_000)));
@@ -397,10 +423,10 @@ export async function startServer(
       return;
     }
 
-    if (path === '/metrics' && method !== 'GET') {
+    if (path === '/metrics' && method !== 'GET' && method !== 'HEAD') {
       response.shouldKeepAlive = false;
       response.writeHead(405, {
-        allow: 'GET',
+        allow: 'GET, HEAD',
         'cache-control': 'no-store',
         connection: 'close',
         'content-length': '0',
@@ -485,9 +511,9 @@ export async function startServer(
 
     yoga(request, response);
   };
-  const server = createServer({ maxHeaderSize: security.httpMaxHeaderBytes }, handleRequest);
-  server.maxConnections = config.httpMaxConnections;
-  server.maxRequestsPerSocket = security.httpMaxRequestsPerSocket;
+  const server = createServer({ maxHeaderSize: runtimeSecurity.httpMaxHeaderBytes }, handleRequest);
+  server.maxConnections = runtimeSecurity.httpMaxConnections;
+  server.maxRequestsPerSocket = runtimeSecurity.httpMaxRequestsPerSocket;
   server.on('drop', () => {
     metrics.increment('indexer_http_connection_rejections_total');
   });
@@ -516,12 +542,18 @@ export async function startServer(
     const client = request.socket.remoteAddress ?? 'unknown';
     if (
       (activeWebSocketsByClient.get(client) ?? 0) >=
-      security.graphqlWsMaxConnectionsPerClient
+        runtimeSecurity.graphqlWsMaxConnectionsPerClient
     ) {
+      metrics.increment('indexer_websocket_admission_rejections_total', {
+        reason: 'per-client-connection-limit',
+      });
       socket.close(4429, 'Too many WebSocket connections');
       return;
     }
     if (!webSocketLimiter.acquire(socket)) {
+      metrics.increment('indexer_websocket_admission_rejections_total', {
+        reason: 'global-connection-limit',
+      });
       socket.close(4429, 'Too many WebSocket connections');
       return;
     }
@@ -631,7 +663,7 @@ export async function startServer(
     const client = request.socket.remoteAddress ?? 'unknown';
     const limited = checkWebSocketRate(request);
     if (!limited.allowed) {
-      metrics.increment('indexer_websocket_admission_rejections_total');
+      metrics.increment('indexer_websocket_admission_rejections_total', { reason: 'rate-limit' });
       rejectWebSocketUpgrade(
         socket,
         429,
@@ -642,14 +674,24 @@ export async function startServer(
     if (
       !webSocketLimiter.hasCapacity ||
       (activeWebSocketsByClient.get(client) ?? 0) >=
-        security.graphqlWsMaxConnectionsPerClient
+        runtimeSecurity.graphqlWsMaxConnectionsPerClient
     ) {
-      metrics.increment('indexer_websocket_admission_rejections_total');
+      metrics.increment('indexer_websocket_admission_rejections_total', { reason: 'capacity' });
       rejectWebSocketUpgrade(socket, 503);
       return;
     }
 
     const protocols = websocketProtocols(request.headers['sec-websocket-protocol']);
+    if (
+      !protocols.includes(LEGACY_GRAPHQL_WS_PROTOCOL) &&
+      !protocols.includes(GRAPHQL_TRANSPORT_WS_PROTOCOL)
+    ) {
+      metrics.increment('indexer_websocket_admission_rejections_total', {
+        reason: 'unsupported-protocol',
+      });
+      rejectWebSocketUpgrade(socket, 404);
+      return;
+    }
     const selected =
       protocols.includes(LEGACY_GRAPHQL_WS_PROTOCOL) && !protocols.includes(GRAPHQL_TRANSPORT_WS_PROTOCOL)
         ? legacyWsServer

@@ -134,23 +134,73 @@ only to bounded, trusted internal repository callers.
 ## Production Notes
 
 Run the API and worker as separate processes against the same PostgreSQL
-database. For a fresh production deployment, set `CHAIN_START_BLOCK` to the
-earliest block you need indexed; a full-chain backfill is intentionally long.
-Set `NODE_ENV=production` and inject an explicit `DATABASE_URL`; production
-startup rejects the development database fallback. Runtime configuration is
-strict: invalid ports, non-canonical integer values, unsafe GraphQL paths,
-non-PostgreSQL database URLs, credentialed or query-bearing SORA URLs, and
-non-TLS remote SORA endpoints abort startup. Production workers require a second
-`SORA_ARCHIVE_WS_ENDPOINT` on a different reviewed host; it must likewise use
-`wss`, contain no credentials/query/fragment, and prove the same genesis and
-history anchor before the database is opened. Every indexed height must have the
-same hash, raw SCALE block body, raw events storage, and timestamp on both
-endpoints. Storage-derived analytics still treat the reviewed primary RPC as a
-trusted input, so operators must use a locally controlled verifying primary and
-an independently operated archival endpoint rather than public convenience RPCs
-for release evidence.
+database through distinct least-privilege logins. Production Compose requires
+three separately managed URLs: `POLKASWAP_MIGRATION_OWNER_DATABASE_URL` for the
+one-shot DDL owner, `POLKASWAP_API_DATABASE_URL` for the API reader, and
+`POLKASWAP_WORKER_DATABASE_URL` for the worker writer and lease holder. Never
+reuse the migration-owner login for either long-lived service, and do not reuse
+one runtime login for both API and worker. The migration container receives all
+three URLs only for a credential-safe preflight: it rejects an identical URL,
+any repeated decoded PostgreSQL role identity, any different host/port/database
+target, malformed URLs, and unaudited connection controls before reading
+migration configuration. Only `sslmode` and `sslnegotiation` URL parameters are
+accepted, and `sslmode=verify-full` is mandatory; plaintext, downgrade,
+CA-only, and hostname-unverified modes are rejected. Client, statement, and
+query deadlines cannot be overridden by a URL. Production also rejects
+`NODE_OPTIONS`, `NODE_TLS_REJECT_UNAUTHORIZED`, and every `PG*` process
+override so the reviewed URL, TLS policy, and startup options cannot be
+silently replaced.
+It then connects with every credential and requires the live PostgreSQL
+`session_user` and `current_user` to match the URL role and
+`current_database()` to match the shared target. Every application-controlled
+PostgreSQL client pins and verifies `search_path=pg_catalog,public,pg_temp`, so
+role/database defaults and temporary or attacker-owned schemas cannot redirect
+an unqualified relation. Before DDL, the wrapper also requires a non-superuser
+migration owner with schema-create access and no unrelated memberships, and
+runtime roles with no membership in any other role (including predefined
+server-file/program roles), elevated role attributes, direct or assumable DDL
+access, migration-owner membership, or direct/assumable schema, relation,
+routine, or type ownership. After DDL, the migration owner atomically replaces
+the runtime ACLs: API gets `SELECT` on `indexer_documents` and no fence access;
+worker gets
+`SELECT`/`INSERT`/`UPDATE`/`DELETE` on `indexer_documents` and only
+`SELECT`/`INSERT`/`UPDATE` on the worker fence. The wrapper reopens both runtime
+sessions and verifies those exact privileges across the login and every role it
+can assume, including table privileges, column privileges, every grant-option
+path, `NOINHERIT` memberships, and a second complete identity check before
+handoff. Its fixed diagnostics never print a URL, username, password, or host.
+Every preflight/privilege connection and query, plus failed-client cleanup, has
+a hard deadline. Actual migration DDL uses separately configured deadlines and
+intentionally defaults to unlimited for production-scale validation and index
+builds. The
+owner URL is mounted only into the migration service; API and worker set
+`SKIP_POSTGRES_MIGRATION=true`, run exact compiled entrypoints with no
+shell/entrypoint override, and start only after that service exits successfully.
+Direct non-Compose production launches still set `NODE_ENV=production` and
+inject their role-specific URL as `DATABASE_URL`; production startup rejects
+the development database fallback.
 
-The one-shot PostgreSQL schema migration uses
+For a fresh production deployment, set `CHAIN_START_BLOCK` to the earliest
+block you need indexed; a full-chain backfill is intentionally long. Primary
+and archive SORA URLs must be
+credential-free `wss:` endpoints without query strings or fragments, on
+different hosts. The production worker requires `SORA_ARCHIVE_WS_ENDPOINT`.
+After the chain-neutral schema migration completes and before constructing,
+reading, or writing its runtime repository, the worker proves the reviewed SORA
+mainnet genesis and immutable history anchor independently on both endpoints.
+The in-process worker repeats the primary proof and validates a self-consistent
+finalized head before it may persist even its first heartbeat. Every archived
+block then has to match the primary endpoint by height/hash, raw SCALE block and
+event bytes, and timestamp.
+
+The one-shot `dist/src/scripts/production-migrate.js` wrapper validates the URL
+topology, all three live database session identities, and pre-DDL role
+privileges, then invokes the PostgreSQL schema migration with the owner
+configuration, atomically applies the exact per-table runtime grants, and
+verifies them. Storage-derived analytics still treat the reviewed primary RPC
+as a trusted input, so operators must use a locally controlled verifying primary
+and an independently operated archival endpoint rather than public convenience
+RPCs for release evidence. The migration uses
 `POSTGRES_MIGRATION_QUERY_TIMEOUT_MS` and
 `POSTGRES_MIGRATION_STATEMENT_TIMEOUT_MS`, both defaulting to `0` (unlimited),
 instead of the bounded runtime query deadlines. Check constraints are installed
@@ -199,8 +249,9 @@ catch-up inherits that value unless
 bounded at `256`. Set
 `CHAIN_PRICE_STREAM_REFRESH_INTERVAL_BLOCKS` to a positive interval (maximum
 `10,000,000`) to refresh the price stream independently; `0` keeps it coupled
-to normal derived-state refreshes. `SORA_ARCHIVE_WS_ENDPOINT` optionally selects
-a validated `ws:`/`wss:` historical block endpoint, while
+to normal derived-state refreshes. Outside production,
+`SORA_ARCHIVE_WS_ENDPOINT` optionally selects a validated historical block
+endpoint, while
 `CHAIN_LEGACY_SORA_BLOCK_TYPES=true` enables the legacy type bundle. Invalid or
 out-of-range values abort startup.
 
@@ -220,12 +271,18 @@ unpredictable lease epoch while holding a shared transaction fence; lease
 handoff takes that fence exclusively, drains already-validated writes, and
 rejects every old-token write after loss. A second worker fails startup, and
 loss of the lease connection triggers fatal shutdown. The schema migration
-creates `public.polkaswap_indexer_worker_lease_fence`; a split runtime worker
-role needs `SELECT`, `INSERT`, and `UPDATE` on that table but does not need DDL
-privileges. A worker started against an unmigrated database fails closed with an
-instruction to run the migration; it never attempts runtime DDL. API-only and
-administrative repository instances are not fenced unless they are explicitly
-constructed with a worker fencing token.
+creates `public.indexer_documents` and
+`public.polkaswap_indexer_worker_lease_fence`. Provision the API login with
+read-only access to indexed documents and the worker login with its required
+document DML plus `SELECT`, `INSERT`, and `UPDATE` on the fence table. Neither
+runtime login needs schema ownership or DDL privileges; grant both database
+`CONNECT` and schema `USAGE`, then let the one-shot migration owner install and
+verify the exact table/column ACLs and absence of grant options before handoff.
+A
+worker started against an unmigrated database fails closed with an instruction
+to run the migration; it never attempts runtime DDL. API-only and administrative
+repository instances are not fenced unless they are explicitly constructed with
+a worker fencing token.
 
 The public GraphQL boundary is fail-closed and resource bounded. HTTP POST
 requests accept JSON only, with a default 256 KiB body cap; multipart uploads
@@ -264,10 +321,14 @@ point-read during field execution after that emission reservation is acquired.
 Polling fallback likewise hashes one legal document at a time and retains only
 fixed-size SHA-256 fingerprints.
 
-These in-process limits bound the work admitted by one request or connection;
-they are not an identity-aware rate limiter. Production ingress should also
-enforce per-client request/connection rates and its own compatible body/header
-limits at the load balancer or reverse proxy.
+The server also applies bounded fixed-window request and WebSocket-upgrade rates
+to the raw TCP peer, caps tracked peer identities, caps concurrent WebSockets
+per raw peer, bounds header bytes and requests per keep-alive socket, and ignores
+spoofable forwarding headers. A trusted loopback proxy is one raw peer, not the
+end client: production Compose raises that peer bucket only to the process-wide
+backstop, while the TLS edge must overwrite untrusted forwarding headers and
+enforce the attested per-client request, upgrade, connection, body, and header
+limits.
 
 For RocksDB production deployment, use `start:combined` instead of separate API
 and worker processes. RocksDB is embedded local storage; the API and worker must
@@ -499,14 +560,41 @@ configuration and immutable image evidence:
 ```sh
 export POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.example/polkaswap-indexer
 export POLKASWAP_INDEXER_IMAGE_DIGEST=<reviewed-64-hex-digest>
-export POLKASWAP_DATABASE_URL=postgresql://<managed-secret>@db.example/indexer?sslmode=require
+export POLKASWAP_MIGRATION_OWNER_DATABASE_URL=postgresql://pi_migration_owner:<owner-secret>@db.example/indexer?sslmode=verify-full
+export POLKASWAP_API_DATABASE_URL=postgresql://pi_api:<api-secret>@db.example/indexer?sslmode=verify-full
+export POLKASWAP_WORKER_DATABASE_URL=postgresql://pi_worker:<worker-secret>@db.example/indexer?sslmode=verify-full
 export POLKASWAP_SORA_WS_ENDPOINT=wss://<controlled-verifying-primary>
 export POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://<independently-operated-archive>
 export POLKASWAP_CHAIN_START_BLOCK=<reviewed-first-required-block>
-docker compose -f docker-compose.production.yml config
+export POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE=true
+export POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=false
+export POLKASWAP_MOBILE_CONFIG_POLKAMARKT_VISIBLE=true
+export POLKASWAP_MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE=false
+export POLKASWAP_MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE=true
+docker compose -f docker-compose.production.yml config --quiet
 docker compose -f docker-compose.production.yml up -d
 ```
 
+The five mobile capability values are explicit deployment inputs. Their tester
+defaults are `true,false,true,false,true` in the order shown above.
+`MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=true` requires Nexus availability, while
+Polkamarkt mutations require Polkamarkt visibility. Taira's remote default
+remains independent because each mobile client applies the Nexus kill switch to
+effective visibility. Keep send/mutation flags false until the external
+candidate-bound release admission authorizes them; the public production smoke
+validates presence, boolean shape, and these prerequisite relationships. Remote
+capabilities never replace the mobile client's local signing and rollout gates.
+
+Never run an unqualified `docker compose ... config` after exporting database
+credentials because its rendered output contains the interpolated URLs. Use
+`config --quiet` for validation. For a human-readable manifest review, run
+`docker compose -f docker-compose.production.yml config --no-interpolate`
+before loading secrets, then inspect the unresolved variable references.
+`config --quiet` validates required inputs but cannot compare secret values;
+the one-shot credential preflight is the fail-closed URL and live-session role
+and privilege check and runs before every schema migration.
+Production services retain four minutes of graceful-stop time—longer than the
+internal 30-second shutdown deadline—and use bounded local log rotation.
 The production worker overrides the image's API healthcheck with
 `dist/src/scripts/worker-health.js`. This probe has no HTTP or API-container
 dependency. It uses the worker's existing `DATABASE_URL` to require the exact
@@ -547,11 +635,9 @@ The smoke query requires `_health` to identify this service as
 `serviceId=pi.soramitsu.io`, `ecosystem=sora2`, `chainId=sora:mainnet`,
 `network=mainnet`, `schemaVersion=1`, `readOnly=true`, and
 `publicBaseUrl=https://pi.soramitsu.io/graphql`. It intentionally fails if the
-route points at the TON or Solana indexer contracts. A prior deployment passed
-the static service-identity routing check on 2026-07-10. The current endpoint
-does not expose the required checkpoint fields, so that historical routing
-result does not satisfy the current smoke contract or replace operator-attested
-evidence for a specific release artifact.
+route points at the TON or Solana indexer contracts. Production smoke always
+requires an available, ready, running, startup-complete worker with internally
+consistent finalized, indexed, lag, heartbeat, and commit-time details.
 
 The same request requires the exact reviewed genesis in `_health`, a strictly
 shaped immutable `chainIdentity`, and a `chainState` containing the same genesis,
@@ -602,7 +688,3 @@ yarn test:deployment-evidence-audit
 yarn audit:deployment-evidence --require-ready
 POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production
 ```
-
-Production smoke always requires an available, ready, running,
-startup-complete worker with internally consistent finalized, indexed, lag,
-heartbeat, and commit-time details.

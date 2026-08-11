@@ -4,7 +4,10 @@ import { ApiPromise } from '@polkadot/api';
 
 import { MemoryRepository } from '../src/repository/memory.js';
 import { idempotentShutdown, runShutdownGroup, runShutdownSteps } from '../src/shutdown.js';
-import { SORA_MAINNET_GENESIS_HASH } from '../src/soraIdentity.js';
+import {
+  SORA_LEGACY_IDENTITY_ANCHOR,
+  SORA_MAINNET_GENESIS_HASH,
+} from '../src/soraIdentity.js';
 import { ChainIndexer } from '../src/worker/chain.js';
 import {
   parsePersistedWorkerStatus,
@@ -24,6 +27,13 @@ const config: AppConfig = {
   httpHeadersTimeoutMs: 80_000,
   httpRequestTimeoutMs: 120_000,
   httpMaxConnections: 10_000,
+  httpMaxHeaderBytes: 16_384,
+  httpMaxRequestsPerSocket: 1_000,
+  rateLimitWindowMs: 60_000,
+  rateLimitMax: 600,
+  rateLimitMaxKeys: 20_000,
+  rateLimitGlobalWindowMs: 60_000,
+  rateLimitGlobalMax: 50_000,
   graphqlHttpMaxBodyBytes: 262_144,
   graphqlHttpMaxInFlight: 100,
   graphqlMaxDepth: 12,
@@ -36,6 +46,7 @@ const config: AppConfig = {
   graphqlWsMaxPayloadBytes: 65_536,
   graphqlWsConnectionInitTimeoutMs: 30_000,
   graphqlWsMaxConnections: 1_000,
+  graphqlWsMaxConnectionsPerClient: 16,
   graphqlWsMaxOperations: 2_000,
   graphqlWsMaxOperationsPerConnection: 20,
   graphqlWsMaxPendingMessagesPerConnection: 64,
@@ -159,9 +170,11 @@ describe('ChainIndexer lifecycle', () => {
       setLifecycle: (lifecycle: 'running', startupComplete: boolean) => void;
       startWorkerStatusHeartbeat: () => void;
       workerStatusWritePromise: Promise<void> | null;
+      repositoryStatusWritesEnabled: boolean;
       stop: () => Promise<void>;
     };
 
+    indexer.repositoryStatusWritesEnabled = true;
     indexer.setLifecycle('running', true);
     indexer.startWorkerStatusHeartbeat();
     await vi.advanceTimersByTimeAsync(WORKER_STATUS_HEARTBEAT_INTERVAL_MS);
@@ -254,7 +267,14 @@ describe('ChainIndexer lifecycle', () => {
     const unsubscribe = vi.fn(async () => undefined);
     const disconnect = vi.fn(async () => undefined);
     const drainFinalizedHeads = vi.fn(async () => undefined);
-    let onFinalizedHead: ((header: { number: { toNumber: () => number } }) => void) | undefined;
+    let onFinalizedHead:
+      | ((header: {
+          number: { toNumber: () => number };
+          hash: { toString: () => string };
+        }) => void)
+      | undefined;
+    const finalizedBlock = SORA_LEGACY_IDENTITY_ANCHOR.block + 99;
+    const finalizedHash = `0x${'9'.repeat(64)}`;
 
     indexer.api = {
       disconnect,
@@ -273,9 +293,12 @@ describe('ChainIndexer lifecycle', () => {
     await indexer.subscribeFinalizedHeads();
     expect(indexer.finalizedHeadPollTimer).not.toBeNull();
 
-    onFinalizedHead?.({ number: { toNumber: () => 99 } });
+    onFinalizedHead?.({
+      number: { toNumber: () => finalizedBlock },
+      hash: { toString: () => finalizedHash },
+    });
     await Promise.resolve();
-    expect(indexer.getStatus()).toMatchObject({ latestFinalizedBlock: 99 });
+    expect(indexer.getStatus()).toMatchObject({ latestFinalizedBlock: finalizedBlock });
     expect(drainFinalizedHeads).toHaveBeenCalledOnce();
 
     const firstStop = indexer.stop();
@@ -288,10 +311,13 @@ describe('ChainIndexer lifecycle', () => {
     expect(indexer.finalizedHeadPollTimer).toBeNull();
     expect(indexer.pendingFinalizedBlock).toBe(0);
 
-    onFinalizedHead?.({ number: { toNumber: () => 100 } });
+    onFinalizedHead?.({
+      number: { toNumber: () => finalizedBlock + 1 },
+      hash: { toString: () => `0x${'a'.repeat(64)}` },
+    });
     await Promise.resolve();
     expect(drainFinalizedHeads).toHaveBeenCalledOnce();
-    expect(indexer.getStatus()).toMatchObject({ latestFinalizedBlock: 99 });
+    expect(indexer.getStatus()).toMatchObject({ latestFinalizedBlock: finalizedBlock });
   });
 
   it('unsubscribes a subscription that resolves after stop has begun', async () => {
@@ -358,9 +384,24 @@ describe('ChainIndexer lifecycle', () => {
       disconnect,
       rpc: {
         chain: {
+          getBlockHash: vi.fn(async (block: number) => ({
+            toString: () =>
+              block === 0
+                ? SORA_MAINNET_GENESIS_HASH
+                : SORA_LEGACY_IDENTITY_ANCHOR.hash,
+          })),
           getFinalizedHead: vi.fn(async () => {
             throw failure;
           }),
+        },
+      },
+      query: {
+        timestamp: {
+          now: {
+            at: vi.fn(async () => ({
+              toString: () => String(SORA_LEGACY_IDENTITY_ANCHOR.timestamp * 1_000),
+            })),
+          },
         },
       },
     } as never);
@@ -594,7 +635,12 @@ describe('ChainIndexer lifecycle', () => {
     const repository = new MemoryRepository();
     repository.upsert = vi.fn(() => new Promise<void>(() => undefined));
     const shortConfig = { ...config, chainShutdownTimeoutMs: 25 };
-    const indexer = new ChainIndexer(shortConfig, repository);
+    const indexer = new ChainIndexer(shortConfig, repository) as unknown as {
+      repositoryStatusWritesEnabled: boolean;
+      stop: () => Promise<void>;
+      getStatus: () => { lifecycle: string };
+    };
+    indexer.repositoryStatusWritesEnabled = true;
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
     let stopped = false;

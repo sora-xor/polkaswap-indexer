@@ -1,5 +1,15 @@
 import { isIP } from 'node:net';
 
+import { findUnsafePostgresProcessEnvironmentOverride } from './postgres-session.js';
+
+export type MobileCapabilities = {
+  nexusAvailable: boolean;
+  nexusSendsAvailable: boolean;
+  polkamarktVisible: boolean;
+  polkamarktMutationsAvailable: boolean;
+  tairaDefaultVisible: boolean;
+};
+
 export type AppConfig = {
   host: string;
   port: number;
@@ -10,6 +20,13 @@ export type AppConfig = {
   httpHeadersTimeoutMs: number;
   httpRequestTimeoutMs: number;
   httpMaxConnections: number;
+  httpMaxHeaderBytes: number;
+  httpMaxRequestsPerSocket: number;
+  rateLimitWindowMs: number;
+  rateLimitMax: number;
+  rateLimitMaxKeys: number;
+  rateLimitGlobalWindowMs: number;
+  rateLimitGlobalMax: number;
   graphqlHttpMaxBodyBytes: number;
   graphqlHttpMaxInFlight: number;
   graphqlMaxDepth: number;
@@ -22,6 +39,7 @@ export type AppConfig = {
   graphqlWsMaxPayloadBytes: number;
   graphqlWsConnectionInitTimeoutMs: number;
   graphqlWsMaxConnections: number;
+  graphqlWsMaxConnectionsPerClient: number;
   graphqlWsMaxOperations: number;
   graphqlWsMaxOperationsPerConnection: number;
   graphqlWsMaxPendingMessagesPerConnection: number;
@@ -78,6 +96,8 @@ export type AppConfig = {
   workerMetricsHost: string;
   workerMetricsPort: number;
   workerMetricsMaxInFlight: number;
+  /** Public mobile capability projection. Production readConfig always supplies it. */
+  mobileCapabilities?: MobileCapabilities;
 };
 
 export type RuntimeSecurityConfig = {
@@ -220,6 +240,78 @@ const validateUrl = (
   return value;
 };
 
+const validateProductionDatabaseUrl = (value: string, nodeEnvironment: string): string => {
+  if (nodeEnvironment !== 'production') return value;
+  const url = new URL(value);
+  const entries = [...url.searchParams.entries()];
+  const keys = entries.map(([key]) => key);
+  if (
+    new Set(keys).size !== keys.length ||
+    keys.some((key) => key !== key.toLowerCase()) ||
+    keys.some((key) => key !== 'sslmode' && key !== 'sslnegotiation')
+  ) {
+    return invalid(
+      'DATABASE_URL',
+      'may use only one lowercase sslmode and optional sslnegotiation parameter in production'
+    );
+  }
+  if (url.searchParams.get('sslmode') !== 'verify-full') {
+    return invalid('DATABASE_URL', 'must use sslmode=verify-full in production');
+  }
+  const sslNegotiation = url.searchParams.get('sslnegotiation');
+  if (
+    sslNegotiation !== null &&
+    sslNegotiation !== 'direct' &&
+    sslNegotiation !== 'postgres'
+  ) {
+    return invalid(
+      'DATABASE_URL',
+      'sslnegotiation must be direct or postgres in production'
+    );
+  }
+  return value;
+};
+
+const validateSoraWsUrl = (name: string, value: string): string => {
+  if (value !== value.trim() || /[\u0000-\u001f\u007f]/.test(value)) {
+    return invalid(name, 'must be a non-empty single-line value without surrounding whitespace');
+  }
+  validateUrl(name, value, ['ws:', 'wss:']);
+  const parsed = new URL(value);
+  if (parsed.username || parsed.password) {
+    return invalid(name, 'must not contain URL credentials');
+  }
+  if (parsed.search) {
+    return invalid(name, 'must not contain URL credentials or a query string');
+  }
+  if (parsed.hash) {
+    return invalid(name, 'must not contain a URL fragment');
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname.endsWith('.')) {
+    return invalid(name, 'hostname must not have a trailing dot');
+  }
+  const localhost = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+  if (!localhost && parsed.protocol !== 'wss:') {
+    return invalid(name, 'must use TLS outside localhost');
+  }
+  return value;
+};
+
+/**
+ * Production workers must not silently inherit development chain inputs.
+ * The values themselves are parsed and validated by readConfig().
+ */
+export function assertExplicitProductionWorkerChainInputs(): void {
+  if (process.env.NODE_ENV !== 'production') return;
+  if (process.env.SORA_WS_ENDPOINT === undefined) {
+    invalid('SORA_WS_ENDPOINT', 'is required for the production worker');
+  }
+  if (process.env.CHAIN_START_BLOCK === undefined) {
+    invalid('CHAIN_START_BLOCK', 'is required for the production worker');
+  }
+}
+
 const validateGraphqlPath = (value: string): string => {
   if (!value.startsWith('/')) {
     return invalid('GRAPHQL_PATH', 'GRAPHQL_PATH must be an absolute URL path and start with /');
@@ -279,25 +371,27 @@ const readDatabaseUrl = (nodeEnvironment: string, storageEngine: 'postgres' | 'r
   if (new URL(validated).pathname.length <= 1) {
     return invalid('DATABASE_URL', 'DATABASE_URL must include a database name');
   }
-  return validated;
+  return storageEngine === 'postgres'
+    ? validateProductionDatabaseUrl(validated, nodeEnvironment)
+    : validated;
 };
 
 export function readSoraArchiveWsEndpoint(requireConfigured = false): string | null {
-  const configured = readOptionalString('SORA_ARCHIVE_WS_ENDPOINT');
-  if (!configured) {
+  const configured = process.env.SORA_ARCHIVE_WS_ENDPOINT;
+  if (configured === undefined || configured === '') {
     if (requireConfigured) {
-      throw new Error('SORA_ARCHIVE_WS_ENDPOINT is required for the production worker');
+      return invalid('SORA_ARCHIVE_WS_ENDPOINT', 'is required for the production worker');
     }
     return null;
   }
-  return validateUrl('SORA_ARCHIVE_WS_ENDPOINT', configured, ['ws:', 'wss:'], { secureRpc: true });
+  return validateSoraWsUrl('SORA_ARCHIVE_WS_ENDPOINT', configured);
 }
 
 export function assertIndependentSoraRpcEndpoints(primary: string, archive: string): void {
-  const primaryUrl = new URL(primary);
-  const archiveUrl = new URL(archive);
-  if (primaryUrl.hostname.toLowerCase() === archiveUrl.hostname.toLowerCase()) {
-    throw new Error('SORA primary and archive endpoints must use different reviewed hosts');
+  const canonicalHostname = (value: string): string =>
+    new URL(value).hostname.toLowerCase().replace(/\.$/, '');
+  if (canonicalHostname(primary) === canonicalHostname(archive)) {
+    throw new Error('SORA primary and archive endpoints must use different reviewed hosts.');
   }
 }
 
@@ -305,17 +399,24 @@ export function assertIndependentSoraRpcEndpoints(primary: string, archive: stri
 export function readConfig(): AppConfig {
   const nodeEnvironment = readNodeEnvironment();
   const storageEngine = readEnum('STORAGE_ENGINE', 'postgres', ['postgres', 'rocksdb']);
+  if (nodeEnvironment === 'production') {
+    const override = findUnsafePostgresProcessEnvironmentOverride(process.env);
+    if (override !== null) {
+      invalid(
+        override,
+        'must not override production PostgreSQL connection or TLS policy'
+      );
+    }
+  }
   const host = validateNetworkHost('HOST', readString('HOST', '0.0.0.0'));
   const workerMetricsHost = validateNetworkHost(
     'WORKER_METRICS_HOST',
     readString('WORKER_METRICS_HOST', '127.0.0.1')
   );
   const databaseUrl = readDatabaseUrl(nodeEnvironment, storageEngine);
-  const soraWsEndpoint = validateUrl(
+  const soraWsEndpoint = validateSoraWsUrl(
     'SORA_WS_ENDPOINT',
-    readString('SORA_WS_ENDPOINT', 'wss://mof2.sora.org'),
-    ['ws:', 'wss:'],
-    { secureRpc: true }
+    readString('SORA_WS_ENDPOINT', 'wss://mof2.sora.org')
   );
   const soraArchiveWsEndpoint = readSoraArchiveWsEndpoint();
   const httpKeepAliveTimeoutMs = readInteger('HTTP_KEEP_ALIVE_TIMEOUT_MS', 75_000, {
@@ -384,6 +485,19 @@ export function readConfig(): AppConfig {
   if (graphqlMaxResultBytes > graphqlExecutionMemoryMaxBytes) {
     invalid('GRAPHQL_EXECUTION_MEMORY_MAX_BYTES', 'must be at least GRAPHQL_MAX_RESULT_BYTES');
   }
+  const mobileCapabilities: MobileCapabilities = {
+    nexusAvailable: readBoolean('MOBILE_CONFIG_NEXUS_AVAILABLE', true),
+    nexusSendsAvailable: readBoolean('MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE'),
+    polkamarktVisible: readBoolean('MOBILE_CONFIG_POLKAMARKT_VISIBLE', true),
+    polkamarktMutationsAvailable: readBoolean('MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE'),
+    tairaDefaultVisible: readBoolean('MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE', true),
+  };
+  if (mobileCapabilities.nexusSendsAvailable && !mobileCapabilities.nexusAvailable) {
+    invalid('MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE', 'requires MOBILE_CONFIG_NEXUS_AVAILABLE=true');
+  }
+  if (mobileCapabilities.polkamarktMutationsAvailable && !mobileCapabilities.polkamarktVisible) {
+    invalid('MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE', 'requires MOBILE_CONFIG_POLKAMARKT_VISIBLE=true');
+  }
 
   return {
     host,
@@ -400,6 +514,34 @@ export function readConfig(): AppConfig {
     httpMaxConnections: readInteger('HTTP_MAX_CONNECTIONS', 10_000, {
       minimum: 1,
       maximum: 1_000_000,
+    }),
+    httpMaxHeaderBytes: readInteger('HTTP_MAX_HEADER_BYTES', 16 * 1_024, {
+      minimum: 1_024,
+      maximum: 64 * 1_024,
+    }),
+    httpMaxRequestsPerSocket: readInteger('HTTP_MAX_REQUESTS_PER_SOCKET', 1_000, {
+      minimum: 1,
+      maximum: 100_000,
+    }),
+    rateLimitWindowMs: readInteger('RATE_LIMIT_WINDOW_MS', 60_000, {
+      minimum: 1_000,
+      maximum: 3_600_000,
+    }),
+    rateLimitMax: readInteger('RATE_LIMIT_MAX', 600, {
+      minimum: 1,
+      maximum: 1_000_000,
+    }),
+    rateLimitMaxKeys: readInteger('RATE_LIMIT_MAX_KEYS', 20_000, {
+      minimum: 1,
+      maximum: 1_000_000,
+    }),
+    rateLimitGlobalWindowMs: readInteger('RATE_LIMIT_GLOBAL_WINDOW_MS', 60_000, {
+      minimum: 1_000,
+      maximum: 3_600_000,
+    }),
+    rateLimitGlobalMax: readInteger('RATE_LIMIT_GLOBAL_MAX', 50_000, {
+      minimum: 1,
+      maximum: 10_000_000,
     }),
     graphqlHttpMaxBodyBytes: readInteger('GRAPHQL_HTTP_MAX_BODY_BYTES', 256 * 1_024, {
       minimum: 1,
@@ -436,6 +578,10 @@ export function readConfig(): AppConfig {
     graphqlWsMaxConnections: readInteger('GRAPHQL_WS_MAX_CONNECTIONS', 1_000, {
       minimum: 1,
       maximum: 1_000_000,
+    }),
+    graphqlWsMaxConnectionsPerClient: readInteger('GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT', 16, {
+      minimum: 1,
+      maximum: 10_000,
     }),
     graphqlWsMaxOperations: readInteger('GRAPHQL_WS_MAX_OPERATIONS', 2_000, {
       minimum: 1,
@@ -565,6 +711,7 @@ export function readConfig(): AppConfig {
       minimum: 1,
       maximum: 10_000,
     }),
+    mobileCapabilities,
   };
 }
 

@@ -11,6 +11,11 @@ pull requests from `develop`, `release/*` stabilization branches, or urgent
 `hotfix/*` branches. Every commit on `master` must be safe to deploy, and
 release tags must point at commits already merged to `master`.
 
+Direct pushes and force pushes to release branches are prohibited. Required
+status checks, code-owner review, stale-review dismissal, review-thread
+resolution, and approval after the last push must be enforced by repository
+rules before merging to `develop` or `master`.
+
 Feature PRs are squash-merged after review and green CI. Release PRs to
 `master` use merge commits so the release boundary remains visible. Hotfixes
 must be merged or cherry-picked back to `develop` after release.
@@ -29,7 +34,8 @@ bash scripts/audit-public-artifacts.sh
 bash scripts/test-todo-debt-audit.sh
 bash scripts/audit-todo-debt.sh
 yarn test:deployment-manifest
-yarn npm audit --environment production
+yarn audit:dependencies
+yarn audit:dependencies:production
 yarn test
 yarn build
 ```

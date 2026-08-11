@@ -31,7 +31,8 @@ bash scripts/audit-public-artifacts.sh
 bash scripts/test-todo-debt-audit.sh
 bash scripts/audit-todo-debt.sh
 yarn test:deployment-manifest
-yarn npm audit --environment production
+yarn audit:dependencies
+yarn audit:dependencies:production
 yarn test
 yarn build
 ```

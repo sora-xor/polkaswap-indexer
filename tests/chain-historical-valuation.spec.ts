@@ -131,6 +131,8 @@ const historicalState = (blockHeight = 9) => ({
 });
 
 const prepareState = (indexer: ChainIndexer, blockHeight = 9) => {
+  (indexer as unknown as { observedGenesisHash: string }).observedGenesisHash =
+    SORA_MAINNET_GENESIS_HASH;
   const state = historicalState(blockHeight);
   (indexer as any).observedGenesisHash = SORA_MAINNET_GENESIS_HASH;
   (indexer as any).recalculateHistoricalValuationState(state);

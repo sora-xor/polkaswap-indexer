@@ -1,7 +1,9 @@
 import pg from 'pg';
 import { pathToFileURL } from 'node:url';
 
+import { POSTGRES_TRUSTED_SESSION_OPTIONS } from '../postgres-session.js';
 import {
+  isStoredSoraChainStateCoherent,
   parseStoredSoraChainIdentity,
   parseStoredSoraChainState,
   SORA_LEGACY_IDENTITY_ANCHOR,
@@ -203,13 +205,9 @@ export const validateWorkerHealthDocuments = (
   if (!state || state.lastIndexedBlock !== identityRows.stateEnvelope.blockHeight) {
     return { ok: false, code: 'state-checkpoint-invalid' };
   }
-  if (state.lastIndexedBlock < identityRows.identity.verificationBlock ||
-      state.blockTimestamp < identityRows.identity.verificationBlockTimestamp ||
+  if (!isStoredSoraChainStateCoherent(identityRows.identity, state) ||
       identityRows.stateEnvelope.timestamp < state.blockTimestamp - WORKER_HEALTH_MAX_FUTURE_SEC ||
-      identityRows.stateEnvelope.timestamp > nowSec + WORKER_HEALTH_MAX_FUTURE_SEC ||
-      (state.lastIndexedBlock === identityRows.identity.verificationBlock &&
-        (state.blockHash !== identityRows.identity.verificationBlockHash ||
-         state.blockTimestamp !== identityRows.identity.verificationBlockTimestamp))) {
+      identityRows.stateEnvelope.timestamp > nowSec + WORKER_HEALTH_MAX_FUTURE_SEC) {
     return { ok: false, code: 'state-incoherent' };
   }
 
@@ -267,6 +265,7 @@ const defaultDatabase = (databaseUrl: string): WorkerHealthDatabase => {
     idleTimeoutMillis: WORKER_HEALTH_CLEANUP_TIMEOUT_MS,
     query_timeout: WORKER_HEALTH_QUERY_TIMEOUT_MS,
     statement_timeout: WORKER_HEALTH_QUERY_TIMEOUT_MS,
+    options: POSTGRES_TRUSTED_SESSION_OPTIONS,
     application_name: 'polkaswap-worker-health',
     allowExitOnIdle: true,
   });

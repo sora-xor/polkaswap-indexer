@@ -1,6 +1,7 @@
 import pg from 'pg';
 
 import { readConfig } from '../config.js';
+import { POSTGRES_TRUSTED_SESSION_OPTIONS } from '../postgres-session.js';
 import { assertPostgresCaptureTableDropConfirmation, readStrictBoolean } from './env.js';
 import {
   acquireMigrationProcessLock,
@@ -22,7 +23,10 @@ const { Pool } = pg;
 export const cleanupPostgresRocksdbCapture = async (): Promise<void> => {
   const dropChangeTable = readStrictBoolean(process.env, 'ROCKSDB_DROP_CHANGE_TABLE', false);
   assertPostgresCaptureTableDropConfirmation(process.env, dropChangeTable);
-  const pool = new Pool({ connectionString: readConfig().databaseUrl });
+  const pool = new Pool({
+    connectionString: readConfig().databaseUrl,
+    options: POSTGRES_TRUSTED_SESSION_OPTIONS,
+  });
   let lockClient: pg.PoolClient | null = null;
 
   try {

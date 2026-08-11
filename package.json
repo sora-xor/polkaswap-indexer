@@ -17,6 +17,8 @@
     "worker": "tsx src/worker/index.ts",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:migrate:dist": "node dist/src/db/migrate.js",
+    "db:migrate:production": "tsx src/scripts/production-migrate.ts",
+    "db:migrate:production:dist": "node dist/src/scripts/production-migrate.js",
     "storage:migrate:postgres-to-rocksdb": "tsx src/scripts/migrate-postgres-to-rocksdb.ts",
     "storage:migrate:postgres-to-rocksdb:dist": "node dist/src/scripts/migrate-postgres-to-rocksdb.js",
     "storage:verify:rocksdb": "tsx src/scripts/verify-rocksdb.ts",
@@ -46,6 +48,7 @@
     "test:deployment-evidence-audit": "bash scripts/test-deployment-evidence-audit.sh",
     "test:deployment-evidence-template": "bash scripts/test-deployment-evidence-template.sh",
     "test:deployment-manifest": "bash scripts/test-deployment-manifest.sh",
+    "test:production-database-deployment": "bash scripts/test-production-database-deployment.sh",
     "test:production-smoke": "vitest run tests/production-smoke.spec.ts",
     "test": "vitest run"
   },
