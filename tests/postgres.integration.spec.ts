@@ -661,13 +661,13 @@ describeWithPostgres('PostgresRepository integration', () => {
     const memory = new MemoryRepository();
     const documents: IndexerDocument[] = [
       { collection: 'markets', id: 'market-one', blockHeight: 1, data: { id: 'market-one', marketId: 1 } },
-      { collection: 'markets', id: 'market-two', blockHeight: 2, data: { id: 'market-two', marketId: '2.00' } },
+      { collection: 'markets', id: 'market-two', blockHeight: 2, data: { id: 'market-two', marketId: '2' } },
     ];
     await repository.upsertMany(documents);
     await memory.upsertMany(documents);
 
     for (const filter of [
-      { marketId: { equalTo: '1.0' } },
+      { marketId: { equalTo: '1' } },
       { marketId: { in: [1, '2'] } },
     ]) {
       const args = { first: 10, orderBy: ['ID_ASC'], filter, includeTotalCount: false } as const;

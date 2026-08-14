@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from 'node:util';
+
 import { ApiPromise, WsProvider } from '@polkadot/api';
 import { types as soraTypes } from '@sora-substrate/type-definitions';
 
@@ -7,11 +9,16 @@ import {
   assertIndependentSoraRpcEndpoints,
   type AppConfig,
 } from '../config.js';
+import { matchesFilter, sortDocuments } from '../graphql/filter.js';
 import { compareLexical } from '../lexical.js';
 import { metrics } from '../metrics.js';
 import { createRepositoryCursorScope } from '../repository/cursor.js';
 import type { IndexerCollection, IndexerDocument, IndexerRepository, RepositoryQueryArgs } from '../repository/types.js';
-import { MAX_REPOSITORY_WRITE_CALL_DOCUMENTS } from '../repository/validation.js';
+import {
+  assertValidDocumentId,
+  MAX_REPOSITORY_WRITE_CALL_DOCUMENTS,
+  parseRuntimeUInt32,
+} from '../repository/validation.js';
 import {
   isNonzeroCanonicalSubstrateHash,
   parseStoredSoraChainIdentity,
@@ -497,7 +504,9 @@ type ChainIndexerConfig = Partial<AppConfig> &
 
 const CHAIN_STATE_ID = 'chainState';
 const CHAIN_IDENTITY_ID = 'chainIdentity';
-const ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID = 'accountTransactionsBackfill-v1';
+// v2 reprojects legacy rows with canonical module/method and Polkamarkt u32
+// identifiers. A completed v1 marker must not suppress this release repair.
+const ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID = 'accountTransactionsBackfill-v2';
 const ALL_INDEXER_COLLECTIONS: readonly IndexerCollection[] = [
   'accounts',
   'accountMeta',
@@ -552,7 +561,6 @@ const XOR_BURN_BACKFILL_RPC_RETRY_DELAY_MS = readPositiveIntegerEnv('CHAIN_XOR_B
 const BRIDGE_PROXY_HISTORY_BACKFILL_BATCH_SIZE = 500;
 const BRIDGE_PROXY_HISTORY_BACKFILL_RPC_CONCURRENCY = 16;
 const XOR_SUPPLY_REPAIR_RPC_CONCURRENCY = 8;
-const ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE = 1_000;
 const FINALIZED_HEAD_RETRY_DELAY_MS = 5_000;
 const FINALIZED_HEAD_POLL_INTERVAL_MS = 1_000;
 const DERIVED_STATE_REFRESH_RETRY_DELAY_MS = 15_000;
@@ -645,6 +653,7 @@ const ANALYTICS_RETAINED_ENTRY_OVERHEAD_BYTES = 32;
 // analytics arrays. Keep every worker query page bounded independently so a
 // small row count cannot materialize an arbitrarily large PostgreSQL result.
 const WORKER_REPOSITORY_QUERY_PAGE_MAX_BYTES = 8 * 1024 * 1024;
+const WORKER_REPOSITORY_ID_LOOKUP_BATCH_SIZE = 1_000;
 const DERIVED_STORAGE_ENTRIES_PAGE_SIZE = 256;
 const DERIVED_STORAGE_RETAINED_ENTRY_OVERHEAD_BYTES = 32;
 const MAX_HISTORICAL_VALUATION_POINT_READS_PER_BLOCK = 1_024;
@@ -706,19 +715,43 @@ const historyExecutionSucceeded = (execution: unknown): boolean =>
   !execution || typeof execution !== 'object' || (execution as Record<string, unknown>).success !== false;
 
 /** Corrupt or partial markers must not suppress reconstruction from legacy history rows. */
-const hasCompletedAccountTransactionsBackfill = (value: unknown): boolean => {
-  if (typeof value !== 'string' || !value) return false;
+const hasCompletedAccountTransactionsBackfill = (
+  state: IndexerDocument | null,
+  finalizedBlock: number
+): boolean => {
+  if (
+    !state ||
+    state.id !== ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID ||
+    state.data.id !== ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID ||
+    typeof state.data.data !== 'string' ||
+    !state.data.data
+  ) {
+    return false;
+  }
 
   try {
-    const parsed = JSON.parse(value) as {
+    const parsed = JSON.parse(state.data.data) as {
       processedDocuments?: unknown;
       writtenDocuments?: unknown;
       lastIndexedBlock?: unknown;
       lastTimestamp?: unknown;
+      finalizedBlock?: unknown;
     };
 
-    return [parsed.processedDocuments, parsed.writtenDocuments, parsed.lastIndexedBlock, parsed.lastTimestamp].every(
-      (item) => Number.isSafeInteger(item) && Number(item) >= 0
+    return (
+      [
+        parsed.processedDocuments,
+        parsed.writtenDocuments,
+        parsed.lastIndexedBlock,
+        parsed.lastTimestamp,
+        parsed.finalizedBlock,
+      ].every(
+        (item) => Number.isSafeInteger(item) && Number(item) >= 0
+      ) &&
+      Number(parsed.lastIndexedBlock) <= Number(parsed.finalizedBlock) &&
+      Number(parsed.finalizedBlock) <= finalizedBlock &&
+      state.blockHeight === parsed.lastIndexedBlock &&
+      state.data.block === parsed.lastIndexedBlock
     );
   } catch {
     return false;
@@ -950,6 +983,13 @@ const integerSqrt = (value: bigint): bigint => {
 const ratioBps = (numerator: bigint, denominator: bigint): number =>
   denominator <= 0n ? 0 : Number((numerator * 10_000n) / denominator);
 
+const basisPointsToDecimalString = (value: number, decimalPlaces: 2 | 4): string => {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 10_000) {
+    throw new Error('Cannot serialize invalid basis points');
+  }
+  return decimalToString(BigInt(value), decimalPlaces, decimalPlaces);
+};
+
 const normalizedMechanism = (value: string): string => value.replace(/[_\s-]/g, '').toLowerCase();
 
 const emptyIndexedMarketState = (yesShares: bigint, noShares: bigint) => ({
@@ -960,9 +1000,9 @@ const emptyIndexedMarketState = (yesShares: bigint, noShares: bigint) => ({
   marginalNoPriceBps: 0,
   impliedYesProbabilityBps: 0,
   impliedNoProbabilityBps: 0,
-  probability: null as number | null,
-  priceYes: null as number | null,
-  priceNo: null as number | null,
+  probability: null as string | null,
+  priceYes: null as string | null,
+  priceNo: null as string | null,
 });
 
 const dpmIndexedState = (yesShares: bigint, noShares: bigint) => {
@@ -985,9 +1025,9 @@ const dpmIndexedState = (yesShares: bigint, noShares: bigint) => {
     marginalNoPriceBps,
     impliedYesProbabilityBps,
     impliedNoProbabilityBps,
-    probability: impliedYesProbabilityBps / 100,
-    priceYes: impliedYesProbabilityBps / 10_000,
-    priceNo: impliedNoProbabilityBps / 10_000,
+    probability: basisPointsToDecimalString(impliedYesProbabilityBps, 2),
+    priceYes: basisPointsToDecimalString(impliedYesProbabilityBps, 4),
+    priceNo: basisPointsToDecimalString(impliedNoProbabilityBps, 4),
   };
 };
 
@@ -1096,6 +1136,15 @@ const normalizeValue = (value: unknown): unknown => {
   if (typeof json === 'string') return json;
 
   return String((value as CodecLike | undefined)?.toString?.() ?? '');
+};
+
+/** Preserves the complete SCALE u32 domain without accepting coercive or non-canonical IDs. */
+const runtimeUInt32OrNull = (value: unknown): number | null => {
+  try {
+    return parseRuntimeUInt32(normalizeValue(value), 'Polkamarkt identifier');
+  } catch {
+    return null;
+  }
 };
 
 const eventData = (event: EventRecord['event']): Record<string, unknown> => {
@@ -1548,8 +1597,16 @@ const historyIndexedAccounts = (
   address: string,
   history: { data: unknown; from: string; to: string }
 ): string[] => {
-  if (module === 'bridgeProxy' && isRecord(history.data) && bridgeNetworkType(String(history.data.networkId ?? '')) === 'Sub') {
-    return uniqueIndexedAccountIds(method === 'mint' ? [history.from || address] : [address, history.from]);
+  const normalizedModule = module.toLowerCase();
+  const normalizedMethod = method.toLowerCase();
+  if (
+    normalizedModule === 'bridgeproxy' &&
+    isRecord(history.data) &&
+    bridgeNetworkType(String(history.data.networkId ?? '')) === 'Sub'
+  ) {
+    return uniqueIndexedAccountIds(
+      normalizedMethod === 'mint' ? [history.from || address] : [address, history.from]
+    );
   }
 
   return uniqueIndexedAccountIds([address, history.from, history.to]);
@@ -1587,7 +1644,10 @@ const createPolkamarktHistoryData = (
   const trade = findEvent(events, 'polkamarkt', 'TradeExecuted');
 
   if ((token === 'buy' || token === 'sell') && trade) {
-    const marketId = Number(trade.marketId ?? trade.arg0 ?? args.marketId ?? args.arg0 ?? 0);
+    const marketId = runtimeUInt32OrNull(
+      trade.marketId ?? trade.arg0 ?? args.marketId ?? args.arg0
+    );
+    if (marketId === null) return null;
     const trader = firstString(trade, ['trader', 'account', 'arg1']) || signer;
     const collateralAmount = firstPresentValue(trade, ['collateralAmount', 'arg4']) ?? args.collateralIn ?? args.arg2 ?? 0;
     const shareAmount = firstPresentValue(trade, ['shareAmount', 'shares', 'arg5']) ?? args.sharesIn ?? args.arg2 ?? 0;
@@ -1618,12 +1678,16 @@ const createPolkamarktHistoryData = (
   if (token === 'claimmarket') {
     const claim = findEvent(events, 'polkamarkt', 'MarketClaimed');
     if (!claim) return null;
+    const marketId = runtimeUInt32OrNull(
+      claim.marketId ?? claim.arg0 ?? args.marketId ?? args.arg0
+    );
+    if (marketId === null) return null;
     const trader = firstString(claim, ['trader', 'account', 'arg1']) || signer;
     const payout = firstPresentValue(claim, ['payout', 'amount', 'arg2']) ?? 0;
 
     return {
       data: {
-        marketId: Number(claim.marketId ?? claim.arg0 ?? args.marketId ?? args.arg0 ?? 0),
+        marketId,
         side: 'claim',
         collateralUsd: codecToDecimalString(payout, DECIMALS),
         collateralAmountUsd: codecToDecimalString(payout, DECIMALS),
@@ -1638,6 +1702,13 @@ const createPolkamarktHistoryData = (
     const claims = findEvents(events, 'polkamarkt', 'MarketClaimed');
     const batch = findEvent(events, 'polkamarkt', 'MarketClaimsBatched');
     if (!claims.length) return null;
+    const marketIds = claims.map((claim) =>
+      runtimeUInt32OrNull(claim.marketId ?? claim.arg0)
+    );
+    if (marketIds.some((marketId) => marketId === null)) return null;
+    const canonicalMarketIds = marketIds as number[];
+    const marketId = canonicalMarketIds[0];
+    if (marketId === null || marketId === undefined) return null;
     const batchTrader = firstString(batch ?? {}, ['trader', 'account', 'arg0', 'arg1']);
     const claimTraders = claims.map((claim) => firstString(claim, ['trader', 'account', 'arg1'])).filter(Boolean);
     const uniqueTraders = new Set([batchTrader, ...claimTraders].filter(Boolean));
@@ -1647,7 +1718,8 @@ const createPolkamarktHistoryData = (
 
     return {
       data: {
-        marketId: Number(claims[0]?.marketId ?? claims[0]?.arg0 ?? 0) || null,
+        marketId,
+        marketIds: canonicalMarketIds,
         side: 'claim',
         claimedMarkets: claims.length,
         requestedMarkets: Number(batch?.requested ?? batch?.arg1 ?? 0) || claims.length,
@@ -1663,12 +1735,16 @@ const createPolkamarktHistoryData = (
   if (token === 'claimcreatorfees') {
     const claim = findEvent(events, 'polkamarkt', 'CreatorFeesClaimed');
     if (!claim) return null;
+    const marketId = runtimeUInt32OrNull(
+      claim.marketId ?? claim.arg0 ?? args.marketId ?? args.arg0
+    );
+    if (marketId === null) return null;
     const creator = firstString(claim, ['creator', 'account', 'arg1']) || signer;
     const amount = firstPresentValue(claim, ['amount', 'arg2']) ?? 0;
 
     return {
       data: {
-        marketId: Number(claim.marketId ?? claim.arg0 ?? args.marketId ?? args.arg0 ?? 0),
+        marketId,
         side: 'claim_creator_fees',
         collateralUsd: codecToDecimalString(amount, DECIMALS),
         collateralAmountUsd: codecToDecimalString(amount, DECIMALS),
@@ -2519,6 +2595,11 @@ export class ChainIndexer {
       finalizedCatchupPrefetchConcurrency: 1,
       priceStreamRefreshIntervalBlocks: 0,
       legacySoraBlockTypes: false,
+      nexusAvailable: false,
+      nexusSendsAvailable: false,
+      polkamarktVisible: false,
+      polkamarktMutationsAvailable: false,
+      tairaDefaultVisible: true,
       ...config,
       soraArchiveWsEndpoint: archiveSoraWsEndpoint || null,
       archiveSoraWsEndpoint,
@@ -3311,7 +3392,7 @@ export class ChainIndexer {
     if (this.isStopping()) return;
     const repairedSupply = await this.repairXorSupplyDocuments();
     if (this.isStopping()) return;
-    const backfilledTransactions = await this.backfillAccountTransactions();
+    const backfilledTransactions = await this.backfillAccountTransactions(finalizedBlock);
     if (this.isStopping()) return;
     const repairedCounters = await this.repairNetworkTransactionCounters();
     if (this.isStopping()) return;
@@ -3473,19 +3554,55 @@ export class ChainIndexer {
     return 0;
   }
 
-  private async getBridgeProxyHistoryBackfillBlock(): Promise<number> {
+  /** Loads a verified checkpoint and discards malformed receipts before replay. */
+  private async getBridgeProxyHistoryBackfillBlock(finalizedBlock: number): Promise<number> {
     const beforeStart = this.bridgeProxyHistoryBackfillStartBlock() - 1;
     const state = await this.repository.get('updatesStreams', BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID);
-    if (!state?.data?.data || typeof state.data.data !== 'string') return beforeStart;
-
-    try {
-      const parsed = JSON.parse(state.data.data) as { lastIndexedBlock?: number };
-      const block = Number(parsed.lastIndexedBlock);
-
-      return Number.isFinite(block) ? Math.max(Math.trunc(block), beforeStart) : beforeStart;
-    } catch {
+    if (!state) return beforeStart;
+    const discardInvalidMarker = async (): Promise<number> => {
+      await this.repository.deleteMany(
+        collection('updatesStreams'),
+        [BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID]
+      );
       return beforeStart;
+    };
+    if (
+      state.id !== BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID ||
+      state.data.id !== BRIDGE_PROXY_HISTORY_BACKFILL_STATE_ID ||
+      typeof state.data.data !== 'string' ||
+      !state.data.data
+    ) {
+      return discardInvalidMarker();
     }
+
+    let parsed: { lastIndexedBlock?: unknown };
+    try {
+      const value = JSON.parse(state.data.data) as unknown;
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return discardInvalidMarker();
+      }
+      parsed = value as { lastIndexedBlock?: unknown };
+    } catch {
+      return discardInvalidMarker();
+    }
+    const block = parsed.lastIndexedBlock;
+
+    if (
+      !Number.isSafeInteger(block) ||
+      Number(block) < this.bridgeProxyHistoryBackfillStartBlock() ||
+      Number(block) > SORA_MAX_BLOCK_NUMBER ||
+      state.blockHeight !== block ||
+      state.data.block !== block
+    ) {
+      return discardInvalidMarker();
+    }
+    if (Number(block) > finalizedBlock) {
+      throw new Error(
+        `Stored bridgeProxy history backfill checkpoint ${String(block)} is ahead of finalized block ${finalizedBlock}`
+      );
+    }
+
+    return Number(block);
   }
 
   private createBridgeProxyHistoryBackfillStateDocument(block: number): IndexerDocument {
@@ -3576,7 +3693,8 @@ export class ChainIndexer {
     processedDocuments: number,
     writtenDocuments: number,
     blockHeight: number,
-    timestamp: number
+    timestamp: number,
+    finalizedBlock: number
   ): IndexerDocument {
     return {
       collection: collection('updatesStreams'),
@@ -3591,6 +3709,7 @@ export class ChainIndexer {
           writtenDocuments,
           lastIndexedBlock: blockHeight,
           lastTimestamp: timestamp,
+          finalizedBlock,
         }),
       },
     };
@@ -3757,47 +3876,80 @@ export class ChainIndexer {
    * `accountTransactions` collection existed. A completion marker lets GraphQL
    * avoid legacy history scans after the one-time migration has finished.
    */
-  private async backfillAccountTransactions(): Promise<boolean> {
+  private async backfillAccountTransactions(
+    finalizedBlock: number = SORA_MAX_BLOCK_NUMBER
+  ): Promise<boolean> {
     if (this.isStopping()) return false;
     const state = await this.repository.get(collection('updatesStreams'), ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID);
-    if (hasCompletedAccountTransactionsBackfill(state?.data?.data)) return false;
+    if (hasCompletedAccountTransactionsBackfill(state, finalizedBlock)) return false;
+    if (state) {
+      // A corrupt high-block marker would otherwise defeat the repository's
+      // stale-write guard and prevent the valid terminal receipt from replacing
+      // it after a conservative replay.
+      await this.repository.deleteMany(
+        collection('updatesStreams'),
+        [ACCOUNT_TRANSACTIONS_BACKFILL_STATE_ID]
+      );
+    }
 
-    const documents: IndexerDocument[] = [];
     let processedDocuments = 0;
     let writtenDocuments = 0;
     let latestBlock = 0;
     let latestTimestamp = 0;
-    const flush = async (): Promise<void> => {
-      if (!documents.length || this.isStopping()) return;
 
-      const batch = documents.splice(0, documents.length);
-      await this.repository.upsertMany(batch);
-      writtenDocuments += batch.length;
-      await this.drainFinalizedHeads();
-    };
-
-    for await (const page of this.queryPages(collection('historyElements'), { orderBy: ['TIMESTAMP_ASC'] })) {
+    for await (const page of this.queryPages(collection('historyElements'), {
+      filter: { blockHeight: { lessThanOrEqualTo: finalizedBlock } },
+      orderBy: ['TIMESTAMP_ASC'],
+    })) {
       if (this.isStopping()) return false;
+      const accountTransactionDocuments: IndexerDocument[] = [];
+
       for (const document of page) {
         processedDocuments += 1;
         const blockHeight = Number(document.blockHeight ?? document.data.blockHeight ?? latestBlock);
         const timestamp = Number(document.timestamp ?? document.data.timestamp ?? latestTimestamp);
-        if (Number.isFinite(blockHeight)) latestBlock = Math.max(latestBlock, blockHeight);
+        if (!Number.isSafeInteger(blockHeight) || blockHeight < 0) {
+          throw new Error(
+            `Account transaction backfill source returned invalid block ${String(blockHeight)}`
+          );
+        }
+        if (blockHeight > finalizedBlock) {
+          throw new Error(
+            `Account transaction backfill source block ${String(blockHeight)} is ahead of finalized block ${finalizedBlock}`
+          );
+        }
+        latestBlock = Math.max(latestBlock, blockHeight);
         if (Number.isFinite(timestamp)) latestTimestamp = Math.max(latestTimestamp, timestamp);
 
-        documents.push(...this.createAccountTransactionDocumentsFromHistory(document));
-        if (documents.length >= ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE) await flush();
+        accountTransactionDocuments.push(...this.createAccountTransactionDocumentsFromHistory(document));
       }
+
+      await this.upsertDocumentsInCallChunks(accountTransactionDocuments);
+      await this.assertAccountTransactionDocumentsStored(accountTransactionDocuments);
+      writtenDocuments += accountTransactionDocuments.length;
+      await this.drainFinalizedHeads();
     }
 
-    await flush();
+    const prunedDocuments = await this.pruneAccountTransactionDocumentsFromHistory(finalizedBlock);
     if (this.isStopping()) return false;
+    if (latestBlock > finalizedBlock) {
+      throw new Error(
+        `Account transaction backfill source block ${latestBlock} is ahead of finalized block ${finalizedBlock}`
+      );
+    }
     await this.repository.upsert(
-      this.createAccountTransactionsBackfillStateDocument(processedDocuments, writtenDocuments, latestBlock, latestTimestamp)
+      this.createAccountTransactionsBackfillStateDocument(
+        processedDocuments,
+        writtenDocuments,
+        latestBlock,
+        latestTimestamp,
+        finalizedBlock
+      )
     );
     if (writtenDocuments) console.info(`Backfilled ${writtenDocuments} account transaction rows from legacy history`);
+    if (prunedDocuments) console.info(`Pruned ${prunedDocuments} stale account transaction rows from legacy history`);
 
-    return writtenDocuments > 0;
+    return writtenDocuments > 0 || prunedDocuments > 0;
   }
 
   private addNetworkTransactionCounters(target: NetworkTransactionCounters, delta: NetworkTransactionCounters): void {
@@ -4128,7 +4280,7 @@ export class ChainIndexer {
   private async backfillBridgeProxyHistory(finalizedBlock: number): Promise<void> {
     if (this.isStopping() || !this.api) return;
 
-    const lastBackfilled = await this.getBridgeProxyHistoryBackfillBlock();
+    const lastBackfilled = await this.getBridgeProxyHistoryBackfillBlock(finalizedBlock);
     const startBlock = Math.max(this.bridgeProxyHistoryBackfillStartBlock(), lastBackfilled + 1);
 
     if (startBlock > finalizedBlock) return;
@@ -4207,7 +4359,7 @@ export class ChainIndexer {
       );
       const batchDocuments: IndexerDocument[] = [];
       const accountTransactionDocuments: IndexerDocument[] = [];
-      const historyElementIds: string[] = [];
+      const obsoleteAccountTransactionSources = new Map<string, Set<string>>();
 
       if (bridgeBlockIndexes.length) {
         const bridgeBlocks = await mapWithConcurrency(
@@ -4231,19 +4383,44 @@ export class ChainIndexer {
           const { blockHeight, blockHash, contexts } = this.createBridgeProxyHistoryContexts(signedBlock, events);
 
           for (const context of contexts) {
-            historyElementIds.push(context.id);
             const historyDocument = this.createHistoryElementDocument(context, blockHeight, timestamp, blockHash);
-            batchDocuments.push(historyDocument);
-            accountTransactionDocuments.push(
-              ...this.createAccountTransactionDocuments(context, blockHeight, timestamp, historyDocument)
+            const contextAccountTransactionDocuments = this.createAccountTransactionDocuments(
+              context,
+              blockHeight,
+              timestamp,
+              historyDocument
             );
+            batchDocuments.push(historyDocument);
+            accountTransactionDocuments.push(...contextAccountTransactionDocuments);
+            for (const obsoleteId of this.obsoleteAccountTransactionIdsFromHistory(
+              historyDocument,
+              contextAccountTransactionDocuments
+            )) {
+              const sourceIds = obsoleteAccountTransactionSources.get(obsoleteId) ?? new Set<string>();
+              sourceIds.add(historyDocument.id);
+              obsoleteAccountTransactionSources.set(obsoleteId, sourceIds);
+            }
           }
         }
       }
 
       if (this.isStopping()) return;
-      await this.repository.upsertMany(batchDocuments);
-      await this.upsertAndPruneAccountTransactionDocuments(historyElementIds, accountTransactionDocuments);
+      await this.upsertDocumentsInCallChunks(batchDocuments);
+      await this.upsertDocumentsInCallChunks(accountTransactionDocuments);
+      await this.assertAccountTransactionDocumentsStored(accountTransactionDocuments);
+      const canonicalAccountTransactionIds = new Set(
+        accountTransactionDocuments.map((document) => document.id)
+      );
+      for (const id of canonicalAccountTransactionIds) {
+        obsoleteAccountTransactionSources.delete(id);
+      }
+      const verifiedObsoleteAccountTransactionIds = await this.accountTransactionIdsReferencingSources(
+        obsoleteAccountTransactionSources
+      );
+      await this.deleteDocumentIdsInCallChunks(
+        collection('accountTransactions'),
+        verifiedObsoleteAccountTransactionIds
+      );
       if (this.isStopping()) return;
       await this.repository.upsert(this.createBridgeProxyHistoryBackfillStateDocument(batchEnd));
       console.info(`Backfilled bridgeProxy history through SORA block ${batchEnd}/${finalizedBlock}`);
@@ -4338,29 +4515,78 @@ export class ChainIndexer {
     return { blockHeight, blockHash, contexts };
   }
 
-  private async upsertAndPruneAccountTransactionDocuments(
-    historyElementIds: string[],
-    documents: IndexerDocument[]
-  ): Promise<void> {
-    const uniqueHistoryElementIds = [...new Set(historyElementIds)];
-    if (!uniqueHistoryElementIds.length) return;
-
-    const expectedIds = new Set(documents.map((document) => document.id));
-    const staleIds: string[] = [];
-
-    await this.repository.upsertMany(documents);
+  /**
+   * Reconciles legacy account projections in one bounded, finalized-cutoff
+   * ID-keyset pass.
+   * Rows whose source history is absent, partial, or whose reference is
+   * malformed are retained: incomplete evidence is never permission to delete
+   * activity.
+   */
+  private async pruneAccountTransactionDocumentsFromHistory(
+    finalizedBlock: number
+  ): Promise<number> {
+    let prunedDocuments = 0;
 
     for await (const page of this.queryPages(collection('accountTransactions'), {
-      filter: { historyElementId: { in: uniqueHistoryElementIds } },
+      filter: { blockHeight: { lessThanOrEqualTo: finalizedBlock } },
+      orderBy: ['ID_ASC'],
     })) {
+      if (this.isStopping()) return prunedDocuments;
+
+      const historyElementIds = new Set<string>();
       for (const document of page) {
-        if (!expectedIds.has(document.id)) staleIds.push(document.id);
+        const historyElementId = document.data.historyElementId;
+        if (typeof historyElementId !== 'string') continue;
+        try {
+          assertValidDocumentId(historyElementId);
+          historyElementIds.add(historyElementId);
+        } catch {
+          // Preserve rows with malformed source references for manual recovery.
+        }
       }
+
+      const historyElements = historyElementIds.size
+        ? await this.repository.getMany(collection('historyElements'), [...historyElementIds])
+        : new Map<string, IndexerDocument>();
+      const expectedIdsByHistoryElement = new Map<string, Set<string>>();
+      for (const [historyElementId, historyElement] of historyElements) {
+        if (historyElement.id !== historyElementId) continue;
+        const sourceBlockHeight = Number(
+          historyElement.blockHeight ?? historyElement.data.blockHeight
+        );
+        if (
+          !Number.isSafeInteger(sourceBlockHeight) ||
+          sourceBlockHeight < 0 ||
+          sourceBlockHeight > finalizedBlock
+        ) {
+          // Unknown or newer sources are outside this fixed repair snapshot;
+          // retain every referencing projection for a later/manual pass.
+          continue;
+        }
+        const expectedDocuments = this.createAccountTransactionDocumentsFromHistory(historyElement);
+        // A present but partial/malformed source is not positive evidence that
+        // every retained projection is obsolete. Preserve it for recovery when
+        // no canonical local account can be reconstructed.
+        if (!expectedDocuments.length) continue;
+        expectedIdsByHistoryElement.set(
+          historyElementId,
+          new Set(expectedDocuments.map((document) => document.id))
+        );
+      }
+
+      const staleIds = page.flatMap((document) => {
+        const historyElementId = document.data.historyElementId;
+        if (typeof historyElementId !== 'string') return [];
+        const expectedIds = expectedIdsByHistoryElement.get(historyElementId);
+        if (!expectedIds) return [];
+        return expectedIds.has(document.id) ? [] : [document.id];
+      });
+      await this.deleteDocumentIdsInCallChunks(collection('accountTransactions'), staleIds);
+      prunedDocuments += staleIds.length;
+      await this.drainFinalizedHeads();
     }
 
-    for (let start = 0; start < staleIds.length; start += ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE) {
-      await this.repository.deleteMany(collection('accountTransactions'), staleIds.slice(start, start + ACCOUNT_TRANSACTIONS_BACKFILL_BATCH_SIZE));
-    }
+    return prunedDocuments;
   }
 
   private async backfill(): Promise<boolean> {
@@ -4960,12 +5186,12 @@ export class ChainIndexer {
   }
 
   private async enrichSellRealizedPnl(context: BlockExtrinsicContext, data: Record<string, unknown>): Promise<string | null> {
-    const marketId = Number(data.marketId ?? data.market_id ?? 0);
+    const marketId = runtimeUInt32OrNull(data.marketId ?? data.market_id);
     const account = context.history.from || context.address;
     const outcome = firstString(data, ['outcome', 'toOutcome', 'to_outcome']);
     const sharesSold = this.decimalStringToScaledOrNull(data.shares ?? data.sharesAmount ?? data.shareAmount);
     const collateralOut = this.decimalStringToScaledOrNull(data.collateralUsd ?? data.collateralAmountUsd);
-    if (!Number.isSafeInteger(marketId) || !account || !outcome || sharesSold === null || collateralOut === null) return null;
+    if (marketId === null || !account || !outcome || sharesSold === null || collateralOut === null) return null;
 
     const position = await this.repository.get(collection('accountPositions'), `${marketId}-${account}`);
     if (!position) return null;
@@ -4993,8 +5219,8 @@ export class ChainIndexer {
       const trader = firstString(claim, ['trader', 'account', 'arg1']) || account;
       if (trader !== account) return null;
 
-      const marketId = Number(claim.marketId ?? claim.arg0 ?? 0);
-      if (!Number.isSafeInteger(marketId)) return null;
+      const marketId = runtimeUInt32OrNull(claim.marketId ?? claim.arg0);
+      if (marketId === null) return null;
 
       const position = await this.repository.get(collection('accountPositions'), `${marketId}-${trader}`);
       const costBasis = this.readPositionCostBasis(position);
@@ -6953,10 +7179,23 @@ export class ChainIndexer {
   ): IndexerDocument[] {
     const source = historyDocument.data;
     const payload = isRecord(source.data) ? source.data : {};
-    const firstCall = Array.isArray(source.calls) && isRecord(source.calls[0]) ? source.calls[0] : {};
-    const firstCallData = isRecord(firstCall.data) ? firstCall.data : {};
-    const records = [source, payload, firstCall, firstCallData];
-    const firstScalar = (keys: readonly string[]): string | number | boolean | null => {
+    const calls = Array.isArray(source.calls) ? source.calls.filter(isRecord) : [];
+    const polkamarktCall = calls.find(
+      (call) => typeof call.module === 'string' && call.module.toLowerCase() === 'polkamarkt'
+    );
+    const polkamarktCallData = isRecord(polkamarktCall?.data) ? polkamarktCall.data : {};
+    const polkamarktCallArgs = isRecord(polkamarktCallData.args) ? polkamarktCallData.args : {};
+    const directPolkamarkt =
+      typeof source.module === 'string' && source.module.toLowerCase() === 'polkamarkt';
+    const tradeRecords = directPolkamarkt
+      ? [payload, source]
+      : polkamarktCall
+        ? [polkamarktCallArgs, polkamarktCallData, polkamarktCall]
+        : [];
+    const firstScalar = (
+      records: Array<Record<string, unknown>>,
+      keys: readonly string[]
+    ): string | number | boolean | null => {
       for (const record of records) {
         for (const key of keys) {
           const value = record[key];
@@ -6971,9 +7210,49 @@ export class ChainIndexer {
       }
       return null;
     };
-    const tradeProjection: Record<string, string | number | boolean> = {};
+    const tradeProjection: Record<string, unknown> = {};
+    const transactionModule = tradeRecords.length
+      ? 'polkamarkt'
+      : firstScalar([source, payload], ['module']);
+    const transactionMethod = firstScalar(
+      polkamarktCall ? [polkamarktCall, source, payload] : [source, payload],
+      ['method']
+    );
+    const blockHash = firstScalar([source, payload], ['blockHash']);
+    if (transactionModule !== null) tradeProjection.module = transactionModule;
+    if (transactionMethod !== null) tradeProjection.method = transactionMethod;
+    if (blockHash !== null) tradeProjection.blockHash = blockHash;
+
+    const marketId = firstScalar(tradeRecords, [
+      'marketId',
+      'market_id',
+      'conditionId',
+      'condition_id',
+    ]);
+    if (marketId !== null) {
+      tradeProjection.marketId = parseRuntimeUInt32(marketId, 'Polkamarkt account transaction marketId');
+    }
+    const rawMarketIds = tradeRecords
+      .map((record) => record.marketIds ?? record.market_ids)
+      .find((value) => value !== null && value !== undefined);
+    if (rawMarketIds !== undefined && typeof tradeProjection.marketId === 'number') {
+      if (!Array.isArray(rawMarketIds) || rawMarketIds.length === 0 || rawMarketIds.length > 24) {
+        throw new Error('Invalid Polkamarkt account transaction marketIds');
+      }
+      const canonicalMarketIds = rawMarketIds.map((value) =>
+        parseRuntimeUInt32(value, 'Polkamarkt account transaction marketIds')
+      );
+      if (new Set(canonicalMarketIds).size !== canonicalMarketIds.length) {
+        throw new Error('Invalid duplicate Polkamarkt account transaction marketIds');
+      }
+      if (
+        canonicalMarketIds[0] !== tradeProjection.marketId
+      ) {
+        throw new Error('Polkamarkt account transaction marketIds do not match marketId');
+      }
+      tradeProjection.marketIds = canonicalMarketIds;
+    }
     for (const [field, keys] of [
-      ['marketId', ['marketId', 'market_id', 'conditionId', 'condition_id']],
       ['side', ['side', 'action', 'method']],
       ['outcome', ['outcome', 'direction']],
       ['fromOutcome', ['fromOutcome', 'from_outcome', 'outcomeIn', 'outcome_in']],
@@ -6985,11 +7264,8 @@ export class ChainIndexer {
       ['price', ['price', 'executionPrice', 'avgPrice']],
       ['feeUsd', ['feeUsd', 'feeUSD', 'feeAmountUsd']],
       ['realizedPnlUsd', ['realizedPnlUsd', 'realizedPnlUSD', 'pnlUsd']],
-      ['blockHash', ['blockHash']],
-      ['module', ['module']],
-      ['method', ['method']],
     ] as const) {
-      const value = firstScalar(keys);
+      const value = firstScalar(tradeRecords, keys);
       if (value !== null) tradeProjection[field] = value;
     }
 
@@ -7015,30 +7291,68 @@ export class ChainIndexer {
 
   /** Reconstructs per-account transaction rows from indexer-owned legacy history fields. */
   private createAccountTransactionDocumentsFromHistory(document: IndexerDocument): IndexerDocument[] {
-    const historyElementId = String(document.data.id ?? document.id);
+    // The repository key is validated and authoritative. Never let a corrupt
+    // denormalized data.id redirect a repair into another transaction's ID
+    // namespace.
+    const historyElementId = document.id;
     const blockHeightValue = Number(document.blockHeight ?? document.data.blockHeight ?? 0);
     const timestampValue = Number(document.timestamp ?? document.data.timestamp ?? 0);
     const blockHeight = Number.isFinite(blockHeightValue) ? blockHeightValue : 0;
     const timestamp = Number.isFinite(timestampValue) ? timestampValue : 0;
-    const accounts = uniqueIndexedAccountIds([document.data.address, document.data.dataFrom, document.data.dataTo]);
-
-    return accounts.map((account) => {
-      const id = accountTransactionId(historyElementId, account);
-
-      return {
-        collection: collection('accountTransactions'),
-        id,
-        blockHeight,
-        timestamp,
-        data: {
-          id,
-          accountId: account,
-          historyElementId,
-          blockHeight,
-          timestamp,
-        },
-      };
+    const module = typeof document.data.module === 'string' ? document.data.module : '';
+    const method = typeof document.data.method === 'string' ? document.data.method : '';
+    const address = typeof document.data.address === 'string' ? document.data.address : '';
+    const from = typeof document.data.dataFrom === 'string' ? document.data.dataFrom : '';
+    const to = typeof document.data.dataTo === 'string' ? document.data.dataTo : '';
+    const accounts = historyIndexedAccounts(module, method, address, {
+      data: document.data.data,
+      from,
+      to,
     });
+
+    return this.createAccountTransactionDocuments(
+      { id: historyElementId, accounts },
+      blockHeight,
+      timestamp,
+      document
+    );
+  }
+
+  /**
+   * Produces only IDs that an older account projection could have derived
+   * directly from this verified history row. This lets focused history
+   * backfills remove their own obsolete rows without an unindexed collection
+   * scan. Malformed candidates are retained for manual recovery.
+   */
+  private obsoleteAccountTransactionIdsFromHistory(
+    historyDocument: IndexerDocument,
+    expectedDocuments: readonly IndexerDocument[]
+  ): string[] {
+    if (!expectedDocuments.length) return [];
+
+    const historyElementId = historyDocument.id;
+    const expectedIds = new Set(expectedDocuments.map((document) => document.id));
+    const obsoleteIds = new Set<string>();
+
+    for (const value of [
+      historyDocument.data.address,
+      historyDocument.data.dataFrom,
+      historyDocument.data.dataTo,
+    ]) {
+      if (typeof value !== 'string') continue;
+      const account = value.trim();
+      if (!account) continue;
+      const candidateId = accountTransactionId(historyElementId, account);
+      if (expectedIds.has(candidateId)) continue;
+      try {
+        assertValidDocumentId(candidateId);
+        obsoleteIds.add(candidateId);
+      } catch {
+        // Never turn malformed legacy evidence into permission to delete.
+      }
+    }
+
+    return [...obsoleteIds];
   }
 
   private applyAccountPointUpdates(
@@ -8294,8 +8608,8 @@ export class ChainIndexer {
 
   /**
    * Repository write calls are deliberately capped so validation and backend
-   * transactions cannot grow without bound. Only idempotent current-state
-   * projections use this helper; finalized block writes remain a single
+   * transactions cannot grow without bound. Only idempotent projections and
+   * repair backfills use this helper; finalized block writes remain a single
    * transaction because they contain read-modify-write aggregates.
    */
   private async upsertDocumentsInCallChunks(documents: IndexerDocument[]): Promise<void> {
@@ -8322,17 +8636,97 @@ export class ChainIndexer {
     }
   }
 
+  /**
+   * Confirms focused cleanup candidates still point at the verified source
+   * history that derived them. Missing or inconsistent rows are retained for
+   * recovery instead of treating a deterministic ID alone as deletion proof.
+   */
+  private async accountTransactionIdsReferencingSources(
+    candidates: ReadonlyMap<string, ReadonlySet<string>>
+  ): Promise<string[]> {
+    const ids = [...candidates.keys()];
+    const verifiedIds: string[] = [];
+
+    for (let start = 0; start < ids.length; start += WORKER_REPOSITORY_ID_LOOKUP_BATCH_SIZE) {
+      const batchIds = ids.slice(start, start + WORKER_REPOSITORY_ID_LOOKUP_BATCH_SIZE);
+      const documents = await this.repository.getMany(collection('accountTransactions'), batchIds);
+
+      for (const [id, document] of documents) {
+        const historyElementId = document.data.historyElementId;
+        if (
+          document.id === id &&
+          typeof historyElementId === 'string' &&
+          candidates.get(id)?.has(historyElementId)
+        ) {
+          verifiedIds.push(id);
+        }
+      }
+    }
+
+    return verifiedIds;
+  }
+
+  /**
+   * Proves idempotent repair upserts were not rejected by stale-write guards or
+   * a partial repository implementation before completion or cleanup proceeds.
+   */
+  private async assertAccountTransactionDocumentsStored(
+    expectedDocuments: readonly IndexerDocument[]
+  ): Promise<void> {
+    for (
+      let start = 0;
+      start < expectedDocuments.length;
+      start += WORKER_REPOSITORY_ID_LOOKUP_BATCH_SIZE
+    ) {
+      const expectedBatch = expectedDocuments.slice(
+        start,
+        start + WORKER_REPOSITORY_ID_LOOKUP_BATCH_SIZE
+      );
+      const storedDocuments = await this.repository.getMany(
+        collection('accountTransactions'),
+        expectedBatch.map((document) => document.id)
+      );
+
+      for (const expected of expectedBatch) {
+        const stored = storedDocuments.get(expected.id);
+        if (
+          !stored ||
+          stored.id !== expected.id ||
+          stored.blockHeight !== expected.blockHeight ||
+          stored.timestamp !== expected.timestamp ||
+          !isDeepStrictEqual(stored.data, expected.data)
+        ) {
+          throw new Error('Account transaction projection verification failed after bounded upsert');
+        }
+      }
+    }
+  }
+
   private async *queryPages(
     collectionName: IndexerCollection,
     args: RepositoryQueryArgs = {},
     remainingRetainedBytes?: () => number
   ): AsyncGenerator<IndexerDocument[], void, unknown> {
+    const pageSize = 1_000;
     if (!this.repository.query) {
-      yield await this.repository.list(collectionName);
+      const documents = sortDocuments(
+        (await this.repository.list(collectionName))
+          .map((document) => ({
+            ...document.data,
+            id: document.id,
+            timestamp: document.timestamp ?? document.data.timestamp,
+            blockHeight: document.blockHeight ?? document.data.blockHeight,
+            __document: document,
+          }))
+          .filter((document) => matchesFilter(document, args.filter)),
+        args.orderBy
+      ).map((document) => document.__document);
+      for (let start = 0; start < documents.length; start += pageSize) {
+        yield documents.slice(start, start + pageSize);
+      }
       return;
     }
 
-    const pageSize = 1_000;
     const firstOrder = Array.isArray(args.orderBy) ? args.orderBy[0] : args.orderBy;
     const normalizedOrder = String(firstOrder ?? '').toUpperCase();
     const useIdKeyset =
@@ -8378,6 +8772,40 @@ export class ChainIndexer {
         seek,
         keyset: useIdKeyset ? keyset : args.keyset,
       });
+
+      // Repair/backfill completion markers are trustworthy only if every
+      // repository page advances the requested stable order. Validate before
+      // yielding so a broken repository/test double cannot make destructive
+      // reconciliation consume an overlapping or out-of-order page.
+      if (useIdKeyset) {
+        let previousId = keyset?.id;
+        for (const document of page.items) {
+          if (previousId !== undefined && compareLexical(document.id, previousId) <= 0) {
+            throw new Error(`Repository ${collectionName} ID-keyset page did not advance`);
+          }
+          previousId = document.id;
+        }
+      } else if (useSeek && seekField !== null) {
+        let previousPosition = seek;
+        for (const document of page.items) {
+          const value = Number(
+            seekField === 'timestamp'
+              ? document.timestamp ?? document.data.timestamp
+              : document.blockHeight ?? document.data.blockHeight
+          );
+          if (!Number.isFinite(value)) {
+            throw new Error(`Repository ${collectionName} ${seekField} page returned an invalid cursor value`);
+          }
+          if (
+            previousPosition &&
+            (value < previousPosition.value ||
+              (value === previousPosition.value && compareLexical(document.id, previousPosition.id) <= 0))
+          ) {
+            throw new Error(`Repository ${collectionName} ${seekField} page did not advance`);
+          }
+          previousPosition = { field: seekField, value, id: document.id, direction: 'asc' };
+        }
+      }
       if (page.items.length) yield page.items;
 
       // Byte-limited repositories can deliberately return a short page while
@@ -8391,7 +8819,9 @@ export class ChainIndexer {
 
       if (useIdKeyset) {
         const last = page.items[page.items.length - 1];
-        if (!last) break;
+        if (!last) {
+          throw new Error(`Repository reported another ${collectionName} ID-keyset page without a cursor row`);
+        }
         keyset = {
           scope: createRepositoryCursorScope(collectionName, args.orderBy, args.filter),
           field: 'id',
@@ -8405,7 +8835,9 @@ export class ChainIndexer {
         const seekValue = Number(
           seekField === 'timestamp' ? last?.timestamp ?? last?.data.timestamp : last?.blockHeight ?? last?.data.blockHeight
         );
-        if (!last || !Number.isFinite(seekValue)) break;
+        if (!last || !Number.isFinite(seekValue) || seekField === null) {
+          throw new Error(`Repository reported another ${collectionName} seek page without a valid cursor row`);
+        }
 
         seek = { field: seekField, value: seekValue, id: last.id, direction: 'asc' };
       } else {
@@ -9594,10 +10026,7 @@ export class ChainIndexer {
   }
 
   private storageKeyNumber(key: StorageEntryKey): number | null {
-    const raw = normalizeValue(key.args?.[0]);
-    const parsed = Number(raw);
-
-    return Number.isSafeInteger(parsed) ? parsed : null;
+    return runtimeUInt32OrNull(key.args?.[0]);
   }
 
   private normalizedRecord(value: unknown): Record<string, unknown> {
@@ -9860,7 +10289,11 @@ export class ChainIndexer {
       if (marketId === null) return [];
 
       const market = this.normalizedRecord(value);
-      const conditionId = Number(market.conditionId ?? market.condition ?? -1);
+      const conditionId = runtimeUInt32OrNull(
+        market.conditionId ?? market.condition
+      );
+      const closeBlock = runtimeUInt32OrNull(market.closeBlock);
+      if (conditionId === null || closeBlock === null) return [];
       const condition = conditionsById.get(conditionId);
       const details = conditionDetailsById.get(conditionId) ?? {};
       const title = this.decodeMetadataText(condition?.question);
@@ -9911,7 +10344,7 @@ export class ChainIndexer {
           rulesUri: rulesUri || null,
           oracle,
           resolutionSource,
-          closeBlock: Number(market.closeBlock ?? 0),
+          closeBlock,
           status: this.variantName(market.status),
           mechanism,
           creator: String(market.creator ?? ''),
@@ -10034,10 +10467,9 @@ export class ChainIndexer {
     }
 
     for (const [key, value] of dpmCostBasis) {
-      const marketIdRaw = normalizeValue(key.args?.[0]);
-      const marketId = Number(marketIdRaw);
+      const marketId = runtimeUInt32OrNull(key.args?.[0]);
       const account = String(normalizeValue(key.args?.[1]) ?? '');
-      if (!Number.isSafeInteger(marketId) || !account) continue;
+      if (marketId === null || !account) continue;
       costBasisByKey.set(`${marketId}-${account}`, this.normalizedRecord(value));
     }
 
@@ -10048,10 +10480,9 @@ export class ChainIndexer {
     }
 
     for (const [key, value] of positions) {
-      const marketIdRaw = normalizeValue(key.args?.[0]);
-      const marketId = Number(marketIdRaw);
+      const marketId = runtimeUInt32OrNull(key.args?.[0]);
       const account = String(normalizeValue(key.args?.[1]) ?? '');
-      if (!Number.isSafeInteger(marketId) || !account) continue;
+      if (marketId === null || !account) continue;
       const id = `${marketId}-${account}`;
       positionsByKey.set(id, this.normalizedRecord(value));
       accountMarketKeys.set(id, { marketId, account });

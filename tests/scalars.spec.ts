@@ -1,7 +1,7 @@
 import { parseValue } from 'graphql';
 import { describe, expect, it } from 'vitest';
 
-import { CursorScalar, FilterScalars, JSONScalar, OrderByScalar } from '../src/graphql/scalars.js';
+import { CursorScalar, FilterScalars, JSONScalar, OrderByScalar, UInt32Scalar } from '../src/graphql/scalars.js';
 
 describe('GraphQL scalar compatibility', () => {
   it('parses nested JSON literals', () => {
@@ -68,5 +68,16 @@ describe('GraphQL scalar compatibility', () => {
   it('passes cursor and order-by values through unchanged', () => {
     expect(CursorScalar.parseValue('12')).toBe('12');
     expect(OrderByScalar.parseValue(['TIMESTAMP_DESC', 'ID_DESC'])).toEqual(['TIMESTAMP_DESC', 'ID_DESC']);
+  });
+
+  it('preserves the complete runtime u32 market identifier domain', () => {
+    expect(UInt32Scalar.serialize('4294967295')).toBe(4_294_967_295);
+    expect(UInt32Scalar.parseValue(4_294_967_295)).toBe(4_294_967_295);
+    expect(UInt32Scalar.parseLiteral(parseValue('4294967295'), {})).toBe(4_294_967_295);
+    expect(() => UInt32Scalar.serialize(4_294_967_296)).toThrow(/invalid/);
+    expect(() => UInt32Scalar.serialize(-1)).toThrow(/invalid/);
+    expect(() => UInt32Scalar.serialize(-0)).toThrow(/invalid/);
+    expect(() => UInt32Scalar.serialize('01')).toThrow(/invalid/);
+    expect(() => UInt32Scalar.parseLiteral(parseValue('1.0'), {})).toThrow(/integer/);
   });
 });

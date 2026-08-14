@@ -53,6 +53,7 @@ require_literal "$DOCKERFILE" 'RATE_LIMIT_GLOBAL_MAX=50000' "runtime image must 
 require_literal "$DOCKERFILE" 'GRAPHQL_ALLOW_INTROSPECTION=false' "runtime image must disable production introspection"
 require_literal "$DOCKERFILE" 'GRAPHQL_WS_MAX_CONNECTIONS=512' "runtime image must bound WebSocket connections"
 require_literal "$DOCKERFILE" 'GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION=32' "runtime image must bound WebSocket operations"
+require_literal "$DOCKERFILE" 'MOBILE_TAIRA_DEFAULT_VISIBLE=true' "runtime image must retain the tester-release Taira visibility default"
 require_literal "$DOCKERFILE" 'POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS=4000' "runtime healthcheck must use a deadline shorter than its container timeout"
 require_literal "$DOCKERFILE" 'node dist/src/scripts/production-smoke.js' "runtime healthcheck must reuse the complete PI identity smoke contract"
 require_literal "$DOCKERFILE" 'http://127.0.0.1:${PORT:-4350}${GRAPHQL_PATH:-/graphql}' "runtime healthcheck must probe the loopback GraphQL endpoint"
@@ -78,6 +79,7 @@ require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_ALLOW_INTROSPECTION: "false"' "Pr
 require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_WS_MAX_CONNECTIONS: "512"' "Production Compose must bound WebSocket connections"
 require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT: "512"' "Production Compose must avoid treating the loopback proxy as one WebSocket client"
 require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION: "32"' "Production Compose must bound WebSocket operations"
+require_literal "$PRODUCTION_COMPOSE" 'MOBILE_TAIRA_DEFAULT_VISIBLE: "${MOBILE_TAIRA_DEFAULT_VISIBLE:-true}"' "Production Compose must retain the tester-release Taira visibility default"
 
 if [[ "$(grep -Fc '<<: *runtime-security' "$PRODUCTION_COMPOSE")" -ne 2 ]]; then
   fail "Production Compose must apply the hardened runtime anchor to both API and worker"

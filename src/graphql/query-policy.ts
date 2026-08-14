@@ -2,6 +2,7 @@ import { getOrderField } from './order.js';
 import {
   assertValidNativePositionQueryValue,
   NATIVE_POSITION_FIELDS,
+  parseRuntimeUInt32,
 } from '../repository/validation.js';
 
 import type { IndexerCollection } from '../repository/types.js';
@@ -446,6 +447,14 @@ const assertNumeric = (value: unknown, label: string): void => {
 };
 
 const assertNumericFieldValue = (field: string, value: unknown, label: string): void => {
+  if (field === 'marketId') {
+    try {
+      parseRuntimeUInt32(value, 'marketId');
+    } catch {
+      throw new Error(`${label} must be a runtime u32 integer`);
+    }
+    return;
+  }
   if (!NATIVE_POSITION_FIELDS.has(field)) {
     assertNumeric(value, label);
     return;

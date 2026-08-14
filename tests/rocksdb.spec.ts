@@ -45,6 +45,11 @@ const createConfig = (rocksdbPath: string): AppConfig => ({
   graphqlCacheTtlMs: 2_000,
   graphqlMaxResultBytes: 67_108_864,
   graphqlExecutionMemoryMaxBytes: 536_870_912,
+  nexusAvailable: false,
+  nexusSendsAvailable: false,
+  polkamarktVisible: false,
+  polkamarktMutationsAvailable: false,
+  tairaDefaultVisible: false,
   storageEngine: 'rocksdb',
   databaseUrl: 'postgres://polkaswap:polkaswap@127.0.0.1:5432/polkaswap_indexer',
   skipPostgresMigration: false,
@@ -1521,7 +1526,7 @@ describe('RocksRepository', () => {
       orderBy: ['BLOCK_HEIGHT_DESC'],
       filter: {
         // Numeric compact equality prefixes canonicalize number/string forms.
-        marketId: { equalTo: '7.00' },
+        marketId: { equalTo: '7' },
         type: { equalTo: 'DEFAULT' },
         blockHeight: { lessThanOrEqualTo: 100 },
       },

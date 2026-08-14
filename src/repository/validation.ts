@@ -18,6 +18,7 @@ export const MAX_REPOSITORY_WRITE_CALL_DOCUMENTS = 10_000;
 export const MAX_INDEXED_DECIMAL_TEXT_LENGTH = 256;
 export const MAX_INDEXED_DECIMAL_INTEGER_DIGITS = 256;
 export const MAX_INDEXED_EQUALITY_VALUE_BYTES = 256;
+export const RUNTIME_UINT32_MAX = 4_294_967_295;
 export const NATIVE_POSITION_FIELDS = new Set(['timestamp', 'blockHeight']);
 
 /** Scalar decimals exposed to repository numeric casts for each collection. */
@@ -25,6 +26,7 @@ export const QUERYABLE_DECIMAL_FIELDS_BY_COLLECTION: Partial<
   Record<IndexerCollection, readonly string[]>
 > = {
   accountPositions: ['marketId'],
+  accountTrades: ['marketId'],
   assets: [
     'liquidity', 'liquidityBooks', 'liquidityUSD', 'priceUSD', 'priceChangeDay',
     'priceChangeWeek', 'volumeDayUSD', 'volumeWeekUSD',
@@ -106,6 +108,27 @@ export const assertValidNativePositionQueryValue = (
   }
 };
 
+const RUNTIME_UINT32_PATTERN = /^(0|[1-9][0-9]*)$/;
+
+/** Exact JSON/repository domain for SCALE u32 identifiers. */
+export const parseRuntimeUInt32 = (value: unknown, field = 'runtime u32'): number => {
+  const parsed =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string' && RUNTIME_UINT32_PATTERN.test(value)
+        ? Number(value)
+        : Number.NaN;
+  if (
+    !Number.isSafeInteger(parsed) ||
+    Object.is(parsed, -0) ||
+    parsed < 0 ||
+    parsed > RUNTIME_UINT32_MAX
+  ) {
+    throw new Error(`Invalid ${field}: expected a canonical runtime u32 integer`);
+  }
+  return parsed;
+};
+
 const isQueryRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -136,6 +159,33 @@ const assertValidNativePositionCondition = (
   }
 };
 
+const assertValidRuntimeUInt32Condition = (
+  field: string,
+  condition: unknown
+): void => {
+  if (condition === null || condition === undefined || condition === 'null') return;
+  if (!isQueryRecord(condition)) {
+    parseRuntimeUInt32(condition, field);
+    return;
+  }
+
+  for (const [operator, expected] of Object.entries(condition)) {
+    if (expected === null || expected === undefined || expected === 'null') continue;
+    if (operator === 'in' || operator === 'notIn' || operator === 'not_in') {
+      if (!Array.isArray(expected)) {
+        throw new Error(`Invalid ${field}: expected a bounded runtime u32 array`);
+      }
+      for (const value of expected) {
+        if (value !== null && value !== undefined && value !== 'null') {
+          parseRuntimeUInt32(value, field);
+        }
+      }
+      continue;
+    }
+    parseRuntimeUInt32(expected, field);
+  }
+};
+
 /** Validates trusted repository filters and positions before any engine work. */
 export const assertValidRepositoryQueryPositions = (args: RepositoryQueryArgs): void => {
   if (
@@ -156,6 +206,8 @@ export const assertValidRepositoryQueryPositions = (args: RepositoryQueryArgs): 
       }
       if (field === 'timestamp' || field === 'blockHeight') {
         assertValidNativePositionCondition(field, condition);
+      } else if (field === 'marketId') {
+        assertValidRuntimeUInt32Condition(field, condition);
       }
     }
   };
@@ -175,6 +227,8 @@ export const assertValidRepositoryQueryPositions = (args: RepositoryQueryArgs): 
     (keyset?.field === 'timestamp' || keyset?.field === 'blockHeight')
   ) {
     assertValidNativePositionQueryValue(keyset.field, keyset.value);
+  } else if (keyset?.value !== null && keyset?.field === 'marketId') {
+    parseRuntimeUInt32(keyset.value, keyset.field);
   }
 };
 
@@ -305,6 +359,94 @@ const validateJsonValue = (
   }
 };
 
+const validatePolkamarktRuntimeUInt32Tree = (value: unknown, path: string): void => {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) =>
+      validatePolkamarktRuntimeUInt32Tree(item, `${path}[${index}]`)
+    );
+    return;
+  }
+  if (!isPlainObject(value)) return;
+
+  for (const [key, child] of Object.entries(value)) {
+    if (
+      (key === 'marketId' || key === 'conditionId' || key === 'closeBlock') &&
+      child !== null &&
+      child !== undefined
+    ) {
+      try {
+        parseRuntimeUInt32(child, `${path}.${key}`);
+      } catch {
+        invalidData(`${path}.${key} must be a canonical runtime u32 integer`);
+      }
+    } else if (key === 'marketIds' && child !== null && child !== undefined) {
+      if (!Array.isArray(child) || child.length === 0 || child.length > 24) {
+        invalidData(`${path}.${key} must contain between 1 and 24 canonical runtime u32 integers`);
+      }
+      const canonicalMarketIds: number[] = [];
+      for (const marketId of child) {
+        try {
+          canonicalMarketIds.push(
+            parseRuntimeUInt32(marketId, `${path}.${key}`)
+          );
+        } catch {
+          invalidData(`${path}.${key} must contain only canonical runtime u32 integers`);
+        }
+      }
+      if (new Set(canonicalMarketIds).size !== canonicalMarketIds.length) {
+        invalidData(`${path}.${key} must not contain duplicate runtime identifiers`);
+      }
+    }
+    validatePolkamarktRuntimeUInt32Tree(child, `${path}.${key}`);
+  }
+};
+
+const validatePolkamarktMarketIdsPrimary = (data: Record<string, unknown>): void => {
+  if (data.marketIds === null || data.marketIds === undefined) return;
+
+  const marketIds = data.marketIds as unknown[];
+  let marketId: number;
+  try {
+    marketId = parseRuntimeUInt32(data.marketId, 'data.marketId');
+  } catch {
+    invalidData('data.marketId must identify the first market in data.marketIds');
+  }
+  if (parseRuntimeUInt32(marketIds[0], 'data.marketIds[0]') !== marketId) {
+    invalidData('data.marketId must identify the first market in data.marketIds');
+  }
+};
+
+const validateDocumentPolkamarktIdentifiers = (
+  collection: IndexerCollection,
+  data: Record<string, unknown>
+): void => {
+  if (
+    collection === 'markets' ||
+    collection === 'marketSnapshots' ||
+    collection === 'accountPositions' ||
+    collection === 'accountTrades'
+  ) {
+    validatePolkamarktRuntimeUInt32Tree(data, 'data');
+    if (collection === 'accountTrades') validatePolkamarktMarketIdsPrimary(data);
+    return;
+  }
+  if (
+    String(data.module ?? '').toLowerCase() === 'polkamarkt' ||
+    (collection === 'accountTransactions' &&
+      (Object.hasOwn(data, 'marketId') || Object.hasOwn(data, 'marketIds')))
+  ) {
+    validatePolkamarktRuntimeUInt32Tree(data, 'data');
+    if (collection === 'accountTransactions') validatePolkamarktMarketIdsPrimary(data);
+    return;
+  }
+  if (!Array.isArray(data.calls)) return;
+  data.calls.forEach((call, index) => {
+    if (isPlainObject(call) && String(call.module ?? '').toLowerCase() === 'polkamarkt') {
+      validatePolkamarktRuntimeUInt32Tree(call, `data.calls[${index}]`);
+    }
+  });
+};
+
 const canonicalPosition = (
   name: 'blockHeight' | 'timestamp',
   envelopeValue: unknown,
@@ -336,6 +478,7 @@ const validateIndexerDocument = (document: unknown): { document: IndexerDocument
     throw new Error('Invalid indexer document data: expected a plain object');
   }
   validateJsonValue(document.data, 'data', 0, { nodes: 0, active: new WeakSet() });
+  validateDocumentPolkamarktIdentifiers(document.collection, document.data);
   if (Object.hasOwn(document.data, 'id') && document.data.id !== document.id) {
     throw new Error('Invalid indexer document data: data.id conflicts with the canonical id');
   }

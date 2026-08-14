@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   assertValidIndexerDocument,
+  assertValidRepositoryQueryPositions,
   chunkIndexerDocumentJsonPayloads,
   indexerDocumentJsonBytes,
   MAX_DOCUMENT_DATA_DEPTH,
@@ -82,6 +83,159 @@ describe('persisted repository document validation', () => {
         data: { id: 'pool', targetAssetReserves: '9'.repeat(257) },
       })
     ).toThrow(/indexed decimal/);
+  });
+
+  it('preserves only canonical runtime u32 Polkamarkt identifiers', () => {
+    for (const value of [0, 4_294_967_295, '4294967295']) {
+      expect(() =>
+        assertValidIndexerDocument({
+          collection: 'markets',
+          id: String(value),
+          data: {
+            id: String(value),
+            marketId: value,
+            conditionId: value,
+            closeBlock: value,
+          },
+        })
+      ).not.toThrow();
+      expect(() =>
+        assertValidRepositoryQueryPositions({
+          filter: { marketId: { equalTo: value } },
+        })
+      ).not.toThrow();
+    }
+
+    for (const value of [-1, -0, 1.5, 4_294_967_296, '4294967296', '01', '1.0']) {
+      expect(() =>
+        assertValidIndexerDocument({
+          collection: 'markets',
+          id: 'invalid-market',
+          data: { id: 'invalid-market', marketId: value },
+        })
+      ).toThrow(/runtime u32/);
+      expect(() =>
+        assertValidIndexerDocument({
+          collection: 'markets',
+          id: 'invalid-close-block',
+          data: { id: 'invalid-close-block', marketId: 1, closeBlock: value },
+        })
+      ).toThrow(/runtime u32/);
+      expect(() =>
+        assertValidRepositoryQueryPositions({
+          filter: { marketId: { equalTo: value } },
+        })
+      ).toThrow(/runtime u32/);
+    }
+    expect(() =>
+      assertValidRepositoryQueryPositions({
+        filter: { marketId: { in: [0, 4_294_967_296] } },
+      })
+    ).toThrow(/runtime u32/);
+    const marketIdKeyset = {
+      scope: 'a'.repeat(43),
+      field: 'marketId',
+      id: 'market-position',
+      direction: 'asc' as const,
+      numeric: true,
+    };
+    expect(() =>
+      assertValidRepositoryQueryPositions({
+        keyset: { ...marketIdKeyset, value: '4294967295' },
+      })
+    ).not.toThrow();
+    expect(() =>
+      assertValidRepositoryQueryPositions({
+        keyset: { ...marketIdKeyset, value: null },
+      })
+    ).not.toThrow();
+    expect(() =>
+      assertValidRepositoryQueryPositions({
+        keyset: { ...marketIdKeyset, value: '4294967296' },
+      })
+    ).toThrow(/runtime u32/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'historyElements',
+        id: 'invalid-nested-market',
+        data: { module: 'polkamarkt', data: { marketId: 4_294_967_296 } },
+      })
+    ).toThrow(/runtime u32/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'historyElements',
+        id: 'invalid-market-batch',
+        data: { calls: [{ module: 'polkamarkt', data: { marketIds: [0, 4_294_967_296] } }] },
+      })
+    ).toThrow(/runtime u32/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'historyElements',
+        id: 'duplicate-market-batch',
+        data: { module: 'polkamarkt', data: { marketIds: [1, 1] } },
+      })
+    ).toThrow(/duplicate/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'historyElements',
+        id: 'oversized-market-batch',
+        data: {
+          module: 'polkamarkt',
+          data: { marketIds: Array.from({ length: 25 }, (_, index) => index) },
+        },
+      })
+    ).toThrow(/between 1 and 24/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'accountTransactions',
+        id: 'missing-primary-market',
+        data: { id: 'missing-primary-market', module: 'polkamarkt', marketIds: [1, 2] },
+      })
+    ).toThrow(/first market/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'accountTransactions',
+        id: 'mismatched-primary-market',
+        data: {
+          id: 'mismatched-primary-market',
+          module: 'polkamarkt',
+          marketId: 2,
+          marketIds: [1, 2],
+        },
+      })
+    ).toThrow(/first market/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'accountTransactions',
+        id: 'matching-primary-market',
+        data: {
+          id: 'matching-primary-market',
+          module: 'polkamarkt',
+          marketId: 1,
+          marketIds: [1, 2],
+        },
+      })
+    ).not.toThrow();
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'historyElements',
+        id: 'unrelated-condition',
+        data: { module: 'otherPallet', data: { conditionId: 'external-condition' } },
+      })
+    ).not.toThrow();
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'historyElements',
+        id: 'mixed-batch',
+        data: {
+          module: 'utility',
+          calls: [
+            { module: 'polkamarkt', data: { marketId: 4_294_967_295 } },
+            { module: 'otherPallet', data: { conditionId: 'external-condition' } },
+          ],
+        },
+      })
+    ).not.toThrow();
   });
 
   it('rejects non-scalar equality keys and deep-owns canonicalized data', () => {

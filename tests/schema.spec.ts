@@ -289,6 +289,7 @@ describe('Polkaswap indexer schema', () => {
 
   it('exposes Polkamarkt market and snapshot data', async () => {
     const repository = new MemoryRepository();
+    // Probability/price numbers emulate documents persisted before the exact-string worker change.
     await repository.upsertMany([
       {
         collection: 'markets',
@@ -416,6 +417,63 @@ describe('Polkaswap indexer schema', () => {
         'impliedNoProbabilityBps',
       ])
     );
+    const marketType = schema.getType('Market') as GraphQLObjectType;
+    const snapshotType = schema.getType('MarketSnapshot') as GraphQLObjectType;
+    for (const field of ['probability', 'priceYes', 'priceNo']) {
+      expect(String(marketType.getFields()[field]?.type)).toBe('String');
+      expect(String(snapshotType.getFields()[field]?.type)).toBe('String');
+    }
+    expect(marketType.getFields().probability?.description).toContain('0 through 100');
+    expect(marketType.getFields().priceYes?.description).toContain('0 through 1');
+    expect(snapshotType.getFields().priceNo?.description).toContain('0 through 1');
+    expect(
+      marketType.getFields().probability?.resolve?.(
+        { probability: 5e-7 },
+        {},
+        {},
+        {} as GraphQLResolveInfo
+      )
+    ).toBe('0.0000005');
+    expect(
+      snapshotType.getFields().priceYes?.resolve?.(
+        { priceYes: '000.506600' },
+        {},
+        {},
+        {} as GraphQLResolveInfo
+      )
+    ).toBe('0.5066');
+    expect(() => {
+      snapshotType.getFields().priceNo?.resolve?.(
+        { priceNo: Number.NaN },
+        {},
+        {},
+        {} as GraphQLResolveInfo
+      );
+    }).toThrow('Indexed decimal quantity is invalid.');
+    expect(() => {
+      snapshotType.getFields().priceYes?.resolve?.(
+        { priceYes: Number.MAX_SAFE_INTEGER + 1 },
+        {},
+        {},
+        {} as GraphQLResolveInfo
+      );
+    }).toThrow('Indexed decimal quantity is invalid.');
+    expect(() => {
+      marketType.getFields().probability?.resolve?.(
+        { probability: '100.01' },
+        {},
+        {},
+        {} as GraphQLResolveInfo
+      );
+    }).toThrow('Indexed decimal quantity is invalid.');
+    expect(() => {
+      snapshotType.getFields().priceYes?.resolve?.(
+        { priceYes: '1.01' },
+        {},
+        {},
+        {} as GraphQLResolveInfo
+      );
+    }).toThrow('Indexed decimal quantity is invalid.');
     const marketsField = schema.getQueryType()?.getFields().markets;
     const marketSnapshotsField = schema.getQueryType()?.getFields().marketSnapshots;
 
@@ -517,6 +575,36 @@ describe('Polkaswap indexer schema', () => {
     });
   });
 
+  it('canonicalizes every mobile quantity field without lossy default string coercion', () => {
+    const schema = createSchema();
+    const resolve = (typeName: string, fieldName: string, parent: Record<string, unknown>) =>
+      (schema.getType(typeName) as GraphQLObjectType).getFields()[fieldName]?.resolve?.(
+        parent,
+        {},
+        {},
+        {} as GraphQLResolveInfo
+      );
+
+    expect(resolve('Asset', 'priceUSD', { priceUSD: '0001.2500' })).toBe('1.25');
+    expect(String((schema.getType('Asset') as GraphQLObjectType).getFields().priceChangeDay?.type)).toBe('Float');
+    expect(String((schema.getType('Asset') as GraphQLObjectType).getFields().volumeDayUSD?.type)).toBe('String');
+    expect(resolve('Asset', 'volumeDayUSD', { volumeDayUSD: '999999999999999999999.1' })).toBe(
+      '999999999999999999999.1'
+    );
+    expect(resolve('HistoryElement', 'networkFee', { networkFee: 5e-7 })).toBe('0.0000005');
+    expect(resolve('AccountPosition', 'realizedPnlUsd', { realizedPnlUsd: '-001.2500' })).toBe('-1.25');
+    expect(resolve('AccountTrade', 'realizedPnlUsd', { realizedPnlUsd: -0 })).toBe('0');
+    expect(() =>
+      resolve('Market', 'dpmCollateral', { dpmCollateral: Number.MAX_SAFE_INTEGER + 1 })
+    ).toThrow('Indexed decimal quantity is invalid.');
+    expect(() => resolve('MarketSnapshot', 'realYesShares', { realYesShares: '-1' })).toThrow(
+      'Indexed decimal quantity is invalid.'
+    );
+    expect(() => resolve('PoolXYK', 'strategicBonusApy', { strategicBonusApy: true })).toThrow(
+      'Indexed decimal quantity is invalid.'
+    );
+  });
+
   it('serves mobile app config for SORA iOS', async () => {
     const schema = createSchema();
     const mobileConfigField = schema.getQueryType()?.getFields().mobileConfig;
@@ -527,6 +615,36 @@ describe('Polkaswap indexer schema', () => {
         'https://raw.githubusercontent.com/sora-xor/sora2-substrate-js-library/metadata14ios/packages/types/src/metadata/prod/types_scalecodec_mobile.json',
       soracard: false,
       nodes: [{ name: 'Sora', address: 'wss://mof2.sora.org' }],
+      nexusAvailable: false,
+      nexusSendsAvailable: false,
+      polkamarktVisible: false,
+      polkamarktMutationsAvailable: false,
+      tairaDefaultVisible: true,
+    });
+
+    const enabledSchema = createSchema({
+      graphqlCacheMaxEntries: 1,
+      graphqlCacheMaxBytes: 1_024,
+      graphqlCacheTtlMs: 0,
+      nexusAvailable: true,
+      nexusSendsAvailable: true,
+      polkamarktVisible: true,
+      polkamarktMutationsAvailable: true,
+      tairaDefaultVisible: true,
+    });
+    expect(
+      enabledSchema.getQueryType()?.getFields().mobileConfig?.resolve?.(
+        {},
+        {},
+        { repository: new MemoryRepository() },
+        {} as never
+      )
+    ).toMatchObject({
+      nexusAvailable: true,
+      nexusSendsAvailable: true,
+      polkamarktVisible: true,
+      polkamarktMutationsAvailable: true,
+      tairaDefaultVisible: true,
     });
   });
 
@@ -605,8 +723,8 @@ describe('Polkaswap indexer schema', () => {
           title: 'Open market',
           creator: 'alice',
           status: 'Open',
-          liquidityUSD: '100',
-          volumeUSD: '10',
+          liquidityUSD: '100.1',
+          volumeUSD: '9007199254740993.1',
         },
       },
       {
@@ -622,8 +740,8 @@ describe('Polkaswap indexer schema', () => {
           status: 'Resolved',
           resolutionOutcome: 'Yes',
           closeBlock: 50,
-          liquidityUSD: '0',
-          volumeUSD: '20',
+          liquidityUSD: '0.2',
+          volumeUSD: '0.2',
         },
       },
       {
@@ -665,18 +783,47 @@ describe('Polkaswap indexer schema', () => {
       },
     ]);
 
-    const signalsField = createSchema().getQueryType()?.getFields().polkamarktSignals;
+    const schema = createSchema();
+    const signalType = schema.getType('PolkamarktSignals') as GraphQLObjectType;
+    const signalPointType = schema.getType('PolkamarktSignalPoint') as GraphQLObjectType;
+    const signalAnswerType = schema.getType('PolkamarktSignalAnswerBreakdown') as GraphQLObjectType;
+    const signalAccuracyMarketType = schema.getType('PolkamarktSignalAccuracyMarket') as GraphQLObjectType;
+    const marketType = schema.getType('Market') as GraphQLObjectType;
+    const marketSnapshotType = schema.getType('MarketSnapshot') as GraphQLObjectType;
+    const accountPositionType = schema.getType('AccountPosition') as GraphQLObjectType;
+    const accountTradeType = schema.getType('AccountTrade') as GraphQLObjectType;
+    expect(String(signalType.getFields().totalVolumeUsd?.type)).toBe('String!');
+    expect(String(signalType.getFields().liquidityUsd?.type)).toBe('String!');
+    expect(String(signalPointType.getFields().value?.type)).toBe('String!');
+    expect(String(signalAnswerType.getFields().volumeUsd?.type)).toBe('String!');
+    expect(String(signalAccuracyMarketType.getFields().marketId?.type)).toBe('UInt32!');
+    expect(String(marketType.getFields().marketId?.type)).toBe('UInt32');
+    expect(String(marketType.getFields().conditionId?.type)).toBe('UInt32');
+    expect(String(marketType.getFields().closeBlock?.type)).toBe('UInt32');
+    expect(String(marketSnapshotType.getFields().marketId?.type)).toBe('UInt32');
+    expect(String(accountPositionType.getFields().marketId?.type)).toBe('UInt32');
+    expect(String(accountTradeType.getFields().marketId?.type)).toBe('UInt32');
+    expect(
+      signalPointType.getFields().value?.resolve?.(
+        { value: 1e-7 },
+        {},
+        {},
+        {} as GraphQLResolveInfo
+      )
+    ).toBe('0.0000001');
+
+    const signalsField = schema.getQueryType()?.getFields().polkamarktSignals;
     const signals = await signalsField?.resolve?.({}, {}, { repository }, {} as never);
 
     expect(signals).toMatchObject({
-      totalVolumeUsd: 30,
+      totalVolumeUsd: '9007199254740993.3',
       activeMarkets: 1,
       activeAccounts: 3,
-      liquidityUsd: 100,
+      liquidityUsd: '100.3',
       answerBreakdown: [],
       liquiditySeries: [
-        { value: 50 },
-        { value: 100 },
+        { value: '50' },
+        { value: '100' },
       ],
       accuracySummary: {
         scoredMarkets: 1,
@@ -698,7 +845,119 @@ describe('Polkaswap indexer schema', () => {
     });
   });
 
-  it('requests Polkamarkt signal top-N documents without total counts', async () => {
+  it('keeps probability percentages distinct from unit prices and recognizes every active status', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'markets',
+        id: '1',
+        data: {
+          id: '1',
+          marketId: 1,
+          title: 'Active market',
+          creator: 'alice',
+          status: 'Active',
+          liquidityUSD: '0',
+          volumeUSD: '0',
+        },
+      },
+      {
+        collection: 'markets',
+        id: '2',
+        data: {
+          id: '2',
+          marketId: 2,
+          title: 'Live market',
+          creator: 'bob',
+          status: 'Live',
+          liquidityUSD: '0',
+          volumeUSD: '0',
+        },
+      },
+      {
+        collection: 'markets',
+        id: '3',
+        data: {
+          id: '3',
+          marketId: 3,
+          title: 'One percent YES',
+          creator: 'carol',
+          status: 'Resolved',
+          resolutionOutcome: 'No',
+          closeBlock: 50,
+          liquidityUSD: '0',
+          volumeUSD: '0',
+        },
+      },
+      {
+        collection: 'marketSnapshots',
+        id: 'snapshot-3-default',
+        blockHeight: 45,
+        timestamp: 150,
+        data: {
+          id: 'snapshot-3-default',
+          marketId: 3,
+          type: 'DEFAULT',
+          blockHeight: 45,
+          timestamp: 150,
+          probability: '1',
+          priceYes: '0.01',
+        },
+      },
+      {
+        collection: 'markets',
+        id: '4',
+        data: {
+          id: '4',
+          marketId: 4,
+          title: 'Malformed probability',
+          creator: 'dave',
+          status: 'Resolved',
+          resolutionOutcome: 'Yes',
+          closeBlock: 50,
+          liquidityUSD: '0',
+          volumeUSD: '0',
+        },
+      },
+      {
+        collection: 'marketSnapshots',
+        id: 'snapshot-4-default',
+        blockHeight: 45,
+        timestamp: 151,
+        data: {
+          id: 'snapshot-4-default',
+          marketId: 4,
+          type: 'DEFAULT',
+          blockHeight: 45,
+          timestamp: 151,
+          probability: true,
+        },
+      },
+    ]);
+
+    const signalsField = createSchema().getQueryType()?.getFields().polkamarktSignals;
+    const signals = await signalsField?.resolve?.({}, {}, { repository }, {} as never);
+
+    expect(signals).toMatchObject({
+      activeMarkets: 2,
+      accuracySummary: {
+        scoredMarkets: 1,
+        resolvedMarkets: 2,
+        correctMarkets: 1,
+        accuracyPercent: 100,
+        averageConfidencePercent: 99,
+        latest: {
+          marketId: 3,
+          predictedOutcome: 'NO',
+          confidencePercent: 99,
+          yesProbability: 1,
+          correct: true,
+        },
+      },
+    });
+  });
+
+  it('starts bounded Polkamarkt signal scans without total counts', async () => {
     const queryCalls: Array<{ collection: string; args: RepositoryQueryArgs }> = [];
     const repository = repositoryWithQuery(async (collection, args) => {
       queryCalls.push({ collection, args });
@@ -716,11 +975,117 @@ describe('Polkaswap indexer schema', () => {
     expect(queryCalls.map((call) => call.collection)).toEqual(['markets', 'historyElements', 'networkSnapshots']);
     expect(queryCalls.map((call) => call.args.includeTotalCount)).toEqual([false, false, false]);
     expect(queryCalls.map((call) => call.args.first)).toEqual([1_000, 1_000, 8]);
+    expect(queryCalls.map((call) => call.args.orderBy)).toEqual([
+      ['ID_ASC'],
+      ['ID_ASC'],
+      ['TIMESTAMP_DESC'],
+    ]);
     expect(queryCalls.map((call) => call.args.maxBytes)).toEqual([
       64 * 1_024 * 1_024,
       64 * 1_024 * 1_024,
       64 * 1_024 * 1_024,
     ]);
+  });
+
+  it('paginates Polkamarkt signals beyond the first 1,000 documents', async () => {
+    const firstMarketPage: IndexerDocument[] = Array.from({ length: 1_000 }, (_, index) => ({
+      collection: 'markets',
+      id: `market-${String(index).padStart(4, '0')}`,
+      timestamp: index,
+      data: {
+        id: `market-${String(index).padStart(4, '0')}`,
+        creator: `creator-${index}`,
+        status: 'Open',
+        volumeUSD: '1',
+        liquidityUSD: '2',
+      },
+    }));
+    const finalMarket: IndexerDocument = {
+      collection: 'markets',
+      id: 'market-1000',
+      timestamp: 1_000,
+      data: {
+        id: 'market-1000',
+        creator: 'creator-1000',
+        status: 'Open',
+        volumeUSD: '1',
+        liquidityUSD: '2',
+      },
+    };
+    const marketQueries: RepositoryQueryArgs[] = [];
+    const repository = repositoryWithQuery(async (collection, args) => {
+      if (collection === 'markets') {
+        marketQueries.push(args);
+        return args.keyset
+          ? { items: [finalMarket], totalCount: null, hasNextPage: false }
+          : { items: firstMarketPage, totalCount: null, hasNextPage: true };
+      }
+      return { items: [], totalCount: null, hasNextPage: false };
+    });
+    const signalsField = createSchema().getQueryType()?.getFields().polkamarktSignals;
+    const signals = await signalsField?.resolve?.({}, {}, { repository }, {} as never);
+
+    expect(signals).toMatchObject({
+      totalVolumeUsd: '1001',
+      liquidityUsd: '2002',
+      activeMarkets: 1_001,
+      activeAccounts: 1_001,
+    });
+    expect(marketQueries).toHaveLength(2);
+    expect(marketQueries[1]?.keyset).toEqual({
+      scope: createRepositoryCursorScope('markets', ['ID_ASC'], {}),
+      field: 'id',
+      value: 'market-0999',
+      id: 'market-0999',
+      direction: 'asc',
+      numeric: false,
+    });
+  });
+
+  it('rejects repeated Polkamarkt signal pages instead of double-counting them', async () => {
+    const repeatedMarket: IndexerDocument = {
+      collection: 'markets',
+      id: 'market-repeated',
+      timestamp: 10,
+      data: {
+        id: 'market-repeated',
+        status: 'Open',
+        volumeUSD: '1',
+        liquidityUSD: '1',
+      },
+    };
+    const repository = repositoryWithQuery(async (collection) =>
+      collection === 'markets'
+        ? { items: [repeatedMarket], totalCount: null, hasNextPage: true }
+        : { items: [], totalCount: null, hasNextPage: false }
+    );
+    const signalsField = createSchema().getQueryType()?.getFields().polkamarktSignals;
+
+    await expect(signalsField?.resolve?.({}, {}, { repository }, {} as never)).rejects.toThrow(
+      'repeated markets document'
+    );
+  });
+
+  it('fails closed when indexed Polkamarkt signal quantities are malformed', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsert({
+      collection: 'markets',
+      id: 'invalid-quantity',
+      data: {
+        id: 'invalid-quantity',
+        status: 'Open',
+        liquidityUSD: '1',
+        volumeUSD: '1e3',
+      },
+    });
+    const signalsField = createSchema().getQueryType()?.getFields().polkamarktSignals;
+
+    await expect(
+      signalsField?.resolve?.({}, {}, { repository }, {} as GraphQLResolveInfo)
+    ).rejects.toMatchObject({
+      message: 'Indexed decimal quantity is invalid.',
+      extensions: { code: 'INDEXED_DECIMAL_INVALID' },
+    });
   });
 
   it('serves the stats page GraphQL data from network snapshots', async () => {
@@ -1079,7 +1444,9 @@ describe('Polkaswap indexer schema', () => {
           id: 'history-a-alice',
           accountId: 'alice',
           historyElementId: 'history-a',
-          marketId: 7,
+          marketId: 4_294_967_295,
+          marketIds: [4_294_967_295],
+          module: 'polkamarkt',
           side: 'buy',
           outcome: 'YES',
           toOutcome: 'YES',
@@ -1090,6 +1457,36 @@ describe('Polkaswap indexer schema', () => {
           blockHash: '0xabc',
           blockHeight: 12,
           timestamp: 200,
+        },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'transfer-a-alice',
+        blockHeight: 13,
+        timestamp: 210,
+        data: {
+          id: 'transfer-a-alice',
+          accountId: 'alice',
+          historyElementId: 'transfer-a',
+          module: 'assets',
+          method: 'transfer',
+          blockHeight: 13,
+          timestamp: 210,
+        },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'claim-noop-alice',
+        blockHeight: 14,
+        timestamp: 220,
+        data: {
+          id: 'claim-noop-alice',
+          accountId: 'alice',
+          historyElementId: 'claim-noop',
+          module: 'polkamarkt',
+          method: 'claim_markets',
+          blockHeight: 14,
+          timestamp: 220,
         },
       },
       {
@@ -1146,8 +1543,9 @@ describe('Polkaswap indexer schema', () => {
     expect(positionsField?.args.map((arg) => arg.name)).toContain('where');
     expect(tradesField?.args.map((arg) => arg.name)).toContain('where');
     expect(Object.keys(accountTradeFields)).toEqual(
-      expect.arrayContaining(['fromOutcome', 'toOutcome', 'sharesIn', 'sharesOut'])
+      expect.arrayContaining(['marketIds', 'fromOutcome', 'toOutcome', 'sharesIn', 'sharesOut'])
     );
+    expect(String(accountTradeFields.marketIds?.type)).toBe('[UInt32!]!');
 
     const positions = await positionsField?.resolve?.(
       {},
@@ -1183,7 +1581,8 @@ describe('Polkaswap indexer schema', () => {
     expect(trades.edges[0]?.node).toMatchObject({
       id: 'history-a-alice',
       account: 'alice',
-      marketId: 7,
+      marketId: 4_294_967_295,
+      marketIds: [4_294_967_295],
       side: 'buy',
       outcome: 'YES',
       toOutcome: 'YES',
@@ -1195,9 +1594,48 @@ describe('Polkaswap indexer schema', () => {
       blockNumber: 12,
       blockHash: '0xabc',
       extrinsicHash: 'history-a',
-      market: { id: '7', marketId: 7 },
+      market: { id: '4294967295', marketId: 4_294_967_295 },
     });
     expect(getManySpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects inconsistent Polkamarkt batch identifiers in account trade projections', async () => {
+    const repository = repositoryWithQuery(async (collection) => ({
+      items:
+        collection === 'accountTransactions'
+          ? [
+              {
+                collection: 'accountTransactions',
+                id: 'invalid-batch-alice',
+                blockHeight: 12,
+                timestamp: 200,
+                data: {
+                  id: 'invalid-batch-alice',
+                  accountId: 'alice',
+                  historyElementId: 'invalid-batch',
+                  module: 'polkamarkt',
+                  marketId: 7,
+                  marketIds: [8, 7],
+                },
+              },
+            ]
+          : [],
+      totalCount: 1,
+      hasNextPage: false,
+    }));
+    const tradesField = createSchema().getQueryType()?.getFields().accountTrades;
+
+    await expect(
+      tradesField?.resolve?.(
+        {},
+        { where: { account_eq: 'alice' }, first: 10 },
+        { repository },
+        {} as never
+      )
+    ).rejects.toMatchObject({
+      message: 'Indexed Polkamarkt market identifiers are inconsistent',
+      extensions: { code: 'INDEXED_UINT32_INVALID' },
+    });
   });
 
   it('merges Polkamarkt account position account aliases with caller filters', async () => {

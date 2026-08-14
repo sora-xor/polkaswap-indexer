@@ -65,6 +65,39 @@ export const CursorScalar = new GraphQLScalarType({
     return parseCursor(ast.value);
   },
 });
+
+export const UINT32_MAX_VALUE = 4_294_967_295;
+
+const parseUInt32 = (value: unknown, message: string, code: string): number => {
+  const parsed =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value)
+        ? Number(value)
+        : Number.NaN;
+  if (
+    !Number.isSafeInteger(parsed) ||
+    Object.is(parsed, -0) ||
+    parsed < 0 ||
+    parsed > UINT32_MAX_VALUE
+  ) {
+    throw new GraphQLError(message, { extensions: { code } });
+  }
+  return parsed;
+};
+
+/** Runtime Polkamarkt u32 values exceed GraphQL's signed Int range. */
+export const UInt32Scalar = new GraphQLScalarType({
+  name: 'UInt32',
+  description: 'Unsigned 32-bit integer serialized as an exact JSON number.',
+  serialize: (value) => parseUInt32(value, 'Indexed UInt32 value is invalid', 'INDEXED_UINT32_INVALID'),
+  parseValue: (value) => parseUInt32(value, 'UInt32 variable is invalid', 'BAD_USER_INPUT'),
+  parseLiteral: (ast) => {
+    if (ast.kind !== Kind.INT) throw new GraphQLError('UInt32 literal must be an integer');
+    return parseUInt32(ast.value, 'UInt32 literal is invalid', 'BAD_USER_INPUT');
+  },
+});
+
 export const OrderByScalar = opaqueScalar('OrderBy', 'SubQuery-compatible order-by token.');
 
 export const FilterScalars = {

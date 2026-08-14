@@ -126,11 +126,65 @@ export const POSTGRES_EXACT_JSON_NUMERIC_FUNCTIONS_SQL = `
        end
     )
   $$;
+
+  create or replace function indexer_json_runtime_u32_array_is_valid_v1(candidate jsonb)
+  returns boolean
+  language plpgsql
+  immutable
+  strict
+  parallel safe
+  as $$
+  declare
+    element jsonb;
+    rendered text;
+    parsed numeric;
+    seen text[] := array[]::text[];
+  begin
+    if jsonb_typeof(candidate) <> 'array' then
+      return false;
+    end if;
+    if jsonb_array_length(candidate) not between 1 and 24 then
+      return false;
+    end if;
+
+    for element in select value from jsonb_array_elements(candidate) as entries(value) loop
+      if jsonb_typeof(element) not in ('string', 'number') then return false; end if;
+      rendered := element #>> '{}';
+      if octet_length(rendered) > 10 or rendered collate "C" !~ '^(0|[1-9][0-9]*)$' then
+        return false;
+      end if;
+      begin
+        parsed := rendered::numeric;
+      exception when numeric_value_out_of_range then
+        return false;
+      end;
+      if parsed not between 0 and 4294967295 or rendered = any(seen) then return false; end if;
+      seen := array_append(seen, rendered);
+    end loop;
+
+    return true;
+  end;
+  $$;
 `;
 
 const quotedIndexerCollections = INDEXER_COLLECTIONS.map(
   (collection) => `'${collection.replace(/'/g, "''")}'`
 ).join(', ');
+
+const postgresRuntimeUInt32FieldCheck = (field: string): string =>
+  `(case ` +
+  `when not data ? '${field}' or jsonb_typeof(data->'${field}') = 'null' then true ` +
+  `when jsonb_typeof(data->'${field}') not in ('string', 'number') then false ` +
+  `when octet_length(data->>'${field}') > 10 or data->>'${field}' collate "C" !~ '^(0|[1-9][0-9]*)$' then false ` +
+  `else (data->>'${field}')::numeric between 0 and 4294967295 end)`;
+const postgresPolkamarktProjection =
+  `(collection in ('markets', 'marketSnapshots', 'accountPositions', 'accountTrades') ` +
+  `or lower(coalesce(data->>'module', '')) = 'polkamarkt' ` +
+  `or (collection = 'accountTransactions' and (data ? 'marketId' or data ? 'marketIds')))`;
+const postgresPolkamarktMarketIdsCheck =
+  `(case when not data ? 'marketIds' or jsonb_typeof(data->'marketIds') = 'null' then true ` +
+  `when not indexer_json_runtime_u32_array_is_valid_v1(data->'marketIds') then false ` +
+  `else data ? 'marketId' and data->'marketIds'->>0 = data->>'marketId' end)`;
 
 /** Database-level backstop for the repository write contract. */
 export const POSTGRES_DOCUMENT_CHECK_CONSTRAINTS: readonly PostgresDocumentCheckConstraint[] = [
@@ -183,6 +237,14 @@ export const POSTGRES_DOCUMENT_CHECK_CONSTRAINTS: readonly PostgresDocumentCheck
           `(jsonb_typeof(data->'data') <> 'object' or not (data->'data') ? '${field}' or jsonb_typeof(data->'data'->'${field}') = 'null' or (jsonb_typeof(data->'data'->'${field}') = 'string' and octet_length(data->'data'->>'${field}') <= 256))`
       ),
     ].join(' and ')})`,
+  },
+  {
+    name: 'indexer_documents_polkamarkt_u32_v2_check',
+    expression:
+      `(case when ${postgresPolkamarktProjection} then (` +
+      `${['marketId', 'conditionId', 'closeBlock'].map(postgresRuntimeUInt32FieldCheck).join(' and ')}` +
+      ` and ${postgresPolkamarktMarketIdsCheck}` +
+      `) else true end)`,
   },
   {
     name: 'indexer_documents_indexed_decimals_v1_check',
@@ -501,6 +563,9 @@ const OBSOLETE_BROAD_QUERY_INDEXES = [
   'indexer_documents_collection_commission_idx',
   'indexer_documents_collection_reward_points_idx',
 ] as const;
+const OBSOLETE_DOCUMENT_CHECK_CONSTRAINTS = [
+  'indexer_documents_polkamarkt_u32_v1_check',
+] as const;
 
 export async function migrate(input: string | MigrationRuntimeConfig = readConfig()): Promise<void> {
   const config = migrationRuntimeConfig(input);
@@ -615,6 +680,13 @@ export async function migrate(input: string | MigrationRuntimeConfig = readConfi
     for (const { name } of pendingConstraintValidation) {
       await client.query(
         `alter table indexer_documents validate constraint ${quoteIdentifier(name)};`
+      );
+    }
+    // Keep the prior constraint active until its reviewed replacement both
+    // protects new writes and validates retained documents.
+    for (const name of OBSOLETE_DOCUMENT_CHECK_CONSTRAINTS) {
+      await client.query(
+        `alter table indexer_documents drop constraint if exists ${quoteIdentifier(name)};`
       );
     }
     await client.query('drop index if exists indexer_documents_collection_timestamp_idx;');

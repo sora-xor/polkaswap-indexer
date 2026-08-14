@@ -30,6 +30,11 @@ export type AppConfig = {
   graphqlCacheTtlMs: number;
   graphqlMaxResultBytes: number;
   graphqlExecutionMemoryMaxBytes: number;
+  nexusAvailable: boolean;
+  nexusSendsAvailable: boolean;
+  polkamarktVisible: boolean;
+  polkamarktMutationsAvailable: boolean;
+  tairaDefaultVisible: boolean;
   storageEngine: 'postgres' | 'rocksdb';
   databaseUrl: string;
   skipPostgresMigration: boolean;
@@ -384,6 +389,17 @@ export function readConfig(): AppConfig {
   if (graphqlMaxResultBytes > graphqlExecutionMemoryMaxBytes) {
     invalid('GRAPHQL_EXECUTION_MEMORY_MAX_BYTES', 'must be at least GRAPHQL_MAX_RESULT_BYTES');
   }
+  const nexusAvailable = readBoolean('MOBILE_NEXUS_AVAILABLE');
+  const nexusSendsAvailable = readBoolean('MOBILE_NEXUS_SENDS_AVAILABLE');
+  const polkamarktVisible = readBoolean('MOBILE_POLKAMARKT_VISIBLE');
+  const polkamarktMutationsAvailable = readBoolean('MOBILE_POLKAMARKT_MUTATIONS_AVAILABLE');
+  const tairaDefaultVisible = readBoolean('MOBILE_TAIRA_DEFAULT_VISIBLE', true);
+  if (nexusSendsAvailable && !nexusAvailable) {
+    invalid('MOBILE_NEXUS_SENDS_AVAILABLE', 'requires MOBILE_NEXUS_AVAILABLE=true');
+  }
+  if (polkamarktMutationsAvailable && !polkamarktVisible) {
+    invalid('MOBILE_POLKAMARKT_MUTATIONS_AVAILABLE', 'requires MOBILE_POLKAMARKT_VISIBLE=true');
+  }
 
   return {
     host,
@@ -464,6 +480,11 @@ export function readConfig(): AppConfig {
     }),
     graphqlMaxResultBytes,
     graphqlExecutionMemoryMaxBytes,
+    nexusAvailable,
+    nexusSendsAvailable,
+    polkamarktVisible,
+    polkamarktMutationsAvailable,
+    tairaDefaultVisible,
     storageEngine,
     databaseUrl,
     skipPostgresMigration: readBoolean('SKIP_POSTGRES_MIGRATION'),

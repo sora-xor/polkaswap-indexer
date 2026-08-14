@@ -38,6 +38,11 @@ const CONFIG_ENV_KEYS = [
   'GRAPHQL_CACHE_TTL_MS',
   'GRAPHQL_MAX_RESULT_BYTES',
   'GRAPHQL_EXECUTION_MEMORY_MAX_BYTES',
+  'MOBILE_NEXUS_AVAILABLE',
+  'MOBILE_NEXUS_SENDS_AVAILABLE',
+  'MOBILE_POLKAMARKT_VISIBLE',
+  'MOBILE_POLKAMARKT_MUTATIONS_AVAILABLE',
+  'MOBILE_TAIRA_DEFAULT_VISIBLE',
   'STORAGE_ENGINE',
   'DATABASE_URL',
   'SKIP_POSTGRES_MIGRATION',
@@ -146,6 +151,11 @@ describe('runtime configuration', () => {
       graphqlCacheTtlMs: 2_000,
       graphqlMaxResultBytes: 67_108_864,
       graphqlExecutionMemoryMaxBytes: 536_870_912,
+      nexusAvailable: false,
+      nexusSendsAvailable: false,
+      polkamarktVisible: false,
+      polkamarktMutationsAvailable: false,
+      tairaDefaultVisible: true,
       storageEngine: 'postgres',
       databaseUrl: 'postgres://polkaswap:polkaswap@127.0.0.1:5432/polkaswap_indexer',
       skipPostgresMigration: false,
@@ -226,6 +236,11 @@ describe('runtime configuration', () => {
       GRAPHQL_CACHE_TTL_MS: '1500',
       GRAPHQL_MAX_RESULT_BYTES: '100663296',
       GRAPHQL_EXECUTION_MEMORY_MAX_BYTES: '268435456',
+      MOBILE_NEXUS_AVAILABLE: 'yes',
+      MOBILE_NEXUS_SENDS_AVAILABLE: 'on',
+      MOBILE_POLKAMARKT_VISIBLE: '1',
+      MOBILE_POLKAMARKT_MUTATIONS_AVAILABLE: 'true',
+      MOBILE_TAIRA_DEFAULT_VISIBLE: 'yes',
       STORAGE_ENGINE: 'ROCKSDB',
       DATABASE_URL: 'postgresql://user:pass@localhost:5432/indexer',
       SKIP_POSTGRES_MIGRATION: 'yes',
@@ -303,6 +318,11 @@ describe('runtime configuration', () => {
       graphqlCacheTtlMs: 1_500,
       graphqlMaxResultBytes: 100_663_296,
       graphqlExecutionMemoryMaxBytes: 268_435_456,
+      nexusAvailable: true,
+      nexusSendsAvailable: true,
+      polkamarktVisible: true,
+      polkamarktMutationsAvailable: true,
+      tairaDefaultVisible: true,
       storageEngine: 'rocksdb',
       databaseUrl: 'postgresql://user:pass@localhost:5432/indexer',
       skipPostgresMigration: true,
@@ -640,6 +660,11 @@ describe('runtime configuration', () => {
     ['SKIP_POSTGRES_MIGRATION', 'sometimes', 'true, false'],
     ['GRAPHQL_ALLOW_INTROSPECTION', 'sometimes', 'true, false'],
     ['CHAIN_LEGACY_SORA_BLOCK_TYPES', 'sometimes', 'true, false'],
+    ['MOBILE_NEXUS_AVAILABLE', 'sometimes', 'true, false'],
+    ['MOBILE_NEXUS_SENDS_AVAILABLE', 'sometimes', 'true, false'],
+    ['MOBILE_POLKAMARKT_VISIBLE', 'sometimes', 'true, false'],
+    ['MOBILE_POLKAMARKT_MUTATIONS_AVAILABLE', 'sometimes', 'true, false'],
+    ['MOBILE_TAIRA_DEFAULT_VISIBLE', 'sometimes', 'true, false'],
   ])('rejects unsupported enum/boolean input %s=%s', (name, value, message) => {
     process.env[name] = value;
     expect(() => readConfig()).toThrow(new RegExp(`Invalid ${name}:.*${message}`));
@@ -677,11 +702,34 @@ describe('runtime configuration', () => {
       process.env.GRAPHQL_ALLOW_INTROSPECTION = value;
       process.env.SKIP_POSTGRES_MIGRATION = value;
       process.env.CHAIN_LEGACY_SORA_BLOCK_TYPES = value;
+      process.env.MOBILE_NEXUS_AVAILABLE = value;
+      process.env.MOBILE_NEXUS_SENDS_AVAILABLE = value;
+      process.env.MOBILE_POLKAMARKT_VISIBLE = value;
+      process.env.MOBILE_POLKAMARKT_MUTATIONS_AVAILABLE = value;
+      process.env.MOBILE_TAIRA_DEFAULT_VISIBLE = value;
       expect(readConfig().rocksdbEnableStats).toBe(false);
       expect(readConfig().graphqlAllowIntrospection).toBe(false);
       expect(readConfig().skipPostgresMigration).toBe(false);
       expect(readConfig().legacySoraBlockTypes).toBe(false);
+      expect(readConfig().nexusAvailable).toBe(false);
+      expect(readConfig().nexusSendsAvailable).toBe(false);
+      expect(readConfig().polkamarktVisible).toBe(false);
+      expect(readConfig().polkamarktMutationsAvailable).toBe(false);
+      expect(readConfig().tairaDefaultVisible).toBe(false);
     }
+  });
+
+  it('rejects mutation capability flags without their parent feature', () => {
+    process.env.MOBILE_NEXUS_SENDS_AVAILABLE = 'true';
+    expect(() => readConfig()).toThrow(
+      /Invalid MOBILE_NEXUS_SENDS_AVAILABLE:.*MOBILE_NEXUS_AVAILABLE=true/
+    );
+
+    delete process.env.MOBILE_NEXUS_SENDS_AVAILABLE;
+    process.env.MOBILE_POLKAMARKT_MUTATIONS_AVAILABLE = 'true';
+    expect(() => readConfig()).toThrow(
+      /Invalid MOBILE_POLKAMARKT_MUTATIONS_AVAILABLE:.*MOBILE_POLKAMARKT_VISIBLE=true/
+    );
   });
 
   it('defaults finalized catch-up prefetching to the configured backfill concurrency', () => {
