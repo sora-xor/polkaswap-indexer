@@ -195,6 +195,8 @@ export const typeDefs = /* GraphQL */ `
     supply: String
     mint: String
     burn: String
+    "Cumulative chain denomination at the CLOSE price; null for unverified legacy data."
+    denominator: String
     priceUSD: JSON
     volume: JSON
   }

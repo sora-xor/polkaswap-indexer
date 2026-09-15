@@ -565,6 +565,8 @@ describe('ChainIndexer price derivation', () => {
     expect(indexer.derivedStorageDomainsForPallet('tokens', 'Withdrawn')).toEqual(['assetSupply']);
     expect(indexer.derivedStorageDomainsForPallet('balances', 'Rescinded')).toEqual(['assetSupply']);
     expect(indexer.derivedStorageDomainsForPallet('system', 'CodeUpdated')).toHaveLength(12);
+    expect(indexer.derivedStorageDomainsForPallet('denomination', 'Denominated')).toHaveLength(12);
+    expect(indexer.derivedStorageDomainsForPallet('denomination', 'startDenomination')).toHaveLength(12);
   });
 
   it('reuses clean storage domains and reloads only domains marked dirty', async () => {
@@ -5983,7 +5985,8 @@ describe('ChainIndexer price derivation', () => {
         },
         blockHeight: number,
         timestamp: number,
-        includeSnapshots: boolean
+        includeSnapshots: boolean,
+        denominator?: string | null
       ) => Promise<Array<{ collection: string; id: string; data: Record<string, unknown> }>>;
     };
     const timestamp = 1_700_000_349;
@@ -6004,12 +6007,15 @@ describe('ChainIndexer price derivation', () => {
       analytics,
       77,
       timestamp,
-      true
+      true,
+      '1000000'
     );
 
     const defaultSnapshot = documents.find((document) => document.collection === 'assetSnapshots' && document.data.type === 'DEFAULT');
     const daySnapshot = documents.find((document) => document.collection === 'assetSnapshots' && document.data.type === 'DAY');
 
+    expect(defaultSnapshot?.data.denominator).toBe('1000000');
+    expect(daySnapshot?.data.denominator).toBe('1000000');
     expect(defaultSnapshot?.id).toBe(`asset-${XOR}-DEFAULT-1700000100`);
     expect(defaultSnapshot?.data.timestamp).toBe(timestamp);
     expect(daySnapshot?.id).toBe(`asset-${XOR}-DAY-1699920000`);
