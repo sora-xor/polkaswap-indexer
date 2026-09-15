@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  assertExplicitProductionWorkerChainInputs,
   assertIndependentSoraRpcEndpoints,
   readConfig,
   readRuntimeSecurityConfig,
@@ -9,6 +10,11 @@ import {
 
 const CONFIG_ENV_KEYS = [
   'NODE_ENV',
+  'NODE_OPTIONS',
+  'NODE_TLS_REJECT_UNAUTHORIZED',
+  'PGOPTIONS',
+  'PGPASSWORD',
+  'PGSSLMODE',
   'HOST',
   'PORT',
   'GRAPHQL_PATH',
@@ -18,6 +24,13 @@ const CONFIG_ENV_KEYS = [
   'HTTP_HEADERS_TIMEOUT_MS',
   'HTTP_REQUEST_TIMEOUT_MS',
   'HTTP_MAX_CONNECTIONS',
+  'HTTP_MAX_HEADER_BYTES',
+  'HTTP_MAX_REQUESTS_PER_SOCKET',
+  'RATE_LIMIT_WINDOW_MS',
+  'RATE_LIMIT_MAX',
+  'RATE_LIMIT_MAX_KEYS',
+  'RATE_LIMIT_GLOBAL_WINDOW_MS',
+  'RATE_LIMIT_GLOBAL_MAX',
   'GRAPHQL_HTTP_MAX_BODY_BYTES',
   'GRAPHQL_HTTP_MAX_IN_FLIGHT',
   'GRAPHQL_MAX_DEPTH',
@@ -30,6 +43,7 @@ const CONFIG_ENV_KEYS = [
   'GRAPHQL_WS_MAX_PAYLOAD_BYTES',
   'GRAPHQL_WS_CONNECTION_INIT_TIMEOUT_MS',
   'GRAPHQL_WS_MAX_CONNECTIONS',
+  'GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT',
   'GRAPHQL_WS_MAX_OPERATIONS',
   'GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION',
   'GRAPHQL_WS_MAX_PENDING_MESSAGES_PER_CONNECTION',
@@ -92,6 +106,11 @@ const CONFIG_ENV_KEYS = [
   'WORKER_METRICS_HOST',
   'WORKER_METRICS_PORT',
   'WORKER_METRICS_MAX_IN_FLIGHT',
+  'MOBILE_CONFIG_NEXUS_AVAILABLE',
+  'MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE',
+  'MOBILE_CONFIG_POLKAMARKT_VISIBLE',
+  'MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE',
+  'MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE',
 ] as const;
 
 const originalEnv = new Map(CONFIG_ENV_KEYS.map((key) => [key, process.env[key]]));
@@ -126,6 +145,13 @@ describe('runtime configuration', () => {
       httpHeadersTimeoutMs: 80_000,
       httpRequestTimeoutMs: 120_000,
       httpMaxConnections: 10_000,
+      httpMaxHeaderBytes: 16_384,
+      httpMaxRequestsPerSocket: 1_000,
+      rateLimitWindowMs: 60_000,
+      rateLimitMax: 600,
+      rateLimitMaxKeys: 20_000,
+      rateLimitGlobalWindowMs: 60_000,
+      rateLimitGlobalMax: 50_000,
       graphqlHttpMaxBodyBytes: 262_144,
       graphqlHttpMaxInFlight: 100,
       graphqlMaxDepth: 12,
@@ -138,6 +164,7 @@ describe('runtime configuration', () => {
       graphqlWsMaxPayloadBytes: 65_536,
       graphqlWsConnectionInitTimeoutMs: 30_000,
       graphqlWsMaxConnections: 1_000,
+      graphqlWsMaxConnectionsPerClient: 16,
       graphqlWsMaxOperations: 2_000,
       graphqlWsMaxOperationsPerConnection: 20,
       graphqlWsMaxPendingMessagesPerConnection: 64,
@@ -192,7 +219,114 @@ describe('runtime configuration', () => {
       workerMetricsHost: '127.0.0.1',
       workerMetricsPort: 9464,
       workerMetricsMaxInFlight: 10,
+      mobileCapabilities: {
+        nexusAvailable: true,
+        nexusSendsAvailable: false,
+        polkamarktVisible: true,
+        polkamarktMutationsAvailable: false,
+        tairaDefaultVisible: true,
+      },
     });
+  });
+
+  it('requires an explicit database URL in production', () => {
+    process.env.NODE_ENV = 'production';
+    expect(() => readConfig()).toThrow(
+      /Invalid DATABASE_URL:.*required when NODE_ENV=production/
+    );
+
+    process.env.DATABASE_URL =
+      'postgresql://pi@database.internal/polkaswap?sslmode=verify-full';
+    expect(readConfig().databaseUrl).toBe(
+      'postgresql://pi@database.internal/polkaswap?sslmode=verify-full'
+    );
+  });
+
+  it.each([
+    ['missing TLS mode', 'postgresql://pi@database.internal/polkaswap'],
+    [
+      'plaintext TLS mode',
+      'postgresql://pi@database.internal/polkaswap?sslmode=disable',
+    ],
+    [
+      'downgrade TLS mode',
+      'postgresql://pi@database.internal/polkaswap?sslmode=prefer',
+    ],
+    [
+      'hostname-unverified TLS mode',
+      'postgresql://pi@database.internal/polkaswap?sslmode=require',
+    ],
+  ])('rejects a production database URL with %s', (_label, databaseUrl) => {
+    process.env.NODE_ENV = 'production';
+    process.env.DATABASE_URL = databaseUrl;
+    expect(() => readConfig()).toThrow(
+      /Invalid DATABASE_URL:.*must use sslmode=verify-full in production/
+    );
+  });
+
+  it('rejects production database URL controls that can override client policy', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.DATABASE_URL =
+      'postgresql://pi@database.internal/polkaswap?sslmode=verify-full&query_timeout=0';
+    expect(() => readConfig()).toThrow(
+      /Invalid DATABASE_URL:.*may use only one lowercase sslmode/
+    );
+  });
+
+  it.each([
+    ['global TLS disable', 'NODE_TLS_REJECT_UNAUTHORIZED', '0'],
+    ['Node preload options', 'NODE_OPTIONS', '--require=/tmp/unreviewed.js'],
+    ['PostgreSQL startup options', 'PGOPTIONS', '-c search_path=attacker,public'],
+    ['PostgreSQL TLS mode', 'PGSSLMODE', 'disable'],
+    ['PostgreSQL password fallback', 'PGPASSWORD', 'must-not-log'],
+  ])('rejects the production %s process override', (_label, name, value) => {
+    process.env.NODE_ENV = 'production';
+    process.env.DATABASE_URL =
+      'postgresql://pi@database.internal/polkaswap?sslmode=verify-full';
+    process.env[name] = value;
+    expect(() => readConfig()).toThrow(
+      new RegExp(`Invalid ${name}:.*must not override production PostgreSQL`)
+    );
+    try {
+      readConfig();
+    } catch (error) {
+      expect(String(error)).not.toContain(value);
+    }
+  });
+
+  it('treats an exactly empty archive endpoint as absent only outside the production worker', () => {
+    process.env.SORA_ARCHIVE_WS_ENDPOINT = '';
+    expect(readConfig().archiveSoraWsEndpoint).toBe('');
+    expect(readSoraArchiveWsEndpoint()).toBeNull();
+    expect(() => readSoraArchiveWsEndpoint(true)).toThrow(
+      /Invalid SORA_ARCHIVE_WS_ENDPOINT:.*required for the production worker/
+    );
+  });
+
+  it('requires explicit reviewed chain inputs only for the production worker', () => {
+    assertExplicitProductionWorkerChainInputs();
+
+    process.env.NODE_ENV = 'production';
+    expect(() => assertExplicitProductionWorkerChainInputs()).toThrow(
+      /Invalid SORA_WS_ENDPOINT:.*required for the production worker/
+    );
+
+    process.env.SORA_WS_ENDPOINT = 'wss://primary.example.invalid';
+    expect(() => assertExplicitProductionWorkerChainInputs()).toThrow(
+      /Invalid CHAIN_START_BLOCK:.*required for the production worker/
+    );
+
+    process.env.CHAIN_START_BLOCK = '0';
+    expect(() => assertExplicitProductionWorkerChainInputs()).not.toThrow();
+  });
+
+  it('rejects primary/archive hostname aliases regardless of case or a trailing dot', () => {
+    expect(() =>
+      assertIndependentSoraRpcEndpoints(
+        'wss://PRIMARY.example.invalid:443',
+        'wss://primary.example.invalid.:9944'
+      )
+    ).toThrow(/must use different reviewed hosts/);
   });
 
   it('parses every supported override without coercing its type', () => {
@@ -206,6 +340,13 @@ describe('runtime configuration', () => {
       HTTP_HEADERS_TIMEOUT_MS: '65000',
       HTTP_REQUEST_TIMEOUT_MS: '90000',
       HTTP_MAX_CONNECTIONS: '25000',
+      HTTP_MAX_HEADER_BYTES: '8192',
+      HTTP_MAX_REQUESTS_PER_SOCKET: '500',
+      RATE_LIMIT_WINDOW_MS: '30000',
+      RATE_LIMIT_MAX: '300',
+      RATE_LIMIT_MAX_KEYS: '10000',
+      RATE_LIMIT_GLOBAL_WINDOW_MS: '45000',
+      RATE_LIMIT_GLOBAL_MAX: '25000',
       GRAPHQL_HTTP_MAX_BODY_BYTES: '131072',
       GRAPHQL_HTTP_MAX_IN_FLIGHT: '250',
       GRAPHQL_MAX_DEPTH: '16',
@@ -218,6 +359,7 @@ describe('runtime configuration', () => {
       GRAPHQL_WS_MAX_PAYLOAD_BYTES: '32768',
       GRAPHQL_WS_CONNECTION_INIT_TIMEOUT_MS: '15000',
       GRAPHQL_WS_MAX_CONNECTIONS: '500',
+      GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT: '8',
       GRAPHQL_WS_MAX_OPERATIONS: '750',
       GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION: '10',
       GRAPHQL_WS_MAX_PENDING_MESSAGES_PER_CONNECTION: '32',
@@ -271,6 +413,11 @@ describe('runtime configuration', () => {
       WORKER_METRICS_HOST: '::1',
       WORKER_METRICS_PORT: '9465',
       WORKER_METRICS_MAX_IN_FLIGHT: '20',
+      MOBILE_CONFIG_NEXUS_AVAILABLE: 'yes',
+      MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE: 'yes',
+      MOBILE_CONFIG_POLKAMARKT_VISIBLE: 'yes',
+      MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE: 'yes',
+      MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE: 'yes',
     });
 
     expect(readConfig()).toEqual({
@@ -283,6 +430,13 @@ describe('runtime configuration', () => {
       httpHeadersTimeoutMs: 65_000,
       httpRequestTimeoutMs: 90_000,
       httpMaxConnections: 25_000,
+      httpMaxHeaderBytes: 8_192,
+      httpMaxRequestsPerSocket: 500,
+      rateLimitWindowMs: 30_000,
+      rateLimitMax: 300,
+      rateLimitMaxKeys: 10_000,
+      rateLimitGlobalWindowMs: 45_000,
+      rateLimitGlobalMax: 25_000,
       graphqlHttpMaxBodyBytes: 131_072,
       graphqlHttpMaxInFlight: 250,
       graphqlMaxDepth: 16,
@@ -295,6 +449,7 @@ describe('runtime configuration', () => {
       graphqlWsMaxPayloadBytes: 32_768,
       graphqlWsConnectionInitTimeoutMs: 15_000,
       graphqlWsMaxConnections: 500,
+      graphqlWsMaxConnectionsPerClient: 8,
       graphqlWsMaxOperations: 750,
       graphqlWsMaxOperationsPerConnection: 10,
       graphqlWsMaxPendingMessagesPerConnection: 32,
@@ -349,6 +504,13 @@ describe('runtime configuration', () => {
       workerMetricsHost: '::1',
       workerMetricsPort: 9465,
       workerMetricsMaxInFlight: 20,
+      mobileCapabilities: {
+        nexusAvailable: true,
+        nexusSendsAvailable: true,
+        polkamarktVisible: true,
+        polkamarktMutationsAvailable: true,
+        tairaDefaultVisible: true,
+      },
     });
   });
 
@@ -483,7 +645,7 @@ describe('runtime configuration', () => {
   it('reads an optional archive endpoint and requires it for production worker startup', () => {
     expect(readSoraArchiveWsEndpoint()).toBeNull();
     expect(() => readSoraArchiveWsEndpoint(true)).toThrow(
-      'SORA_ARCHIVE_WS_ENDPOINT is required for the production worker',
+      /SORA_ARCHIVE_WS_ENDPOINT:.*required for the production worker/,
     );
 
     process.env.SORA_ARCHIVE_WS_ENDPOINT = 'wss://archive.sora.example/ws';
@@ -493,7 +655,6 @@ describe('runtime configuration', () => {
   });
 
   it.each([
-    ['', /non-empty single-line value/],
     ['   ', /non-empty single-line value/],
     ['not a URL', /must be a valid URL/],
     ['https://archive.sora.org', /unsupported URL scheme/],
@@ -554,6 +715,13 @@ describe('runtime configuration', () => {
     ['HTTP_SHUTDOWN_TIMEOUT_MS', '3600001', 'at most 3600000'],
     ['HTTP_KEEP_ALIVE_TIMEOUT_MS', '0', 'at least 1'],
     ['HTTP_MAX_CONNECTIONS', '0', 'at least 1'],
+    ['HTTP_MAX_HEADER_BYTES', '1023', 'at least 1024'],
+    ['HTTP_MAX_REQUESTS_PER_SOCKET', '0', 'at least 1'],
+    ['RATE_LIMIT_WINDOW_MS', '999', 'at least 1000'],
+    ['RATE_LIMIT_MAX', '0', 'at least 1'],
+    ['RATE_LIMIT_MAX_KEYS', '0', 'at least 1'],
+    ['RATE_LIMIT_GLOBAL_WINDOW_MS', '3600001', 'at most 3600000'],
+    ['RATE_LIMIT_GLOBAL_MAX', '10000001', 'at most 10000000'],
     ['GRAPHQL_HTTP_MAX_BODY_BYTES', '16777217', 'at most 16777216'],
     ['GRAPHQL_HTTP_MAX_IN_FLIGHT', '0', 'at least 1'],
     ['GRAPHQL_HTTP_MAX_IN_FLIGHT', '1e2', 'integer'],
@@ -567,6 +735,7 @@ describe('runtime configuration', () => {
     ['GRAPHQL_WS_MAX_PAYLOAD_BYTES', '0', 'at least 1'],
     ['GRAPHQL_WS_CONNECTION_INIT_TIMEOUT_MS', '0', 'at least 1'],
     ['GRAPHQL_WS_MAX_CONNECTIONS', '0', 'at least 1'],
+    ['GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT', '0', 'at least 1'],
     ['GRAPHQL_WS_MAX_OPERATIONS', '0', 'at least 1'],
     ['GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION', '0', 'at least 1'],
     ['GRAPHQL_WS_MAX_PENDING_MESSAGES_PER_CONNECTION', '0', 'at least 1'],
@@ -640,6 +809,11 @@ describe('runtime configuration', () => {
     ['SKIP_POSTGRES_MIGRATION', 'sometimes', 'true, false'],
     ['GRAPHQL_ALLOW_INTROSPECTION', 'sometimes', 'true, false'],
     ['CHAIN_LEGACY_SORA_BLOCK_TYPES', 'sometimes', 'true, false'],
+    ['MOBILE_CONFIG_NEXUS_AVAILABLE', 'sometimes', 'true, false'],
+    ['MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE', 'sometimes', 'true, false'],
+    ['MOBILE_CONFIG_POLKAMARKT_VISIBLE', 'sometimes', 'true, false'],
+    ['MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE', 'sometimes', 'true, false'],
+    ['MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE', 'sometimes', 'true, false'],
   ])('rejects unsupported enum/boolean input %s=%s', (name, value, message) => {
     process.env[name] = value;
     expect(() => readConfig()).toThrow(new RegExp(`Invalid ${name}:.*${message}`));
@@ -661,6 +835,8 @@ describe('runtime configuration', () => {
     ['SORA_WS_ENDPOINT', 'wss://', 'absolute URL'],
     ['SORA_ARCHIVE_WS_ENDPOINT', 'https://archive.example', 'ws: or wss:'],
     ['SORA_ARCHIVE_WS_ENDPOINT', 'not a url', 'absolute URL'],
+    ['SORA_ARCHIVE_WS_ENDPOINT', '   ', 'without surrounding whitespace'],
+    ['SORA_ARCHIVE_WS_ENDPOINT', 'wss://archive.example.', 'trailing dot'],
     ['ROCKSDB_PATH', '', 'must not be empty'],
     ['WORKER_METRICS_HOST', '', 'must not be empty'],
     ['WORKER_METRICS_HOST', 'bad host', 'whitespace'],
@@ -677,11 +853,34 @@ describe('runtime configuration', () => {
       process.env.GRAPHQL_ALLOW_INTROSPECTION = value;
       process.env.SKIP_POSTGRES_MIGRATION = value;
       process.env.CHAIN_LEGACY_SORA_BLOCK_TYPES = value;
+      process.env.MOBILE_CONFIG_NEXUS_AVAILABLE = value;
+      process.env.MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE = value;
+      process.env.MOBILE_CONFIG_POLKAMARKT_VISIBLE = value;
+      process.env.MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE = value;
+      process.env.MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE = value;
       expect(readConfig().rocksdbEnableStats).toBe(false);
       expect(readConfig().graphqlAllowIntrospection).toBe(false);
       expect(readConfig().skipPostgresMigration).toBe(false);
       expect(readConfig().legacySoraBlockTypes).toBe(false);
+      expect(readConfig().mobileCapabilities).toEqual({
+        nexusAvailable: false,
+        nexusSendsAvailable: false,
+        polkamarktVisible: false,
+        polkamarktMutationsAvailable: false,
+        tairaDefaultVisible: false,
+      });
     }
+  });
+
+  it.each([
+    ['MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE', 'MOBILE_CONFIG_NEXUS_AVAILABLE'],
+    ['MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE', 'MOBILE_CONFIG_POLKAMARKT_VISIBLE'],
+  ])('rejects capability %s when prerequisite %s is disabled', (capability, prerequisite) => {
+    process.env[capability] = 'true';
+    process.env[prerequisite] = 'false';
+    expect(() => readConfig()).toThrow(
+      new RegExp(`Invalid ${capability}:.*requires ${prerequisite}=true`)
+    );
   });
 
   it('defaults finalized catch-up prefetching to the configured backfill concurrency', () => {

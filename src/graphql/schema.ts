@@ -84,6 +84,11 @@ export const typeDefs = /* GraphQL */ `
     substrateTypesUrl: String
     soracard: Boolean!
     nodes: [MobileChainNode!]!
+    nexusAvailable: Boolean!
+    nexusSendsAvailable: Boolean!
+    polkamarktVisible: Boolean!
+    polkamarktMutationsAvailable: Boolean!
+    tairaDefaultVisible: Boolean!
   }
 
   type PageInfo {

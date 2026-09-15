@@ -237,15 +237,36 @@ describe('database-free SORA identity preflight', () => {
 
   it('keeps both endpoint proofs before repository construction and migration in the worker entrypoint', async () => {
     const source = await readFile(resolve(repoRoot, 'src/worker/index.ts'), 'utf8');
-    const topology = source.indexOf('assertIndependentSoraRpcEndpoints(baseConfig.soraWsEndpoint, archiveSoraWsEndpoint)');
+    const topology = source.indexOf('assertIndependentSoraRpcEndpoints(config.soraWsEndpoint, archiveSoraWsEndpoint)');
     const preflight = source.indexOf('await Promise.all([');
     const primary = source.indexOf('preflightSoraMainnetIdentity(config.soraWsEndpoint, { requireAnchorTimestamp: true })');
     const archive = source.indexOf('preflightSoraMainnetIdentity(archiveSoraWsEndpoint)');
     const migration = source.indexOf('await migrate(config)');
-    const repository = source.indexOf('createRepository(config, {');
+    const repository = source.indexOf('createRepository(config');
 
     expect(topology).toBeGreaterThan(-1);
     expect(preflight).toBeGreaterThan(-1);
+    expect(preflight).toBeGreaterThan(topology);
+    expect(primary).toBeGreaterThan(preflight);
+    expect(archive).toBeGreaterThan(primary);
+    expect(migration).toBeGreaterThan(archive);
+    expect(repository).toBeGreaterThan(migration);
+  });
+
+  it('keeps both endpoint proofs before repository construction and migration in the combined entrypoint', async () => {
+    const source = await readFile(resolve(repoRoot, 'src/combined.ts'), 'utf8');
+    const topology = source.indexOf(
+      'assertIndependentSoraRpcEndpoints(config.soraWsEndpoint, archiveSoraWsEndpoint)'
+    );
+    const preflight = source.indexOf('await Promise.all([');
+    const primary = source.indexOf(
+      'preflightSoraMainnetIdentity(config.soraWsEndpoint, { requireAnchorTimestamp: true })'
+    );
+    const archive = source.indexOf('preflightSoraMainnetIdentity(archiveSoraWsEndpoint)');
+    const migration = source.indexOf('await migrate(config)');
+    const repository = source.indexOf('createRepository(config');
+
+    expect(topology).toBeGreaterThan(-1);
     expect(preflight).toBeGreaterThan(topology);
     expect(primary).toBeGreaterThan(preflight);
     expect(archive).toBeGreaterThan(primary);

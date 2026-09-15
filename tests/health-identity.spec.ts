@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createSchema } from '../src/graphql/resolvers.js';
 import { MemoryRepository } from '../src/repository/memory.js';
 import { SORA_LEGACY_IDENTITY_ANCHOR, SORA_MAINNET_GENESIS_HASH } from '../src/soraIdentity.js';
+import { createPersistedWorkerStatusDocument } from '../src/worker/status.js';
 
 import type { IndexerDocument } from '../src/repository/types.js';
 
@@ -11,19 +12,6 @@ const CHECKPOINT_BLOCK = 30_000_000;
 const VERIFICATION_BLOCK = SORA_LEGACY_IDENTITY_ANCHOR.block;
 const CHECKPOINT_HASH = `0x${'ab'.repeat(32)}`;
 const VERIFICATION_HASH = SORA_LEGACY_IDENTITY_ANCHOR.hash;
-
-const readyWorkerStatusProvider = {
-  getStatus: () => ({
-    lifecycle: 'running' as const,
-    startupComplete: true,
-    latestFinalizedBlock: CHECKPOINT_BLOCK,
-    latestIndexedBlock: CHECKPOINT_BLOCK,
-    lag: 0,
-    lastSuccessfulIndexTimestamp: NOW,
-    lastError: null,
-    lastErrorTimestamp: null,
-  }),
-};
 
 type IdentityFixtureOptions = {
   identity?: Record<string, unknown>;
@@ -67,12 +55,7 @@ const identityFixture = (options: IdentityFixtureOptions = {}): IndexerDocument[
       collection: 'updatesStreams',
       id: 'chainState',
       blockHeight: CHECKPOINT_BLOCK,
-      timestamp:
-        typeof state.blockTimestamp === 'number' &&
-        Number.isSafeInteger(state.blockTimestamp) &&
-        state.blockTimestamp >= 0
-          ? state.blockTimestamp
-          : NOW,
+      timestamp: typeof state.blockTimestamp === 'number' ? state.blockTimestamp : NOW,
       data: {
         id: 'chainState',
         block: CHECKPOINT_BLOCK,
@@ -80,19 +63,29 @@ const identityFixture = (options: IdentityFixtureOptions = {}): IndexerDocument[
         ...options.stateEnvelope,
       },
     },
+    createPersistedWorkerStatusDocument({
+      lifecycle: 'running',
+      startupComplete: true,
+      latestFinalizedBlock: CHECKPOINT_BLOCK,
+      latestIndexedBlock: CHECKPOINT_BLOCK,
+      lag: 0,
+      lastSuccessfulIndexTimestamp: NOW,
+      lastError: null,
+      lastErrorTimestamp: null,
+    }, NOW),
   ];
 };
 
 const resolveHealth = async (documents: IndexerDocument[]) => {
   const repository = new MemoryRepository();
-  await repository.upsertMany(documents);
-  const healthField = createSchema().getQueryType()?.getFields()._health;
-  return healthField?.resolve?.(
-    {},
-    {},
-    { repository, workerStatusProvider: readyWorkerStatusProvider },
-    {} as never,
+  const documentsByKey = new Map(
+    documents.map((document) => [`${document.collection}\u0000${document.id}`, document])
   );
+  vi.spyOn(repository, 'get').mockImplementation(async (collection, id) =>
+    documentsByKey.get(`${collection}\u0000${id}`) ?? null
+  );
+  const healthField = createSchema().getQueryType()?.getFields()._health;
+  return healthField?.resolve?.({}, {}, { repository }, {} as never);
 };
 
 describe('PI GraphQL mainnet identity health', () => {
@@ -164,6 +157,49 @@ describe('PI GraphQL mainnet identity health', () => {
     await expect(resolveHealth(identityFixture(options))).resolves.toMatchObject({ ok: false });
   });
 
+  it('rejects an equal-height checkpoint unless its hash and timestamp exactly match the identity', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(SORA_LEGACY_IDENTITY_ANCHOR.timestamp * 1_000);
+    const documents = identityFixture({
+      state: {
+        lastIndexedBlock: VERIFICATION_BLOCK,
+        blockHash: CHECKPOINT_HASH,
+        blockTimestamp: SORA_LEGACY_IDENTITY_ANCHOR.timestamp,
+      },
+    });
+    documents[1].blockHeight = VERIFICATION_BLOCK;
+    documents[1].timestamp = SORA_LEGACY_IDENTITY_ANCHOR.timestamp;
+    documents[1].data.block = VERIFICATION_BLOCK;
+    documents[2] = createPersistedWorkerStatusDocument({
+      lifecycle: 'running',
+      startupComplete: true,
+      latestFinalizedBlock: VERIFICATION_BLOCK,
+      latestIndexedBlock: VERIFICATION_BLOCK,
+      lag: 0,
+      lastSuccessfulIndexTimestamp: SORA_LEGACY_IDENTITY_ANCHOR.timestamp,
+      lastError: null,
+      lastErrorTimestamp: null,
+    }, SORA_LEGACY_IDENTITY_ANCHOR.timestamp);
+
+    await expect(resolveHealth(documents)).resolves.toMatchObject({ ok: false });
+  });
+
+  it('rejects a ready heartbeat that does not identify the persisted chainState', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW * 1_000);
+    const documents = identityFixture();
+    documents[2] = createPersistedWorkerStatusDocument({
+      lifecycle: 'running',
+      startupComplete: true,
+      latestFinalizedBlock: CHECKPOINT_BLOCK + 1,
+      latestIndexedBlock: CHECKPOINT_BLOCK + 1,
+      lag: 0,
+      lastSuccessfulIndexTimestamp: NOW,
+      lastError: null,
+      lastErrorTimestamp: null,
+    }, NOW);
+
+    await expect(resolveHealth(documents)).resolves.toMatchObject({ ok: false });
+  });
+
   it.each([
     ['wrong/testnet identity genesis', { genesisHash: `0x${'22'.repeat(32)}` }],
     ['zero verification hash', { verificationBlockHash: `0x${'0'.repeat(64)}` }],
@@ -181,18 +217,13 @@ describe('PI GraphQL mainnet identity health', () => {
     IdentityFixtureOptions,
     { identityBlockHeight?: number; stateBlockHeight?: number },
   ]> = [
+    ['identity id', { identityEnvelope: { id: 'mainnet-chainIdentity' } }, {}],
     ['identity block', { identityEnvelope: { block: VERIFICATION_BLOCK + 1 } }, {}],
     ['identity document height', {}, { identityBlockHeight: VERIFICATION_BLOCK + 1 }],
+    ['checkpoint id', { stateEnvelope: { id: 'mainnet-chainState' } }, {}],
     ['checkpoint block', { stateEnvelope: { block: CHECKPOINT_BLOCK + 1 } }, {}],
     ['checkpoint document height', {}, { stateBlockHeight: CHECKPOINT_BLOCK + 1 }],
   ];
-
-  it.each([
-    ['identity id', { identityEnvelope: { id: 'mainnet-chainIdentity' } }],
-    ['checkpoint id', { stateEnvelope: { id: 'mainnet-chainState' } }],
-  ])('rejects a %s mismatch before it can be persisted', async (_label, options) => {
-    await expect(resolveHealth(identityFixture(options))).rejects.toThrow();
-  });
 
   it.each(envelopeMismatchCases)('rejects a persisted %s envelope mismatch', async (_label, options, documentMutation) => {
     vi.spyOn(Date, 'now').mockReturnValue(NOW * 1_000);
@@ -210,12 +241,7 @@ describe('PI GraphQL mainnet identity health', () => {
     vi.spyOn(repository, 'healthCheck').mockResolvedValue(false);
     const healthField = createSchema().getQueryType()?.getFields()._health;
 
-    await expect(healthField?.resolve?.(
-      {},
-      {},
-      { repository, workerStatusProvider: readyWorkerStatusProvider },
-      {} as never,
-    )).resolves.toMatchObject({
+    await expect(healthField?.resolve?.({}, {}, { repository }, {} as never)).resolves.toMatchObject({
       ok: false,
       genesisHash: SORA_MAINNET_GENESIS_HASH,
       latestIndexedBlock: CHECKPOINT_BLOCK,

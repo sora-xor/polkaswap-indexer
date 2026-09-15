@@ -9,6 +9,10 @@ import {
   PINNED_WALLET_HISTORY_DOCUMENT,
   PINNED_WALLET_OPERATION_CRITERIA,
 } from './pinned-wallet-history-fixture.js';
+import {
+  createHealthIdentityDocuments,
+  HEALTH_TEST_STATE_BLOCK,
+} from './sora-health-fixture.js';
 
 import type { AppConfig } from '../src/config.js';
 
@@ -22,6 +26,13 @@ const config: AppConfig = {
   httpHeadersTimeoutMs: 80_000,
   httpRequestTimeoutMs: 120_000,
   httpMaxConnections: 10_000,
+  httpMaxHeaderBytes: 16_384,
+  httpMaxRequestsPerSocket: 1_000,
+  rateLimitWindowMs: 60_000,
+  rateLimitMax: 600,
+  rateLimitMaxKeys: 20_000,
+  rateLimitGlobalWindowMs: 60_000,
+  rateLimitGlobalMax: 50_000,
   graphqlHttpMaxBodyBytes: 262_144,
   graphqlHttpMaxInFlight: 100,
   graphqlMaxDepth: 12,
@@ -34,6 +45,7 @@ const config: AppConfig = {
   graphqlWsMaxPayloadBytes: 65_536,
   graphqlWsConnectionInitTimeoutMs: 30_000,
   graphqlWsMaxConnections: 1_000,
+  graphqlWsMaxConnectionsPerClient: 16,
   graphqlWsMaxOperations: 2_000,
   graphqlWsMaxOperationsPerConnection: 20,
   graphqlWsMaxPendingMessagesPerConnection: 64,
@@ -87,6 +99,13 @@ const config: AppConfig = {
   workerMetricsHost: '127.0.0.1',
   workerMetricsPort: 9464,
   workerMetricsMaxInFlight: 10,
+  mobileCapabilities: {
+    nexusAvailable: true,
+    nexusSendsAvailable: false,
+    polkamarktVisible: true,
+    polkamarktMutationsAvailable: false,
+    tairaDefaultVisible: true,
+  },
 };
 
 const post = (
@@ -104,25 +123,52 @@ describe('production GraphQL handler', () => {
   it('executes a normal request without binding a TCP port', async () => {
     const now = Math.floor(Date.now() / 1_000);
     const repository = new MemoryRepository();
-    await repository.upsert(
+    await repository.upsertMany([
+      ...createHealthIdentityDocuments(now),
       createPersistedWorkerStatusDocument({
         lifecycle: 'running',
         startupComplete: true,
-        latestFinalizedBlock: 1_000,
-        latestIndexedBlock: 995,
+        latestFinalizedBlock: HEALTH_TEST_STATE_BLOCK + 5,
+        latestIndexedBlock: HEALTH_TEST_STATE_BLOCK,
         lag: 5,
         lastSuccessfulIndexTimestamp: now,
         lastError: null,
         lastErrorTimestamp: null,
-      })
-    );
+      }),
+    ]);
     const { yoga } = createGraphQLHandler(config, repository);
     const response = await post(yoga, '{ _health { ok serviceId readOnly } }');
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
-      data: { _health: { ok: false, serviceId: 'pi.soramitsu.io', readOnly: true } },
+      data: { _health: { ok: true, serviceId: 'pi.soramitsu.io', readOnly: true } },
     });
+  });
+
+  it('projects one exact configured mobile capability snapshot through the handler', async () => {
+    const mobileCapabilities = {
+      nexusAvailable: true,
+      nexusSendsAvailable: true,
+      polkamarktVisible: true,
+      polkamarktMutationsAvailable: true,
+      tairaDefaultVisible: false,
+    };
+    const { yoga } = createGraphQLHandler(
+      { ...config, mobileCapabilities },
+      new MemoryRepository()
+    );
+    const response = await post(yoga, `{
+      mobileConfig {
+        nexusAvailable
+        nexusSendsAvailable
+        polkamarktVisible
+        polkamarktMutationsAvailable
+        tairaDefaultVisible
+      }
+    }`);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ data: { mobileConfig: mobileCapabilities } });
   });
 
   it('applies introspection, alias, and connection-cost limits before resolvers', async () => {

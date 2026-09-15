@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 
 import pg from 'pg';
 
+import { POSTGRES_TRUSTED_SESSION_OPTIONS } from '../postgres-session.js';
 import {
   assertPostgresWorkerFencingToken,
   POSTGRES_WORKER_LEASE_FENCE_TABLE,
@@ -49,6 +50,7 @@ export const createPostgresWorkerLeaseClientConfig = (
   connectionTimeoutMillis: options.connectionTimeoutMs ?? 10_000,
   query_timeout: options.queryTimeoutMs ?? 120_000,
   statement_timeout: options.statementTimeoutMs ?? 120_000,
+  options: POSTGRES_TRUSTED_SESSION_OPTIONS,
   keepAlive: true,
   application_name: 'polkaswap-indexer-chain-worker-lease',
 });

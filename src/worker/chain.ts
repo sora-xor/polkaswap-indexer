@@ -5,6 +5,7 @@ import { readSnapshotDenominator } from './denomination.js';
 import { uniqueIndexedAccountIds } from '../account-activity.js';
 import { estimateRetainedValueBytes } from '../cache-weight.js';
 import {
+  assertExplicitProductionWorkerChainInputs,
   assertIndependentSoraRpcEndpoints,
   type AppConfig,
 } from '../config.js';
@@ -2530,6 +2531,7 @@ export class ChainIndexer {
       (Object.prototype.hasOwnProperty.call(config, 'soraArchiveWsEndpoint') &&
         config.chainRpcTimeoutMs === undefined);
     if (process.env.NODE_ENV === 'production') {
+      assertExplicitProductionWorkerChainInputs();
       if (!this.archiveSoraWsEndpoint) {
         throw new Error('SORA_ARCHIVE_WS_ENDPOINT is required for the production worker.');
       }
@@ -2615,6 +2617,7 @@ export class ChainIndexer {
   }
 
   private async persistWorkerStatusBestEffort(status: ChainIndexerStatus = this.getStatus()): Promise<void> {
+    if (!this.repositoryStatusWritesEnabled) return;
     try {
       await this.persistWorkerStatus(status);
     } catch (error) {
@@ -2673,6 +2676,9 @@ export class ChainIndexer {
       this.api = api;
       const supportsIdentityPreflight =
         typeof (api.rpc.chain as { getBlockHash?: unknown }).getBlockHash === 'function';
+      if (!supportsIdentityPreflight && this.enforceFinalizedIdentity) {
+        throw new Error('Primary SORA endpoint cannot prove the reviewed chain identity');
+      }
       if (supportsIdentityPreflight) {
         this.observedGenesisHash = await this.requireMainnetIdentity(api, 'primary SORA endpoint');
         await this.requireReviewedMainnetAnchor(api, 'primary SORA endpoint', true);
@@ -3238,12 +3244,11 @@ export class ChainIndexer {
     includeStartPromise: boolean,
     terminalLifecycle: Extract<ChainIndexerLifecycle, 'stopped' | 'failed'> = 'stopped'
   ): Promise<void> {
-    const stoppedFromIdle = this.lifecycleState === 'idle';
     const shutdownDeadline =
       Date.now() + (this.config.chainShutdownTimeoutMs ?? CHAIN_DISCONNECT_TIMEOUT_MS);
     this.setLifecycle('stopping');
     this.clearLifecycleTimersAndQueues();
-    const terminalStatusWrite = this.repositoryStatusWritesEnabled || stoppedFromIdle
+    const terminalStatusWrite = this.repositoryStatusWritesEnabled
       ? this.persistWorkerStatusBestEffort({
           ...this.getStatus(),
           lifecycle: terminalLifecycle,
@@ -3286,6 +3291,7 @@ export class ChainIndexer {
 
     await this.waitForShutdownTasks(workTasks, shutdownDeadline);
     await this.waitForShutdownTasks([...this.lateRpcDisposals], shutdownDeadline);
+    this.repositoryStatusWritesEnabled = false;
     this.setLifecycle(terminalLifecycle);
   }
 
@@ -3394,18 +3400,19 @@ export class ChainIndexer {
   private async getLastIndexedBlock(): Promise<number> {
     const state = await this.repository.get('updatesStreams', CHAIN_STATE_ID);
     if (!state) return Math.max(0, this.config.chainStartBlock - 1);
-    let block: number;
     try {
-      block = this.parseCurrentChainState(state).lastIndexedBlock;
-    } catch {
+      const current = this.parseCurrentChainState(state);
+      this.updateIndexedStatus(current.lastIndexedBlock, current.blockTimestamp, false);
+      return current.lastIndexedBlock;
+    } catch (currentError) {
       try {
-        block = this.parseLegacyChainState(state);
+        const legacy = this.parseLegacyChainState(state);
+        this.updateIndexedStatus(legacy, state.timestamp ?? null, false);
+        return legacy;
       } catch {
-        throw new Error('Stored chainState document is malformed');
+        throw currentError;
       }
     }
-    this.updateIndexedStatus(block, state.timestamp ?? null, false);
-    return block;
   }
 
   private createChainStateDocument(block: number, blockHash: string, blockTimestamp: number): IndexerDocument {

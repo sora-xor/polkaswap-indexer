@@ -3,6 +3,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import pg from 'pg';
 
 import { readConfig } from '../config.js';
+import { POSTGRES_TRUSTED_SESSION_OPTIONS } from '../postgres-session.js';
 import { parseExactJsonObject } from '../repository/json-numeric.js';
 import { decodePostgresDocument, decodePostgresDocumentText } from '../repository/postgres-document.js';
 import { ROCKSDB_FORMAT_METADATA_KEY, RocksRepository } from '../repository/rocksdb.js';
@@ -405,7 +406,10 @@ export const runPostgresToRocksdbMigration = async (): Promise<void> => {
   );
   const follow = readStrictBoolean(process.env, 'ROCKSDB_MIGRATION_FOLLOW', false);
   const pollMs = readBoundedPositiveInteger('ROCKSDB_MIGRATION_FOLLOW_POLL_MS', 2_000, 60_000);
-  const pool = new Pool({ connectionString: config.databaseUrl });
+  const pool = new Pool({
+    connectionString: config.databaseUrl,
+    options: POSTGRES_TRUSTED_SESSION_OPTIONS,
+  });
   const repository = new RocksRepository(
     { ...config, storageEngine: 'rocksdb' },
     { allowIncompleteMigration: true }

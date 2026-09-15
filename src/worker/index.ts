@@ -1,6 +1,8 @@
 import {
+  assertExplicitProductionWorkerChainInputs,
   assertIndependentSoraRpcEndpoints,
   readConfig,
+  readSoraArchiveWsEndpoint,
 } from '../config.js';
 import { assertStandaloneStorageMode } from '../deployment.js';
 import { migrate } from '../db/migrate.js';
@@ -11,28 +13,22 @@ import { preflightSoraMainnetIdentity } from './identityPreflight.js';
 import { acquirePostgresWorkerLease, stopOnWorkerLeaseLoss } from './lease.js';
 import { startWorkerObservabilityServer } from './observability.js';
 
-const baseConfig = readConfig();
-const archiveSoraWsEndpoint =
-  baseConfig.soraArchiveWsEndpoint ?? baseConfig.archiveSoraWsEndpoint;
-const config = baseConfig;
+const config = readConfig();
 assertStandaloneStorageMode(config, 'worker');
+assertExplicitProductionWorkerChainInputs();
 
-if (process.env.NODE_ENV === 'production' && !archiveSoraWsEndpoint) {
-  throw new Error('SORA_ARCHIVE_WS_ENDPOINT is required for the production worker.');
-}
+const archiveSoraWsEndpoint = readSoraArchiveWsEndpoint(process.env.NODE_ENV === 'production');
 if (archiveSoraWsEndpoint) {
-  assertIndependentSoraRpcEndpoints(baseConfig.soraWsEndpoint, archiveSoraWsEndpoint);
+  assertIndependentSoraRpcEndpoints(config.soraWsEndpoint, archiveSoraWsEndpoint);
 }
 await Promise.all([
   preflightSoraMainnetIdentity(config.soraWsEndpoint, { requireAnchorTimestamp: true }),
-  ...(archiveSoraWsEndpoint
-    ? [preflightSoraMainnetIdentity(archiveSoraWsEndpoint)]
-    : []),
+  ...(archiveSoraWsEndpoint ? [preflightSoraMainnetIdentity(archiveSoraWsEndpoint)] : []),
 ]);
 console.info(
   archiveSoraWsEndpoint
-    ? 'Verified reviewed primary and archive SORA mainnet identities before database initialization'
-    : 'Verified reviewed SORA mainnet identity before database initialization'
+    ? 'Verified reviewed primary and archive SORA mainnet identities before storage initialization'
+    : 'Verified reviewed SORA mainnet identity before storage initialization'
 );
 
 if (!config.skipPostgresMigration && shouldRunPostgresMigration(config)) await migrate(config);

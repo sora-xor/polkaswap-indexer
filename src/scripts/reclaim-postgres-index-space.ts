@@ -1,6 +1,7 @@
 import pg from 'pg';
 
 import { readConfig } from '../config.js';
+import { POSTGRES_TRUSTED_SESSION_OPTIONS } from '../postgres-session.js';
 import { assertPostgresReclaimConfirmation, readStrictBoolean, readStrictEnum } from './env.js';
 
 const { Pool } = pg;
@@ -61,7 +62,10 @@ const extraDropIndexes = readNameSet('POSTGRES_RECLAIM_EXTRA_DROP_INDEXES');
 const extraKeepIndexes = readNameSet('POSTGRES_RECLAIM_KEEP_INDEXES');
 const dropIndexes = new Set([...DEFAULT_DROP_INDEXES, ...extraDropIndexes]);
 const keepIndexes = new Set([...DEFAULT_KEEP_INDEXES, ...extraKeepIndexes]);
-const pool = new Pool({ connectionString: readConfig().databaseUrl });
+const pool = new Pool({
+  connectionString: readConfig().databaseUrl,
+  options: POSTGRES_TRUSTED_SESSION_OPTIONS,
+});
 
 try {
   const result = await pool.query<IndexRow>(`

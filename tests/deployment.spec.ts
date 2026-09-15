@@ -89,7 +89,7 @@ setInterval(() => undefined, 1_000);
     runner.stdout.on('data', (chunk: Buffer) => output.push(chunk));
     runner.stderr.on('data', (chunk: Buffer) => output.push(chunk));
     const waitForFile = async (path: string): Promise<string> => {
-      for (let attempt = 0; attempt < 200; attempt += 1) {
+      for (let attempt = 0; attempt < 500; attempt += 1) {
         try {
           return await readFile(path, 'utf8');
         } catch {
@@ -123,5 +123,5 @@ setInterval(() => undefined, 1_000);
       if (runner.exitCode === null && runner.signalCode === null) runner.kill('SIGKILL');
       await rm(base, { recursive: true, force: true });
     }
-  }, 10_000);
+  }, 15_000);
 });

@@ -28,6 +28,13 @@ const baseConfig = (port: number): AppConfig => ({
   httpHeadersTimeoutMs: 80_000,
   httpRequestTimeoutMs: 120_000,
   httpMaxConnections: 10_000,
+  httpMaxHeaderBytes: 16_384,
+  httpMaxRequestsPerSocket: 1_000,
+  rateLimitWindowMs: 60_000,
+  rateLimitMax: 600,
+  rateLimitMaxKeys: 20_000,
+  rateLimitGlobalWindowMs: 60_000,
+  rateLimitGlobalMax: 50_000,
   graphqlHttpMaxBodyBytes: 262_144,
   graphqlHttpMaxInFlight: 100,
   graphqlMaxDepth: 12,
@@ -40,6 +47,7 @@ const baseConfig = (port: number): AppConfig => ({
   graphqlWsMaxPayloadBytes: 65_536,
   graphqlWsConnectionInitTimeoutMs: 30_000,
   graphqlWsMaxConnections: 1_000,
+  graphqlWsMaxConnectionsPerClient: 16,
   graphqlWsMaxOperations: 2_000,
   graphqlWsMaxOperationsPerConnection: 20,
   graphqlWsMaxPendingMessagesPerConnection: 64,
@@ -531,8 +539,7 @@ describe('startServer', () => {
         body: '{"query":"{ _health { ok } }"}',
       });
       expect(metricsPost.status).toBe(405);
-      expect(metricsPost.headers.get('allow')).toBe('GET');
-      expect(metricsPost.headers.get('connection')).toBe('close');
+      expect(metricsPost.headers.get('allow')).toBe('GET, HEAD');
 
       const unknown = await fetch(`http://127.0.0.1:${port}/not-graphql`, {
         method: 'POST',

@@ -7,24 +7,43 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
 
 - Confirm all release work has landed on `develop` and that `master` changes
   have been merged or cherry-picked back to `develop`.
-- Confirm the GraphQL schema, `_health` identity, production environment notes,
-  and storage compatibility are final.
+- Confirm the GraphQL schema, `_health` identity, the five `mobileConfig`
+  capability booleans, production environment notes, and storage compatibility
+  are final. The tester projection defaults to `true,false,true,false,true` for
+  Nexus, Nexus sends, Polkamarkt, Polkamarkt mutations, and Taira respectively;
+  never enable send or mutation capabilities before the candidate-bound mobile
+  release gates qualify.
 - Confirm no private tokens, database credentials, deployment keys, local
   environment files, database files, or backups are committed.
-- Confirm `NODE_ENV=production` and an externally injected `DATABASE_URL` are
-  present in the deployment secret store; verify omitting `DATABASE_URL` or
-  supplying malformed numeric/URL configuration aborts before listening.
+- Confirm the deployment secret store has three distinct PostgreSQL role URLs:
+  `POLKASWAP_MIGRATION_OWNER_DATABASE_URL`,
+  `POLKASWAP_API_DATABASE_URL`, and
+  `POLKASWAP_WORKER_DATABASE_URL`. Verify the API and worker logins are
+  different, neither is the schema owner, and omitting any URL aborts Compose
+  validation. Confirm the one-shot credential preflight also rejects equal URL
+  values, repeated decoded role identities, different database targets, and
+  target-changing or deadline-overriding URL parameters without printing any
+  credential component. Only the audited `sslmode` and `sslnegotiation`
+  parameters may be present, and every URL must use `sslmode=verify-full`.
+  Confirm it connects all three credentials and verifies the expected
+  `session_user`, `current_user`, and `current_database()` before DDL. Confirm
+  the owner is a non-superuser schema creator; API and worker must have no
+  elevated role attributes, direct or assumable DDL access, owner membership,
+  or direct/assumable application-object ownership.
+  Direct production processes must still receive their role URL as `DATABASE_URL`
+  with `NODE_ENV=production`.
 - Run `bash scripts/test-branch-flow-audit.sh` and
   `bash scripts/audit-branch-flow.sh`.
 - Run `bash scripts/test-public-artifacts-audit.sh` and
   `bash scripts/audit-public-artifacts.sh`.
 - Run `bash scripts/test-todo-debt-audit.sh` and
   `bash scripts/audit-todo-debt.sh`.
-- Run `corepack enable`, `yarn install --immutable`, and
-  `yarn audit:dependencies:production`. The command audits all recursive
-  production dependencies at low severity or higher. It suppresses registry
-  deprecation notices (currently emitted by optional upstream Polkadot fetch and
-  light-client packages) but does not suppress security advisories.
+- Run `corepack enable`, `yarn install --immutable`,
+  `yarn audit:dependencies`, and `yarn audit:dependencies:production`. The
+  commands audit the complete and shipped recursive graphs at low severity or
+  higher. They suppress registry deprecation notices (currently emitted by
+  optional upstream Polkadot fetch and light-client packages) but do not
+  suppress security advisories.
 - Run `yarn test:deployment-evidence-template`,
   `yarn generate:deployment-evidence-template --output
   build/reports/production-deployment-evidence-template.json`,
@@ -33,18 +52,48 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
 - Run `yarn test:production-smoke`, `yarn test`, and `yarn build`.
 - Run `yarn test:deployment-manifest` and confirm immutable dependency
   installation fails closed, the runtime image uses production dependencies
-  only, and the worker overrides the inherited API healthcheck with the compiled
-  database-only probe.
+  only, the restart-disabled migration owner runs exactly once, API and worker
+  wait for its successful completion with in-process migration disabled, and
+  the worker overrides the inherited API healthcheck with the compiled
+  database-only probe. Confirm the manifest rejects owner/runtime URL reuse,
+  weak migration dependencies, runtime migration commands/entrypoints,
+  per-service shutdown/logging overrides, short shutdown grace, and unbounded
+  logging. Confirm the resolved-manifest audit checks the exact service and
+  environment maps for all three services and rejects Node/PostgreSQL process
+  overrides.
+- Build the exact candidate image and run
+  `POLKASWAP_TEST_IMAGE=<candidate> yarn test:production-database-deployment`.
+  Confirm the pinned PostgreSQL 16 TLS test passes the fresh migration,
+  idempotent rerun, hostile role-default search path, exact table and column ACL
+  matrix, absence of grant options, API repository probe, hostname-verification
+  and process-override negative cases, predefined/assumable-role,
+  schema/object-owner, PUBLIC column-ACL, column grant-option, and extra-ACL
+  adversarial cases without logging credential components.
 - Run `docker build -t polkaswap-indexer:release .` and confirm the production
   image builds from the checked-in container contract.
 - Inspect the image user and dependency surface; the runtime user must be `node`,
   production dependencies must resolve, and `typescript`, `vitest`, and `tsx`
   must not resolve in the final image.
 - Confirm any database migration has a tested backup, restore, and rollback
-  path. Stop or quiesce writers before a destructive storage cutover.
-- Inspect the resolved production Compose manifest and confirm it requires
-  distinct reviewed primary/archive RPC inputs and an explicit reviewed
-  `POLKASWAP_CHAIN_START_BLOCK`. Run
+  path. Stop or quiesce writers before a destructive storage cutover. Confirm
+  the migration-owner role can atomically provision the exact runtime ACLs,
+  the credential preflight completes before DDL, the one-shot migration exits
+  successfully, and its credential is absent from the API and worker
+  containers. The API and worker credentials are transiently present in the
+  one-shot container only so it can prove all three live session roles and the
+  database target. After DDL, confirm the same one-shot gate proves the API has
+  only `SELECT` on `indexer_documents` and no fence access. Confirm the worker
+  has `SELECT`/`INSERT`/`UPDATE`/`DELETE` on `indexer_documents`, only
+  `SELECT`/`INSERT`/`UPDATE` on the fence, and no `TRUNCATE`, `REFERENCES`, or
+  `TRIGGER` on either table. Confirm this audit includes every directly or
+  indirectly assumable role, including `NOINHERIT` memberships.
+- Validate production Compose with `docker compose -f
+  docker-compose.production.yml config --quiet`; never print the interpolated
+  manifest after loading secrets. Inspect an unresolved manifest with
+  `config --no-interpolate` before loading credentials. Confirm the contract
+  uses a four-minute shutdown grace and bounded local log rotation, requires
+  distinct reviewed primary/archive RPC inputs, and requires an explicit
+  reviewed `POLKASWAP_CHAIN_START_BLOCK`. Run
   `node dist/src/scripts/worker-health.js` inside the worker container and
   inspect its container health. It must validate the immutable mainnet anchor,
   fresh exact `chainState`, and matching `BLOCK` snapshot directly through
@@ -56,13 +105,21 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   `ecosystem=sora2`, `chainId=sora:mainnet`, `network=mainnet`,
   `publicBaseUrl=https://pi.soramitsu.io/graphql`, `readOnly=true`, the exact
   reviewed genesis, and a fresh exact block height/hash/timestamp. Confirm the
-  worker log shows its genesis/history-anchor preflight completed before the
-  database migration for both distinct RPC hosts. Confirm the primary is a
-  locally controlled verifying node, the archive is independently operated,
-  and sampled block hashes, raw SCALE blocks/events, and timestamps agree. The
-  a prior deployment passed only the static service-identity routing check on
+  migration container exited successfully before API and worker startup, and
+  the worker log shows its genesis/history-anchor preflight completed before
+  worker repository construction for both distinct RPC hosts. Confirm the
+  primary is a locally controlled verifying node, the archive is independently
+  operated, and sampled block hashes, raw SCALE blocks/events, and timestamps
+  agree. A prior deployment passed only the static service-identity routing check on
   2026-07-10; the current endpoint does not expose the required checkpoint
   fields, and every release must pass the complete current smoke contract.
+- Confirm the same smoke response exposes boolean `nexusAvailable`,
+  `nexusSendsAvailable`, `polkamarktVisible`,
+  `polkamarktMutationsAvailable`, and `tairaDefaultVisible` fields under
+  `mobileConfig`. Nexus sends require Nexus availability, Polkamarkt mutations
+  require Polkamarkt visibility, and mobile clients independently combine the
+  Taira remote default with the Nexus kill switch. Record the exact
+  operator-selected projection; do not infer a missing value.
 - Before declaring the deployment production-ready, use the generated evidence
   template to create operator-attested evidence for the current release commit,
   immutable Docker image digest, deployment ID, UTC deployment and smoke

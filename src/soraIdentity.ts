@@ -34,6 +34,16 @@ export type StoredSoraChainState = {
   blockTimestamp: number;
 };
 
+export const isStoredSoraChainStateCoherent = (
+  identity: StoredSoraChainIdentity,
+  state: StoredSoraChainState,
+): boolean =>
+  state.lastIndexedBlock >= identity.verificationBlock &&
+  state.blockTimestamp >= identity.verificationBlockTimestamp &&
+  (state.lastIndexedBlock !== identity.verificationBlock ||
+    (state.blockHash === identity.verificationBlockHash &&
+      state.blockTimestamp === identity.verificationBlockTimestamp));
+
 const hasExactKeys = (value: Record<string, unknown>, expected: readonly string[]): boolean => {
   const actual = Object.keys(value).sort();
   const wanted = [...expected].sort();
