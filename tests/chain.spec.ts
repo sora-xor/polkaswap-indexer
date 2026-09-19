@@ -6083,7 +6083,7 @@ describe('ChainIndexer price derivation', () => {
     await expect(defaultSnapshotId(1_700_000_400)).resolves.toBe(`asset-${XOR}-DEFAULT-1700000400`);
   });
 
-  it('persists only four chart asset granularities and never looks up BLOCK snapshots', async () => {
+  it('keeps open-hour chart samples and never looks up BLOCK snapshots', async () => {
     const repository = new MemoryRepository();
     const getMany = vi.spyOn(repository, 'getMany');
     const indexer = new ChainIndexer(config, repository) as unknown as {

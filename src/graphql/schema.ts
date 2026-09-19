@@ -202,6 +202,8 @@ export const typeDefs = /* GraphQL */ `
     burn: String
     "Cumulative chain denomination at the CLOSE price; null for unverified legacy data."
     denominator: String
+    "Adjacent finalized block proof for a corrected hourly CLOSE; other OHLC fields retain their original evidence."
+    closeEvidence: JSON
     priceUSD: JSON
     volume: JSON
   }

@@ -16,6 +16,8 @@ const CONFIG_ENV_KEYS = [
   'PGPASSWORD',
   'PGSSLMODE',
   'HOST',
+  'CHAIN_HOURLY_REPAIR_FILE',
+  'CHAIN_HOURLY_REPAIR_SHA256',
   'PORT',
   'GRAPHQL_PATH',
   'HTTP_LISTEN_BACKLOG',
@@ -903,5 +905,17 @@ describe('runtime configuration', () => {
     expect(() => readConfig()).toThrow(
       /Invalid POSTGRES_WATCH_RECONNECT_MAX_DELAY_MS:.*POSTGRES_WATCH_RECONNECT_MIN_DELAY_MS/
     );
+  });
+});
+
+
+describe('checked hourly repair startup configuration', () => {
+  it('requires the explicit artifact path and SHA together', () => {
+    process.env.CHAIN_HOURLY_REPAIR_FILE = '/tmp/checked-history.jsonl';
+    expect(() => readConfig()).toThrow('both values');
+    process.env.CHAIN_HOURLY_REPAIR_SHA256 = 'not-a-checksum';
+    expect(() => readConfig()).toThrow('lowercase SHA-256');
+    process.env.CHAIN_HOURLY_REPAIR_SHA256 = 'a'.repeat(64);
+    expect(readConfig()).toMatchObject({ hourlyRepairFile: '/tmp/checked-history.jsonl', hourlyRepairSha256: 'a'.repeat(64) });
   });
 });
