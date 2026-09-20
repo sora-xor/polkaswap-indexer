@@ -27,6 +27,8 @@ export type HourlyBackfillObservation = {
   prices: Array<{ id: string; value: string }>;
   pools: Array<{ baseAssetId: string; targetAssetId: string; baseAssetReserves: string; targetAssetReserves: string }>;
   priceRoutes?: Array<{ id: string; poolIds: string[] }>;
+  /** The retained list includes every same-state direct XOR pool for the seven major assets. */
+  xorPoolsComplete?: true;
 };
 export type HourlyBackfillRow = HourlyBackfillObservation & {
   kind: 'hour';
@@ -99,6 +101,7 @@ function documentsForRow(row: HourlyBackfillRow, previous?: Map<string, IndexerD
     assets: new Map(row.assets.map((asset) => [asset.id, asset])),
     prices: new Map(row.prices.map((price) => [price.id, BigInt(price.value)])),
     pools,
+    xorPoolsComplete: row.xorPoolsComplete,
     priceRoutes: row.priceRoutes ? new Map(row.priceRoutes.map((route) => [route.id,
       route.poolIds.map((id) => pools.find((pool) => `${pool.baseAssetId}:${pool.targetAssetId}` === id)!),
     ])) : undefined,
@@ -108,7 +111,9 @@ function documentsForRow(row: HourlyBackfillRow, previous?: Map<string, IndexerD
 
 function assertRow(value: unknown, boundary: number, manifest: HourlyBackfillManifest): asserts value is HourlyBackfillRow {
   fields(value, ['kind', 'boundary', 'before', 'after', 'denominator', 'assets', 'prices', 'pools',
-    ...(record(value) && 'priceRoutes' in value ? ['priceRoutes'] : [])]);
+    ...(record(value) && 'priceRoutes' in value ? ['priceRoutes'] : []),
+    ...(record(value) && 'xorPoolsComplete' in value ? ['xorPoolsComplete'] : [])]);
+  if ('xorPoolsComplete' in value && value.xorPoolsComplete !== true) throw new Error('Invalid direct XOR pool completeness evidence');
   assertBlock(value.before);
   assertBlock(value.after);
   if (value.kind !== 'hour' || value.boundary !== boundary || value.before.height + 1 !== value.after.height ||

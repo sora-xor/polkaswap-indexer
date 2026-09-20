@@ -40,9 +40,55 @@ export interface AssetHourlyCloseInput {
   prices: Map<string, bigint>;
   /** Optional same-state reserve evidence; only pools touching the requested asset are retained. */
   pools?: readonly HourlyPoolReserves[];
+  /** True only when every direct XOR pool was observed at this same historical state. Legacy pruned lists omit it. */
+  xorPoolsComplete?: true;
   /** Winning discovery path, including stable-anchor legs, for each eligible USD price. */
   priceRoutes?: Map<string, readonly HourlyPoolReserves[]>;
   previous?: Map<string, IndexerDocument>;
+}
+
+export interface DirectXorPoolEvidence {
+  baseAssetId: string;
+  targetAssetId: string;
+  baseAssetReserves: string;
+  targetAssetReserves: string;
+  baseDecimals: number;
+  targetDecimals: number;
+}
+
+/** Preserve an actual direct-pair mark independently of the stable-anchored USD discovery route. */
+export function directXorPoolEvidence(
+  assetId: string,
+  input: Pick<AssetHourlyCloseInput, 'assets' | 'pools' | 'xorPoolsComplete'>
+): DirectXorPoolEvidence | null | undefined {
+  if (!input.xorPoolsComplete || !input.pools) return undefined;
+  const xorId = HOURLY_HISTORY_ASSETS[0]!.id;
+  const xor = input.assets.get(xorId), asset = input.assets.get(assetId);
+  if (!xor || !asset) return undefined;
+  if (xor.id !== xorId || asset.id !== assetId) throw new Error('Direct XOR pool metadata mismatch');
+  for (const metadata of [xor, asset]) {
+    const expected = HOURLY_HISTORY_ASSETS.find((item) => item.id === metadata.id);
+    if (!expected || expected.symbol !== metadata.symbol || !Number.isSafeInteger(metadata.decimals) || metadata.decimals < 0 || metadata.decimals > 36) {
+      throw new Error('Direct XOR pool metadata mismatch');
+    }
+  }
+  if (assetId === xorId) return null;
+  const matches = input.pools.filter((pool) =>
+    (pool.baseAssetId === xorId && pool.targetAssetId === assetId) ||
+    (pool.baseAssetId === assetId && pool.targetAssetId === xorId));
+  if (matches.length > 1) throw new Error('Ambiguous direct XOR pool evidence');
+  const pool = matches[0];
+  if (!pool) return null;
+  for (const value of [pool.baseAssetReserves, pool.targetAssetReserves]) {
+    if (typeof value !== 'bigint' || value < 0n || value >= (1n << 128n)) throw new Error('Invalid direct XOR pool reserves');
+  }
+  const forward = pool.baseAssetId === xorId;
+  return {
+    baseAssetId: xorId, targetAssetId: assetId,
+    baseAssetReserves: (forward ? pool.baseAssetReserves : pool.targetAssetReserves).toString(),
+    targetAssetReserves: (forward ? pool.targetAssetReserves : pool.baseAssetReserves).toString(),
+    baseDecimals: xor.decimals, targetDecimals: asset.decimals,
+  };
 }
 
 /** Shared existing stable-anchored, liquidity-gated pool valuation; no latest-state inputs. */
@@ -172,6 +218,7 @@ export function buildAssetHourlyCloseDocumentsAtBoundary(input: AssetHourlyClose
     const availability = !metadata ? 'metadata-unavailable' : price === undefined || price <= 0n ? 'price-unavailable' : 'priced';
     const observedPools = input.pools?.filter((pool) => pool.baseAssetId === required.id || pool.targetAssetId === required.id);
     const evidencePools = availability === 'priced' ? input.priceRoutes?.get(required.id) ?? observedPools : observedPools;
+    const xorPool = directXorPoolEvidence(required.id, input);
     const marketStatus = availability === 'priced' ? 'priced' : !observedPools ? 'unknown' : observedPools.some((pool) => pool.baseAssetReserves > 0n && pool.targetAssetReserves > 0n) ? 'liquidity-gate-or-route-unavailable' : 'no-observed-pool';
     const id = assetHourlyCloseId(required.id, before.timestamp);
     const previous = input.previous?.get(id);
@@ -193,6 +240,7 @@ export function buildAssetHourlyCloseDocumentsAtBoundary(input: AssetHourlyClose
           blockHeight: before.height, blockHash: before.hash, timestamp: before.timestamp,
           nextBlockHeight: after.height, nextBlockHash: after.hash, nextTimestamp: after.timestamp,
           requestedSymbol: required.symbol, symbol: metadata?.symbol ?? null, decimals: metadata?.decimals ?? null,
+          ...(xorPool === undefined ? {} : { xorPool }),
           ...(evidencePools ? { poolObservationCount: evidencePools.length, poolObservationsTruncated: evidencePools.length > 16, pools: evidencePools.slice(0, 16).map((pool) => ({
             baseAssetId: pool.baseAssetId, targetAssetId: pool.targetAssetId,
             baseAssetReserves: pool.baseAssetReserves.toString(), targetAssetReserves: pool.targetAssetReserves.toString(),

@@ -10,6 +10,7 @@ import { HOURLY_HISTORY_ASSETS } from '../src/worker/hourly-history.js';
 const hash = (number: number) => `0x${number.toString(16).padStart(64, '0')}`;
 const xor = HOURLY_HISTORY_ASSETS.find((asset) => asset.symbol === 'XOR')!;
 const dai = HOURLY_HISTORY_ASSETS.find((asset) => asset.symbol === 'DAI')!;
+const kusd = HOURLY_HISTORY_ASSETS.find((asset) => asset.symbol === 'KUSD')!;
 const metadata = (value: unknown) => ({ toHuman: () => value });
 const key = (id: string) => ({ toJSON: () => ({ code: id }) });
 
@@ -48,6 +49,30 @@ function setup() {
 afterEach(() => vi.clearAllMocks());
 
 describe('pinned archive hourly source', () => {
+  it('retains nonwinning direct stable/XOR reserves and precision independently of USD routing', async () => {
+    const fixture = setup();
+    fixture.reservePages.mockResolvedValue([
+      [{ args: [key(xor.id), key(dai.id)] }, { toJSON: () => ['100000000000000000000', '200000000000000000000'] }],
+      [{ args: [key(kusd.id), key(xor.id)] }, { toJSON: () => ['7000000000000000000', '1000000000000000000'] }],
+    ]);
+    const archive = await createArchiveHourlyBackfillSource();
+    const value = await archive.observation({ height: 10, hash: hash(10), parentHash: hash(9), timestamp: 7_199 });
+    expect(value.xorPoolsComplete).toBe(true);
+    expect(value.prices.find((price) => price.id === xor.id)?.value).toBe('2000000000000000000');
+    expect(value.priceRoutes?.find((route) => route.id === kusd.id)?.poolIds).toEqual([]);
+    expect(value.pools).toContainEqual({ baseAssetId: kusd.id, targetAssetId: xor.id,
+      baseAssetReserves: '7000000000000000000', targetAssetReserves: '1000000000000000000' });
+    expect(value.assets).toContainEqual({ ...kusd, decimals: 18 });
+  });
+
+  it('rejects duplicate direct pools before map retention can silently remove the ambiguity', async () => {
+    const fixture = setup();
+    const pool = [{ args: [key(xor.id), key(kusd.id)] }, { toJSON: () => ['1000', '2000'] }];
+    fixture.reservePages.mockResolvedValue([pool, pool]);
+    const archive = await createArchiveHourlyBackfillSource();
+    await expect(archive.observation({ height: 10, hash: hash(10), parentHash: hash(9), timestamp: 7_199 })).rejects.toThrow('Ambiguous');
+  });
+
   it('reads price graph, precision and denomination exclusively from the closing block runtime', async () => {
     const fixture = setup();
     const archive = await createArchiveHourlyBackfillSource();
@@ -85,10 +110,10 @@ describe('pinned archive hourly source', () => {
     }
   );
 
-  it('rejects unsupported precision instead of inferring eighteen decimals', async () => {
+  it.each([undefined, null, '', '1e1', false])('rejects unsupported archive precision %s', async (precision) => {
     const fixture = setup();
-    fixture.assetPages.mockResolvedValue([[{ args: [key(xor.id)] }, metadata({ symbol: 'XOR' })]]);
+    fixture.assetPages.mockResolvedValue([[{ args: [key(xor.id)] }, metadata({ symbol: 'XOR', precision })]]);
     const archive = await createArchiveHourlyBackfillSource();
-    await expect(archive.observation({ height: 10, hash: hash(10), parentHash: hash(9), timestamp: 7_199 })).rejects.toThrow('metadata');
+    await expect(archive.observation({ height: 10, hash: hash(10), parentHash: hash(9), timestamp: 7_199 })).rejects.toThrow('precision');
   });
 });

@@ -5367,7 +5367,7 @@ export class ChainIndexer {
       before,
       after: { height, hash: header.hash.toString(), timestamp },
       genesisHash, denominator, assets: state.assets, prices,
-      pools, priceRoutes, previous,
+      pools, priceRoutes, previous, xorPoolsComplete: true,
     });
   }
 
@@ -6531,7 +6531,9 @@ export class ChainIndexer {
     if (unwrapped === null) return null;
     const human = toHuman(unwrapped);
     if (!isRecord(human)) throw new Error(`Historical asset metadata for ${id} is not an object`);
-    const decimals = Number(human.precision ?? human.decimals ?? DECIMALS);
+    const precision = human.precision ?? human.decimals;
+    const decimals = typeof precision === 'number' || (typeof precision === 'string' && /^(?:0|[1-9]\d{0,2})$/.test(precision))
+      ? Number(precision) : Number.NaN;
     if (!Number.isSafeInteger(decimals) || decimals < 0 || decimals > 255) {
       throw new Error(`Historical asset metadata for ${id} has invalid precision`);
     }

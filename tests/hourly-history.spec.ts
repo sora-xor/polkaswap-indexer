@@ -4,7 +4,7 @@ import { MemoryRepository } from '../src/repository/memory.js';
 import type { IndexerDocument } from '../src/repository/types.js';
 import { ChainIndexer } from '../src/worker/chain.js';
 import {
-  assetHourlyCloseId, buildAssetHourlyCloseDocumentsAtBoundary, deriveAssetPrices,
+  assetHourlyCloseId, buildAssetHourlyCloseDocumentsAtBoundary, deriveAssetPrices, directXorPoolEvidence,
   HOURLY_HISTORY_ASSETS, HOURLY_HISTORY_GENESIS,
   type AssetHourlyCloseInput, type HourlyBoundaryBlock,
 } from '../src/worker/hourly-history.js';
@@ -27,6 +27,84 @@ function input(): AssetHourlyCloseInput {
 }
 
 describe('durable hourly close evidence', () => {
+  it.each([undefined, null, '', '1e1', false])('never infers historical asset precision (%s)', (precision) => {
+    const worker = new ChainIndexer(readConfig(), new MemoryRepository()) as unknown as {
+      parseHistoricalAssetInfo(id: string, value: unknown): { decimals: number };
+    };
+    expect(() => worker.parseHistoricalAssetInfo(KUSD, { toHuman: () => ({ symbol: 'KUSD', precision }) })).toThrow('precision');
+    expect(worker.parseHistoricalAssetInfo(KUSD, { toHuman: () => ({ symbol: 'KUSD', precision: 6 }) }).decimals).toBe(6);
+  });
+
+  it('retains exact direct KUSD/XOR evidence even when stable USD price uses no pool', () => {
+    const source = input();
+    source.xorPoolsComplete = true;
+    source.assets.get(KUSD)!.decimals = 6;
+    source.pools = [{ baseAssetId: XOR, targetAssetId: KUSD, baseAssetReserves: 12345678901234567890n, targetAssetReserves: 456789012n }];
+    source.priceRoutes = new Map([[KUSD, []], [XOR, []]]);
+    const row = buildAssetHourlyCloseDocumentsAtBoundary(source).find((item) => item.data.assetId === KUSD)!;
+    expect(row.data.priceUSD).toEqual({ close: '1' });
+    expect(row.data.closeEvidence).toMatchObject({ pools: [], xorPool: {
+      baseAssetId: XOR, targetAssetId: KUSD, baseAssetReserves: '12345678901234567890', targetAssetReserves: '456789012',
+      baseDecimals: 18, targetDecimals: 6,
+    } });
+  });
+
+  it('distinguishes unknown legacy pool coverage from an observed missing direct pair', () => {
+    const source = input();
+    source.pools = [];
+    expect(directXorPoolEvidence(KUSD, source)).toBeUndefined();
+    source.xorPoolsComplete = true;
+    expect(directXorPoolEvidence(KUSD, source)).toBeNull();
+    expect(directXorPoolEvidence(XOR, source)).toBeNull();
+    source.pools = undefined;
+    expect(directXorPoolEvidence(KUSD, source)).toBeUndefined();
+  });
+
+  it('normalizes one reversed pool without replacing observed zero reserves', () => {
+    const source = input();
+    source.xorPoolsComplete = true;
+    source.pools = [{ baseAssetId: KUSD, targetAssetId: XOR, baseAssetReserves: 17n, targetAssetReserves: 0n }];
+    expect(directXorPoolEvidence(KUSD, source)).toEqual({
+      baseAssetId: XOR, targetAssetId: KUSD, baseAssetReserves: '0', targetAssetReserves: '17', baseDecimals: 18, targetDecimals: 18,
+    });
+  });
+
+  it.each([false, true])('rejects duplicate or ambiguous reversed direct pairs (reversed=%s)', (reversed) => {
+    const source = input();
+    source.xorPoolsComplete = true;
+    const pool = { baseAssetId: XOR, targetAssetId: KUSD, baseAssetReserves: 1n, targetAssetReserves: 2n };
+    source.pools = [pool, reversed ? { ...pool, baseAssetId: KUSD, targetAssetId: XOR } : { ...pool }];
+    expect(() => directXorPoolEvidence(KUSD, source)).toThrow('Ambiguous');
+  });
+
+  it.each([-1n, 1n << 128n])('rejects direct reserves outside u128 (%s)', (value) => {
+    const source = input();
+    source.xorPoolsComplete = true;
+    source.pools = [{ baseAssetId: XOR, targetAssetId: KUSD, baseAssetReserves: value, targetAssetReserves: 2n }];
+    expect(() => directXorPoolEvidence(KUSD, source)).toThrow('reserves');
+  });
+
+  it('requires exact same-state metadata for both pool legs', () => {
+    const source = input();
+    source.xorPoolsComplete = true;
+    source.pools = [{ baseAssetId: XOR, targetAssetId: KUSD, baseAssetReserves: 1n, targetAssetReserves: 2n }];
+    source.assets.delete(XOR);
+    expect(directXorPoolEvidence(KUSD, source)).toBeUndefined();
+    source.assets.set(XOR, { id: KUSD, symbol: 'KUSD', decimals: 18 });
+    expect(() => directXorPoolEvidence(KUSD, source)).toThrow('metadata');
+    source.assets.set(XOR, { id: XOR, symbol: 'XOR', decimals: 37 });
+    expect(() => directXorPoolEvidence(KUSD, source)).toThrow('metadata');
+  });
+
+  it('does not carry previous direct-pair evidence into an unavailable observation', () => {
+    const source = input();
+    const id = assetHourlyCloseId(KUSD, before.timestamp);
+    source.previous = new Map([[id, { collection: 'assetSnapshots', id, blockHeight: 99, timestamp: 7000,
+      data: { assetId: KUSD, type: 'HOUR', closeEvidence: { xorPool: { baseAssetReserves: '1' } } } }]]);
+    const row = buildAssetHourlyCloseDocumentsAtBoundary(source).find((item) => item.data.assetId === KUSD)!;
+    expect(row.data.closeEvidence).not.toHaveProperty('xorPool');
+  });
+
   it('builds all seven canonical observations with exact fractional prices and adjacent finalized proof', () => {
     const source = input();
     source.prices.set(XOR, 1234567890123456789n);
@@ -152,6 +230,7 @@ describe('finalized-block hourly collection', () => {
     const snapshots = await test.repository.list('assetSnapshots');
     expect(snapshots).toHaveLength(7);
     expect(snapshots.every((row) => row.timestamp === before.timestamp)).toBe(true);
+    expect(snapshots.find((row) => row.data.assetId === KUSD)?.data.closeEvidence).toHaveProperty('xorPool', null);
     expect(test.internal.getHistoricalValuationQueryAt).toHaveBeenCalledWith(before.height);
     expect((await test.repository.get('updatesStreams', 'chainState'))?.blockHeight).toBe(after.height);
     expect(test.internal.previousHourlyHistoryBlock).toEqual(after);

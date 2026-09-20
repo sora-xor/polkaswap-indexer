@@ -36,6 +36,15 @@ block. Only relevant winning-route reserves, unavailable-asset diagnostics and
 their metadata are retained in the artifact. A halted or missing hour cannot be
 filled by carrying an earlier price forward.
 
+New preparation also retains every direct XOR pool touching the seven required
+assets, including nonwinning USD routes, and both legs' same-state precision.
+Each such observation has `xorPoolsComplete: true`. The canonical completed-hour
+documents expose these as `closeEvidence.xorPool`; reversed storage orientation
+is normalized exactly, ambiguous duplicates reject preparation, and zero reserves
+remain zero. Legacy artifacts without the marker remain valid but leave this
+field absent. They must not be relabelled as complete or reused to assert a
+missing pair; fresh exact historical state is required to repair that evidence.
+
 ## Applying through the existing database owner
 
 Activation is separate from preparation. Do not run a second repair process

@@ -1,7 +1,7 @@
 import { ApiPromise, HttpProvider } from '@polkadot/api';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-import { deriveAssetPrices, HOURLY_HISTORY_ASSETS } from '../worker/hourly-history.js';
+import { deriveAssetPrices, directXorPoolEvidence, HOURLY_HISTORY_ASSETS } from '../worker/hourly-history.js';
 import type { HourlyAssetMetadata, HourlyPoolReserves } from '../worker/hourly-history.js';
 import { HOURLY_ARCHIVE_ENDPOINT, HOURLY_GENESIS_HASH } from './hourly-backfill-constants.js';
 import type { HourlyBackfillBlock, HourlyBackfillSource } from './backfill-hourly-history.js';
@@ -178,7 +178,9 @@ export async function createArchiveHourlyBackfillSource(): Promise<HourlyBackfil
         if (raw.isNone) continue;
         const value = (raw.unwrap ? raw.unwrap() : raw).toHuman();
         if (!value || typeof value !== 'object' || !('precision' in value) || !('symbol' in value)) throw new Error('Historical asset metadata is malformed');
-        const decimals = Number(value.precision);
+        const precision = value.precision;
+        const decimals = typeof precision === 'number' || (typeof precision === 'string' && /^(?:0|[1-9]\d{0,2})$/.test(precision))
+          ? Number(precision) : Number.NaN;
         if (!Number.isSafeInteger(decimals) || decimals < 0 || decimals > 36) throw new Error('Historical asset precision is unsupported');
         const id = assetId(key.args[0]!);
         assets.set(id, { id, symbol: String(value.symbol), decimals });
@@ -194,14 +196,22 @@ export async function createArchiveHourlyBackfillSource(): Promise<HourlyBackfil
       const prices = deriveAssetPrices(assets, pools, routes);
       const ids = new Set(HOURLY_HISTORY_ASSETS.map((asset) => asset.id));
       const retained = new Map<string, HourlyPoolReserves>();
+      const xorId = HOURLY_HISTORY_ASSETS[0]!.id;
       for (const asset of HOURLY_HISTORY_ASSETS) {
+        directXorPoolEvidence(asset.id, { assets, pools, xorPoolsComplete: true });
         const evidence = prices.has(asset.id) ? routes.get(asset.id) ?? []
           : pools.filter((pool) => pool.baseAssetId === asset.id || pool.targetAssetId === asset.id);
         for (const pool of evidence) retained.set(`${pool.baseAssetId}:${pool.targetAssetId}`, pool);
+        for (const pool of pools.filter((pool) =>
+          (pool.baseAssetId === xorId && pool.targetAssetId === asset.id) ||
+          (pool.baseAssetId === asset.id && pool.targetAssetId === xorId))) {
+          retained.set(`${pool.baseAssetId}:${pool.targetAssetId}`, pool);
+        }
       }
       const retainedAssets = new Set([...ids, ...[...retained.values()].flatMap((pool) => [pool.baseAssetId, pool.targetAssetId])]);
       return {
         denominator,
+        xorPoolsComplete: true,
         assets: [...assets.values()].filter((asset) => retainedAssets.has(asset.id)),
         prices: [...prices].filter(([id, value]) => ids.has(id) && value > 0n).map(([id, value]) => ({ id, value: value.toString() })),
         pools: [...retained.values()].map((pool) => ({

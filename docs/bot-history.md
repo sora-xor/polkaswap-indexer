@@ -58,6 +58,35 @@ only CLOSE, never invented OHLC extrema or flow totals. Stored document height
 uses the successor height, or a later legacy height to satisfy repository
 ordering; the exact source height is always `closeEvidence.blockHeight`.
 
+### Direct XOR pair marks
+
+The global USD price is a chart valuation: DAI, KUSD and XSTUSD are fixed USD
+anchors, and the winning discovery route can change between hours. Dividing two
+such USD prices is not evidence of the directly executable token pair.
+
+New completed-hour evidence includes `closeEvidence.xorPool`, independently of
+`priceUSD` and its existing `pools` route. A present object has `baseAssetId` (XOR),
+`targetAssetId` (this row's asset), exact unsigned codec strings
+`baseAssetReserves` and `targetAssetReserves`, plus `baseDecimals` and
+`targetDecimals` from this same block's metadata. A single reverse-oriented stored
+pool is normalized by swapping its reserves. Duplicate pairs or both stored
+orientations are ambiguous and reject the boundary; no DEX route is inferred.
+Observed zero reserves remain zero and cannot support a usable market mark.
+
+`xorPool: null` means a complete same-state pool observation found no direct pair
+(also used for the XOR row itself). An absent field means unknown legacy coverage
+or unavailable metadata/pools. Previous direct-pair evidence is never carried
+into an unavailable new observation. The live collector sets
+`xorPoolsComplete: true` only from its complete immutable pool map; historical
+artifacts must explicitly retain that marker and all required direct XOR pools.
+Older artifacts remain readable but cannot acquire synthetic absence evidence.
+
+Clients must validate the common finalized block, adjacent successor, genesis,
+denomination, precision and asset identities before deriving ratios. Natural
+reserves use their respective decimals. For KUSD input and XOR output, both the
+pair close and XOR fee close are natural KUSD reserve / natural XOR reserve.
+Neither USD stable anchors nor a winning USD route may replace a missing pair.
+
 ## Historical repair and release
 
 Historical repair is explicit. `CHAIN_HOURLY_REPAIR_FILE` and

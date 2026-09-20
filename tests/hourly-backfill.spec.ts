@@ -142,6 +142,65 @@ describe('finalized hourly archive preparation', () => {
 });
 
 describe('owner-only hourly snapshot repair', () => {
+  it('upgrades existing same-block hourly rows with new direct-pair evidence despite a legacy repair receipt', async () => {
+    const file = await artifact();
+    const repository = new MemoryRepository();
+    const options = { ...file, genesisHash: HOURLY_GENESIS_HASH, finalizedHeight: 7 };
+    await applyHourlyBackfillFile(repository, options);
+    const before = await repository.list('assetSnapshots');
+    expect(before[0]?.data.closeEvidence).not.toHaveProperty('xorPool');
+    const sha256 = await rewrite(file.path, (lines) => {
+      for (const line of lines.slice(1)) line.xorPoolsComplete = true;
+    });
+    expect(await applyHourlyBackfillFile(repository, { ...options, sha256 })).toMatchObject({ status: 'applied', changed: 14 });
+    const after = await repository.list('assetSnapshots');
+    expect(after.map(({ id, blockHeight }) => ({ id, blockHeight }))).toEqual(before.map(({ id, blockHeight }) => ({ id, blockHeight })));
+    expect(after.every((row) => (row.data.closeEvidence as Record<string, unknown>).xorPool === null)).toBe(true);
+    expect(await applyHourlyBackfillFile(repository, { ...options, sha256 })).toMatchObject({ status: 'already-applied', changed: 0 });
+  });
+
+  it.each([false, true])('keeps legacy coverage unknown and publishes explicit complete XOR coverage (%s)', async (complete) => {
+    const file = await artifact();
+    const sha256 = complete ? await rewrite(file.path, (lines) => {
+      for (const line of lines.slice(1)) line.xorPoolsComplete = true;
+    }) : file.sha256;
+    const repository = new MemoryRepository();
+    await applyHourlyBackfillFile(repository, { ...file, sha256, genesisHash: HOURLY_GENESIS_HASH, finalizedHeight: 7 });
+    const rows = await repository.list('assetSnapshots');
+    for (const row of rows) {
+      if (complete) expect(row.data.closeEvidence).toHaveProperty('xorPool', null);
+      else expect(row.data.closeEvidence).not.toHaveProperty('xorPool');
+    }
+  });
+
+  it('rejects malformed direct-pool completeness before any write', async () => {
+    const file = await artifact();
+    const sha256 = await rewrite(file.path, (lines) => { lines[2]!.xorPoolsComplete = 'true'; });
+    const repository = new MemoryRepository();
+    await expect(applyHourlyBackfillFile(repository, { ...file, sha256, genesisHash: HOURLY_GENESIS_HASH, finalizedHeight: 7 })).rejects.toThrow('completeness');
+    expect(await repository.list('assetSnapshots')).toEqual([]);
+  });
+
+  it('round trips a nonwinning reversed direct pool without changing the stable USD mark', async () => {
+    const file = await artifact();
+    const xor = HOURLY_HISTORY_ASSETS[0]!.id, kusd = HOURLY_HISTORY_ASSETS[4]!.id;
+    const sha256 = await rewrite(file.path, (lines) => {
+      for (const line of lines.slice(1)) {
+        line.xorPoolsComplete = true;
+        line.pools = [{ baseAssetId: kusd, targetAssetId: xor, baseAssetReserves: '456789', targetAssetReserves: '1234567890123456789' }];
+        line.priceRoutes = HOURLY_HISTORY_ASSETS.map((asset) => ({ id: asset.id, poolIds: [] }));
+      }
+    });
+    const repository = new MemoryRepository();
+    await applyHourlyBackfillFile(repository, { ...file, sha256, genesisHash: HOURLY_GENESIS_HASH, finalizedHeight: 7 });
+    const row = (await repository.list('assetSnapshots')).find((item) => item.data.assetId === kusd)!;
+    expect(row.data.priceUSD).toEqual({ close: '1.234567890123456789' });
+    expect(row.data.closeEvidence).toMatchObject({ pools: [], xorPool: {
+      baseAssetId: xor, targetAssetId: kusd, baseAssetReserves: '1234567890123456789', targetAssetReserves: '456789',
+      baseDecimals: 18, targetDecimals: 18,
+    } });
+  });
+
   it('changes only CLOSE/provenance, preserves nonempty fields and leaves current assets/checkpoint untouched', async () => {
     const file = await artifact();
     const { rows } = await readHourlyBackfillArtifact(file.path, file.sha256);
