@@ -41,6 +41,7 @@ const ROOT_QUERY_FIELD_BASE_COST: Readonly<Record<string, number>> = {
   exploreStats: 10_000,
   networkAccountActivity: 75_000,
   polkamarktSignals: 75_000,
+  assetHourlyCoverage: 75_000,
 };
 
 const limitError = (message: string, nodes?: ASTNode | readonly ASTNode[]): GraphQLError =>

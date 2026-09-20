@@ -27,6 +27,7 @@ import { getOrderField, NUMERIC_ORDER_FIELDS } from './order.js';
 import { validatePublicConnectionQuery } from './query-policy.js';
 import { CursorScalar, FilterScalars, JSONScalar, OrderByScalar } from './scalars.js';
 import { typeDefs } from './schema.js';
+import { assetHourlyCoverage } from './hourly-history.js';
 
 import type {
   IndexerCollection,
@@ -1847,6 +1848,8 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
         account: documentResolver(collection('accounts')),
         assets: connectionResolver(collection('assets')),
         assetSnapshots: connectionResolver(collection('assetSnapshots')),
+        assetHourlyCoverage: (_parent: unknown, args: Parameters<typeof assetHourlyCoverage>[1], context: Context) =>
+          assetHourlyCoverage(context.repository, args),
         accountLiquiditySnapshots: connectionResolver(collection('accountLiquiditySnapshots')),
         market: documentResolver(collection('markets')),
         markets: connectionResolver(collection('markets')),
