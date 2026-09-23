@@ -20,6 +20,13 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   the generated GraphQL schema includes the field. Do not deploy an older
   worker against the same database: its ordinary eight-day cleanup would
   delete retained major-token HOUR rows.
+- Confirm the deployed volume contract counts only successful Liquidity Proxy
+  `Exchange` events (including utility-wrapped swaps and `swapTransferBatch`),
+  excludes unrelated burn, mint, deposit and claim amounts, and retains
+  block-height pagination for `xorBurns`. Run the volume, query-policy and
+  one-shot repair tests. Historical network snapshot corrections require the
+  separate dry-run and controlled apply procedure in `README.md`; a code
+  release alone does not rewrite old aggregate values.
 - Confirm no private tokens, database credentials, deployment keys, local
   environment files, database files, or backups are committed.
 - Confirm the deployment secret store has three distinct PostgreSQL role URLs:

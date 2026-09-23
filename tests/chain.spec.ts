@@ -2280,6 +2280,7 @@ describe('ChainIndexer price derivation', () => {
 
   it('counts every supported direct swap method from executed Exchange events only', async () => {
     const repository = new MemoryRepository();
+    const blockHash = canonicalBlockHash('supported-swaps-block');
     const indexer = new ChainIndexer(config, repository) as unknown as {
       api: unknown;
       prices: Map<string, bigint>;
@@ -2315,7 +2316,7 @@ describe('ChainIndexer price derivation', () => {
     ]);
     indexer.api = testBlockApi(
       62,
-      '0xsupported-swaps-block',
+      blockHash,
       [
         testExtrinsic(
           '0xdirect-swap',
@@ -2439,7 +2440,8 @@ describe('ChainIndexer price derivation', () => {
       ]
     );
 
-    await indexer.indexBlockByHash('0xsupported-swaps-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(blockHash);
 
     const snapshot = await repository.get('networkSnapshots', 'block-62');
     const histories = await repository.getMany('historyElements', [
@@ -2463,6 +2465,7 @@ describe('ChainIndexer price derivation', () => {
 
   it('values utility-wrapped swaps from their scoped Exchange events', async () => {
     const repository = new MemoryRepository();
+    const blockHash = canonicalBlockHash('utility-swap-block');
     const indexer = new ChainIndexer(config, repository) as unknown as {
       api: unknown;
       prices: Map<string, bigint>;
@@ -2503,7 +2506,7 @@ describe('ChainIndexer price derivation', () => {
     ]);
     indexer.api = testBlockApi(
       63,
-      '0xutility-swap-block',
+      blockHash,
       [testExtrinsic('0xutility-swap', 'utility', 'batchAll', [[swapCall]], ['calls'])],
       [
         eventRecord('liquidityProxy', 'Exchange', {
@@ -2515,7 +2518,8 @@ describe('ChainIndexer price derivation', () => {
       ]
     );
 
-    await indexer.indexBlockByHash('0xutility-swap-block');
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(blockHash);
 
     const history = await repository.get('historyElements', '0xutility-swap');
     const snapshot = await repository.get('networkSnapshots', 'block-63');
@@ -2586,7 +2590,7 @@ describe('ChainIndexer price derivation', () => {
       extractVolumeUSD: (data: unknown) => bigint;
       indexBlockByHash: (hash: string) => Promise<void>;
     };
-    const blockHash = `0xnon-swap-${testCase.blockHeight}`;
+    const blockHash = canonicalBlockHash(`non-swap-${testCase.blockHeight}`);
     const extrinsicHash = `0xnon-swap-extrinsic-${testCase.blockHeight}`;
 
     indexer.prices = new Map([
@@ -2612,6 +2616,7 @@ describe('ChainIndexer price derivation', () => {
       testCase.events
     );
 
+    markIndexerMainnet(indexer);
     await indexer.indexBlockByHash(blockHash);
 
     const history = await repository.get('historyElements', extrinsicHash);
