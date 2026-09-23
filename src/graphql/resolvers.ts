@@ -27,6 +27,7 @@ import { getOrderField, NUMERIC_ORDER_FIELDS } from './order.js';
 import { validatePublicConnectionQuery } from './query-policy.js';
 import { CursorScalar, FilterScalars, JSONScalar, OrderByScalar } from './scalars.js';
 import { typeDefs } from './schema.js';
+import { assetHourlyCoverage } from './hourly-history.js';
 
 import type {
   IndexerCollection,
@@ -85,6 +86,7 @@ const CACHE_ENTRY_OVERHEAD_BYTES = 128;
 
 const DEFAULT_CONNECTION_PAGE_SIZE = 100;
 const MAX_CONNECTION_PAGE_SIZE = 100;
+const XOR_BURNS_MAX_CONNECTION_PAGE_SIZE = 1_000;
 const DEFAULT_GRAPHQL_QUERY_MAX_BYTES = 64 * 1_024 * 1_024;
 const MAX_CONNECTION_OFFSET = 100_000;
 // Real SubQuery-compatible filters can combine and/or groups with nested JSON
@@ -1079,9 +1081,12 @@ const shouldCacheConnection = (collectionName: IndexerCollection, args: Connecti
 
 const createConnectionResolver =
   (cache: TtlCache, queryMaxBytes: number) =>
-  (collectionName: IndexerCollection) =>
+  (
+    collectionName: IndexerCollection,
+    maximumPageSize = MAX_CONNECTION_PAGE_SIZE
+  ) =>
   async (_parent: unknown, args: ConnectionArgs, context: Context, info?: GraphQLResolveInfo) => {
-    const normalizedArgs = normalizeConnectionArgs(args, info);
+    const normalizedArgs = normalizeConnectionArgs(args, info, maximumPageSize);
     assertPublicConnectionQuery(collectionName, normalizedArgs.orderBy, normalizedArgs.filter);
     const resolveConnection = async () => {
       if (context.repository.query) {
@@ -1847,6 +1852,8 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
         account: documentResolver(collection('accounts')),
         assets: connectionResolver(collection('assets')),
         assetSnapshots: connectionResolver(collection('assetSnapshots')),
+        assetHourlyCoverage: (_parent: unknown, args: Parameters<typeof assetHourlyCoverage>[1], context: Context) =>
+          assetHourlyCoverage(context.repository, args),
         accountLiquiditySnapshots: connectionResolver(collection('accountLiquiditySnapshots')),
         market: documentResolver(collection('markets')),
         markets: connectionResolver(collection('markets')),
@@ -1859,7 +1866,7 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
         orderBookOrders: connectionResolver(collection('orderBookOrders')),
         orderBookSnapshots: connectionResolver(collection('orderBookSnapshots')),
         historyElements: connectionResolver(collection('historyElements')),
-        xorBurns: connectionResolver(collection('xorBurns')),
+        xorBurns: connectionResolver(collection('xorBurns'), XOR_BURNS_MAX_CONNECTION_PAGE_SIZE),
         referrerRewards: connectionResolver(collection('referrerRewards')),
         stakingStakers: connectionResolver(collection('stakingStakers')),
         stakingValidators: connectionResolver(collection('stakingValidators')),

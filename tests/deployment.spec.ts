@@ -118,7 +118,20 @@ setInterval(() => undefined, 1_000);
       expect(await readFile(drainedPath, 'utf8')).toBe('TERM\n');
       await expect(access(join(base, 'combined.pid'))).rejects.toThrow();
       await expect(access(join(base, 'api-4350.pid'))).rejects.toThrow();
-      expect(() => process.kill(childPid, 0)).toThrow();
+      // Under a parallel suite, process-table cleanup can lag the supervisor's
+      // exit event briefly. Still fail if the Node child remains orphaned.
+      let childGone = false;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        try {
+          process.kill(childPid, 0);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+          childGone = true;
+          break;
+        }
+        await sleep(10);
+      }
+      expect(childGone).toBe(true);
     } finally {
       if (runner.exitCode === null && runner.signalCode === null) runner.kill('SIGKILL');
       await rm(base, { recursive: true, force: true });

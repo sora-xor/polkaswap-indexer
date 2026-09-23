@@ -1,6 +1,16 @@
 import { ApiPromise, WsProvider } from '@polkadot/api';
 import { types as soraTypes } from '@sora-substrate/type-definitions';
 import { readSnapshotDenominator } from './denomination.js';
+import {
+  assetHourlyCloseId,
+  buildAssetHourlyCloseDocumentsAtBoundary,
+  deriveAssetPrices,
+  HOURLY_HISTORY_ASSET_IDS,
+  HOURLY_HISTORY_GENESIS,
+  HOUR_SECONDS,
+  type HourlyBoundaryBlock,
+  type HourlyPoolReserves,
+} from './hourly-history.js';
 
 import { uniqueIndexedAccountIds } from '../account-activity.js';
 import { estimateRetainedValueBytes } from '../cache-weight.js';
@@ -691,9 +701,20 @@ const emptyNetworkTransactionCounters = (): NetworkTransactionCounters => ({
   bridgeOutgoingTransactions: 0,
 });
 
+const LIQUIDITY_PROXY_SWAP_METHODS = new Set(['swap', 'swapTransfer', 'swapTransferBatch']);
+
+/**
+ * Identifies the public liquidity-proxy calls that can execute user exchange
+ * legs. The exact allow-list deliberately excludes other successful
+ * liquidity-proxy operations and also covers the same calls inside utility
+ * batches.
+ */
 const isLiquidityProxySwap = (module: string, method: string, callNames: string[] = []): boolean =>
-  (module === 'liquidityProxy' && (method === 'swap' || method === 'swapTransfer')) ||
-  callNames.some((name) => name === 'liquidityProxy.swap' || name === 'liquidityProxy.swapTransfer');
+  (module === 'liquidityProxy' && LIQUIDITY_PROXY_SWAP_METHODS.has(method)) ||
+  callNames.some((name) => {
+    const [callModule, callMethod] = name.split('.');
+    return callModule === 'liquidityProxy' && LIQUIDITY_PROXY_SWAP_METHODS.has(callMethod ?? '');
+  });
 
 const isBridgeOutgoing = (module: string, method: string): boolean =>
   module === 'ethBridge' || (module === 'bridgeProxy' && method === 'burn');
@@ -2432,6 +2453,8 @@ export class ChainIndexer {
   private networkLiquidityStats = emptyNetworkLiquidityStats();
   private networkLiquidityStatsBlockHeight = -1;
   private liveValuationState: HistoricalValuationState | null = null;
+  /** Updated only after the finalized block transaction commits; replay retries retain the prior close. */
+  private previousHourlyHistoryBlock: HourlyBoundaryBlock | null = null;
   private pendingFinalizedBlock = 0;
   private finalizedHeadDrainRunning = false;
   private finalizedHeadRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2693,6 +2716,15 @@ export class ChainIndexer {
       await this.persistWorkerStatusBestEffort();
 
       this.updateFinalizedStatus(finalizedBlock);
+      if (this.config.hourlyRepairFile) {
+        const { applyHourlyBackfillFile } = await import('../scripts/backfill-hourly-history.js');
+        await applyHourlyBackfillFile(this.repository, {
+          path: this.config.hourlyRepairFile,
+          sha256: this.config.hourlyRepairSha256!,
+          genesisHash: api.genesisHash.toString(),
+          finalizedHeight: finalizedBlock,
+        });
+      }
       const indexedAny = await this.backfill();
       if (this.isStopping()) return;
 
@@ -5069,6 +5101,9 @@ export class ChainIndexer {
     const valuationLiquidityStats =
       historicalValuationState?.networkLiquidityStats ?? this.networkLiquidityStats;
     const documents: IndexerDocument[] = [];
+    if (historicalValuationState) {
+      documents.push(...await this.prepareAssetHourlyCloseDocuments(signedBlock, timestamp, historicalValuationState));
+    }
     const touchedAccounts = new Set<string>();
     let totalFees = 0n;
     let feePayingSignedTransactions = 0;
@@ -5102,9 +5137,22 @@ export class ChainIndexer {
       if (extrinsic.isSigned && fee > 0n) feePayingSignedTransactions += 1;
       const currentAccounts = historyIndexedAccounts(extrinsic.method.section, extrinsic.method.method, address, history);
       totalFees += fee;
-      if (!failed) volumeUSD += this.extractVolumeUSD(history.data);
       if (!failed && isLiquidityProxySwap(extrinsic.method.section, extrinsic.method.method, callNames)) {
+        const exchangeVolumeUSD = this.extractExecutedExchangeVolumeUSD(
+          eventsForExtrinsic,
+          valuationPrices,
+          valuationAssets
+        );
+        volumeUSD += exchangeVolumeUSD;
         swaps += 1;
+        // Keep the event-derived natural decimal beside the persisted call
+        // payload so future snapshot repairs do not require archive event
+        // replay. This also covers utility and swapTransferBatch rows whose
+        // generic call arguments do not otherwise contain executed USD legs.
+        history.data = {
+          ...(isRecord(history.data) ? history.data : { value: history.data }),
+          exchangeVolumeUSD: scaledToString(exchangeVolumeUSD, 8),
+        };
       }
       if (!failed && extrinsic.method.section === 'bridgeMultisig') bridgeIncomingTransactions += 1;
       if (!failed && isBridgeOutgoing(extrinsic.method.section, extrinsic.method.method)) {
@@ -5128,7 +5176,6 @@ export class ChainIndexer {
 
       const incomingContext = createBridgeProxyIncomingContext(context, args, valuationPrices, valuationAssets);
       if (incomingContext) {
-        volumeUSD += this.extractVolumeUSD(incomingContext.history.data);
         bridgeIncomingTransactions += 1;
         incomingContext.accounts.forEach((account) => touchedAccounts.add(account));
         extrinsicContexts.push(incomingContext);
@@ -5256,6 +5303,7 @@ export class ChainIndexer {
     // oversized block must fail before any document is written, because
     // chunking would make a crash retry double-apply those totals.
     await this.repository.upsertMany(preparedDocuments);
+    this.previousHourlyHistoryBlock = { height: blockHeight, hash: blockHash, timestamp };
     if (historicalValuationState && historicalValuationAdvance) {
       this.applyHistoricalValuationAdvance(historicalValuationState, historicalValuationAdvance);
     }
@@ -5298,6 +5346,52 @@ export class ChainIndexer {
     ) {
       this.requestPriceStreamRefresh(blockHeight, timestamp);
     }
+  }
+
+  /**
+   * Finalize the actual previous block's hourly CLOSE before advancing its immutable
+   * valuation state. This runs in the block transaction, independently of projection
+   * cadence and queue coalescing. Whole halted hours produce no synthetic observations.
+   */
+  private async prepareAssetHourlyCloseDocuments(
+    signedBlock: FetchedBlock['signedBlock'],
+    timestamp: number,
+    state: HistoricalValuationState
+  ): Promise<IndexerDocument[]> {
+    const genesisHash = this.api?.genesisHash?.toString();
+    if (genesisHash !== HOURLY_HISTORY_GENESIS || state.blockHeight < 1) return [];
+    const header = signedBlock.block.header;
+    const height = header.number.toNumber();
+    const parentHash = header.parentHash?.toString();
+    if (typeof parentHash !== 'string' || !/^0x[0-9a-f]{64}$/.test(parentHash)) throw new Error('Hourly history parent hash is unavailable');
+    let before = this.previousHourlyHistoryBlock;
+    if (!before || before.height !== height - 1) {
+      const stored = await this.repository.get('networkSnapshots', `block-${height - 1}`);
+      let priorTimestamp = Number(stored?.timestamp ?? stored?.data.timestamp);
+      if (!Number.isSafeInteger(priorTimestamp) || priorTimestamp <= 0) {
+        const api = await this.getBlockDataApi();
+        priorTimestamp = await this.fetchBlockTimestamp(parentHash, api);
+      }
+      before = { height: height - 1, hash: parentHash, timestamp: priorTimestamp };
+    }
+    if (before.height !== state.blockHeight || before.hash !== parentHash) throw new Error('Hourly history pre-state identity mismatch');
+    if (Math.floor(timestamp / HOUR_SECONDS) <= Math.floor(before.timestamp / HOUR_SECONDS)) return [];
+    const query = await this.getHistoricalValuationQueryAt(before.height);
+    const denominator = await this.withRpcTimeout(
+      () => readSnapshotDenominator(query),
+      `denomination.denominator(${before.height}) for hourly close`
+    );
+    if (!denominator) throw new Error('Hourly history requires the exact historical denomination');
+    const previous = await this.repository.getMany('assetSnapshots', [...HOURLY_HISTORY_ASSET_IDS].map((id) => assetHourlyCloseId(id, before!.timestamp)));
+    const pools = [...state.pools.values()];
+    const priceRoutes = new Map<string, HourlyPoolReserves[]>();
+    const prices = deriveAssetPrices(state.assets, pools, priceRoutes);
+    return buildAssetHourlyCloseDocumentsAtBoundary({
+      before,
+      after: { height, hash: header.hash.toString(), timestamp },
+      genesisHash, denominator, assets: state.assets, prices,
+      pools, priceRoutes, previous, xorPoolsComplete: true,
+    });
   }
 
   private mergeDerivedStateRefreshRequests(
@@ -6460,7 +6554,9 @@ export class ChainIndexer {
     if (unwrapped === null) return null;
     const human = toHuman(unwrapped);
     if (!isRecord(human)) throw new Error(`Historical asset metadata for ${id} is not an object`);
-    const decimals = Number(human.precision ?? human.decimals ?? DECIMALS);
+    const precision = human.precision ?? human.decimals;
+    const decimals = typeof precision === 'number' || (typeof precision === 'string' && /^(?:0|[1-9]\d{0,2})$/.test(precision))
+      ? Number(precision) : Number.NaN;
     if (!Number.isSafeInteger(decimals) || decimals < 0 || decimals > 255) {
       throw new Error(`Historical asset metadata for ${id} has invalid precision`);
     }
@@ -6894,6 +6990,49 @@ export class ChainIndexer {
     }
 
     return max;
+  }
+
+  /**
+   * Values authoritative liquidity-proxy `Exchange` events for one successful
+   * swap extrinsic. Each executed exchange leg contributes its larger USD side,
+   * preserving the existing transaction-volume convention without treating
+   * unrelated `amountUSD` history fields as trading volume.
+   *
+   * `swapTransferBatch` can include direct transfers or reused output assets;
+   * those legs intentionally contribute zero unless the runtime emitted an
+   * `Exchange` event. Utility-wrapped swaps use the same scoped event stream, so
+   * their volume is available even though the utility history payload itself is
+   * not swap-enriched.
+   */
+  private extractExecutedExchangeVolumeUSD(
+    events: EventRecord[],
+    prices: Map<string, bigint>,
+    assets: Map<string, AssetInfo>
+  ): bigint {
+    return findEvents(events, 'liquidityProxy', 'Exchange').reduce((total, exchange) => {
+      const inputAssetId = firstString(exchange, ['inputAssetId', 'baseAssetId', 'arg2']);
+      const outputAssetId = firstString(exchange, ['outputAssetId', 'targetAssetId', 'arg3']);
+      const inputAmount = firstPresentValue(exchange, ['inputAmount', 'baseAssetAmount', 'arg4']) ?? 0;
+      const outputAmount = firstPresentValue(exchange, ['outputAmount', 'targetAssetAmount', 'arg5']) ?? 0;
+      const inputAmountUSD = decimalStringToScaled(
+        codecUsd(
+          inputAssetId,
+          codecToBigInt(inputAmount),
+          prices,
+          assets.get(inputAssetId)?.decimals ?? DECIMALS
+        )
+      );
+      const outputAmountUSD = decimalStringToScaled(
+        codecUsd(
+          outputAssetId,
+          codecToBigInt(outputAmount),
+          prices,
+          assets.get(outputAssetId)?.decimals ?? DECIMALS
+        )
+      );
+
+      return total + (inputAmountUSD > outputAmountUSD ? inputAmountUSD : outputAmountUSD);
+    }, 0n);
   }
 
   private async createAccountDocuments(
@@ -7561,7 +7700,13 @@ export class ChainIndexer {
         offset: null,
         orderBy: ['TIMESTAMP_ASC'],
         filter: {
-          and: [{ type: { equalTo: type } }, { timestamp: { lessThan: cutoff } }],
+          and: [
+            { type: { equalTo: type } },
+            { timestamp: { lessThan: cutoff } },
+            ...(collectionName === 'assetSnapshots' && type === 'HOUR'
+              ? [{ assetId: { notIn: [...HOURLY_HISTORY_ASSET_IDS] } }]
+              : []),
+          ],
         },
         includeTotalCount: false,
       });
@@ -8223,85 +8368,7 @@ export class ChainIndexer {
     assets: Map<string, Pick<AssetInfo, 'id' | 'decimals'>>,
     pools: Array<{ baseAssetId: string; targetAssetId: string; baseAssetReserves: bigint; targetAssetReserves: bigint }>
   ): Map<string, bigint> {
-    const prices = new Map<string, bigint>();
-    const confidence = new Map<string, bigint>();
-    const depth = new Map<string, bigint>();
-    const fixedAssets = new Set<string>();
-
-    for (const asset of assets.values()) {
-      if (STABLE_ASSET_IDS.has(asset.id)) {
-        prices.set(asset.id, SCALE);
-        fixedAssets.add(asset.id);
-      }
-    }
-
-    for (let round = 0; round < 12; round += 1) {
-      let changed = false;
-
-      for (const pool of pools) {
-        if (pool.baseAssetReserves === 0n || pool.targetAssetReserves === 0n) continue;
-
-        const baseInfo = assets.get(pool.baseAssetId);
-        const targetInfo = assets.get(pool.targetAssetId);
-        if (!baseInfo || !targetInfo) continue;
-
-        const baseNatural = reserveToNaturalScaled(pool.baseAssetReserves, baseInfo.decimals);
-        const targetNatural = reserveToNaturalScaled(pool.targetAssetReserves, targetInfo.decimals);
-        if (baseNatural === 0n || targetNatural === 0n) continue;
-
-        const basePrice = prices.get(pool.baseAssetId);
-        const targetPrice = prices.get(pool.targetAssetId);
-
-        const applyCandidate = (assetId: string, price: bigint, candidateConfidence: bigint, candidateDepth: bigint) => {
-          if (
-            fixedAssets.has(assetId) ||
-            price <= 0n ||
-            candidateConfidence < MIN_PRICE_DISCOVERY_LIQUIDITY_USD ||
-            candidateDepth < MIN_PRICE_DISCOVERY_AMOUNT
-          ) {
-            return;
-          }
-
-          const currentDepth = depth.get(assetId) ?? 0n;
-          const currentConfidence = confidence.get(assetId) ?? 0n;
-
-          if (candidateDepth > currentDepth || (candidateDepth === currentDepth && candidateConfidence > currentConfidence)) {
-            prices.set(assetId, price);
-            confidence.set(assetId, candidateConfidence);
-            depth.set(assetId, candidateDepth);
-            changed = true;
-          }
-        };
-
-        if (basePrice && basePrice > 0n) {
-          const baseLiquidityUSD = scaledMul(baseNatural, basePrice);
-          const baseConfidence = confidence.get(pool.baseAssetId);
-          applyCandidate(
-            pool.targetAssetId,
-            scaledDiv(baseLiquidityUSD, targetNatural),
-            baseConfidence ? baseConfidence < baseLiquidityUSD ? baseConfidence : baseLiquidityUSD : baseLiquidityUSD,
-            targetNatural
-          );
-        }
-
-        if (targetPrice && targetPrice > 0n) {
-          const targetLiquidityUSD = scaledMul(targetNatural, targetPrice);
-          const targetConfidence = confidence.get(pool.targetAssetId);
-          applyCandidate(
-            pool.baseAssetId,
-            scaledDiv(targetLiquidityUSD, baseNatural),
-            targetConfidence ? targetConfidence < targetLiquidityUSD ? targetConfidence : targetLiquidityUSD : targetLiquidityUSD,
-            baseNatural
-          );
-        }
-      }
-
-      if (!changed) {
-        break;
-      }
-    }
-
-    return prices;
+    return deriveAssetPrices(assets, pools);
   }
 
   /**
@@ -9426,6 +9493,14 @@ export class ChainIndexer {
           const id = snapshotId('asset', asset.id, type, timestamp, blockHeight);
           const aggregate = analytics.assets.get(asset.id)?.get(type) ?? newAssetAggregate(priceUSD);
           const previous = previousSnapshots.get(id);
+          // Keep ordinary observations while the hour is open, but never replace
+          // its finalized close. A projection built before closure also loses to
+          // the successor-height write version if its write arrives later.
+          if (
+            type === 'HOUR' && HOURLY_HISTORY_ASSET_IDS.has(asset.id) &&
+            isRecord(previous?.data.closeEvidence) &&
+            previous.data.closeEvidence.kind === 'finalized-hour-close'
+          ) continue;
           const priceSnapshot = mergePriceOhlc(previous?.data.priceUSD, priceUSD);
           documents.push({
             collection: collection('assetSnapshots'),

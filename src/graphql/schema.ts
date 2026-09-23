@@ -202,6 +202,8 @@ export const typeDefs = /* GraphQL */ `
     burn: String
     "Cumulative chain denomination at the CLOSE price; null for unverified legacy data."
     denominator: String
+    "Adjacent finalized block proof for a corrected hourly CLOSE; other OHLC fields retain their original evidence."
+    closeEvidence: JSON
     priceUSD: JSON
     volume: JSON
   }
@@ -216,6 +218,59 @@ export const typeDefs = /* GraphQL */ `
     edges: [AssetSnapshotEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
+  }
+
+  enum HourlyProofStatus { MISSING LEGACY INVALID VERIFIED }
+  enum HourlyPoolStatus { UNKNOWN ABSENT ZERO_RESERVE USABLE XOR_SELF }
+  enum HourlyGapStatus { MISSING LEGACY INVALID UNKNOWN_POOL ABSENT_POOL ZERO_RESERVE }
+
+  "Validated provenance only; contains no price or reserve values."
+  type AssetHourlyCloseMetadata {
+    hour: Int!
+    proofStatus: HourlyProofStatus!
+    poolStatus: HourlyPoolStatus!
+    completedAt: Int
+    timestamp: Int
+    blockHeight: Int
+    blockHash: String
+    nextTimestamp: Int
+    nextBlockHeight: Int
+    nextBlockHash: String
+    denominator: String
+    decimals: Int
+  }
+
+  "A contiguous range of unusable hourly buckets, with an exclusive end."
+  type AssetHourlyCoverageGap {
+    start: Int!
+    end: Int!
+    hours: Int!
+    status: HourlyGapStatus!
+  }
+
+  type AssetHourlyCoverage {
+    assetId: String!
+    symbol: String!
+    start: Int!
+    end: Int!
+    asOf: Int!
+    expectedHours: Int!
+    observedHours: Int!
+    verifiedHours: Int!
+    poolUsableHours: Int!
+    missingHours: Int!
+    legacyHours: Int!
+    invalidHours: Int!
+    absentPoolHours: Int!
+    zeroReserveHours: Int!
+    unknownPoolHours: Int!
+    "Latest validated canonical boundary in this range, regardless of pool usability."
+    latestCompletedAt: Int
+    "Latest completed bucket with any stored row; this is not a proof of canonical coverage."
+    latestObservedCompletedAt: Int
+    latestUsableCompletedAt: Int
+    hours: [AssetHourlyCloseMetadata!]!
+    gaps: [AssetHourlyCoverageGap!]!
   }
 
   type PoolXYK {
@@ -863,6 +918,8 @@ export const typeDefs = /* GraphQL */ `
     account(id: String!): JSON
     assets(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AssetFilter): AssetConnection!
     assetSnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AssetSnapshotFilter): AssetSnapshotConnection!
+    "Uncached metadata for one canonical major asset over 1–2160 completed UTC hours [start, end)."
+    assetHourlyCoverage(assetId: String!, start: Int!, end: Int!): AssetHourlyCoverage!
     accountLiquiditySnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AccountLiquiditySnapshotFilter): AccountLiquiditySnapshotConnection!
     market(id: String!): Market
     markets(first: Int, after: Cursor, orderBy: [OrderBy!], filter: MarketFilter): MarketConnection!

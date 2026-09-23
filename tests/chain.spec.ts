@@ -52,6 +52,61 @@ const eventRecord = (section: string, method: string, data: Record<string, unkno
   },
 });
 
+/** Builds the minimal signed extrinsic shape consumed by the chain worker tests. */
+const testExtrinsic = (
+  hash: string,
+  section: string,
+  method: string,
+  args: unknown[],
+  argumentNames: string[],
+  signer = 'alice'
+) => ({
+  isSigned: true,
+  signer: { toString: () => signer },
+  hash: { toString: () => hash },
+  method: {
+    section,
+    method,
+    args,
+    meta: { args: argumentNames.map((name) => ({ name })) },
+  },
+});
+
+/** Builds a pinned block API response without requiring a live SORA node. */
+const testBlockApi = (
+  blockHeight: number,
+  blockHash: string,
+  extrinsics: ReturnType<typeof testExtrinsic>[],
+  events: ReturnType<typeof eventRecord>[],
+  timestampMs = 1_700_000_000_000
+) => ({
+  rpc: {
+    chain: {
+      getBlock: async () => ({
+        block: {
+          header: {
+            number: { toNumber: () => blockHeight },
+            hash: { toString: () => blockHash },
+          },
+          extrinsics,
+        },
+      }),
+    },
+  },
+  query: {
+    system: {
+      events: {
+        at: async () => events,
+      },
+    },
+    timestamp: {
+      now: {
+        at: async () => ({ toString: () => String(timestampMs) }),
+      },
+    },
+  },
+});
+
 const config = {
   host: '0.0.0.0',
   port: 4350,
@@ -2221,6 +2276,356 @@ describe('ChainIndexer price derivation', () => {
     expect(snapshot?.data.volumeUSD).toBe('0');
     expect(snapshot?.data.fees).toBe(SCALE.toString());
     expect(accountMeta?.data.xorFees).toEqual({ amount: '1', amountUSD: '2' });
+  });
+
+  it('counts every supported direct swap method from executed Exchange events only', async () => {
+    const repository = new MemoryRepository();
+    const blockHash = canonicalBlockHash('supported-swaps-block');
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+    const desiredInput = (amount: bigint) => ({
+      WithDesiredInput: { desiredAmountIn: amount.toString(), minAmountOut: '0' },
+    });
+    const batchArgs = [
+      [
+        {
+          outcomeAssetId: KUSD,
+          outcomeAssetReuse: '0',
+          dexId: 0,
+          receivers: [{ accountId: 'bob', targetAmount: (11n * SCALE).toString() }],
+        },
+      ],
+      XOR,
+      (6n * SCALE).toString(),
+      ['PoolXYK'],
+      'Disabled',
+      null,
+    ];
+
+    indexer.prices = new Map([
+      [XOR, 3n * SCALE],
+      [KUSD, SCALE],
+    ]);
+    indexer.assetInfos = new Map([
+      [XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }],
+      [KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 0n }],
+    ]);
+    indexer.api = testBlockApi(
+      62,
+      blockHash,
+      [
+        testExtrinsic(
+          '0xdirect-swap',
+          'liquidityProxy',
+          'swap',
+          [0, XOR, KUSD, desiredInput(5n * SCALE), ['PoolXYK'], 'Disabled'],
+          ['dexId', 'inputAssetId', 'outputAssetId', 'swapAmount', 'selectedSourceTypes', 'filterMode']
+        ),
+        testExtrinsic(
+          '0xswap-transfer',
+          'liquidityProxy',
+          'swapTransfer',
+          ['bob', 0, XOR, KUSD, desiredInput(2n * SCALE), ['PoolXYK'], 'Disabled'],
+          [
+            'receiver',
+            'dexId',
+            'inputAssetId',
+            'outputAssetId',
+            'swapAmount',
+            'selectedSourceTypes',
+            'filterMode',
+          ]
+        ),
+        testExtrinsic(
+          '0xswap-transfer-batch',
+          'liquidityProxy',
+          'swapTransferBatch',
+          batchArgs,
+          [
+            'swapBatches',
+            'inputAssetId',
+            'maxInputAmount',
+            'selectedSourceTypes',
+            'filterMode',
+            'additionalData',
+          ]
+        ),
+        testExtrinsic(
+          '0xtransfer-only-batch',
+          'liquidityProxy',
+          'swapTransferBatch',
+          [
+            [
+              {
+                outcomeAssetId: XOR,
+                outcomeAssetReuse: '0',
+                dexId: 0,
+                receivers: [{ accountId: 'carol', targetAmount: (3n * SCALE).toString() }],
+              },
+            ],
+            XOR,
+            (3n * SCALE).toString(),
+            ['PoolXYK'],
+            'Disabled',
+            null,
+          ],
+          [
+            'swapBatches',
+            'inputAssetId',
+            'maxInputAmount',
+            'selectedSourceTypes',
+            'filterMode',
+            'additionalData',
+          ]
+        ),
+      ],
+      [
+        eventRecord(
+          'liquidityProxy',
+          'Exchange',
+          {
+            inputAssetId: XOR,
+            outputAssetId: KUSD,
+            inputAmount: (5n * SCALE).toString(),
+            outputAmount: (14n * SCALE).toString(),
+          },
+          0
+        ),
+        eventRecord(
+          'liquidityProxy',
+          'Exchange',
+          {
+            inputAssetId: XOR,
+            outputAssetId: KUSD,
+            inputAmount: (2n * SCALE).toString(),
+            outputAmount: ((11n * SCALE) / 2n).toString(),
+          },
+          1
+        ),
+        eventRecord(
+          'liquidityProxy',
+          'Exchange',
+          {
+            inputAssetId: XOR,
+            outputAssetId: KUSD,
+            inputAmount: (4n * SCALE).toString(),
+            outputAmount: (11n * SCALE).toString(),
+          },
+          2
+        ),
+        eventRecord(
+          'liquidityProxy',
+          'BatchSwapExecuted',
+          {
+            adarFee: '0',
+            inputAmount: (6n * SCALE).toString(),
+            additionalData: null,
+          },
+          2
+        ),
+        eventRecord(
+          'liquidityProxy',
+          'BatchSwapExecuted',
+          {
+            adarFee: '0',
+            inputAmount: (3n * SCALE).toString(),
+            additionalData: null,
+          },
+          3
+        ),
+      ]
+    );
+
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(blockHash);
+
+    const snapshot = await repository.get('networkSnapshots', 'block-62');
+    const histories = await repository.getMany('historyElements', [
+      '0xdirect-swap',
+      '0xswap-transfer',
+      '0xswap-transfer-batch',
+      '0xtransfer-only-batch',
+    ]);
+
+    expect(snapshot?.data.swaps).toBe(4);
+    expect(snapshot?.data.volumeUSD).toBe('33');
+    expect(
+      [
+        '0xdirect-swap',
+        '0xswap-transfer',
+        '0xswap-transfer-batch',
+        '0xtransfer-only-batch',
+      ].map((id) => (histories.get(id)?.data.data as Record<string, unknown>)?.exchangeVolumeUSD)
+    ).toEqual(['15', '6', '12', '0']);
+  });
+
+  it('values utility-wrapped swaps from their scoped Exchange events', async () => {
+    const repository = new MemoryRepository();
+    const blockHash = canonicalBlockHash('utility-swap-block');
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      extractVolumeUSD: (data: unknown) => bigint;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+    const swapCall = {
+      section: 'liquidityProxy',
+      method: 'swap',
+      args: [
+        0,
+        XOR,
+        KUSD,
+        { WithDesiredInput: { desiredAmountIn: (5n * SCALE).toString(), minAmountOut: '0' } },
+        ['PoolXYK'],
+        'Disabled',
+      ],
+      meta: {
+        args: [
+          { name: 'dexId' },
+          { name: 'inputAssetId' },
+          { name: 'outputAssetId' },
+          { name: 'swapAmount' },
+          { name: 'selectedSourceTypes' },
+          { name: 'filterMode' },
+        ],
+      },
+    };
+
+    indexer.prices = new Map([
+      [XOR, 3n * SCALE],
+      [KUSD, SCALE],
+    ]);
+    indexer.assetInfos = new Map([
+      [XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }],
+      [KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 0n }],
+    ]);
+    indexer.api = testBlockApi(
+      63,
+      blockHash,
+      [testExtrinsic('0xutility-swap', 'utility', 'batchAll', [[swapCall]], ['calls'])],
+      [
+        eventRecord('liquidityProxy', 'Exchange', {
+          inputAssetId: XOR,
+          outputAssetId: KUSD,
+          inputAmount: (5n * SCALE).toString(),
+          outputAmount: (14n * SCALE).toString(),
+        }),
+      ]
+    );
+
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(blockHash);
+
+    const history = await repository.get('historyElements', '0xutility-swap');
+    const snapshot = await repository.get('networkSnapshots', 'block-63');
+
+    expect(indexer.extractVolumeUSD(history?.data.data)).toBe(0n);
+    expect(history?.data.data).toMatchObject({ exchangeVolumeUSD: '15' });
+    expect(snapshot?.data.swaps).toBe(1);
+    expect(snapshot?.data.volumeUSD).toBe('15');
+  });
+
+  it.each([
+    {
+      label: 'asset burn',
+      blockHeight: 64,
+      module: 'assets',
+      method: 'burn',
+      args: [XOR, (5n * SCALE).toString()],
+      argumentNames: ['assetId', 'amount'],
+      events: [],
+    },
+    {
+      label: 'asset mint',
+      blockHeight: 65,
+      module: 'assets',
+      method: 'mint',
+      args: [XOR, 'bob', (5n * SCALE).toString()],
+      argumentNames: ['assetId', 'to', 'amount'],
+      events: [],
+    },
+    {
+      label: 'liquidity deposit',
+      blockHeight: 66,
+      module: 'poolXYK',
+      method: 'depositLiquidity',
+      args: [0, XOR, KUSD, (5n * SCALE).toString(), (10n * SCALE).toString(), '0', '0'],
+      argumentNames: [
+        'dexId',
+        'inputAssetA',
+        'inputAssetB',
+        'inputADesired',
+        'inputBDesired',
+        'inputAMin',
+        'inputBMin',
+      ],
+      events: [],
+    },
+    {
+      label: 'Polkamarkt claim',
+      blockHeight: 67,
+      module: 'polkamarkt',
+      method: 'claimMarket',
+      args: [7],
+      argumentNames: ['marketId'],
+      events: [
+        eventRecord('polkamarkt', 'MarketClaimed', {
+          marketId: 7,
+          trader: 'alice',
+          payout: (10n * SCALE).toString(),
+        }),
+      ],
+    },
+  ])('excludes successful $label history with USD amounts from network volume', async (testCase) => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      assetInfos: Map<string, { id: string; symbol: string; name: string; decimals: number; supply: bigint }>;
+      extractVolumeUSD: (data: unknown) => bigint;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+    const blockHash = canonicalBlockHash(`non-swap-${testCase.blockHeight}`);
+    const extrinsicHash = `0xnon-swap-extrinsic-${testCase.blockHeight}`;
+
+    indexer.prices = new Map([
+      [XOR, 2n * SCALE],
+      [KUSD, SCALE],
+    ]);
+    indexer.assetInfos = new Map([
+      [XOR, { id: XOR, symbol: 'XOR', name: 'XOR', decimals: 18, supply: 0n }],
+      [KUSD, { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 18, supply: 0n }],
+    ]);
+    indexer.api = testBlockApi(
+      testCase.blockHeight,
+      blockHash,
+      [
+        testExtrinsic(
+          extrinsicHash,
+          testCase.module,
+          testCase.method,
+          testCase.args,
+          testCase.argumentNames
+        ),
+      ],
+      testCase.events
+    );
+
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(blockHash);
+
+    const history = await repository.get('historyElements', extrinsicHash);
+    const snapshot = await repository.get('networkSnapshots', `block-${testCase.blockHeight}`);
+
+    expect(indexer.extractVolumeUSD(history?.data.data)).toBeGreaterThan(0n);
+    expect(history?.data.data).not.toHaveProperty('exchangeVolumeUSD');
+    expect(snapshot?.data.swaps).toBe(0);
+    expect(snapshot?.data.volumeUSD).toBe('0');
   });
 
   it('does not count failed bridge burns as outgoing bridge volume or deposits', async () => {
@@ -6083,7 +6488,7 @@ describe('ChainIndexer price derivation', () => {
     await expect(defaultSnapshotId(1_700_000_400)).resolves.toBe(`asset-${XOR}-DEFAULT-1700000400`);
   });
 
-  it('persists only four chart asset granularities and never looks up BLOCK snapshots', async () => {
+  it('keeps open-hour chart samples and never looks up BLOCK snapshots', async () => {
     const repository = new MemoryRepository();
     const getMany = vi.spyOn(repository, 'getMany');
     const indexer = new ChainIndexer(config, repository) as unknown as {

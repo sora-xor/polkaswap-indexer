@@ -35,6 +35,8 @@
     "storage:audit:rocksdb:dist": "node dist/src/scripts/audit-rocksdb.js",
     "storage:benchmark:rocksdb": "tsx src/scripts/benchmark-rocksdb.ts",
     "storage:benchmark:rocksdb:dist": "node dist/src/scripts/benchmark-rocksdb.js",
+    "storage:repair:network-volume": "tsx src/scripts/repair-network-volume.ts",
+    "storage:repair:network-volume:dist": "node dist/src/scripts/repair-network-volume.js",
     "storage:reclaim:postgres-index-space": "tsx src/scripts/reclaim-postgres-index-space.ts",
     "storage:reclaim:postgres-index-space:dist": "node dist/src/scripts/reclaim-postgres-index-space.js",
     "storage:cleanup:postgres-rocksdb-capture": "tsx src/scripts/cleanup-postgres-rocksdb-capture.ts",
@@ -70,6 +72,6 @@
     "@types/ws": "^8.18.1",
     "tsx": "4.23.0",
     "typescript": "~5.9.3",
-    "vitest": "4.1.10"
+    "vitest": "4.1.11"
   }
 }

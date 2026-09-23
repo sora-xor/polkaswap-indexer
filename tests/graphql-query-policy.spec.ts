@@ -84,6 +84,40 @@ describe('public GraphQL repository query policy', () => {
         ],
       })
     ).not.toThrow();
+    // polkaswap-exchange-web/src/indexer/queries/network/volume.ts
+    expect(() =>
+      validatePublicConnectionQuery('historyElements', ['TIMESTAMP_DESC', 'ID_DESC'], {
+        and: [
+          { timestamp: { lessThanOrEqualTo: 200 } },
+          { timestamp: { greaterThan: 100 } },
+          { module: { equalTo: 'liquidityProxy' } },
+        ],
+      })
+    ).not.toThrow();
+    expect(() =>
+      validatePublicConnectionQuery('networkSnapshots', ['TIMESTAMP_DESC'], {
+        and: [
+          { type: { equalTo: 'BLOCK' } },
+          { timestamp: { lessThanOrEqualTo: 200 } },
+          { timestamp: { greaterThanOrEqualTo: 100 } },
+          { fees: { greaterThan: '0' } },
+        ],
+      })
+    ).not.toThrow();
+    expect(() =>
+      validatePublicConnectionQuery('networkSnapshots', ['TIMESTAMP_DESC'], {
+        and: [
+          { type: { equalTo: 'BLOCK' } },
+          { timestamp: { lessThanOrEqualTo: 200 } },
+          { timestamp: { greaterThanOrEqualTo: 100 } },
+          { volumeUSD: { greaterThan: '0' } },
+        ],
+      })
+    ).not.toThrow();
+  });
+
+  it('admits the dedicated XOR burn collection in the UI block-height order', () => {
+    expect(() => validatePublicConnectionQuery('xorBurns', ['BLOCK_HEIGHT_ASC'], undefined)).not.toThrow();
   });
 
   it('admits pinned wallet history filters while rejecting an unanchored first page', () => {
@@ -245,6 +279,37 @@ describe('public GraphQL repository query policy', () => {
         ],
       })
     ).toThrow();
+  });
+
+  it('keeps global timestamp history scans bounded and limited to liquidityProxy volume reads', () => {
+    const filter = (module: string, timestamp: Record<string, number>) => ({
+      and: [
+        { timestamp },
+        { module: { equalTo: module } },
+      ],
+    });
+
+    expect(() =>
+      validatePublicConnectionQuery(
+        'historyElements',
+        ['TIMESTAMP_DESC', 'ID_DESC'],
+        filter('liquidityProxy', { greaterThan: 100, lessThanOrEqualTo: 200 })
+      )
+    ).not.toThrow();
+    expect(() =>
+      validatePublicConnectionQuery(
+        'historyElements',
+        ['TIMESTAMP_DESC', 'ID_DESC'],
+        filter('liquidityProxy', { greaterThan: 100 })
+      )
+    ).toThrow('bounded public storage plan');
+    expect(() =>
+      validatePublicConnectionQuery(
+        'historyElements',
+        ['TIMESTAMP_DESC', 'ID_DESC'],
+        filter('assets', { greaterThan: 100, lessThanOrEqualTo: 200 })
+      )
+    ).toThrow('bounded public storage plan');
   });
 
   it('bounds public decimal syntax and precision', () => {

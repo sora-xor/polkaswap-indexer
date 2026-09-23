@@ -21,6 +21,7 @@ type PublicFilterPlan = {
   requiredAny?: ReadonlySet<string>;
   requiredExactAll?: ReadonlySet<string>;
   requiredExactAny?: ReadonlySet<string>;
+  requiredExactValues?: Readonly<Record<string, string | number | boolean>>;
   requiredBranchExactAll?: ReadonlySet<string>;
   requiredIndexedAll?: ReadonlySet<string>;
   requiredRangeFields?: ReadonlySet<string>;
@@ -67,6 +68,7 @@ const plan = (
     | 'requiredAny'
     | 'requiredExactAll'
     | 'requiredExactAny'
+    | 'requiredExactValues'
     | 'requiredBranchExactAll'
     | 'requiredIndexedAll'
     | 'requiredRangeFields'
@@ -182,7 +184,9 @@ const PUBLIC_QUERY_POLICIES: Partial<Record<PublicConnectionName, PublicQueryPol
       type: 'identifier',
       timestamp: 'numeric',
       blockHeight: 'numeric',
+      fees: 'numeric',
       liquidityUSD: 'numeric',
+      volumeUSD: 'numeric',
     }),
   },
   orderBooks: {
@@ -291,7 +295,7 @@ const PUBLIC_QUERY_POLICIES: Partial<Record<PublicConnectionName, PublicQueryPol
     }),
   },
   xorBurns: {
-    orderFields: orders(),
+    orderFields: orders('blockHeight'),
     filterFields: fields({
       id: 'identifier',
       address: 'identifier',
@@ -346,6 +350,11 @@ const PUBLIC_FILTER_PLANS: Partial<Record<PublicConnectionName, readonly PublicF
       ['type', 'timestamp', 'blockHash', 'module', 'method', 'address', 'dataFrom', 'dataTo', 'dataAssets', 'callNames', 'data'],
       { requiredExactAll: fieldSet('address') }
     ),
+    plan('timestamp', ['timestamp', 'module'], {
+      requiredAll: fieldSet('timestamp'),
+      requiredExactValues: { module: 'liquidityProxy' },
+      requiredBoundedRangeFields: fieldSet('timestamp'),
+    }),
     plan('id', ['type', 'blockHeight', 'blockHash', 'module', 'method', 'address', 'dataFrom', 'dataTo', 'dataAssets', 'callNames', 'data'], {
       requiredAll: fieldSet('blockHeight'),
       requiredRangeFields: fieldSet('blockHeight'),
@@ -362,8 +371,10 @@ const PUBLIC_FILTER_PLANS: Partial<Record<PublicConnectionName, readonly PublicF
     }),
   ],
   networkSnapshots: [
-    plan('timestamp', ['type', 'timestamp', 'liquidityUSD'], { requiredExactAll: fieldSet('type') }),
-    plan('timestamp', ['type', 'timestamp', 'liquidityUSD'], {
+    plan('timestamp', ['type', 'timestamp', 'fees', 'liquidityUSD', 'volumeUSD'], {
+      requiredExactAll: fieldSet('type'),
+    }),
+    plan('timestamp', ['type', 'timestamp', 'fees', 'liquidityUSD', 'volumeUSD'], {
       requiredAll: fieldSet('timestamp'),
       requiredBoundedRangeFields: fieldSet('timestamp'),
     }),
@@ -757,8 +768,18 @@ const GLOBAL_ORDERED_SOURCES: Partial<Record<PublicConnectionName, ReadonlySet<s
   orderBookSnapshots: fieldSet('timestamp'),
 };
 
+// XOR burns are already isolated in a compact collection. Its block-height
+// order is served by the repository's bounded document scan/sort path, whose
+// public resolver has a collection-specific 1,000-row page cap and whose
+// RocksDB implementation retains its independent scan budget.
+const DOCUMENT_SCAN_ORDER_SOURCES: Partial<Record<PublicConnectionName, ReadonlySet<string>>> = {
+  xorBurns: fieldSet('blockHeight'),
+};
+
 const unfilteredOrderAllowed = (connectionName: PublicConnectionName, field: string): boolean =>
-  field === 'id' || Boolean(GLOBAL_ORDERED_SOURCES[connectionName]?.has(field));
+  field === 'id' ||
+  Boolean(GLOBAL_ORDERED_SOURCES[connectionName]?.has(field)) ||
+  Boolean(DOCUMENT_SCAN_ORDER_SOURCES[connectionName]?.has(field));
 
 const planMatches = (
   candidate: PublicFilterPlan,
@@ -783,6 +804,16 @@ const planMatches = (
     return false;
   }
   if (candidate.requiredExactAny && !hasAnchoredSource(filter, candidate.requiredExactAny, false)) return false;
+  if (candidate.requiredExactValues) {
+    const exactValues = collectConjunctiveExactValues(filter);
+    if (
+      Object.entries(candidate.requiredExactValues).some(
+        ([field, expected]) => exactValues.get(field) !== expected
+      )
+    ) {
+      return false;
+    }
+  }
   if (
     candidate.requiredBranchExactAll &&
     [...candidate.requiredBranchExactAll].some(

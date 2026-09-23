@@ -216,8 +216,8 @@ describe('swap chart fixture data', () => {
     const result = (await xorBurnsField?.resolve?.(
       {},
       {
-        first: 100,
-        orderBy: ['ID_ASC'],
+        first: 1_000,
+        orderBy: ['BLOCK_HEIGHT_ASC'],
       },
       { repository },
       undefined as never
@@ -236,5 +236,17 @@ describe('swap chart fixture data', () => {
         nexusRecipient: expect.stringMatching(/^sora/),
       }),
     ]);
+
+    await expect(
+      xorBurnsField?.resolve?.(
+        {},
+        {
+          first: 1_001,
+          orderBy: ['BLOCK_HEIGHT_ASC'],
+        },
+        { repository },
+        undefined as never
+      )
+    ).rejects.toThrow('first must not exceed 1000');
   });
 });

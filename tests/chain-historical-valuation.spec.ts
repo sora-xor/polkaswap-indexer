@@ -147,7 +147,7 @@ describe('historical valuation state', () => {
     });
   });
 
-  it('values history, network flow, and account fees from the N-1 state without mutating globals', async () => {
+  it('values non-swap history and account fees from N-1 without adding network exchange volume', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as any;
     const state = prepareState(indexer);
@@ -171,7 +171,8 @@ describe('historical valuation state', () => {
     const account = await repository.get('accountMeta', 'alice');
     expect(history?.data.data).toMatchObject({ amountUSD: '2' });
     expect(network?.data).toMatchObject({
-      volumeUSD: '2',
+      volumeUSD: '0',
+      swaps: 0,
       poolLiquidityUSD: '400',
       liquidityUSD: null,
       orderBookLiquidityUSD: null,

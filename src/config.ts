@@ -78,6 +78,9 @@ export type AppConfig = {
   chainBatchSize: number;
   stateRefreshIntervalBlocks: number;
   snapshotIntervalBlocks: number;
+  /** Optional checked artifact applied by the existing repository owner before normal indexing. */
+  hourlyRepairFile?: string;
+  hourlyRepairSha256?: string;
   fullReconciliationIntervalBlocks: number;
   chainShutdownTimeoutMs: number;
   chainRpcTimeoutMs: number;
@@ -499,7 +502,16 @@ export function readConfig(): AppConfig {
     invalid('MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE', 'requires MOBILE_CONFIG_POLKAMARKT_VISIBLE=true');
   }
 
+  const hourlyRepairFile = process.env.CHAIN_HOURLY_REPAIR_FILE;
+  const hourlyRepairSha256 = process.env.CHAIN_HOURLY_REPAIR_SHA256;
+  if ((hourlyRepairFile === undefined) !== (hourlyRepairSha256 === undefined)) {
+    invalid('CHAIN_HOURLY_REPAIR_FILE/CHAIN_HOURLY_REPAIR_SHA256', 'both values are required together');
+  }
+  if (hourlyRepairFile !== undefined && (!hourlyRepairFile.trim() || !/^[a-f0-9]{64}$/.test(hourlyRepairSha256!))) {
+    invalid('CHAIN_HOURLY_REPAIR_FILE/CHAIN_HOURLY_REPAIR_SHA256', 'requires a nonempty path and lowercase SHA-256');
+  }
   return {
+    ...(hourlyRepairFile !== undefined ? { hourlyRepairFile, hourlyRepairSha256 } : {}),
     host,
     port: readInteger('PORT', 4350, { minimum: 1, maximum: 65_535 }),
     graphqlPath: validateGraphqlPath(readString('GRAPHQL_PATH', '/graphql')),
