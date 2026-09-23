@@ -233,8 +233,13 @@ orders at the same height. The worker never substitutes a misleading zero.
 
 Public asset, pool, order-book, market, and network chart snapshots use only
 `DEFAULT`, `HOUR`, `DAY`, and `MONTH`; per-block entity chart snapshots are not
-stored. `DEFAULT` buckets are retained for 48 hours and `HOUR` buckets for 8
-days, while `DAY` and `MONTH` remain available for all-time charts.
+stored. `DEFAULT` buckets are retained for 48 hours and ordinary `HOUR` buckets
+for 8 days, while `DAY` and `MONTH` remain available for all-time charts.
+Completed `HOUR` observations for XOR, VAL, PSWAP, DAI, KUSD, LLD, and LLM are
+retained without that limit and expose verified close and direct-XOR-pool
+evidence through `assetSnapshots`. The bounded, uncached
+`assetHourlyCoverage` query reports which historical and newly finalized hours
+are actually usable; see [bot history](docs/bot-history.md).
 Account-liquidity snapshots use `DEFAULT` and the same 48-hour horizon. Raw
 network `BLOCK` rows used by rolling analytics are retained for 31 days.
 Cleanup queries the type/timestamp indexes and deletes a bounded number of

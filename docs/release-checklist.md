@@ -13,6 +13,13 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   Nexus, Nexus sends, Polkamarkt, Polkamarkt mutations, and Taira respectively;
   never enable send or mutation capabilities before the candidate-bound mobile
   release gates qualify.
+- For a release serving Polkaswap bot history, confirm both API and worker are
+  built from a commit containing the seven-asset completed-hour collector,
+  direct XOR reserve evidence, historical repair path, and
+  `assetHourlyCoverage` resolver. Run the hourly-history tests and check that
+  the generated GraphQL schema includes the field. Do not deploy an older
+  worker against the same database: its ordinary eight-day cleanup would
+  delete retained major-token HOUR rows.
 - Confirm no private tokens, database credentials, deployment keys, local
   environment files, database files, or backups are committed.
 - Confirm the deployment secret store has three distinct PostgreSQL role URLs:
@@ -169,6 +176,13 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   and verify the production `_health` identity.
 - Verify representative wallet and Polkaswap GraphQL queries against production
   without mutating chain or indexer state.
+- Query `assetHourlyCoverage` for each canonical XOR, VAL, PSWAP, DAI, KUSD,
+  LLD, and LLM ID over the last completed 24 hours, using the read-only command
+  in `docs/bot-history.md`. Confirm the returned field exists, the expected
+  hours are represented by verified finalized rows, and newly completed hours
+  become queryable without an API restart. LLM may correctly report an absent
+  direct pool; do not count it as a usable price or invent one. Record any
+  missing, legacy, invalid, or unknown-pool hours as a release issue.
 - Monitor GraphQL error rate and latency, SORA RPC health, finalized-block lag,
   worker restarts, database health, storage growth, and backup completion.
 - Keep the previous release artifact and compatible data backup until the

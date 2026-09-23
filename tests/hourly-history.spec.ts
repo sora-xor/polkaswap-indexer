@@ -199,6 +199,7 @@ function collector() {
   const worker = new ChainIndexer({ ...readConfig(), priceStreamRefreshIntervalBlocks: 0 }, repository);
   const internal = worker as unknown as {
     api: unknown;
+    observedGenesisHash: string;
     previousHourlyHistoryBlock: HourlyBoundaryBlock | null;
     getHistoricalValuationQueryAt: (height: number) => Promise<unknown>;
     prepareHistoricalValuationAdvance: (...args: unknown[]) => Promise<unknown>;
@@ -207,6 +208,8 @@ function collector() {
     retireExpiredChartSnapshotBuckets: (groups: unknown[], height: number, timestamp: number) => Promise<void>;
   };
   internal.api = { genesisHash: { toString: () => HOURLY_HISTORY_GENESIS } };
+  // The current worker requires the reviewed genesis before persisting chainState.
+  internal.observedGenesisHash = HOURLY_HISTORY_GENESIS;
   internal.previousHourlyHistoryBlock = { ...before };
   internal.getHistoricalValuationQueryAt = vi.fn(async () => ({ denomination: { denominator: async () => ({ toString: () => input().denominator }) } }));
   internal.prepareHistoricalValuationAdvance = vi.fn(async () => ({ blockHeight: after.height, assets: [], pools: [] }));
@@ -217,7 +220,7 @@ function collector() {
     networkLiquidityStats: { liquidityUSD: '0', poolLiquidityUSD: '0', orderBookLiquidityUSD: '0', activePools: 0, activeOrderBooks: 0, listedAssets: 7 },
   };
   const block = {
-    timestamp: after.timestamp, events: [],
+    requestedHash: after.hash, timestamp: after.timestamp, events: [],
     signedBlock: { block: { header: { number: { toNumber: () => after.height }, hash: { toString: () => after.hash }, parentHash: { toString: () => before.hash } }, extrinsics: [] } },
   };
   return { repository, internal, state, block };
