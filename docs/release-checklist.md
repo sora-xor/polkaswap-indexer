@@ -9,7 +9,7 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   have been merged or cherry-picked back to `develop`.
 - Confirm the GraphQL schema, `_health` identity, the five `mobileConfig`
   capability booleans, production environment notes, and storage compatibility
-  are final. The tester projection defaults to `true,false,true,false,true` for
+  are final. The example tester projection is `true,false,true,false,true` for
   Nexus, Nexus sends, Polkamarkt, Polkamarkt mutations, and Taira respectively;
   never enable send or mutation capabilities before the candidate-bound mobile
   release gates qualify.
@@ -123,11 +123,14 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   `mobileConfig`. Nexus sends require Nexus availability, Polkamarkt mutations
   require Polkamarkt visibility, and mobile clients independently combine the
   Taira remote default with the Nexus kill switch. Record the exact
-  operator-selected projection; do not infer a missing value.
+  operator-selected projection from the public GraphQL readback; do not infer a
+  missing value. The deployment evidence `mobileConfig` object must contain
+  exactly these five booleans and match that readback.
 - Before declaring the deployment production-ready, use the generated evidence
   template to create operator-attested evidence for the current release commit,
   immutable Docker image digest, deployment ID, UTC deployment and smoke
-  timestamps, exact `_health` payload, and the command
+  timestamps, exact `_health` payload, the five-boolean `mobileConfig` public
+  readback, and the command
   `POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production`.
   The health payload must report genesis
   `0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5`,
