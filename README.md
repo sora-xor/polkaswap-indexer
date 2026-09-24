@@ -660,13 +660,23 @@ enforces 600 HTTP requests per client per 60 seconds, permits at most 600
 WebSocket upgrades per client per 60 seconds, and caps concurrent WebSockets at
 16 per client.
 
-Prepare the operator template and run the ready gate before enabling release
-routing:
+Prepare and test the evidence template before deployment:
 
 ```sh
 yarn test:deployment-evidence-template
 yarn generate:deployment-evidence-template --output build/reports/production-deployment-evidence-template.json
 yarn test:deployment-evidence-audit
-yarn audit:deployment-evidence --require-ready
+```
+
+Deploy the reviewed image with its immutable digest on the provisioned target.
+After the migration, API, worker, and internal health pass, route the public
+endpoint to that candidate while keeping the previous service available for
+rollback. Run the public smoke against the routed candidate, record the observed
+health, five mobile booleans, image digest, deployment identity, RPC/TLS
+controls, and smoke timestamp in operator-attested evidence, then run the ready
+audit before declaring the deployment ready or enabling mobile release flags:
+
+```sh
 POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production
+yarn audit:deployment-evidence --require-ready
 ```
