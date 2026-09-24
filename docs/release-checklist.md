@@ -98,67 +98,6 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   [legacy identity preflight](#legacy-database-identity-preflight) through a
   direct, read-only PostgreSQL session. Do not infer that the audited migration
   anchor still exists from a healthy public API or a recent `BLOCK` snapshot.
-- Validate production Compose with `docker compose -f
-  docker-compose.production.yml config --quiet`; never print the interpolated
-  manifest after loading secrets. Inspect an unresolved manifest with
-  `config --no-interpolate` before loading credentials. Confirm the contract
-  uses a four-minute shutdown grace and bounded local log rotation, requires
-  distinct reviewed primary/archive RPC inputs, and requires an explicit
-  reviewed `POLKASWAP_CHAIN_START_BLOCK`. Run
-  `node dist/src/scripts/worker-health.js` inside the worker container and
-  inspect its container health. It must validate the immutable mainnet anchor,
-  fresh exact `chainState`, and matching `BLOCK` snapshot directly through
-  PostgreSQL without reaching the API container. Confirm its 4-second total
-  deadline is below the 5-second container timeout; missing, stale, future,
-  malformed, and mismatched records must remain unhealthy.
-- Confirm `https://pi.soramitsu.io/graphql` routes to the intended release and
-  returns `_health` with `serviceId=pi.soramitsu.io`, `schemaVersion=1`,
-  `ecosystem=sora2`, `chainId=sora:mainnet`, `network=mainnet`,
-  `publicBaseUrl=https://pi.soramitsu.io/graphql`, `readOnly=true`, the exact
-  reviewed genesis, and a fresh exact block height/hash/timestamp. Confirm the
-  migration container exited successfully before API and worker startup, and
-  the worker log shows its genesis/history-anchor preflight completed before
-  worker repository construction for both distinct RPC hosts. Confirm the
-  primary is a locally controlled verifying node, the archive is independently
-  operated, and sampled block hashes, raw SCALE blocks/events, and timestamps
-  agree. A prior deployment passed only the static service-identity routing check on
-  2026-07-10; the current endpoint does not expose the required checkpoint
-  fields, and every release must pass the complete current smoke contract.
-- Confirm the same smoke response exposes boolean `nexusAvailable`,
-  `nexusSendsAvailable`, `polkamarktVisible`,
-  `polkamarktMutationsAvailable`, and `tairaDefaultVisible` fields under
-  `mobileConfig`. Nexus sends require Nexus availability, Polkamarkt mutations
-  require Polkamarkt visibility, and mobile clients independently combine the
-  Taira remote default with the Nexus kill switch. Record the exact
-  operator-selected projection from the public GraphQL readback; do not infer a
-  missing value. The deployment evidence `mobileConfig` object must contain
-  exactly these five booleans and match that readback.
-- Before declaring the deployment production-ready, use the generated evidence
-  template to create operator-attested evidence for the current release commit,
-  immutable Docker image digest, deployment ID, UTC deployment and smoke
-  timestamps, exact `_health` payload, the five-boolean `mobileConfig` public
-  readback, and the command
-  `POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production`.
-  The health payload must report genesis
-  `0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5`,
-  a positive safe-integer `latestIndexedBlock`, a canonical nonzero lowercase
-  32-byte `latestIndexedBlockHash`, and an integer Unix-seconds
-  `latestIndexedAt` no more than 300 seconds before or 30 seconds after
-  `smokePassedAt`.
-  Include exact `soraRpcControls` with canonical credential-free `wss` URLs on
-  distinct non-public hosts, the required local-primary and independent-archive
-  control roles, exact identity preflight, and raw height/hash/SCALE
-  block/events/timestamp agreement. Public `*.sora.org` convenience endpoints
-  do not satisfy ready evidence.
-  The same evidence record must attest the TLS-edge controls delegated by the
-  loopback-only container contract: TLS termination, overwrite (never preserve)
-  of forwarded client-IP headers, 600 HTTP requests per client per 60 seconds,
-  600 WebSocket upgrades per client per 60 seconds, and no more than 16
-  concurrent WebSockets per client.
-  Set `status: ready` and `releaseEnabled: true`, then run
-  `yarn audit:deployment-evidence --require-ready`. If release tooling validates
-  a tagged commit instead of local `HEAD`, set
-  `DEPLOYMENT_EVIDENCE_EXPECTED_COMMIT` to that 40-character commit.
 - Confirm green CI for branch-flow, public-artifact, TODO-debt, immutable install,
   production dependency audit, deployment-evidence, adversarial production
   smoke, build, and the full test suite.
@@ -233,11 +172,80 @@ reviewed migration with operator-attested evidence is designed and tested.
 
 ## After Release
 
+Follow these steps in order for the tagged release. Keep the previous release
+artifact and compatible database available through the rollback window.
+
+- Validate production Compose with `docker compose -f
+  docker-compose.production.yml config --quiet`; never print the interpolated
+  manifest after loading secrets. Inspect an unresolved manifest with
+  `config --no-interpolate` before loading credentials. Confirm the contract
+  uses a four-minute shutdown grace and bounded local log rotation, requires
+  distinct reviewed primary/archive RPC inputs, and requires an explicit
+  reviewed `POLKASWAP_CHAIN_START_BLOCK`.
+- Repeat the direct, read-only [legacy identity preflight](#legacy-database-identity-preflight)
+  against the selected production database immediately before startup.
+- Deploy the exact tagged image and recorded digest to the reviewed target.
+  Confirm the one-shot migration exited successfully before the API and worker
+  start. Run `node dist/src/scripts/worker-health.js` inside the worker container and
+  inspect its container health. It must validate the immutable mainnet anchor,
+  fresh exact `chainState`, and matching `BLOCK` snapshot directly through
+  PostgreSQL without reaching the API container. Confirm its 4-second total
+  deadline is below the 5-second container timeout; missing, stale, future,
+  malformed, and mismatched records must remain unhealthy.
 - Verify the deployed service is serving the tagged commit and recorded image
   digest.
-- Run
-  `POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production`
-  and verify the production `_health` identity.
+- After internal health passes, route `pi.soramitsu.io` to the candidate
+  while keeping the previous service and compatible data available for rollback.
+- Run `POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production`
+  against the public candidate.
+- Confirm `https://pi.soramitsu.io/graphql` routes to the intended release and
+  returns `_health` with `serviceId=pi.soramitsu.io`, `schemaVersion=1`,
+  `ecosystem=sora2`, `chainId=sora:mainnet`, `network=mainnet`,
+  `publicBaseUrl=https://pi.soramitsu.io/graphql`, `readOnly=true`, the exact
+  reviewed genesis, and a fresh exact block height/hash/timestamp. Confirm the
+  migration container exited successfully before API and worker startup, and
+  the worker log shows its genesis/history-anchor preflight completed before
+  worker repository construction for both distinct RPC hosts. Confirm the
+  primary is a locally controlled verifying node, the archive is independently
+  operated, and sampled block hashes, raw SCALE blocks/events, and timestamps
+  agree. A prior deployment passed only the static service-identity routing check on
+  2026-07-10; the current endpoint does not expose the required checkpoint
+  fields, and every release must pass the complete current smoke contract.
+- Confirm the same smoke response exposes boolean `nexusAvailable`,
+  `nexusSendsAvailable`, `polkamarktVisible`,
+  `polkamarktMutationsAvailable`, and `tairaDefaultVisible` fields under
+  `mobileConfig`. Nexus sends require Nexus availability, Polkamarkt mutations
+  require Polkamarkt visibility, and mobile clients independently combine the
+  Taira remote default with the Nexus kill switch. Record the exact
+  operator-selected projection from the public GraphQL readback; do not infer a
+  missing value. The deployment evidence `mobileConfig` object must contain
+  exactly these five booleans and match that readback.
+- Before declaring the deployment production-ready, use the generated evidence
+  template to create operator-attested evidence for the current release commit,
+  immutable Docker image digest, deployment ID, UTC deployment and smoke
+  timestamps, the required `_health` identity and checkpoint projection,
+  the five-boolean `mobileConfig` public readback, and the command
+  `POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production`.
+  The health payload must report genesis
+  `0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5`,
+  a positive safe-integer `latestIndexedBlock`, a canonical nonzero lowercase
+  32-byte `latestIndexedBlockHash`, and an integer Unix-seconds
+  `latestIndexedAt` no more than 300 seconds before or 30 seconds after
+  `smokePassedAt`.
+  Include exact `soraRpcControls` with canonical credential-free `wss` URLs on
+  distinct non-public hosts, the required local-primary and independent-archive
+  control roles, exact identity preflight, and raw height/hash/SCALE
+  block/events/timestamp agreement. Public `*.sora.org` convenience endpoints
+  do not satisfy ready evidence.
+  The same evidence record must attest the TLS-edge controls delegated by the
+  loopback-only container contract: TLS termination, overwrite (never preserve)
+  of forwarded client-IP headers, 600 HTTP requests per client per 60 seconds,
+  600 WebSocket upgrades per client per 60 seconds, and no more than 16
+  concurrent WebSockets per client.
+  Set `status: ready` and `releaseEnabled: true`, then run
+  `yarn audit:deployment-evidence --require-ready`. If release tooling validates
+  a tagged commit instead of local `HEAD`, set
+  `DEPLOYMENT_EVIDENCE_EXPECTED_COMMIT` to that 40-character commit.
 - Verify representative wallet and Polkaswap GraphQL queries against production
   without mutating chain or indexer state.
 - Monitor GraphQL error rate and latency, SORA RPC health, finalized-block lag,
