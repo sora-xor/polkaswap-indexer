@@ -54,6 +54,11 @@ expect_resolved_failure() {
     POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
     POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
     POLKASWAP_CHAIN_START_BLOCK=14000000 \
+    POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE=true \
+    POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=false \
+    POLKASWAP_MOBILE_CONFIG_POLKAMARKT_VISIBLE=true \
+    POLKASWAP_MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE=false \
+    POLKASWAP_MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE=true \
       "${COMPOSE_COMMAND[@]}" -f "$ROOT_DIR/docker-compose.production.yml" config --format json
   )"; then
     echo "[deployment-manifest-test][error] $label fixture did not render" >&2
@@ -182,12 +187,12 @@ expect_failure "api-extra-environment" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.docker
 api_missing_mobile_capability="$TMP_DIR/docker-compose.api-missing-mobile-capability.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$api_missing_mobile_capability"
 perl -0pi -e 's/^      MOBILE_CONFIG_NEXUS_AVAILABLE:.*\n//m' "$api_missing_mobile_capability"
-expect_failure "api-missing-mobile-capability" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "Production Compose must expose MOBILE_CONFIG_NEXUS_AVAILABLE through its exact reviewed deployment input" "$api_missing_mobile_capability"
+expect_failure "api-missing-mobile-capability" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "Production Compose must require MOBILE_CONFIG_NEXUS_AVAILABLE through its exact reviewed deployment input" "$api_missing_mobile_capability"
 
 api_unreviewed_mobile_default="$TMP_DIR/docker-compose.api-unreviewed-mobile-default.yml"
 cp "$ROOT_DIR/docker-compose.production.yml" "$api_unreviewed_mobile_default"
-perl -0pi -e 's/POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE:-false/POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE:-true/' "$api_unreviewed_mobile_default"
-expect_failure "api-unreviewed-mobile-default" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "Production Compose must expose MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE through its exact reviewed deployment input" "$api_unreviewed_mobile_default"
+perl -0pi -e 's/POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE:\?Set the reviewed Nexus sends value/POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE:-true/' "$api_unreviewed_mobile_default"
+expect_failure "api-unreviewed-mobile-default" "$ROOT_DIR/Dockerfile" "$ROOT_DIR/.dockerignore" "Production Compose must require MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE through its exact reviewed deployment input" "$api_unreviewed_mobile_default"
 
 dockerfile_mobile_default_drift="$TMP_DIR/Dockerfile.mobile-default-drift"
 cp "$ROOT_DIR/Dockerfile" "$dockerfile_mobile_default_drift"
@@ -542,6 +547,39 @@ expect_failure "insecure-database-instructions" "$ROOT_DIR/Dockerfile" "$ROOT_DI
 secure_owner_url='postgresql://manifest_migration_owner:owner-test-only@database.invalid/polkaswap?sslmode=verify-full'
 secure_api_url='postgresql://manifest_api:api-test-only@database.invalid/polkaswap?sslmode=verify-full'
 secure_worker_url='postgresql://manifest_worker:worker-test-only@database.invalid/polkaswap?sslmode=verify-full'
+for mobile_input in \
+  POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE \
+  POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE \
+  POLKASWAP_MOBILE_CONFIG_POLKAMARKT_VISIBLE \
+  POLKASWAP_MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE \
+  POLKASWAP_MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE; do
+  for missing_mode in unset empty; do
+    if (
+      export POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.invalid/polkaswap-indexer
+      export POLKASWAP_INDEXER_IMAGE_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      export POLKASWAP_MIGRATION_OWNER_DATABASE_URL="$secure_owner_url"
+      export POLKASWAP_API_DATABASE_URL="$secure_api_url"
+      export POLKASWAP_WORKER_DATABASE_URL="$secure_worker_url"
+      export POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid
+      export POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid
+      export POLKASWAP_CHAIN_START_BLOCK=14000000
+      export POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE=true
+      export POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=false
+      export POLKASWAP_MOBILE_CONFIG_POLKAMARKT_VISIBLE=true
+      export POLKASWAP_MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE=false
+      export POLKASWAP_MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE=true
+      if [[ "$missing_mode" == unset ]]; then
+        unset "$mobile_input"
+      else
+        export "$mobile_input="
+      fi
+      "${COMPOSE_COMMAND[@]}" -f "$ROOT_DIR/docker-compose.production.yml" config --quiet >/dev/null 2>&1
+    ); then
+      echo "[deployment-manifest-test][error] $mobile_input $missing_mode unexpectedly passed Compose validation" >&2
+      exit 1
+    fi
+  done
+done
 expect_resolved_failure \
   "resolved-plaintext-owner-url" \
   "resolved PostgreSQL URLs must require verified TLS without unaudited controls" \

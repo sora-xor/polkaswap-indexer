@@ -639,8 +639,9 @@ docker compose -f docker-compose.production.yml config --quiet
 docker compose -f docker-compose.production.yml up -d
 ```
 
-The five mobile capability values are explicit deployment inputs. Their tester
-defaults are `true,false,true,false,true` in the order shown above.
+The five mobile capability values are required explicit production deployment
+inputs; Compose validation fails if any value is missing or empty. The example
+tester projection is `true,false,true,false,true` in the order shown above.
 `MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=true` requires Nexus availability, while
 Polkamarkt mutations require Polkamarkt visibility. Taira's remote default
 remains independent because each mobile client applies the Nexus kill switch to
@@ -730,7 +731,8 @@ Production release evidence is tracked in
 blocked on `production-deployment-evidence-missing` and
 `live-production-smoke-failing` until the current public smoke passes and an
 operator records the deployed image digest, git commit, deployment id, PI health
-response, and live smoke timestamp for the intended release. The attested health
+response, the exact five-boolean public `mobileConfig` readback, and live smoke
+timestamp for the intended release. The attested health
 response must
 contain the exact SORA mainnet genesis hash
 `0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5`,
