@@ -63,6 +63,7 @@ const manifest = {
     'deployedAt',
     'smokePassedAt',
     'healthInfo',
+    'mobileConfig',
     'soraRpcControls',
     'tlsEdgeControls',
     'operator'
@@ -90,6 +91,13 @@ const manifest = {
         latestIndexedBlock: 26_000_001,
         latestIndexedBlockHash: '0x28dd415867e637e5c70056a564cfa4e81f0f3df3a18d1132ccc61fe5025c762c',
         latestIndexedAt: Math.floor(Date.parse('2026-07-01T00:03:00Z') / 1000)
+      },
+      mobileConfig: {
+        nexusAvailable: true,
+        nexusSendsAvailable: false,
+        polkamarktVisible: true,
+        polkamarktMutationsAvailable: false,
+        tairaDefaultVisible: true
       },
       soraRpcControls: {
         primaryEndpoint: 'wss://sora-primary-rpc.prod.internal/ws',
@@ -132,6 +140,21 @@ const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
 const healthInfo = manifest.deploymentEvidence[0].healthInfo;
 if (jsonValue === '__DELETE__') delete healthInfo[field];
 else healthInfo[field] = JSON.parse(jsonValue);
+fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
+NODE
+}
+
+set_mobile_config_value() {
+  local file="$1"
+  local field="$2"
+  local json_value="$3"
+  node - "$file" "$field" "$json_value" <<'NODE'
+const fs = require('fs');
+const [file, field, jsonValue] = process.argv.slice(2);
+const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+const mobileConfig = manifest.deploymentEvidence[0].mobileConfig;
+if (jsonValue === '__DELETE__') delete mobileConfig[field];
+else mobileConfig[field] = JSON.parse(jsonValue);
 fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
 NODE
 }
@@ -480,6 +503,84 @@ unsupported_health_field="$TMP_DIR/unsupported-health-field.json"
 write_ready_manifest "$unsupported_health_field"
 set_health_value "$unsupported_health_field" rpcEndpoint '"wss://should-not-be-public.example"'
 expect_failure "unsupported health evidence field" "healthInfo.rpcEndpoint is not supported in public deployment evidence" run_audit "$unsupported_health_field" --require-ready
+
+missing_mobile_config="$TMP_DIR/missing-mobile-config.json"
+write_ready_manifest "$missing_mobile_config"
+node - "$missing_mobile_config" <<'NODE'
+const fs = require('fs');
+const file = process.argv[2];
+const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+delete manifest.deploymentEvidence[0].mobileConfig;
+fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
+NODE
+expect_failure "missing mobile config readback" "deploymentEvidence[0].mobileConfig missing" run_audit "$missing_mobile_config" --require-ready
+
+missing_mobile_config_required_field="$TMP_DIR/missing-mobile-config-required-field.json"
+write_ready_manifest "$missing_mobile_config_required_field"
+node - "$missing_mobile_config_required_field" <<'NODE'
+const fs = require('fs');
+const file = process.argv[2];
+const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+manifest.requiredEvidenceFields = manifest.requiredEvidenceFields.filter((field) => field !== 'mobileConfig');
+fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
+NODE
+expect_failure "missing mobile config required evidence field" "requiredEvidenceFields[] missing mobileConfig" run_audit "$missing_mobile_config_required_field" --require-ready
+
+for container_value in 'null' '[]' '"invalid"'; do
+  fixture="$TMP_DIR/mobile-config-wrong-container-$(printf '%s' "$container_value" | tr -cd '[:alnum:]').json"
+  write_ready_manifest "$fixture"
+  node - "$fixture" "$container_value" <<'NODE'
+const fs = require('fs');
+const [file, jsonValue] = process.argv.slice(2);
+const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+manifest.deploymentEvidence[0].mobileConfig = JSON.parse(jsonValue);
+fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
+NODE
+  expect_failure "wrong mobile config container $container_value" "mobileConfig must be an object" run_audit "$fixture" --require-ready
+done
+
+for field in nexusAvailable nexusSendsAvailable polkamarktVisible polkamarktMutationsAvailable tairaDefaultVisible; do
+  missing_field="$TMP_DIR/mobile-config-missing-$field.json"
+  write_ready_manifest "$missing_field"
+  set_mobile_config_value "$missing_field" "$field" '__DELETE__'
+  expect_failure "missing mobile config field $field" "mobileConfig.$field must be boolean" run_audit "$missing_field" --require-ready
+
+  non_boolean_field="$TMP_DIR/mobile-config-non-boolean-$field.json"
+  write_ready_manifest "$non_boolean_field"
+  set_mobile_config_value "$non_boolean_field" "$field" '"true"'
+  expect_failure "non-Boolean mobile config field $field" "mobileConfig.$field must be boolean" run_audit "$non_boolean_field" --require-ready
+done
+
+unsupported_mobile_field="$TMP_DIR/mobile-config-unsupported-field.json"
+write_ready_manifest "$unsupported_mobile_field"
+set_mobile_config_value "$unsupported_mobile_field" unreviewedFeature 'true'
+expect_failure "unsupported mobile config field" "mobileConfig.unreviewedFeature is not supported in public deployment evidence" run_audit "$unsupported_mobile_field" --require-ready
+
+nexus_sends_without_nexus="$TMP_DIR/mobile-config-nexus-sends-without-nexus.json"
+write_ready_manifest "$nexus_sends_without_nexus"
+set_mobile_config_value "$nexus_sends_without_nexus" nexusAvailable 'false'
+set_mobile_config_value "$nexus_sends_without_nexus" nexusSendsAvailable 'true'
+expect_failure "Nexus sends without Nexus" "mobileConfig.nexusSendsAvailable requires nexusAvailable=true" run_audit "$nexus_sends_without_nexus" --require-ready
+
+polkamarkt_mutations_without_visibility="$TMP_DIR/mobile-config-polkamarkt-mutations-without-visibility.json"
+write_ready_manifest "$polkamarkt_mutations_without_visibility"
+set_mobile_config_value "$polkamarkt_mutations_without_visibility" polkamarktVisible 'false'
+set_mobile_config_value "$polkamarkt_mutations_without_visibility" polkamarktMutationsAvailable 'true'
+expect_failure "Polkamarkt mutations without visibility" "mobileConfig.polkamarktMutationsAvailable requires polkamarktVisible=true" run_audit "$polkamarkt_mutations_without_visibility" --require-ready
+
+for projection in 'false,false,false,false,false' 'true,true,true,true,false'; do
+  fixture="$TMP_DIR/mobile-config-valid-${projection//,/}.json"
+  write_ready_manifest "$fixture"
+  node - "$fixture" "$projection" <<'NODE'
+const fs = require('fs');
+const [file, projection] = process.argv.slice(2);
+const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+const fields = ['nexusAvailable', 'nexusSendsAvailable', 'polkamarktVisible', 'polkamarktMutationsAvailable', 'tairaDefaultVisible'];
+manifest.deploymentEvidence[0].mobileConfig = Object.fromEntries(fields.map((field, index) => [field, projection.split(',')[index] === 'true']));
+fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
+NODE
+  run_audit "$fixture" --require-ready >/dev/null
+done
 
 missing_sora_rpc_controls="$TMP_DIR/missing-sora-rpc-controls.json"
 write_ready_manifest "$missing_sora_rpc_controls"

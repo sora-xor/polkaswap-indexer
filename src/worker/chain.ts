@@ -707,7 +707,8 @@ const isLiquidityProxySwap = (module: string, method: string, callNames: string[
   callNames.some((name) => name === 'liquidityProxy.swap' || name === 'liquidityProxy.swapTransfer');
 
 const isBridgeOutgoing = (module: string, method: string): boolean =>
-  module === 'ethBridge' || (module === 'bridgeProxy' && method === 'burn');
+  (module === 'ethBridge' && method === 'transferToSidechain') ||
+  (module === 'bridgeProxy' && method === 'burn');
 
 const isSyntheticBridgeIncoming = (id: string, module: string, method: string): boolean =>
   module === 'bridgeProxy' && method === 'mint' && id.endsWith('-mint');
@@ -2228,7 +2229,7 @@ const normalizeStakingData = (method: string, args: Record<string, unknown>, pri
 
   if (method === 'bond') return { ...amountData, controller: firstString(args, ['controller']), payee: args.payee ?? {} };
   if (method === 'bondExtra') return amountData;
-  if (method === 'unbond') return { amount: String(amount), amountUSD: amountData.amountUSD };
+  if (method === 'unbond') return amountData;
   if (method === 'rebond') return { value: amountData.amount, amountUSD: amountData.amountUSD };
   if (method === 'nominate') return { targets: Array.isArray(args.targets) ? args.targets : [] };
   if (method === 'withdrawUnbonded') return { ...amountData, numSlashingSpans: Number(args.numSlashingSpans ?? 0) };
@@ -5369,7 +5370,11 @@ export class ChainIndexer {
       if (!failed && isLiquidityProxySwap(extrinsic.method.section, extrinsic.method.method, callNames)) {
         swaps += 1;
       }
-      if (!failed && extrinsic.method.section === 'bridgeMultisig') bridgeIncomingTransactions += 1;
+      const hasIncomingBridgeMovement =
+        !failed &&
+        extrinsic.method.section === 'bridgeMultisig' &&
+        findIncomingBridgeMovement(historyEvents) !== null;
+      if (hasIncomingBridgeMovement) bridgeIncomingTransactions += 1;
       if (!failed && isBridgeOutgoing(extrinsic.method.section, extrinsic.method.method)) {
         bridgeOutgoingTransactions += 1;
       }
@@ -5393,7 +5398,7 @@ export class ChainIndexer {
       const incomingContext = createBridgeProxyIncomingContext(context, args, valuationPrices, valuationAssets);
       if (incomingContext) {
         volumeUSD += this.extractVolumeUSD(incomingContext.history.data);
-        bridgeIncomingTransactions += 1;
+        if (!hasIncomingBridgeMovement) bridgeIncomingTransactions += 1;
         incomingContext.accounts.forEach((account) => touchedAccounts.add(account));
         extrinsicContexts.push(incomingContext);
       }

@@ -40,6 +40,12 @@ grep -Fq '"genesisHash": "0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9
 grep -Fq '"latestIndexedBlock": "TODO_POSITIVE_SAFE_INTEGER_INDEXED_BLOCK"' "$template" || fail "indexed block placeholder missing"
 grep -Fq '"latestIndexedBlockHash": "TODO_0X_64_LOWERCASE_HEX_INDEXED_BLOCK_HASH"' "$template" || fail "indexed block hash placeholder missing"
 grep -Fq '"latestIndexedAt": "TODO_UNIX_SECONDS_WITHIN_300_BEFORE_OR_30_AFTER_SMOKE"' "$template" || fail "indexed checkpoint timestamp placeholder missing"
+grep -Fq '"mobileConfig"' "$template" || fail "public mobile config readback missing"
+grep -Fq '"nexusAvailable": "TODO_BOOLEAN_NEXUS_AVAILABLE"' "$template" || fail "Nexus availability placeholder missing"
+grep -Fq '"nexusSendsAvailable": "TODO_BOOLEAN_NEXUS_SENDS_AVAILABLE"' "$template" || fail "Nexus sends placeholder missing"
+grep -Fq '"polkamarktVisible": "TODO_BOOLEAN_POLKAMARKT_VISIBLE"' "$template" || fail "Polkamarkt visibility placeholder missing"
+grep -Fq '"polkamarktMutationsAvailable": "TODO_BOOLEAN_POLKAMARKT_MUTATIONS_AVAILABLE"' "$template" || fail "Polkamarkt mutations placeholder missing"
+grep -Fq '"tairaDefaultVisible": "TODO_BOOLEAN_TAIRA_DEFAULT_VISIBLE"' "$template" || fail "Taira default visibility placeholder missing"
 grep -Fq '"soraRpcControls"' "$template" || fail "SORA RPC control attestation missing"
 grep -Fq '"primaryEndpoint": "TODO_CANONICAL_WSS_LOCALLY_CONTROLLED_PRIMARY_RPC_ENDPOINT"' "$template" || fail "primary RPC endpoint placeholder missing"
 grep -Fq '"archiveEndpoint": "TODO_CANONICAL_WSS_INDEPENDENT_ARCHIVE_RPC_ENDPOINT"' "$template" || fail "archive RPC endpoint placeholder missing"
@@ -50,6 +56,7 @@ grep -Fq '"exactIdentityPreflight": true' "$template" || fail "RPC exact identit
 grep -Fq '"rawPayloadAgreement": "height-hash-scale-block-events-timestamp"' "$template" || fail "RPC raw payload agreement missing"
 expect_failure "template cannot pass ready audit with TODO placeholders" "operator-attested deployment evidence must be ready when --require-ready is used" bash "$ROOT_DIR/scripts/audit-deployment-evidence.sh" --evidence "$template" --require-ready
 expect_failure "template rejects TODO primary RPC endpoint" "soraRpcControls.primaryEndpoint must be a canonical credential-free wss URL" bash "$ROOT_DIR/scripts/audit-deployment-evidence.sh" --evidence "$template"
+expect_failure "template rejects TODO mobile capability" "mobileConfig.nexusAvailable must be boolean" bash "$ROOT_DIR/scripts/audit-deployment-evidence.sh" --evidence "$template"
 
 template_wrong_rpc_role="$TMP_DIR/template-wrong-rpc-role.json"
 cp "$template" "$template_wrong_rpc_role"
@@ -127,6 +134,17 @@ manifest.requiredEvidenceFields = manifest.requiredEvidenceFields.filter((field)
 fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
 NODE
 expect_failure "SORA RPC controls required by generator" "requiredEvidenceFields missing soraRpcControls" bash "$ROOT_DIR/scripts/generate-deployment-evidence-template.sh" --evidence "$missing_sora_rpc_required_field"
+
+missing_mobile_config_required_field="$TMP_DIR/missing-mobile-config-required-field.json"
+cp "$ROOT_DIR/scripts/production-deployment-evidence.json" "$missing_mobile_config_required_field"
+node - "$missing_mobile_config_required_field" <<'NODE'
+const fs = require('fs');
+const file = process.argv[2];
+const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+manifest.requiredEvidenceFields = manifest.requiredEvidenceFields.filter((field) => field !== 'mobileConfig');
+fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
+NODE
+expect_failure "mobile config evidence required by generator" "requiredEvidenceFields missing mobileConfig" bash "$ROOT_DIR/scripts/generate-deployment-evidence-template.sh" --evidence "$missing_mobile_config_required_field"
 
 unsupported="$TMP_DIR/unsupported-manifest.json"
 cp "$ROOT_DIR/scripts/production-deployment-evidence.json" "$unsupported"
