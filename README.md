@@ -670,6 +670,13 @@ the 4-second hard process deadline remains below the 5-second container timeout.
 Diagnostics contain only fixed failure codes and never include the database URL
 or raw driver error text.
 
+Before starting this worker against a legacy database without `chainIdentity`,
+run the direct PostgreSQL preflight in [the release checklist](docs/release-checklist.md#legacy-database-identity-preflight).
+The audited historical `BLOCK` row can expire under the worker's 31-day
+retention policy. A healthy current checkpoint does not prove that the row is
+still present; recover it from a verified backup or backfill an empty parallel
+database before cutover.
+
 During rollout, confirm worker health independently of GraphQL:
 
 ```sh

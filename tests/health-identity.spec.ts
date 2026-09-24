@@ -96,6 +96,7 @@ describe('PI GraphQL mainnet identity health', () => {
 
     await expect(resolveHealth(identityFixture())).resolves.toEqual({
       ok: true,
+      checkpointCoherent: true,
       repositoryReady: true,
       service: 'polkaswap-indexer',
       serviceId: 'pi.soramitsu.io',
