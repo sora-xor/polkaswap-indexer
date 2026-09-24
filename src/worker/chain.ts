@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 
 import { ApiPromise, WsProvider } from '@polkadot/api';
 import { types as soraTypes } from '@sora-substrate/type-definitions';
+import { readSnapshotDenominator } from './denomination.js';
 
 import { uniqueIndexedAccountIds } from '../account-activity.js';
 import { estimateRetainedValueBytes } from '../cache-weight.js';
@@ -6199,6 +6200,9 @@ export class ChainIndexer {
     const normalizedPallet = pallet.toLowerCase();
     const normalizedMethod = method.toLowerCase();
 
+    // A denomination changes amounts across pallets; cached pre-transition prices
+    // must never be labelled with the new snapshot coefficient.
+    if (normalizedPallet === 'denomination') return [...DERIVED_STORAGE_DOMAINS];
     if (
       normalizedPallet === 'system' &&
       (normalizedMethod === 'codeupdated' || normalizedMethod === 'setstorage' || normalizedMethod === 'killstorage')
@@ -8237,8 +8241,9 @@ export class ChainIndexer {
     this.publishLiveValuationState(effectiveBlockHeight, assets, poolStates, prices, liquidityStats);
     this.applyNetworkLiquidityStats(analytics, liquidityStats);
     const apyByPool = this.derivePoolApy(poolStates, farmingPoolFarmers, effectiveBlockHeight, prices);
+    const snapshotDenominator = includeSnapshots ? await readSnapshotDenominator(query) : null;
     const [assetDocuments, poolDocuments, orderBookDocuments] = await Promise.all([
-      this.createAssetDocuments(assets, prices, assetPoolLiquidity, analytics, effectiveBlockHeight, timestamp, includeSnapshots),
+      this.createAssetDocuments(assets, prices, assetPoolLiquidity, analytics, effectiveBlockHeight, timestamp, includeSnapshots, snapshotDenominator),
       this.createPoolDocuments(poolStates, analytics, apyByPool, effectiveBlockHeight, timestamp, includeSnapshots),
       this.createOrderBookDocuments(
         orderBooks,
@@ -9801,7 +9806,8 @@ export class ChainIndexer {
     analytics: Analytics,
     blockHeight: number,
     timestamp: number,
-    includeSnapshots: boolean
+    includeSnapshots: boolean,
+    denominator: string | null = null
   ): Promise<IndexerDocument[]> {
     const documents: IndexerDocument[] = [];
     const previousSnapshots = includeSnapshots
@@ -9856,6 +9862,7 @@ export class ChainIndexer {
             data: {
               id,
               assetId: asset.id,
+              denominator,
               timestamp,
               type,
               supply: asset.supply.toString(),
