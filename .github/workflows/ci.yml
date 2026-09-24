@@ -123,6 +123,11 @@ jobs:
           POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
           POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
           POLKASWAP_CHAIN_START_BLOCK=14000000 \
+          POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE=true \
+          POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=false \
+          POLKASWAP_MOBILE_CONFIG_POLKAMARKT_VISIBLE=true \
+          POLKASWAP_MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE=false \
+          POLKASWAP_MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE=true \
             docker compose -f docker-compose.production.yml config --quiet
 
       - name: Build
