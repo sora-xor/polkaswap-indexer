@@ -1174,42 +1174,6 @@ const readNumber = (value: unknown): number | null => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-const readEqualFilterValue = (value: unknown): string | null => {
-  const direct = readString(value);
-  if (direct) return direct;
-
-  if (!isRecord(value)) return null;
-
-  return readString(value.equalTo) ?? readString(value.eq) ?? readString(value._eq) ?? null;
-};
-
-const readAccountFromFilter = (filter: unknown): string | null => {
-  if (!isRecord(filter)) return null;
-
-  for (const [key, value] of Object.entries(filter)) {
-    if ((key === 'and' || key === 'or') && Array.isArray(value)) {
-      const nested = value.map(readAccountFromFilter).find((account): account is string => Boolean(account));
-      if (nested) return nested;
-      continue;
-    }
-
-    if (key === 'account_eq' || key === 'accountId_eq' || key === 'account_id_eq') {
-      const account = readString(value);
-      if (account) return account;
-    }
-
-    if (key === 'account' || key === 'accountId' || key === 'account_id') {
-      const account = readEqualFilterValue(value);
-      if (account) return account;
-    }
-  }
-
-  return null;
-};
-
-const readAccountFromArgs = (args: AccountActivityConnectionArgs): string | null =>
-  readAccountFromFilter(args.where) ?? readAccountFromFilter(args.filter);
-
 const addFilterField = (filter: Record<string, unknown>, field: string, condition: unknown): void => {
   const existing = filter[field];
   if (existing === undefined) {
@@ -1223,24 +1187,27 @@ const addFilterField = (filter: Record<string, unknown>, field: string, conditio
   filter.and = [...andFilters, { [field]: existing }, { [field]: condition }];
 };
 
-const normalizeAccountPositionFilter = (filter: unknown): Record<string, unknown> | null => {
+const normalizeAccountActivityFilter = (
+  filter: unknown,
+  accountField: 'account' | 'accountId'
+): Record<string, unknown> | null => {
   if (!isRecord(filter)) return null;
 
   const normalized: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(filter)) {
     if ((key === 'and' || key === 'or') && Array.isArray(value)) {
-      normalized[key] = value.map((entry) => normalizeAccountPositionFilter(entry) ?? entry);
+      normalized[key] = value.map((entry) => normalizeAccountActivityFilter(entry, accountField) ?? entry);
       continue;
     }
 
     if (key === 'account_eq' || key === 'accountId_eq' || key === 'account_id_eq') {
-      addFilterField(normalized, 'account', { equalTo: value });
+      addFilterField(normalized, accountField, { equalTo: value });
       continue;
     }
 
-    if (key === 'accountId' || key === 'account_id') {
-      addFilterField(normalized, 'account', value);
+    if (key === 'account' || key === 'accountId' || key === 'account_id') {
+      addFilterField(normalized, accountField, value);
       continue;
     }
 
@@ -1250,15 +1217,25 @@ const normalizeAccountPositionFilter = (filter: unknown): Record<string, unknown
   return normalized;
 };
 
-const accountPositionFilterFromArgs = (args: AccountActivityConnectionArgs): Record<string, unknown> => {
-  const filters = [normalizeAccountPositionFilter(args.where), normalizeAccountPositionFilter(args.filter)].filter(
-    (filter): filter is Record<string, unknown> => Boolean(filter && Object.keys(filter).length)
-  );
+const accountActivityFilterFromArgs = (
+  args: AccountActivityConnectionArgs,
+  accountField: 'account' | 'accountId'
+): Record<string, unknown> => {
+  const filters = [
+    normalizeAccountActivityFilter(args.where, accountField),
+    normalizeAccountActivityFilter(args.filter, accountField),
+  ].filter((filter): filter is Record<string, unknown> => Boolean(filter && Object.keys(filter).length));
 
   if (filters.length === 0) return {};
   if (filters.length === 1) return filters[0]!;
   return { and: filters };
 };
+
+const accountPositionFilterFromArgs = (args: AccountActivityConnectionArgs): Record<string, unknown> =>
+  accountActivityFilterFromArgs(args, 'account');
+
+const accountTransactionFilterFromArgs = (args: AccountActivityConnectionArgs): Record<string, unknown> =>
+  accountActivityFilterFromArgs(args, 'accountId');
 
 const normalizeAccountPositionOrder = (orderBy: unknown): unknown => {
   const normalizeToken = (token: unknown): unknown => {
@@ -1374,7 +1351,7 @@ const timestampIso = (value: unknown): string | null => {
 
 const toAccountTradeNode = (
   historyDocument: IndexerDocument | null | undefined,
-  account: string,
+  account: string | null,
   accountTransaction?: IndexerDocument
 ): Record<string, unknown> => {
   const source = historyDocument?.data ?? accountTransaction?.data ?? {};
@@ -1395,7 +1372,7 @@ const toAccountTradeNode = (
     readString(source.id) ??
     readString(accountTransaction?.id) ??
     readString(historyDocument?.id) ??
-    `${account}-${String(timestamp ?? 'activity')}`;
+    `${account ?? 'unknown'}-${String(timestamp ?? 'activity')}`;
 
   return {
     id,
@@ -1461,11 +1438,8 @@ const accountTradesResolver = async (
 ) => {
   const normalizedArgs = normalizeConnectionArgs(args);
   const orderBy = args.orderBy ?? ['TIMESTAMP_DESC'];
-  assertPublicConnectionQuery('accountTrades', orderBy, accountPositionFilterFromArgs(args));
-  const account = readAccountFromArgs(args);
-  if (!account) return buildConnection(collection('accountTrades'), [], normalizedArgs);
-
-  const transactionFilter = { accountId: { equalTo: account } };
+  const transactionFilter = accountTransactionFilterFromArgs(args);
+  assertPublicConnectionQuery('accountTrades', orderBy, transactionFilter);
   const accountTransactionResult = await queryDocuments(
     context.repository,
     collection('accountTransactions'),
@@ -1476,7 +1450,7 @@ const accountTradesResolver = async (
   );
 
   const nodes = accountTransactionResult.items.map((document) =>
-    toAccountTradeNode(null, account, document)
+    toAccountTradeNode(null, readString(document.data.accountId), document)
   );
   return connectionFromNodes(
     collection('accountTransactions'),

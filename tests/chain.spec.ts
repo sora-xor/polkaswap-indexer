@@ -1725,6 +1725,58 @@ describe('ChainIndexer price derivation', () => {
     });
   });
 
+  it('normalizes staking unbond amounts to decimal XOR units', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 43 },
+                hash: { toString: () => canonicalBlockHash('staking-unbond-block') },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xstaking-unbond' },
+                  method: {
+                    section: 'staking',
+                    method: 'unbond',
+                    args: [(3n * SCALE).toString()],
+                    meta: { args: [{ name: 'value' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: { events: { at: async () => [] } },
+        timestamp: { now: { at: async () => ({ toString: () => '1700000000000' }) } },
+      },
+    };
+
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('staking-unbond-block'));
+
+    await expect(repository.get('historyElements', '0xstaking-unbond')).resolves.toMatchObject({
+      data: {
+        module: 'staking',
+        method: 'unbond',
+        data: { amount: '3', amountUSD: '6' },
+      },
+    });
+  });
+
   it('aggregates Polkamarkt batch claims without inventing payouts for skipped markets', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
@@ -2743,6 +2795,7 @@ describe('ChainIndexer price derivation', () => {
     await indexer.indexBlockByHash(canonicalBlockHash('ethincomingblock'));
 
     const history = await repository.get('historyElements', '0xethincoming');
+    const snapshot = await repository.get('networkSnapshots', 'block-43');
     const accountMeta = await repository.get('accountMeta', 'alice');
     const aliceActivity = await repository.get('accountTransactions', '0xethincoming-alice');
     const bridgeSignerActivity = await repository.get('accountTransactions', '0xethincoming-bridge-peer');
@@ -2762,9 +2815,70 @@ describe('ChainIndexer price derivation', () => {
         to: 'alice',
       },
     });
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(1);
     expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '8', outgoingUSD: '0' });
     expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: '0xethincoming' });
     expect(bridgeSignerActivity).toBeNull();
+  });
+
+  it('does not count bridge approvals without an asset transfer', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 44 },
+                hash: { toString: () => canonicalBlockHash('bridge-approvals-block') },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'bridge-peer' },
+                  hash: { toString: () => '0xmultisig-approval' },
+                  method: {
+                    section: 'bridgeMultisig',
+                    method: 'approveAsMulti',
+                    args: ['0xrequest'],
+                    meta: { args: [{ name: 'requestHash' }] },
+                  },
+                },
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'bridge-peer' },
+                  hash: { toString: () => '0xeth-approval' },
+                  method: {
+                    section: 'ethBridge',
+                    method: 'approveRequest',
+                    args: ['0xrequest'],
+                    meta: { args: [{ name: 'requestHash' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: { events: { at: async () => [] } },
+        timestamp: { now: { at: async () => ({ toString: () => '1700000000000' }) } },
+      },
+    };
+
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('bridge-approvals-block'));
+
+    await expect(repository.get('networkSnapshots', 'block-44')).resolves.toMatchObject({
+      data: {
+        bridgeIncomingTransactions: 0,
+        bridgeOutgoingTransactions: 0,
+      },
+    });
   });
 
   it('indexes bridgeProxy request events as mint history for EVM incoming restores', async () => {

@@ -150,6 +150,11 @@ describe('GraphQL filter compatibility', () => {
     ).toBe(true);
   });
 
+  it('treats substring metacharacters as ordinary characters', () => {
+    expect(matchesFilter({ module: 'assets' }, { module: { includesInsensitive: '%' } })).toBe(false);
+    expect(matchesFilter({ module: 'assets_%_bridge' }, { module: { includesInsensitive: '_%_' } })).toBe(true);
+  });
+
   it('fails numeric comparisons closed for invalid decimal values', () => {
     expect(matchesFilter({ liquidity: 'not-a-number' }, { liquidity: { greaterThanOrEqualTo: 0 } })).toBe(false);
     expect(matchesFilter({ liquidity: 'not-a-number' }, { liquidity: { greaterThan: 0 } })).toBe(false);
