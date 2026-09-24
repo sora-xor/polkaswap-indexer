@@ -26,8 +26,91 @@ vi.mock('pg', () => ({
 const { migrate, POSTGRES_DOCUMENT_CHECK_CONSTRAINTS, POSTGRES_QUERY_INDEX_DEFINITIONS, POSTGRES_SECONDARY_INDEX_DEFINITIONS } = await import(
   '../src/db/migrate.js'
 );
+const { SORA_LEGACY_IDENTITY_ANCHOR, SORA_MAINNET_GENESIS_HASH } = await import('../src/soraIdentity.js');
 
 const DATABASE_URL = 'postgres://polkaswap:polkaswap@localhost:5432/polkaswap_indexer';
+const BLOCK = 27_159_179;
+const TIMESTAMP = 1_783_900_000;
+const existingMetadata = {
+  relationKind: 'r',
+  keyColumnsValid: true,
+  primaryKeyValid: true,
+  rowSecurityEnabled: false,
+};
+const legacyState = {
+  collection: 'updatesStreams', id: 'chainState', blockHeight: String(BLOCK), timestamp: String(TIMESTAMP),
+  data: { id: 'chainState', block: BLOCK, data: JSON.stringify({ lastIndexedBlock: BLOCK }) },
+};
+const currentState = {
+  ...legacyState,
+  data: {
+    id: 'chainState', block: BLOCK,
+    data: JSON.stringify({
+      lastIndexedBlock: BLOCK,
+      genesisHash: SORA_MAINNET_GENESIS_HASH,
+      blockHash: `0x${'a'.repeat(64)}`,
+      blockTimestamp: TIMESTAMP,
+    }),
+  },
+};
+const matchingSnapshot = {
+  collection: 'networkSnapshots', id: `block-${BLOCK}`, blockHeight: String(BLOCK),
+  timestamp: String(TIMESTAMP),
+  data: { id: `block-${BLOCK}`, type: 'BLOCK', timestamp: TIMESTAMP },
+};
+const identityOnly = {
+  collection: 'updatesStreams', id: 'chainIdentity',
+  blockHeight: String(SORA_LEGACY_IDENTITY_ANCHOR.block),
+  timestamp: String(SORA_LEGACY_IDENTITY_ANCHOR.timestamp),
+  data: {
+    id: 'chainIdentity', block: SORA_LEGACY_IDENTITY_ANCHOR.block,
+    data: JSON.stringify({
+      schemaVersion: 1,
+      genesisHash: SORA_MAINNET_GENESIS_HASH,
+      verificationBlock: SORA_LEGACY_IDENTITY_ANCHOR.block,
+      verificationBlockHash: SORA_LEGACY_IDENTITY_ANCHOR.hash,
+      verificationBlockTimestamp: SORA_LEGACY_IDENTITY_ANCHOR.timestamp,
+      migration: 'fresh-database',
+    }),
+  },
+};
+const workerStatusKey = { collection: 'updatesStreams', id: 'workerStatus-v1' };
+
+const mockExistingDatabase = (options: {
+  metadata?: typeof existingMetadata;
+  firstRows?: { collection: string; id: string }[];
+  state?: typeof legacyState | typeof currentState | null;
+  snapshot?: typeof matchingSnapshot | null;
+  identity?: typeof identityOnly | null;
+}) => {
+  mocks.client.query.mockImplementation(async (sql: unknown, values?: unknown[]) => {
+    const statement = String(sql);
+    if (statement.includes('from pg_catalog.pg_class documents')) {
+      return { rows: [options.metadata ?? existingMetadata] };
+    }
+    if (statement.includes('order by collection, id limit 3')) {
+      return { rows: options.firstRows ?? [{ collection: 'assets', id: 'existing' }] };
+    }
+    if (statement.includes('from public.indexer_documents') && values?.[1] === 'chainState') {
+      return { rows: options.state === null ? [] : [options.state ?? legacyState] };
+    }
+    if (statement.includes('from public.indexer_documents') && values?.[1] === `block-${BLOCK}`) {
+      return { rows: options.snapshot === null ? [] : [options.snapshot ?? matchingSnapshot] };
+    }
+    if (statement.includes('from public.indexer_documents') && values?.[1] === 'chainIdentity') {
+      return { rows: options.identity === null ? [] : [options.identity ?? identityOnly] };
+    }
+    return { rows: [] };
+  });
+};
+
+const migrationStatements = (): string[] => mocks.client.query.mock.calls.map(([sql]) => String(sql));
+const expectNoMigrationDdl = (): void => {
+  expect(migrationStatements().some((sql) => /^\s*(create|alter|drop|comment|do\b)/i.test(sql))).toBe(false);
+  expect(migrationStatements()).toContain('rollback;');
+  expect(mocks.client.release).toHaveBeenCalledOnce();
+  expect(mocks.pool.end).toHaveBeenCalledOnce();
+};
 
 describe('migrate', () => {
   afterEach(() => {
@@ -49,6 +132,121 @@ describe('migrate', () => {
       .find((sql) => sql.includes('indexer_documents_collection_created_at_timestamp_idx'));
 
     expect(createIndexSql).toBeUndefined();
+  });
+
+  it('commits a read-only preflight for a fresh database before its first DDL', async () => {
+    mocks.client.query.mockResolvedValue({ rows: [] });
+
+    await migrate(DATABASE_URL);
+
+    const statements = migrationStatements();
+    expect(statements).toContain('begin transaction isolation level repeatable read read only;');
+    expect(statements.indexOf('commit;')).toBeGreaterThan(
+      statements.findIndex((sql) => sql.includes('from pg_catalog.pg_class documents'))
+    );
+    expect(statements.indexOf('commit;')).toBeLessThan(
+      statements.findIndex((sql) => sql.includes('create or replace function'))
+    );
+  });
+
+  it('rejects non-C collection/id collation and performs no DDL', async () => {
+    mockExistingDatabase({ metadata: { ...existingMetadata, keyColumnsValid: false } });
+
+    await expect(migrate(DATABASE_URL)).rejects.toThrow('indexer-documents-key-collation');
+
+    expect(migrationStatements()).toContain('begin transaction isolation level repeatable read read only;');
+    expectNoMigrationDdl();
+  });
+
+  it('rejects an existing database with no chainState and performs no DDL', async () => {
+    mockExistingDatabase({ state: null });
+
+    await expect(migrate(DATABASE_URL)).rejects.toThrow('chain-state-missing-or-malformed');
+
+    expectNoMigrationDdl();
+  });
+
+  it('allows the worker heartbeat-only startup state with a bounded key probe', async () => {
+    mockExistingDatabase({ firstRows: [workerStatusKey], state: null });
+
+    await migrate(DATABASE_URL);
+
+    const statements = migrationStatements();
+    expect(statements).toContain('commit;');
+    expect(statements).not.toContain('rollback;');
+    expect(mocks.client.query.mock.calls.some(([, values]) => values?.[1] === 'chainState')).toBe(false);
+  });
+
+  it('allows a valid identity-only startup state before DDL', async () => {
+    mockExistingDatabase({ firstRows: [identityOnly, workerStatusKey], state: null });
+
+    await migrate(DATABASE_URL);
+
+    expect(migrationStatements()).toContain('commit;');
+    expect(mocks.client.query.mock.calls.some(([, values]) => values?.[1] === 'chainIdentity')).toBe(true);
+  });
+
+  it('rejects a malformed identity-only startup state before DDL', async () => {
+    mockExistingDatabase({
+      firstRows: [identityOnly], state: null,
+      identity: { ...identityOnly, data: { ...identityOnly.data, data: '{bad json' } },
+    });
+
+    await expect(migrate(DATABASE_URL)).rejects.toThrow('chain-identity-malformed');
+
+    expectNoMigrationDdl();
+  });
+
+  it('rejects an extra document beside identity and heartbeat when chainState is absent', async () => {
+    mockExistingDatabase({
+      firstRows: [identityOnly, workerStatusKey, { collection: 'vaults', id: 'unexpected' }],
+      state: null,
+    });
+
+    await expect(migrate(DATABASE_URL)).rejects.toThrow('chain-state-missing-or-malformed');
+
+    expectNoMigrationDdl();
+  });
+
+  it('rejects a malformed legacy checkpoint and performs no DDL', async () => {
+    mockExistingDatabase({ state: { ...legacyState, data: { ...legacyState.data, block: BLOCK - 1 } } });
+
+    await expect(migrate(DATABASE_URL)).rejects.toThrow('chain-state-missing-or-malformed');
+
+    expectNoMigrationDdl();
+  });
+
+  it('rejects a missing exact chainState BLOCK snapshot and performs no DDL', async () => {
+    mockExistingDatabase({ snapshot: null });
+
+    await expect(migrate(DATABASE_URL)).rejects.toThrow('chain-state-block-snapshot-missing-or-malformed');
+
+    expect(migrationStatements().some((sql) => sql.includes('where collection = $1 and id = $2'))).toBe(true);
+    expectNoMigrationDdl();
+  });
+
+  it('rejects a current checkpoint whose snapshot timestamp differs and performs no DDL', async () => {
+    mockExistingDatabase({ state: currentState, snapshot: { ...matchingSnapshot, timestamp: String(TIMESTAMP + 1) } });
+
+    await expect(migrate(DATABASE_URL)).rejects.toThrow('chain-state-block-snapshot-missing-or-malformed');
+
+    expectNoMigrationDdl();
+  });
+
+  it.each([
+    ['legacy', legacyState],
+    ['current', currentState],
+  ])('accepts a coherent %s checkpoint and exact BLOCK snapshot before DDL', async (_label, state) => {
+    mockExistingDatabase({ state });
+
+    await migrate(DATABASE_URL);
+
+    const statements = migrationStatements();
+    expect(statements).toContain('commit;');
+    expect(statements.indexOf('commit;')).toBeLessThan(
+      statements.findIndex((sql) => sql.includes('create or replace function'))
+    );
+    expect(statements).not.toContain('rollback;');
   });
 
   it('constructs the migration pool with dedicated long-running operation timeouts', async () => {
