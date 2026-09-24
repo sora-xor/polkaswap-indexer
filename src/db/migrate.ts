@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import pg from 'pg';
 
 import { readConfig } from '../config.js';
+import { POSTGRES_TRUSTED_SESSION_OPTIONS } from '../postgres-session.js';
 import { POSTGRES_WORKER_LEASE_FENCE_TABLE_SQL } from '../postgres-worker-fence.js';
 import { INDEXER_COLLECTIONS } from '../repository/types.js';
 import {
@@ -15,7 +16,7 @@ const { Pool } = pg;
 const NUMERIC_TEXT_PATTERN = "^-?[0-9]+(\\.[0-9]+)?$";
 const MIGRATION_LOCK_KEY = 4_350_435_000;
 
-type MigrationRuntimeConfig = Pick<
+export type MigrationRuntimeConfig = Pick<
   import('../config.js').AppConfig,
   | 'databaseUrl'
   | 'postgresConnectionTimeoutMs'
@@ -81,7 +82,7 @@ export type PostgresDocumentCheckConstraint = {
  * the JavaScript safe-integer domain shared by both engines.
  */
 export const POSTGRES_EXACT_JSON_NUMERIC_FUNCTIONS_SQL = `
-  create or replace function indexer_json_number_is_exact_v1(candidate numeric)
+  create or replace function public.indexer_json_number_is_exact_v1(candidate numeric)
   returns boolean
   language plpgsql
   immutable
@@ -107,7 +108,7 @@ export const POSTGRES_EXACT_JSON_NUMERIC_FUNCTIONS_SQL = `
   end;
   $$;
 
-  create or replace function indexer_json_numbers_are_exact_v1(candidate jsonb)
+  create or replace function public.indexer_json_numbers_are_exact_v1(candidate jsonb)
   returns boolean
   language sql
   immutable
@@ -122,12 +123,12 @@ export const POSTGRES_EXACT_JSON_NUMERIC_FUNCTIONS_SQL = `
              ) as numeric_values(value)
        where case
          when octet_length(value #>> '{}') > 1024 then true
-         else not indexer_json_number_is_exact_v1((value #>> '{}')::numeric)
+         else not public.indexer_json_number_is_exact_v1((value #>> '{}')::numeric)
        end
     )
   $$;
 
-  create or replace function indexer_json_runtime_u32_array_is_valid_v1(candidate jsonb)
+  create or replace function public.indexer_json_runtime_u32_array_is_valid_v1(candidate jsonb)
   returns boolean
   language plpgsql
   immutable
@@ -183,7 +184,7 @@ const postgresPolkamarktProjection =
   `or (collection = 'accountTransactions' and (data ? 'marketId' or data ? 'marketIds')))`;
 const postgresPolkamarktMarketIdsCheck =
   `(case when not data ? 'marketIds' or jsonb_typeof(data->'marketIds') = 'null' then true ` +
-  `when not indexer_json_runtime_u32_array_is_valid_v1(data->'marketIds') then false ` +
+  `when not public.indexer_json_runtime_u32_array_is_valid_v1(data->'marketIds') then false ` +
   `else data ? 'marketId' and data->'marketIds'->>0 = data->>'marketId' end)`;
 
 /** Database-level backstop for the repository write contract. */
@@ -222,7 +223,7 @@ export const POSTGRES_DOCUMENT_CHECK_CONSTRAINTS: readonly PostgresDocumentCheck
   },
   {
     name: 'indexer_documents_json_numbers_v1_check',
-    expression: `indexer_json_numbers_are_exact_v1(data)`,
+    expression: `public.indexer_json_numbers_are_exact_v1(data)`,
   },
   {
     name: 'indexer_documents_indexed_strings_v1_check',
@@ -506,6 +507,7 @@ export const POSTGRES_SECONDARY_INDEX_DEFINITIONS: readonly PostgresQueryIndexDe
 ];
 
 const quoteIdentifier = (value: string): string => `"${value.replace(/"/g, '""')}"`;
+const publicIdentifier = (value: string): string => `public.${quoteIdentifier(value)}`;
 
 const indexManifestComment = ({ definition, predicate, using = 'btree' }: PostgresQueryIndexDefinition): string => {
   const fingerprint = createHash('sha256')
@@ -574,6 +576,7 @@ export async function migrate(input: string | MigrationRuntimeConfig = readConfi
     connectionTimeoutMillis: config.postgresConnectionTimeoutMs,
     query_timeout: config.postgresMigrationQueryTimeoutMs,
     statement_timeout: config.postgresMigrationStatementTimeoutMs,
+    options: POSTGRES_TRUSTED_SESSION_OPTIONS,
   });
   pool.on('error', () => {
     console.error('PostgreSQL migration pool reported an idle client error');
@@ -592,17 +595,17 @@ export async function migrate(input: string | MigrationRuntimeConfig = readConfi
               i.indisvalid as "isValid"
        from pg_index i
        where i.indexrelid = to_regclass($1)`,
-      [name]
+      [`public.${name}`]
     );
     const current = existing.rows[0];
     if (current && (current.manifestComment !== expectedComment || current.isValid !== true)) {
-      await client.query(`drop index concurrently ${quoteIdentifier(name)};`);
+      await client.query(`drop index concurrently ${publicIdentifier(name)};`);
     }
     if (!current || current.manifestComment !== expectedComment || current.isValid !== true) {
       await client.query(
-        `create index concurrently ${quoteIdentifier(name)} on indexer_documents using ${using} (${definition.definition}) where ${predicate};`
+        `create index concurrently ${quoteIdentifier(name)} on public.indexer_documents using ${using} (${definition.definition}) where ${predicate};`
       );
-      await client.query(`comment on index ${quoteIdentifier(name)} is '${expectedComment}';`);
+      await client.query(`comment on index ${publicIdentifier(name)} is '${expectedComment}';`);
     }
   };
   const ensureDocumentCheckConstraint = async ({
@@ -617,7 +620,7 @@ export async function migrate(input: string | MigrationRuntimeConfig = readConfi
       `select obj_description(c.oid, 'pg_constraint') as "manifestComment",
               c.convalidated as "isValid"
        from pg_constraint c
-       where c.conrelid = 'indexer_documents'::regclass
+       where c.conrelid = 'public.indexer_documents'::regclass
          and c.conname = $1
          and c.contype = 'c'`,
       [name]
@@ -625,15 +628,17 @@ export async function migrate(input: string | MigrationRuntimeConfig = readConfi
     let current: (typeof existing.rows)[number] | undefined = existing.rows[0];
 
     if (current && current.manifestComment !== expectedComment) {
-      await client.query(`alter table indexer_documents drop constraint ${quoteIdentifier(name)};`);
+      await client.query(
+        `alter table public.indexer_documents drop constraint ${quoteIdentifier(name)};`
+      );
       current = undefined;
     }
     if (!current) {
       await client.query(
-        `alter table indexer_documents add constraint ${quoteIdentifier(name)} check (${expression}) not valid;`
+        `alter table public.indexer_documents add constraint ${quoteIdentifier(name)} check (${expression}) not valid;`
       );
       await client.query(
-        `comment on constraint ${quoteIdentifier(name)} on indexer_documents is '${expectedComment}';`
+        `comment on constraint ${quoteIdentifier(name)} on public.indexer_documents is '${expectedComment}';`
       );
       return false;
     }
@@ -645,7 +650,7 @@ export async function migrate(input: string | MigrationRuntimeConfig = readConfi
     await client.query('select pg_advisory_lock($1);', [MIGRATION_LOCK_KEY]);
     await client.query(POSTGRES_EXACT_JSON_NUMERIC_FUNCTIONS_SQL);
     await client.query(`
-      create table if not exists indexer_documents (
+      create table if not exists public.indexer_documents (
         collection text collate "C" not null,
         id text collate "C" not null,
         block_height bigint,
@@ -664,7 +669,7 @@ export async function migrate(input: string | MigrationRuntimeConfig = readConfi
         if exists (
           select 1
           from pg_attribute
-          where attrelid = 'indexer_documents'::regclass
+          where attrelid = 'public.indexer_documents'::regclass
             and attname in ('collection', 'id')
             and attcollation <> '"C"'::regcollation
         ) then
@@ -679,20 +684,24 @@ export async function migrate(input: string | MigrationRuntimeConfig = readConfi
     }
     for (const { name } of pendingConstraintValidation) {
       await client.query(
-        `alter table indexer_documents validate constraint ${quoteIdentifier(name)};`
+        `alter table public.indexer_documents validate constraint ${quoteIdentifier(name)};`
       );
     }
     // Keep the prior constraint active until its reviewed replacement both
     // protects new writes and validates retained documents.
     for (const name of OBSOLETE_DOCUMENT_CHECK_CONSTRAINTS) {
       await client.query(
-        `alter table indexer_documents drop constraint if exists ${quoteIdentifier(name)};`
+        `alter table public.indexer_documents drop constraint if exists ${quoteIdentifier(name)};`
       );
     }
-    await client.query('drop index if exists indexer_documents_collection_timestamp_idx;');
-    await client.query('drop index if exists indexer_documents_collection_block_idx;');
+    await client.query(
+      'drop index if exists public.indexer_documents_collection_timestamp_idx;'
+    );
+    await client.query(
+      'drop index if exists public.indexer_documents_collection_block_idx;'
+    );
     for (const name of OBSOLETE_BROAD_QUERY_INDEXES) {
-      await client.query(`drop index if exists ${quoteIdentifier(name)};`);
+      await client.query(`drop index if exists ${publicIdentifier(name)};`);
     }
     for (const definition of POSTGRES_SECONDARY_INDEX_DEFINITIONS) {
       await ensureAuditedIndex(definition);

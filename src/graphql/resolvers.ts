@@ -19,6 +19,7 @@ import {
   parseRuntimeUInt32,
 } from '../repository/validation.js';
 import {
+  isStoredSoraChainStateCoherent,
   parseStoredSoraChainIdentity,
   parseStoredSoraChainState,
   SORA_LEGACY_IDENTITY_ANCHOR,
@@ -46,7 +47,7 @@ import type {
   RepositoryWatchMutation,
 } from '../repository/types.js';
 import type { ChainIndexerStatusProvider } from '../worker/status.js';
-import type { AppConfig } from '../config.js';
+import type { AppConfig, MobileCapabilities } from '../config.js';
 import type { GraphQLResolveInfo, GraphQLSchema, SelectionNode } from 'graphql';
 
 type Context = {
@@ -558,26 +559,21 @@ const toConnectionNode = (collectionName: IndexerCollection, document: IndexerDo
   };
 };
 
-const mobileConfigResolver = (
-  config: Pick<
-    AppConfig,
-    | 'nexusAvailable'
-    | 'nexusSendsAvailable'
-    | 'polkamarktVisible'
-    | 'polkamarktMutationsAvailable'
-    | 'tairaDefaultVisible'
-  >
-) => ({
+const DEFAULT_MOBILE_CAPABILITIES: MobileCapabilities = Object.freeze({
+  nexusAvailable: true,
+  nexusSendsAvailable: false,
+  polkamarktVisible: true,
+  polkamarktMutationsAvailable: false,
+  tairaDefaultVisible: true,
+});
+
+const mobileConfigResolver = (capabilities: MobileCapabilities) => ({
   blockExplorerUrl: 'https://sorametrics.org/sorav2?tab=extrinsics&q={transaction}',
   substrateTypesUrl:
     'https://raw.githubusercontent.com/sora-xor/sora2-substrate-js-library/metadata14ios/packages/types/src/metadata/prod/types_scalecodec_mobile.json',
   soracard: false,
   nodes: [{ name: 'Sora', address: 'wss://mof2.sora.org' }],
-  nexusAvailable: config.nexusAvailable,
-  nexusSendsAvailable: config.nexusSendsAvailable,
-  polkamarktVisible: config.polkamarktVisible,
-  polkamarktMutationsAvailable: config.polkamarktMutationsAvailable,
-  tairaDefaultVisible: config.tairaDefaultVisible,
+  ...capabilities,
 });
 
 const activeAssetFilter = {
@@ -1998,7 +1994,6 @@ const parsedUpdateStreamData = (document: IndexerDocument | null, expectedId: st
   ) {
     return null;
   }
-
   try {
     return JSON.parse(document.data.data);
   } catch {
@@ -2046,13 +2041,18 @@ const healthResolver = async (_parent: unknown, _args: unknown, context: Context
   const checkpointCoherent =
     identityValid &&
     stateValid &&
-    state.lastIndexedBlock >= identity.verificationBlock &&
-    state.blockTimestamp >= identity.verificationBlockTimestamp;
+    identity !== null &&
+    state !== null &&
+    isStoredSoraChainStateCoherent(identity, state);
   const checkpointFresh =
     stateAge >= -MAX_HEALTH_FUTURE_SKEW_SECONDS && stateAge <= MAX_HEALTH_AGE_SECONDS;
+  const workerCheckpointCoherent =
+    state !== null &&
+    workerStatus !== null &&
+    workerStatus.latestIndexedBlock === state.lastIndexedBlock;
 
   return {
-    ok: readiness.ok && checkpointCoherent && checkpointFresh,
+    ok: readiness.ok && checkpointCoherent && checkpointFresh && workerCheckpointCoherent,
     repositoryReady: readiness.repositoryReady,
     service: 'polkaswap-indexer',
     serviceId: POLKASWAP_SERVICE_ID,
@@ -2082,29 +2082,21 @@ const healthResolver = async (_parent: unknown, _args: unknown, context: Context
 
 type GraphqlResolverConfig = Pick<
   AppConfig,
-  | 'graphqlCacheMaxEntries'
-  | 'graphqlCacheMaxBytes'
-  | 'graphqlCacheTtlMs'
-  | 'nexusAvailable'
-  | 'nexusSendsAvailable'
-  | 'polkamarktVisible'
-  | 'polkamarktMutationsAvailable'
-  | 'tairaDefaultVisible'
-> & Partial<Pick<AppConfig, 'graphqlMaxResultBytes'>>;
+  'graphqlCacheMaxEntries' | 'graphqlCacheMaxBytes' | 'graphqlCacheTtlMs'
+> & Partial<Pick<AppConfig, 'graphqlMaxResultBytes' | 'mobileCapabilities'>>;
 
 const DEFAULT_GRAPHQL_CACHE_CONFIG: GraphqlResolverConfig = {
   graphqlCacheMaxEntries: 1_000,
   graphqlCacheMaxBytes: 64 * 1_024 * 1_024,
   graphqlCacheTtlMs: 2_000,
   graphqlMaxResultBytes: DEFAULT_GRAPHQL_QUERY_MAX_BYTES,
-  nexusAvailable: false,
-  nexusSendsAvailable: false,
-  polkamarktVisible: false,
-  polkamarktMutationsAvailable: false,
-  tairaDefaultVisible: true,
+  mobileCapabilities: DEFAULT_MOBILE_CAPABILITIES,
 };
 
 export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CACHE_CONFIG): GraphQLSchema {
+  const mobileCapabilities: MobileCapabilities = Object.freeze({
+    ...(config.mobileCapabilities ?? DEFAULT_MOBILE_CAPABILITIES),
+  });
   const cache = new TtlCache({
     maxEntries: config.graphqlCacheMaxEntries,
     maxBytes: config.graphqlCacheMaxBytes,
@@ -2146,7 +2138,7 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
       ...FilterScalars,
       Query: {
         _health: healthResolver,
-        mobileConfig: () => mobileConfigResolver(config),
+        mobileConfig: () => mobileConfigResolver(mobileCapabilities),
         account: documentResolver(collection('accounts')),
         assets: connectionResolver(collection('assets')),
         assetSnapshots: connectionResolver(collection('assetSnapshots')),

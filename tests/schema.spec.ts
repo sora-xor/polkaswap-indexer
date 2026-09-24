@@ -615,25 +615,48 @@ describe('Polkaswap indexer schema', () => {
         'https://raw.githubusercontent.com/sora-xor/sora2-substrate-js-library/metadata14ios/packages/types/src/metadata/prod/types_scalecodec_mobile.json',
       soracard: false,
       nodes: [{ name: 'Sora', address: 'wss://mof2.sora.org' }],
-      nexusAvailable: false,
+      nexusAvailable: true,
       nexusSendsAvailable: false,
-      polkamarktVisible: false,
+      polkamarktVisible: true,
       polkamarktMutationsAvailable: false,
       tairaDefaultVisible: true,
     });
+  });
 
-    const enabledSchema = createSchema({
-      graphqlCacheMaxEntries: 1,
-      graphqlCacheMaxBytes: 1_024,
-      graphqlCacheTtlMs: 0,
+  it('declares every mobile capability as a non-null Boolean', () => {
+    const mobileConfig = createSchema().getType('MobileConfig');
+    expect(mobileConfig?.toString()).toBe('MobileConfig');
+    const fields = (mobileConfig as GraphQLObjectType).getFields();
+    for (const name of [
+      'nexusAvailable',
+      'nexusSendsAvailable',
+      'polkamarktVisible',
+      'polkamarktMutationsAvailable',
+      'tairaDefaultVisible',
+    ]) {
+      expect(fields[name]?.type.toString()).toBe('Boolean!');
+    }
+  });
+
+  it('projects explicitly admitted mobile capabilities without widening defaults', () => {
+    const capabilities = {
       nexusAvailable: true,
       nexusSendsAvailable: true,
       polkamarktVisible: true,
       polkamarktMutationsAvailable: true,
       tairaDefaultVisible: true,
+    };
+    const schema = createSchema({
+      graphqlCacheMaxEntries: 1,
+      graphqlCacheMaxBytes: 1_024,
+      graphqlCacheTtlMs: 1,
+      mobileCapabilities: capabilities,
     });
+    capabilities.nexusAvailable = false;
+    const mobileConfigField = schema.getQueryType()?.getFields().mobileConfig;
+
     expect(
-      enabledSchema.getQueryType()?.getFields().mobileConfig?.resolve?.(
+      mobileConfigField?.resolve?.(
         {},
         {},
         { repository: new MemoryRepository() },
@@ -1067,8 +1090,7 @@ describe('Polkaswap indexer schema', () => {
   });
 
   it('fails closed when indexed Polkamarkt signal quantities are malformed', async () => {
-    const repository = new MemoryRepository();
-    await repository.upsert({
+    const malformedMarket: IndexerDocument = {
       collection: 'markets',
       id: 'invalid-quantity',
       data: {
@@ -1077,7 +1099,12 @@ describe('Polkaswap indexer schema', () => {
         liquidityUSD: '1',
         volumeUSD: '1e3',
       },
-    });
+    };
+    const repository = repositoryWithQuery(async (collection) => ({
+      items: collection === 'markets' ? [malformedMarket] : [],
+      totalCount: null,
+      hasNextPage: false,
+    }));
     const signalsField = createSchema().getQueryType()?.getFields().polkamarktSignals;
 
     await expect(

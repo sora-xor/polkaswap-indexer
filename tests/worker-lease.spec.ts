@@ -74,6 +74,7 @@ describe('Postgres chain-worker lease', () => {
       connectionTimeoutMillis: 1_234,
       query_timeout: 5_678,
       statement_timeout: 9_012,
+      options: '-c search_path=pg_catalog,public,pg_temp',
       keepAlive: true,
       application_name: 'polkaswap-indexer-chain-worker-lease',
     });

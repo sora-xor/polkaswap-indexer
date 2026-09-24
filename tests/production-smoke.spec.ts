@@ -48,6 +48,14 @@ const validHealth = {
 
 const readyWorkerHealth = validHealth;
 
+const validMobileCapabilities = {
+  nexusAvailable: true,
+  nexusSendsAvailable: false,
+  polkamarktVisible: true,
+  polkamarktMutationsAvailable: false,
+  tairaDefaultVisible: true,
+};
+
 const jsonResponse = (body: unknown, init: ResponseInit = {}): Response =>
   new Response(JSON.stringify(body), {
     status: 200,
@@ -60,6 +68,7 @@ const validWorkerState = (
   block = VALID_BLOCK,
   blockHash = VALID_BLOCK_HASH,
 ) => ({
+  mobileConfig: validMobileCapabilities,
   chainIdentity: {
     id: 'chainIdentity',
     block: IDENTITY_BLOCK,
@@ -170,6 +179,10 @@ describe('Polkaswap production smoke', () => {
     expect(init?.signal).toBeInstanceOf(AbortSignal);
     expect((init?.headers as Record<string, string>)['cache-control']).toBe('no-store');
     expect(String(init?.body)).toContain('_health');
+    expect(String(init?.body)).toContain('mobileConfig');
+    for (const field of Object.keys(validMobileCapabilities)) {
+      expect(String(init?.body)).toContain(field);
+    }
     expect(String(init?.body)).toContain('chainIdentity: updatesStream(id: \\"chainIdentity\\")');
     expect(String(init?.body)).toContain('chainState: updatesStream(id: \\"chainState\\")');
     expect(String(init?.body)).toContain('networkSnapshots');
@@ -233,9 +246,9 @@ describe('Polkaswap production smoke', () => {
       createPersistedWorkerStatusDocument({
         lifecycle: 'running',
         startupComplete: true,
-        latestFinalizedBlock: VALID_BLOCK + 5,
+        latestFinalizedBlock: VALID_BLOCK,
         latestIndexedBlock: VALID_BLOCK,
-        lag: 5,
+        lag: 0,
         lastSuccessfulIndexTimestamp: now,
         lastError: null,
         lastErrorTimestamp: null,
@@ -331,19 +344,68 @@ describe('Polkaswap production smoke', () => {
     ).resolves.toBeUndefined();
   });
 
-  it('accepts a healthy persisted worker heartbeat that trails the exact chain checkpoint', async () => {
-    await expect(
-      runProductionSmoke(
-        'https://pi.soramitsu.io/graphql',
-        fetchWithHealth({
-          ...readyWorkerHealth,
-          workerLatestFinalizedBlock: VALID_BLOCK,
-          workerLatestIndexedBlock: VALID_BLOCK - 1,
-          workerLag: 1,
-          workerLastSuccessfulIndexTimestamp: VALID_TIMESTAMP - 1,
-        }),
-      ),
-    ).resolves.toBeUndefined();
+  it.each([200, 400])('rejects an old production schema that omits the mobile capability contract over HTTP %i', async (status) => {
+    const errors = Object.keys(validMobileCapabilities).map((field) => ({
+      message: `Cannot query field "${field}" on type "MobileConfig".`,
+    }));
+    const fetchImpl = vi.fn(async () => jsonResponse({ data: null, errors }, { status }));
+
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
+      /missing mobile capability fields \(nexusAvailable, nexusSendsAvailable, polkamarktVisible, polkamarktMutationsAvailable, tairaDefaultVisible\)/
+    );
+  });
+
+  it.each(Object.keys(validMobileCapabilities))('rejects missing mobile capability %s', async (field) => {
+    const mobileConfig: Record<string, unknown> = { ...validMobileCapabilities };
+    delete mobileConfig[field];
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      data: { _health: validHealth, ...validWorkerState(), mobileConfig },
+    }));
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
+      `mobile capability ${field} must be boolean`
+    );
+  });
+
+  it.each(Object.keys(validMobileCapabilities))('rejects non-Boolean mobile capability %s', async (field) => {
+    const mobileConfig: Record<string, unknown> = { ...validMobileCapabilities, [field]: 'true' };
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      data: { _health: validHealth, ...validWorkerState(), mobileConfig },
+    }));
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
+      `mobile capability ${field} must be boolean`
+    );
+  });
+
+  it.each([
+    [{ ...validMobileCapabilities, nexusAvailable: false, nexusSendsAvailable: true }, 'Nexus sends require Nexus availability'],
+    [{ ...validMobileCapabilities, polkamarktVisible: false, polkamarktMutationsAvailable: true }, 'Polkamarkt mutations require visibility'],
+  ])('rejects an incoherent mobile capability projection', async (mobileConfig, message) => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      data: { _health: validHealth, ...validWorkerState(), mobileConfig },
+    }));
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(message);
+  });
+
+  it.each([
+    {
+      nexusAvailable: false,
+      nexusSendsAvailable: false,
+      polkamarktVisible: false,
+      polkamarktMutationsAvailable: false,
+      tairaDefaultVisible: false,
+    },
+    {
+      nexusAvailable: true,
+      nexusSendsAvailable: true,
+      polkamarktVisible: true,
+      polkamarktMutationsAvailable: true,
+      tairaDefaultVisible: true,
+    },
+  ])('accepts a coherent emergency or promoted mobile capability projection', async (mobileConfig) => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      data: { _health: validHealth, ...validWorkerState(), mobileConfig },
+    }));
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).resolves.toBeUndefined();
   });
 
   it('rejects an available worker that is not ready even if the top-level flag is inconsistent', async () => {
@@ -668,6 +730,31 @@ describe('Polkaswap production smoke', () => {
     );
   });
 
+  it('rejects an equal-height chainState with a hash different from chainIdentity', async () => {
+    const timestamp = IDENTITY_TIMESTAMP;
+    const blockHash = `0x${'cd'.repeat(32)}`;
+    const worker = validWorkerState(timestamp, IDENTITY_BLOCK, blockHash);
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      data: {
+        _health: {
+          ...validHealth,
+          latestIndexedBlock: IDENTITY_BLOCK,
+          latestIndexedBlockHash: blockHash,
+          latestIndexedAt: timestamp,
+          workerLatestFinalizedBlock: IDENTITY_BLOCK,
+          workerLatestIndexedBlock: IDENTITY_BLOCK,
+          workerLag: 0,
+          workerLastSuccessfulIndexTimestamp: timestamp,
+        },
+        ...worker,
+      },
+    }));
+
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
+      'chainState is incoherent with its immutable chainIdentity checkpoint'
+    );
+  });
+
   it('rejects stale or future coherent worker checkpoint timestamps', async () => {
     for (const timestamp of [
       Math.floor(Date.now() / 1000) - 301,
@@ -705,6 +792,27 @@ describe('Polkaswap production smoke', () => {
           workerLastSuccessfulIndexTimestamp: timestamp,
         },
         ...worker,
+      },
+    }));
+
+    try {
+      await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).resolves.toBeUndefined();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('allows the worker commit time to be newer than the indexed block timestamp', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(VALID_TIMESTAMP * 1_000);
+    const blockTimestamp = VALID_TIMESTAMP - 10;
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      data: {
+        _health: {
+          ...validHealth,
+          latestIndexedAt: blockTimestamp,
+          workerLastSuccessfulIndexTimestamp: VALID_TIMESTAMP,
+        },
+        ...validWorkerState(blockTimestamp),
       },
     }));
 
@@ -764,6 +872,19 @@ describe('Polkaswap production smoke', () => {
 
     await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
       'health latestIndexedBlockHash must match chainState',
+    );
+  });
+
+  it('rejects a ready worker heartbeat that does not identify the persisted chainState', async () => {
+    const fetchImpl = fetchWithHealth({
+      ...validHealth,
+      workerLatestFinalizedBlock: VALID_BLOCK + 5,
+      workerLatestIndexedBlock: VALID_BLOCK - 1,
+      workerLag: 6,
+    });
+
+    await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
+      'health workerLatestIndexedBlock must match chainState',
     );
   });
 

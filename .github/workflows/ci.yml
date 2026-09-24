@@ -58,6 +58,9 @@ jobs:
       - name: Reject duplicate dependency resolutions
         run: yarn dedupe --check
 
+      - name: Audit all dependencies
+        run: yarn audit:dependencies
+
       - name: Audit production dependencies
         run: yarn audit:dependencies:production
 
@@ -112,6 +115,15 @@ jobs:
         run: |
           docker compose --profile postgres config --quiet
           docker compose --profile rocksdb config --quiet
+          POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.invalid/polkaswap-indexer \
+          POLKASWAP_INDEXER_IMAGE_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+          POLKASWAP_MIGRATION_OWNER_DATABASE_URL=postgres://migration-owner:owner-test-only@database.invalid:5432/polkaswap?sslmode=verify-full \
+          POLKASWAP_API_DATABASE_URL=postgres://api-runtime:api-test-only@database.invalid:5432/polkaswap?sslmode=verify-full \
+          POLKASWAP_WORKER_DATABASE_URL=postgres://worker-runtime:worker-test-only@database.invalid:5432/polkaswap?sslmode=verify-full \
+          POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
+          POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
+          POLKASWAP_CHAIN_START_BLOCK=14000000 \
+            docker compose -f docker-compose.production.yml config --quiet
 
       - name: Build
         run: yarn build
@@ -127,25 +139,16 @@ jobs:
       - name: Build production container
         run: docker build --tag polkaswap-indexer:ci .
 
-      - name: Verify production image dependency and user contract
+      - name: Verify production image user and dependency boundary
         run: |
-          test "$(docker image inspect --format '{{.Config.User}}' polkaswap-indexer:ci)" = "node"
-          docker run --rm --entrypoint node polkaswap-indexer:ci -e '
-            for (const name of ["graphql", "pg", "@polkadot/api"]) {
-              require.resolve(name);
-            }
-            for (const name of ["typescript", "vitest", "tsx"]) {
-              try {
-                require.resolve(name);
-                console.error(`Development-only dependency leaked into runtime image: ${name}`);
-                process.exitCode = 1;
-              } catch (error) {
-                if (error?.code !== "MODULE_NOT_FOUND") throw error;
-              }
-            }
-          '
+          test "$(docker image inspect --format '{{.Config.User}}' polkaswap-indexer:ci)" = node
+          docker run --rm --entrypoint node polkaswap-indexer:ci -e \
+            "const {createRequire}=await import('node:module');const require=createRequire(import.meta.url);for(const name of ['@babel/runtime/helpers/typeof','@graphql-tools/schema','@harperfast/rocksdb-js','@polkadot/api','@sora-substrate/type-definitions','graphql','graphql-ws','graphql-yoga','pg','ws'])require.resolve(name);for(const name of ['tsx','typescript','vitest']){let found=true;try{require.resolve(name)}catch{found=false}if(found)throw new Error('development dependency shipped: '+name)}"
 
       - name: Verify native RocksDB runtime in production container
         run: >-
           docker run --rm --entrypoint node polkaswap-indexer:ci -e
           "import('@harperfast/rocksdb-js').then(async ({RocksDatabase})=>{const db=RocksDatabase.open('/data/ci-native-smoke.rocksdb');await db.put('ready',true);if(db.getSync('ready')!==true)throw new Error('RocksDB native round trip failed');db.close()})"
+
+      - name: Verify production PostgreSQL migration and runtime handoff
+        run: POLKASWAP_TEST_IMAGE=polkaswap-indexer:ci yarn test:production-database-deployment

@@ -38,9 +38,6 @@ describe('Compose worker environments', () => {
 
     expect(environment).toMatch(/^      NODE_ENV: production$/m);
     expect(environment).toMatch(
-      /^      MOBILE_TAIRA_DEFAULT_VISIBLE: "\$\{MOBILE_TAIRA_DEFAULT_VISIBLE:-true\}"$/m,
-    );
-    expect(environment).toMatch(
       /^      SORA_ARCHIVE_WS_ENDPOINT: "\$\{POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT:\?[^}]+\}"$/m,
     );
   });

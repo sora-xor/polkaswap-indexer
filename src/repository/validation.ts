@@ -380,11 +380,14 @@ const validatePolkamarktRuntimeUInt32Tree = (value: unknown, path: string): void
         invalidData(`${path}.${key} must be a canonical runtime u32 integer`);
       }
     } else if (key === 'marketIds' && child !== null && child !== undefined) {
-      if (!Array.isArray(child) || child.length === 0 || child.length > 24) {
+      const marketIds = Array.isArray(child)
+        ? child
+        : invalidData(`${path}.${key} must contain between 1 and 24 canonical runtime u32 integers`);
+      if (marketIds.length === 0 || marketIds.length > 24) {
         invalidData(`${path}.${key} must contain between 1 and 24 canonical runtime u32 integers`);
       }
       const canonicalMarketIds: number[] = [];
-      for (const marketId of child) {
+      for (const marketId of marketIds) {
         try {
           canonicalMarketIds.push(
             parseRuntimeUInt32(marketId, `${path}.${key}`)
@@ -405,12 +408,13 @@ const validatePolkamarktMarketIdsPrimary = (data: Record<string, unknown>): void
   if (data.marketIds === null || data.marketIds === undefined) return;
 
   const marketIds = data.marketIds as unknown[];
-  let marketId: number;
-  try {
-    marketId = parseRuntimeUInt32(data.marketId, 'data.marketId');
-  } catch {
-    invalidData('data.marketId must identify the first market in data.marketIds');
-  }
+  const marketId = (() => {
+    try {
+      return parseRuntimeUInt32(data.marketId, 'data.marketId');
+    } catch {
+      return invalidData('data.marketId must identify the first market in data.marketIds');
+    }
+  })();
   if (parseRuntimeUInt32(marketIds[0], 'data.marketIds[0]') !== marketId) {
     invalidData('data.marketId must identify the first market in data.marketIds');
   }
