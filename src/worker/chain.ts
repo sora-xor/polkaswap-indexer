@@ -11,6 +11,7 @@ import {
 } from '../config.js';
 import { compareLexical } from '../lexical.js';
 import { metrics } from '../metrics.js';
+import { TONSWAP_START_BLOCK, TONSWAP_COVERAGE_ID, createTonswapBurnCoverage, parseTonswapBurnCoverage, isTonswapBurnRemark } from '../tonswap-burn.js';
 import { createRepositoryCursorScope } from '../repository/cursor.js';
 import type { IndexerCollection, IndexerDocument, IndexerRepository, RepositoryQueryArgs } from '../repository/types.js';
 import { MAX_REPOSITORY_WRITE_CALL_DOCUMENTS } from '../repository/validation.js';
@@ -76,6 +77,7 @@ type CallLike = {
 
 type BlockExtrinsicContext = {
   id: string;
+  extrinsicIndex?: number;
   module: string;
   method: string;
   address: string;
@@ -1242,6 +1244,15 @@ const getBatchAllNexusRecipient = (context: BlockExtrinsicContext): string | und
   return parseSoraNexusRecipient(remarkArgs.remark ?? remarkArgs.arg0);
 };
 
+/** Recognizes only an atomic XOR burn followed by the exact TS marker. */
+const getTonswapCampaign = (module: string, method: string, calls: IndexedCall[]): 'tonswap' | undefined => {
+  const [burn, remark] = calls;
+  if (module !== 'utility' || method !== 'batchAll' || calls.length !== 2 ||
+    !burn || !isXorBurnCall(burn) || remark?.module !== 'system' || remark.method !== 'remark') return undefined;
+  const args = getCallArgs(remark);
+  return isTonswapBurnRemark(args.remark ?? args.arg0) ? 'tonswap' : undefined;
+};
+
 /**
  * Emits compact XOR burn documents so the burn page does not need an expensive historyElements scan.
  */
@@ -1264,6 +1275,8 @@ const createXorBurnDocuments = (
       blockHeight,
       timestamp,
       txHash: context.id,
+      ...(context.extrinsicIndex === undefined ? {} : { extrinsicIndex: context.extrinsicIndex }),
+      ...(getTonswapCampaign(context.module, context.method, context.calls) ? { campaign: 'tonswap' } : {}),
       ...(nexusRecipient ? { nexusRecipient } : {}),
     },
   });
@@ -1365,6 +1378,9 @@ const createXorBurnDocumentsFromEvents = (
           blockHeight,
           ...(timestamp === null ? {} : { timestamp }),
           ...(txHash ? { txHash } : {}),
+          ...(burn.extrinsicIndex === null ? {} : { extrinsicIndex: burn.extrinsicIndex }),
+          ...(extrinsic && getTonswapCampaign(extrinsic.method.section, extrinsic.method.method, getUtilityCalls(extrinsic))
+            ? { campaign: 'tonswap' } : {}),
           ...(nexusRecipient ? { nexusRecipient } : {}),
         },
       },
@@ -2701,6 +2717,10 @@ export class ChainIndexer {
       // loading it earlier would leak future prices into historical rows.
       const caughtUpBlock = await this.getLastIndexedBlock();
       const projectionBlock = Math.max(0, Math.min(finalizedBlock, caughtUpBlock));
+      // New campaign coverage is established from actual finalized events, even
+      // when the existing indexer checkpoint already predates this release.
+      await this.backfillTonswapBurns(caughtUpBlock);
+      if (this.isStopping()) return;
       const startupMaintenanceBlock = await this.runStartupMaintenance(projectionBlock);
       if (this.isStopping()) return;
       this.discardRefreshRequestsCoveredBy(startupMaintenanceBlock);
@@ -4079,6 +4099,28 @@ export class ChainIndexer {
     return true;
   }
 
+  /** Replays every finalized campaign block and commits coverage with its burn evidence. */
+  private async backfillTonswapBurns(finalizedBlock: number): Promise<void> {
+    if (this.isStopping() || !this.api || finalizedBlock < TONSWAP_START_BLOCK) return;
+    const previous = parseTonswapBurnCoverage(await this.repository.get('updatesStreams', TONSWAP_COVERAGE_ID));
+    const startBlock = previous ? previous.indexedThroughBlock + 1 : TONSWAP_START_BLOCK;
+    const runRpc: RpcExecutor = (request, label) => this.withRpcRetry(request, label);
+    for (let block = startBlock; block <= finalizedBlock; block += XOR_BURN_BACKFILL_BATCH_SIZE) {
+      if (this.isStopping()) return;
+      const batchEnd = Math.min(block + XOR_BURN_BACKFILL_BATCH_SIZE - 1, finalizedBlock);
+      const blocks = Array.from({ length: batchEnd - block + 1 }, (_, index) => block + index);
+      const fetched = await mapWithConcurrency(blocks, XOR_BURN_BACKFILL_RPC_CONCURRENCY,
+        (height) => this.fetchBlockByNumber(height, runRpc));
+      const documents = fetched.flatMap((data, index) => createXorBurnDocumentsFromEvents(
+        blocks[index], data.timestamp, data.signedBlock, data.events, this.assetInfos
+      ));
+      const last = fetched[fetched.length - 1];
+      documents.push(createTonswapBurnCoverage(batchEnd, last.requestedHash.toLowerCase(), last.timestamp));
+      if (this.isStopping()) return;
+      await this.repository.upsertMany(documents);
+    }
+  }
+
   private async backfillXorBurns(finalizedBlock: number): Promise<void> {
     if (this.isStopping() || !this.api || finalizedBlock < SORA_XOR_BURN_START_BLOCK) return;
 
@@ -5113,6 +5155,7 @@ export class ChainIndexer {
       currentAccounts.forEach((account) => touchedAccounts.add(account));
       const context = {
         id,
+        extrinsicIndex: index,
         module: extrinsic.method.section,
         method: extrinsic.method.method,
         address,
@@ -5248,6 +5291,12 @@ export class ChainIndexer {
     }
 
     documents.push(this.createChainStateDocument(blockHeight, canonicalBlockHash, timestamp));
+    if (blockHeight >= TONSWAP_START_BLOCK) {
+      const coverage = parseTonswapBurnCoverage(await this.repository.get('updatesStreams', TONSWAP_COVERAGE_ID));
+      if (blockHeight === TONSWAP_START_BLOCK || coverage?.indexedThroughBlock === blockHeight - 1) {
+        documents.push(createTonswapBurnCoverage(blockHeight, canonicalBlockHash, timestamp));
+      }
+    }
     if (this.isStopping()) return;
     const preparedDocuments = await this.prepareReferrerRewardDocuments(documents);
     if (this.isStopping()) return;

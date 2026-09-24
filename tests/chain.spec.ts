@@ -2292,7 +2292,7 @@ describe('ChainIndexer price derivation', () => {
     expect(accountMeta?.data.xorFees).toEqual({ amount: '1', amountUSD: '2' });
   });
 
-  it('indexes utility batch burn calls for burn page stats', async () => {
+  it.each(['0x7b7d', JSON.stringify({ app: 'polkaswap', kind: 'tonswap-xor-burn', version: 1 })])('indexes atomic burn campaign metadata for %s', async (remark) => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
       api: unknown;
@@ -2308,7 +2308,7 @@ describe('ChainIndexer price derivation', () => {
     const remarkCall = {
       section: 'system',
       method: 'remark',
-      args: ['0x7b7d'],
+      args: [remark],
       meta: { args: [{ name: 'remark' }] },
     };
 
@@ -2358,6 +2358,8 @@ describe('ChainIndexer price derivation', () => {
     const history = await repository.get('historyElements', '0xbatchburn');
     const xorBurn = await repository.get('xorBurns', '0xbatchburn');
     const chainState = await repository.get('updatesStreams', 'chainState');
+    expect(xorBurn?.data.extrinsicIndex).toBe(0);
+    expect(xorBurn?.data.campaign).toBe(remark === '0x7b7d' ? undefined : 'tonswap');
 
     expect(history?.data).toMatchObject({
       module: 'utility',
@@ -2375,7 +2377,7 @@ describe('ChainIndexer price derivation', () => {
         {
           module: 'system',
           method: 'remark',
-          data: { args: { remark: '0x7b7d' } },
+          data: { args: { remark } },
         },
       ],
     });
@@ -8532,5 +8534,44 @@ describe('MemoryRepository subscriptions', () => {
 
     await expect(next).resolves.toMatchObject({ value: { id: XOR } });
     await watcher.return(undefined);
+  });
+});
+
+
+describe('TONSWAP finalized coverage', () => {
+  it('backfills exact campaign blocks, rejects non-atomic markers, and advances only after an atomic write', async () => {
+    const repository = new MemoryRepository();
+    const subject = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      fetchBlockByNumber: (height: number) => Promise<unknown>;
+      backfillTonswapBurns: (height: number) => Promise<void>;
+    };
+    subject.api = {};
+    const start = 27_720_478;
+    const marker = JSON.stringify({ app: 'polkaswap', kind: 'tonswap-xor-burn', version: 1 });
+    const burn = { section: 'assets', method: 'burn', args: [XOR, SCALE.toString()],
+      meta: { args: [{ name: 'assetId' }, { name: 'amount' }] } };
+    const remark = { section: 'system', method: 'remark', args: [marker], meta: { args: [{ name: 'remark' }] } };
+    subject.fetchBlockByNumber = vi.fn(async (height) => ({
+      requestedHash: canonicalBlockHash(`ts-${height}`), timestamp: 1_800_000_000,
+      signedBlock: { block: { extrinsics: [
+        { hash: { toString: () => `0xts-${height}` }, method: {
+          section: 'utility', method: height === start ? 'batchAll' : 'batch', args: [[burn, remark]],
+          meta: { args: [{ name: 'calls' }] },
+        } },
+      ] } },
+      events: [eventRecord('assets', 'Burn', { address: 'alice', assetId: XOR, amount: SCALE.toString() })],
+    }));
+    await subject.backfillTonswapBurns(start + 1);
+    expect(subject.fetchBlockByNumber).toHaveBeenCalledTimes(2);
+    expect((await repository.get('xorBurns', `0xts-${start}`))?.data).toMatchObject({ campaign: 'tonswap', extrinsicIndex: 0 });
+    expect((await repository.get('xorBurns', `0xts-${start + 1}`))?.data.campaign).toBeUndefined();
+    expect((await repository.get('updatesStreams', 'tonswapBurnCoverage-v1'))?.data.block).toBe(start + 1);
+    await subject.backfillTonswapBurns(start + 1);
+    expect(subject.fetchBlockByNumber).toHaveBeenCalledTimes(2);
+    vi.spyOn(repository, 'upsertMany').mockRejectedValueOnce(new Error('atomic write failed'));
+    await expect(subject.backfillTonswapBurns(start + 2)).rejects.toThrow('atomic write failed');
+    expect((await repository.get('updatesStreams', 'tonswapBurnCoverage-v1'))?.data.block).toBe(start + 1);
+    expect(await repository.get('xorBurns', `0xts-${start + 2}`)).toBeNull();
   });
 });

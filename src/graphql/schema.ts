@@ -695,6 +695,19 @@ export const typeDefs = /* GraphQL */ `
     timestamp: Int
     txHash: String
     nexusRecipient: String
+    campaign: String
+    extrinsicIndex: Int
+  }
+
+  type TonswapBurnSnapshotConnection {
+    fresh: Boolean!
+    genesisHash: String!
+    startBlock: Int!
+    indexedThroughBlock: Int!
+    checkpointBlock: Int!
+    checkpointTimestamp: Int!
+    nodes: [XorBurn!]!
+    pageInfo: PageInfo!
   }
 
   type XorBurnEdge {
@@ -875,6 +888,7 @@ export const typeDefs = /* GraphQL */ `
     orderBookOrders(first: Int, after: Cursor, orderBy: [OrderBy!], filter: OrderBookOrderFilter): OrderBookOrderConnection!
     orderBookSnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: OrderBookSnapshotFilter): OrderBookSnapshotConnection!
     historyElements(first: Int, last: Int, offset: Int, before: Cursor, after: Cursor, orderBy: [HistoryElementsOrderBy!], filter: HistoryElementFilter): HistoryElementConnection!
+    tonswapBurnSnapshot(first: Int, after: Cursor, atBlock: Int, allowStale: Boolean = false): TonswapBurnSnapshotConnection!
     xorBurns(first: Int, after: Cursor, orderBy: [HistoryElementsOrderBy!], filter: XorBurnFilter): XorBurnConnection!
     referrerRewards(first: Int, after: Cursor, orderBy: [OrderBy!], filter: ReferrerRewardFilter): ReferrerRewardConnection!
     stakingStakers(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AccountFilter): StakingStakerConnection!

@@ -6,6 +6,7 @@ import { GraphQLError } from 'graphql';
 import { normalizeIndexedAccountId } from '../account-activity.js';
 import { estimateRetainedValueBytes } from '../cache-weight.js';
 import { metrics } from '../metrics.js';
+import { TONSWAP_START_BLOCK, TONSWAP_COVERAGE_ID, parseTonswapBurnCoverage, isExcludedTonswapBurnAccount } from '../tonswap-burn.js';
 import { evaluateServiceReadiness, type WorkerReadinessThresholds } from '../readiness.js';
 import {
   createRepositoryCursorScope,
@@ -1759,6 +1760,7 @@ const healthResolver = async (_parent: unknown, _args: unknown, context: Context
 
   return {
     ok: readiness.ok && checkpointCoherent && checkpointFresh && workerCheckpointCoherent,
+    checkpointCoherent,
     repositoryReady: readiness.repositoryReady,
     service: 'polkaswap-indexer',
     serviceId: POLKASWAP_SERVICE_ID,
@@ -1812,6 +1814,60 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
     cache,
     config.graphqlMaxResultBytes ?? DEFAULT_GRAPHQL_QUERY_MAX_BYTES
   );
+  /** Reads a frozen finalized TS snapshot; coverage and rows deliberately bypass cache. */
+  const tonswapBurnSnapshotResolver = async (
+    parent: unknown,
+    args: { first?: number | null; after?: string | null; atBlock?: number | null; allowStale?: boolean | null },
+    context: Context
+  ) => {
+    // Coverage and the chain checkpoint commit atomically, but separate reads can
+    // straddle that commit. Retry once; never accept mismatched evidence.
+    const readProof = async () => {
+      const [health, coverageDocument] = await Promise.all([
+        healthResolver(parent, {}, context),
+        context.repository.get('updatesStreams', TONSWAP_COVERAGE_ID),
+      ]);
+      const coverage = parseTonswapBurnCoverage(coverageDocument);
+      const coherent = health.repositoryReady && health.checkpointCoherent && coverage !== null &&
+        coverage.indexedThroughBlock === health.latestIndexedBlock &&
+        coverage.blockHash === health.latestIndexedBlockHash &&
+        coverage.blockTimestamp === health.latestIndexedAt &&
+        coverage.blockTimestamp - Math.floor(Date.now() / 1_000) <= 15;
+      return { health, coverage, coherent };
+    };
+    let proof = await readProof();
+    if (!proof.coherent) proof = await readProof();
+    const { health, coverage } = proof;
+    const unavailable = () => new GraphQLError('Complete fresh finalized TONSWAP burn coverage is unavailable', {
+      extensions: { code: 'TONSWAP_COVERAGE_UNAVAILABLE' },
+    });
+    if (!proof.coherent || !coverage) throw unavailable();
+    const fresh = health.ok && health.workerLag !== null && health.workerLag <= 2 &&
+      coverage.indexedThroughBlock === health.workerLatestIndexedBlock &&
+      Math.floor(Date.now() / 1_000) - coverage.blockTimestamp <= 60;
+    // Historical display is opt-in; the default signing preflight still fails closed.
+    if (!fresh && args.allowStale !== true) throw unavailable();
+    const atBlock = args.atBlock ?? coverage.indexedThroughBlock;
+    if (!Number.isSafeInteger(atBlock) || atBlock < TONSWAP_START_BLOCK || atBlock > coverage.indexedThroughBlock ||
+      (args.after && args.atBlock === undefined)) throw badUserInput('A valid frozen campaign snapshot block is required');
+    // The compact ID index is bounded and stable. Page through it without a
+    // scan filter; only finalized TS rows within the frozen horizon are exposed.
+    // An empty TS page still advances over unrelated or ineligible Trust burns.
+    const page = await connectionResolver('xorBurns')(parent, {
+      first: args.first ?? 100, after: args.after, orderBy: ['ID_ASC'],
+    }, context);
+    return {
+      fresh,
+      genesisHash: coverage.genesisHash,
+      startBlock: TONSWAP_START_BLOCK,
+      indexedThroughBlock: atBlock,
+      checkpointBlock: coverage.indexedThroughBlock,
+      checkpointTimestamp: coverage.blockTimestamp,
+      nodes: page.nodes.filter((row) => row.campaign === 'tonswap' && !isExcludedTonswapBurnAccount(row.address) &&
+        Number(row.blockHeight) >= TONSWAP_START_BLOCK && Number(row.blockHeight) <= atBlock),
+      pageInfo: page.pageInfo,
+    };
+  };
   const documentResolver = createDocumentResolver(cache);
   const cachedExploreStatsResolver = (
     parent: unknown,
@@ -1860,6 +1916,7 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
         orderBookSnapshots: connectionResolver(collection('orderBookSnapshots')),
         historyElements: connectionResolver(collection('historyElements')),
         xorBurns: connectionResolver(collection('xorBurns')),
+        tonswapBurnSnapshot: tonswapBurnSnapshotResolver,
         referrerRewards: connectionResolver(collection('referrerRewards')),
         stakingStakers: connectionResolver(collection('stakingStakers')),
         stakingValidators: connectionResolver(collection('stakingValidators')),
