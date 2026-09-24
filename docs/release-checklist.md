@@ -9,7 +9,7 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   have been merged or cherry-picked back to `develop`.
 - Confirm the GraphQL schema, `_health` identity, the five `mobileConfig`
   capability booleans, production environment notes, and storage compatibility
-  are final. The tester projection defaults to `true,false,true,false,true` for
+  are final. The example tester projection is `true,false,true,false,true` for
   Nexus, Nexus sends, Polkamarkt, Polkamarkt mutations, and Taira respectively;
   never enable send or mutation capabilities before the candidate-bound mobile
   release gates qualify.
@@ -87,19 +87,110 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   `SELECT`/`INSERT`/`UPDATE` on the fence, and no `TRUNCATE`, `REFERENCES`, or
   `TRIGGER` on either table. Confirm this audit includes every directly or
   indirectly assumable role, including `NOINHERIT` memberships.
+- Before starting the candidate worker against a legacy database, run the
+  [legacy identity preflight](#legacy-database-identity-preflight) through a
+  direct, read-only PostgreSQL session. Do not infer that the audited migration
+  anchor still exists from a healthy public API or a recent `BLOCK` snapshot.
+- Confirm green CI for branch-flow, public-artifact, TODO-debt, immutable install,
+  production dependency audit, deployment-evidence, adversarial production
+  smoke, build, and the full test suite.
+- Confirm rollback owner, monitoring owner, deployment owner, and release
+  communication channel.
+
+## Legacy Database Identity Preflight
+
+The worker's first startup against an existing database with no `chainIdentity`
+requires the exact audited `networkSnapshots` `BLOCK` row at height
+`26872383` and Unix timestamp `1783716432`. The worker retains raw `BLOCK`
+snapshots for only 31 days, so an older anchor may have been retired. On
+2026-09-24, the public GraphQL endpoint returned no row for this anchor while
+returning a recent `BLOCK` row. A subsequent direct, read-only PostgreSQL read
+confirmed the exact anchor row in the then-live database. Repeat the direct
+preflight against the database selected for each upgrade; the public API result
+does not establish the current database contents.
+
+Use the read-only API database role in a direct PostgreSQL session. Run this
+query against the exact database selected for the upgrade; keep the connection
+URL in the operator's secret store, not in command arguments or a release log:
+
+```sql
+BEGIN TRANSACTION READ ONLY;
+
+SELECT id, block_height, timestamp, data->>'data' AS checkpoint
+FROM public.indexer_documents
+WHERE collection = 'updatesStreams' AND id IN ('chainIdentity', 'chainState')
+ORDER BY id;
+
+SELECT count(*) = 1 AS audited_anchor_present
+FROM public.indexer_documents
+WHERE collection = 'networkSnapshots'
+  AND id = 'block-26872383'
+  AND block_height = 26872383
+  AND timestamp = 1783716432
+  AND data->>'id' = 'block-26872383'
+  AND data->>'type' = 'BLOCK'
+  AND data->>'timestamp' = '1783716432';
+
+COMMIT;
+```
+
+If `chainIdentity` is absent and `audited_anchor_present` is false, do not
+start the candidate worker against that database: its identity preflight will
+fail. Keep the existing service available while choosing one of these paths:
+
+1. Restore the exact audited anchor row from a verified, compatible database
+   backup. Rehearse backup and rollback, quiesce writers, restore only the
+   verified row, and rerun the direct preflight before candidate startup. Keep
+   writers quiesced until the candidate has persisted `chainIdentity`; normal
+   snapshot retention may later remove the anchor row again.
+2. Build an empty parallel database and let the candidate backfill from the
+   reviewed first required SORA block. Verify the complete worker and API
+   health contract, data compatibility, and production smoke before switching
+   traffic. Preserve the old database and service for rollback.
+
+A newer retained `BLOCK` snapshot contains no block hash and does not replace
+the audited historical database anchor. Do not synthesize the missing row from
+an RPC response or disable the worker's identity preflight. If neither
+recovery path is available, the upgrade remains blocked until a separately
+reviewed migration with operator-attested evidence is designed and tested.
+
+## Release PR To `master`
+
+- Open the PR from `develop` or `release/<version>` to `master`.
+- Include test evidence, schema compatibility notes, deployment notes, storage
+  migration notes, and rollback notes.
+- Require CODEOWNERS review and green CI before merge.
+- Merge with a merge commit so the release boundary remains visible.
+- Create the release tag only after the merge commit is on `master`.
+
+## After Release
+
+Follow these steps in order for the tagged release. Keep the previous release
+artifact and compatible database available through the rollback window.
+
 - Validate production Compose with `docker compose -f
   docker-compose.production.yml config --quiet`; never print the interpolated
   manifest after loading secrets. Inspect an unresolved manifest with
   `config --no-interpolate` before loading credentials. Confirm the contract
   uses a four-minute shutdown grace and bounded local log rotation, requires
   distinct reviewed primary/archive RPC inputs, and requires an explicit
-  reviewed `POLKASWAP_CHAIN_START_BLOCK`. Run
-  `node dist/src/scripts/worker-health.js` inside the worker container and
+  reviewed `POLKASWAP_CHAIN_START_BLOCK`.
+- Repeat the direct, read-only [legacy identity preflight](#legacy-database-identity-preflight)
+  against the selected production database immediately before startup.
+- Deploy the exact tagged image and recorded digest to the reviewed target.
+  Confirm the one-shot migration exited successfully before the API and worker
+  start. Run `node dist/src/scripts/worker-health.js` inside the worker container and
   inspect its container health. It must validate the immutable mainnet anchor,
   fresh exact `chainState`, and matching `BLOCK` snapshot directly through
   PostgreSQL without reaching the API container. Confirm its 4-second total
   deadline is below the 5-second container timeout; missing, stale, future,
   malformed, and mismatched records must remain unhealthy.
+- Verify the deployed service is serving the tagged commit and recorded image
+  digest.
+- After internal health passes, route `pi.soramitsu.io` to the candidate
+  while keeping the previous service and compatible data available for rollback.
+- Run `POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production`
+  against the public candidate.
 - Confirm `https://pi.soramitsu.io/graphql` routes to the intended release and
   returns `_health` with `serviceId=pi.soramitsu.io`, `schemaVersion=1`,
   `ecosystem=sora2`, `chainId=sora:mainnet`, `network=mainnet`,
@@ -119,11 +210,14 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   `mobileConfig`. Nexus sends require Nexus availability, Polkamarkt mutations
   require Polkamarkt visibility, and mobile clients independently combine the
   Taira remote default with the Nexus kill switch. Record the exact
-  operator-selected projection; do not infer a missing value.
+  operator-selected projection from the public GraphQL readback; do not infer a
+  missing value. The deployment evidence `mobileConfig` object must contain
+  exactly these five booleans and match that readback.
 - Before declaring the deployment production-ready, use the generated evidence
   template to create operator-attested evidence for the current release commit,
   immutable Docker image digest, deployment ID, UTC deployment and smoke
-  timestamps, exact `_health` payload, and the command
+  timestamps, the required `_health` identity and checkpoint projection,
+  the five-boolean `mobileConfig` public readback, and the command
   `POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production`.
   The health payload must report genesis
   `0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5`,
@@ -145,28 +239,6 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   `yarn audit:deployment-evidence --require-ready`. If release tooling validates
   a tagged commit instead of local `HEAD`, set
   `DEPLOYMENT_EVIDENCE_EXPECTED_COMMIT` to that 40-character commit.
-- Confirm green CI for branch-flow, public-artifact, TODO-debt, immutable install,
-  production dependency audit, deployment-evidence, adversarial production
-  smoke, build, and the full test suite.
-- Confirm rollback owner, monitoring owner, deployment owner, and release
-  communication channel.
-
-## Release PR To `master`
-
-- Open the PR from `develop` or `release/<version>` to `master`.
-- Include test evidence, schema compatibility notes, deployment notes, storage
-  migration notes, and rollback notes.
-- Require CODEOWNERS review and green CI before merge.
-- Merge with a merge commit so the release boundary remains visible.
-- Create the release tag only after the merge commit is on `master`.
-
-## After Release
-
-- Verify the deployed service is serving the tagged commit and recorded image
-  digest.
-- Run
-  `POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production`
-  and verify the production `_health` identity.
 - Verify representative wallet and Polkaswap GraphQL queries against production
   without mutating chain or indexer state.
 - Monitor GraphQL error rate and latency, SORA RPC health, finalized-block lag,

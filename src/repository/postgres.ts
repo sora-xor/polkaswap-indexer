@@ -269,8 +269,8 @@ const scalarCondition = (
         if (numericExpression) return `${numericExpression} <= ($${values.length})::numeric`;
         return `(${expression})::numeric <= ($${values.length})::numeric`;
       case 'includesInsensitive':
-        values.push(`%${String(expected).toLowerCase()}%`);
-        return `lower(${expression}) like $${values.length}`;
+        values.push(String(expected).toLowerCase());
+        return `strpos(lower(${expression}), $${values.length}) > 0`;
       case 'contains':
         if (field === 'data' && isFilterObject(expected)) {
           const entries = Object.entries(expected);

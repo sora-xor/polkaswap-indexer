@@ -562,8 +562,9 @@ docker compose -f docker-compose.production.yml config --quiet
 docker compose -f docker-compose.production.yml up -d
 ```
 
-The five mobile capability values are explicit deployment inputs. Their tester
-defaults are `true,false,true,false,true` in the order shown above.
+The five mobile capability values are required explicit production deployment
+inputs; Compose validation fails if any value is missing or empty. The example
+tester projection is `true,false,true,false,true` in the order shown above.
 `MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=true` requires Nexus availability, while
 Polkamarkt mutations require Polkamarkt visibility. Taira's remote default
 remains independent because each mobile client applies the Nexus kill switch to
@@ -593,6 +594,13 @@ ahead. PostgreSQL connection, statement/query, and cleanup waits are bounded;
 the 4-second hard process deadline remains below the 5-second container timeout.
 Diagnostics contain only fixed failure codes and never include the database URL
 or raw driver error text.
+
+Before starting this worker against a legacy database without `chainIdentity`,
+run the direct PostgreSQL preflight in [the release checklist](docs/release-checklist.md#legacy-database-identity-preflight).
+The audited historical `BLOCK` row can expire under the worker's 31-day
+retention policy. A healthy current checkpoint does not prove that the row is
+still present; recover it from a verified backup or backfill an empty parallel
+database before cutover.
 
 During rollout, confirm worker health independently of GraphQL:
 
@@ -632,7 +640,8 @@ Production release evidence is tracked in
 blocked on `production-deployment-evidence-missing` and
 `live-production-smoke-failing` until the current public smoke passes and an
 operator records the deployed image digest, git commit, deployment id, PI health
-response, and live smoke timestamp for the intended release. The attested health
+response, the exact five-boolean public `mobileConfig` readback, and live smoke
+timestamp for the intended release. The attested health
 response must
 contain the exact SORA mainnet genesis hash
 `0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5`,
@@ -651,13 +660,23 @@ enforces 600 HTTP requests per client per 60 seconds, permits at most 600
 WebSocket upgrades per client per 60 seconds, and caps concurrent WebSockets at
 16 per client.
 
-Prepare the operator template and run the ready gate before enabling release
-routing:
+Prepare and test the evidence template before deployment:
 
 ```sh
 yarn test:deployment-evidence-template
 yarn generate:deployment-evidence-template --output build/reports/production-deployment-evidence-template.json
 yarn test:deployment-evidence-audit
-yarn audit:deployment-evidence --require-ready
+```
+
+Deploy the reviewed image with its immutable digest on the provisioned target.
+After the migration, API, worker, and internal health pass, route the public
+endpoint to that candidate while keeping the previous service available for
+rollback. Run the public smoke against the routed candidate, record the observed
+health, five mobile booleans, image digest, deployment identity, RPC/TLS
+controls, and smoke timestamp in operator-attested evidence, then run the ready
+audit before declaring the deployment ready or enabling mobile release flags:
+
+```sh
 POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production
+yarn audit:deployment-evidence --require-ready
 ```

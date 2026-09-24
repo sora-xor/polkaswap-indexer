@@ -835,6 +835,52 @@ describe('RocksRepository', () => {
     assertSource('historyElements', 'x:a-t');
   });
 
+  it('keeps every branch of mixed numeric and direct-ID eligibility filters', async () => {
+    const memory = new MemoryRepository();
+    const documents: IndexerDocument[] = [
+      {
+        collection: 'assets',
+        id: 'active',
+        data: { id: 'active', liquidity: '5', liquidityBooks: '0' },
+      },
+      {
+        collection: 'assets',
+        id: 'selected-by-id',
+        data: { id: 'selected-by-id', liquidity: '0', liquidityBooks: '0' },
+      },
+      {
+        collection: 'assets',
+        id: 'inactive',
+        data: { id: 'inactive', liquidity: '0', liquidityBooks: '0' },
+      },
+    ];
+    await Promise.all([memory.upsertMany(documents), repository.upsertMany(documents)]);
+
+    const args = {
+      first: 100,
+      orderBy: ['ID_ASC'],
+      filter: {
+        or: [
+          { liquidity: { greaterThan: '0' } },
+          { id: { equalTo: 'selected-by-id' } },
+        ],
+      },
+      includeTotalCount: true,
+    } as const;
+    metrics.reset();
+    const [memoryResult, rocksResult] = await Promise.all([
+      memory.query('assets', args),
+      repository.query('assets', args),
+    ]);
+
+    expect(rocksResult.items.map(({ id }) => id)).toEqual(['active', 'selected-by-id']);
+    expect(rocksResult.items.map(({ id }) => id)).toEqual(memoryResult.items.map(({ id }) => id));
+    expect(rocksResult.totalCount).toBe(memoryResult.totalCount);
+    expect(metrics.render()).toContain('collection="assets",source="x:assets-active-id"');
+
+    await memory.close();
+  });
+
   it('preserves arbitrary-precision vault updatedAtBlock ordering across compact keys and cursors', async () => {
     const memory = new MemoryRepository();
     const documents: IndexerDocument[] = [
@@ -1417,6 +1463,49 @@ describe('RocksRepository', () => {
 
     expect(firstPage.items.map((document) => document.id)).toEqual(['a', 'b']);
     expect(secondPage.items.map((document) => document.id)).toEqual(['c', 'd']);
+  });
+
+  it('does not repeat a reverse document-key cursor row', async () => {
+    await repository.upsertMany([
+      assetSnapshot('a', 'xor', 10),
+      assetSnapshot('b', 'xor', 20),
+      assetSnapshot('c', 'xor', 30),
+      assetSnapshot('d', 'xor', 40),
+    ]);
+
+    const firstPage = await repository.query('assetSnapshots', {
+      first: 2,
+      orderBy: ['ID_DESC'],
+      includeTotalCount: false,
+    });
+    const keyset = decodeRepositoryCursor(firstPage.itemCursors?.at(-1));
+    const secondPage = await repository.query('assetSnapshots', {
+      first: 2,
+      orderBy: ['ID_DESC'],
+      includeTotalCount: false,
+      keyset,
+    });
+
+    expect(firstPage.items.map((document) => document.id)).toEqual(['d', 'c']);
+    expect(secondPage.items.map((document) => document.id)).toEqual(['b', 'a']);
+  });
+
+  it('reports another unfiltered ID page when totalCount is omitted', async () => {
+    await repository.upsertMany([
+      assetSnapshot('a', 'xor', 10),
+      assetSnapshot('b', 'xor', 20),
+      assetSnapshot('c', 'xor', 30),
+    ]);
+
+    const result = await repository.query('assetSnapshots', {
+      first: 1,
+      orderBy: ['ID_ASC'],
+      includeTotalCount: false,
+    });
+
+    expect(result.items.map((document) => document.id)).toEqual(['a']);
+    expect(result.totalCount).toBeNull();
+    expect(result.hasNextPage).toBe(true);
   });
 
   it('keeps filtered fallback ID pages in binary key order', async () => {
