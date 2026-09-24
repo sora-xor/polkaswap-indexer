@@ -162,8 +162,10 @@ requires the exact audited `networkSnapshots` `BLOCK` row at height
 `26872383` and Unix timestamp `1783716432`. The worker retains raw `BLOCK`
 snapshots for only 31 days, so an older anchor may have been retired. On
 2026-09-24, the public GraphQL endpoint returned no row for this anchor while
-returning a recent `BLOCK` row. That public observation requires confirmation
-with a direct database read before a production upgrade.
+returning a recent `BLOCK` row. A subsequent direct, read-only PostgreSQL read
+confirmed the exact anchor row in the then-live database. Repeat the direct
+preflight against the database selected for each upgrade; the public API result
+does not establish the current database contents.
 
 Use the read-only API database role in a direct PostgreSQL session. Run this
 query against the exact database selected for the upgrade; keep the connection
