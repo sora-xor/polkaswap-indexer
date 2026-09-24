@@ -87,6 +87,10 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   `SELECT`/`INSERT`/`UPDATE` on the fence, and no `TRUNCATE`, `REFERENCES`, or
   `TRIGGER` on either table. Confirm this audit includes every directly or
   indirectly assumable role, including `NOINHERIT` memberships.
+- Before starting the candidate worker against a legacy database, run the
+  [legacy identity preflight](#legacy-database-identity-preflight) through a
+  direct, read-only PostgreSQL session. Do not infer that the audited migration
+  anchor still exists from a healthy public API or a recent `BLOCK` snapshot.
 - Validate production Compose with `docker compose -f
   docker-compose.production.yml config --quiet`; never print the interpolated
   manifest after loading secrets. Inspect an unresolved manifest with
@@ -150,6 +154,61 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
   smoke, build, and the full test suite.
 - Confirm rollback owner, monitoring owner, deployment owner, and release
   communication channel.
+
+## Legacy Database Identity Preflight
+
+The worker's first startup against an existing database with no `chainIdentity`
+requires the exact audited `networkSnapshots` `BLOCK` row at height
+`26872383` and Unix timestamp `1783716432`. The worker retains raw `BLOCK`
+snapshots for only 31 days, so an older anchor may have been retired. On
+2026-09-24, the public GraphQL endpoint returned no row for this anchor while
+returning a recent `BLOCK` row. That public observation requires confirmation
+with a direct database read before a production upgrade.
+
+Use the read-only API database role in a direct PostgreSQL session. Run this
+query against the exact database selected for the upgrade; keep the connection
+URL in the operator's secret store, not in command arguments or a release log:
+
+```sql
+BEGIN TRANSACTION READ ONLY;
+
+SELECT id, block_height, timestamp, data->>'data' AS checkpoint
+FROM public.indexer_documents
+WHERE collection = 'updatesStreams' AND id IN ('chainIdentity', 'chainState')
+ORDER BY id;
+
+SELECT count(*) = 1 AS audited_anchor_present
+FROM public.indexer_documents
+WHERE collection = 'networkSnapshots'
+  AND id = 'block-26872383'
+  AND block_height = 26872383
+  AND timestamp = 1783716432
+  AND data->>'id' = 'block-26872383'
+  AND data->>'type' = 'BLOCK'
+  AND data->>'timestamp' = '1783716432';
+
+COMMIT;
+```
+
+If `chainIdentity` is absent and `audited_anchor_present` is false, do not
+start the candidate worker against that database: its identity preflight will
+fail. Keep the existing service available while choosing one of these paths:
+
+1. Restore the exact audited anchor row from a verified, compatible database
+   backup. Rehearse backup and rollback, quiesce writers, restore only the
+   verified row, and rerun the direct preflight before candidate startup. Keep
+   writers quiesced until the candidate has persisted `chainIdentity`; normal
+   snapshot retention may later remove the anchor row again.
+2. Build an empty parallel database and let the candidate backfill from the
+   reviewed first required SORA block. Verify the complete worker and API
+   health contract, data compatibility, and production smoke before switching
+   traffic. Preserve the old database and service for rollback.
+
+A newer retained `BLOCK` snapshot contains no block hash and does not replace
+the audited historical database anchor. Do not synthesize the missing row from
+an RPC response or disable the worker's identity preflight. If neither
+recovery path is available, the upgrade remains blocked until a separately
+reviewed migration with operator-attested evidence is designed and tested.
 
 ## Release PR To `master`
 
