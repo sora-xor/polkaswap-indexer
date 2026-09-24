@@ -182,6 +182,13 @@ mobile_capability_suffixes=(
   TAIRA_DEFAULT_VISIBLE
 )
 mobile_capability_defaults=(true false true false true)
+mobile_capability_required_messages=(
+  'Set the reviewed Nexus availability value'
+  'Set the reviewed Nexus sends value'
+  'Set the reviewed Polkamarkt visibility value'
+  'Set the reviewed Polkamarkt mutations value'
+  'Set the reviewed Taira default visibility value'
+)
 for index in "${!mobile_capability_suffixes[@]}"; do
   capability="MOBILE_CONFIG_${mobile_capability_suffixes[$index]}"
   deployment_input="POLKASWAP_${capability}"
@@ -232,8 +239,8 @@ require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION:
 for index in "${!mobile_capability_suffixes[@]}"; do
   capability="MOBILE_CONFIG_${mobile_capability_suffixes[$index]}"
   deployment_input="POLKASWAP_${capability}"
-  capability_default="${mobile_capability_defaults[$index]}"
-  require_literal "$PRODUCTION_COMPOSE" "      ${capability}: \"\${${deployment_input}:-${capability_default}}\"" "Production Compose must expose ${capability} through its exact reviewed deployment input"
+  required_message="${mobile_capability_required_messages[$index]}"
+  require_literal "$PRODUCTION_COMPOSE" "      ${capability}: \"\${${deployment_input}:?${required_message}}\"" "Production Compose must require ${capability} through its exact reviewed deployment input"
 done
 
 if [[ "$(grep -Fc '<<: *runtime-security' "$PRODUCTION_COMPOSE")" -ne 3 ]]; then
@@ -303,9 +310,9 @@ else
   for index in "${!mobile_capability_suffixes[@]}"; do
     capability="MOBILE_CONFIG_${mobile_capability_suffixes[$index]}"
     deployment_input="POLKASWAP_${capability}"
-    capability_default="${mobile_capability_defaults[$index]}"
-    if [[ "$(grep -Fxc "      ${capability}: \"\${${deployment_input}:-${capability_default}}\"" <<<"$api_service")" -ne 1 ]]; then
-      fail "api must expose ${capability} through its exact reviewed deployment input"
+    required_message="${mobile_capability_required_messages[$index]}"
+    if [[ "$(grep -Fxc "      ${capability}: \"\${${deployment_input}:?${required_message}}\"" <<<"$api_service")" -ne 1 ]]; then
+      fail "api must require ${capability} through its exact reviewed deployment input"
     fi
   done
 fi
@@ -408,7 +415,7 @@ else
 fi
 
 if [[ "${#compose_command[@]}" -gt 0 ]]; then
-  if resolved_compose="$(
+  if (
     env \
     -u POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE \
     -u POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE \
@@ -423,6 +430,25 @@ if [[ "${#compose_command[@]}" -gt 0 ]]; then
     POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
     POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
     POLKASWAP_CHAIN_START_BLOCK=14000000 \
+      "${compose_command[@]}" -f "$PRODUCTION_COMPOSE" config --quiet >/dev/null 2>&1
+  ); then
+    fail "Production Compose must reject missing mobile capability deployment inputs"
+  fi
+
+  if resolved_compose="$(
+    POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.invalid/polkaswap-indexer \
+    POLKASWAP_INDEXER_IMAGE_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    POLKASWAP_MIGRATION_OWNER_DATABASE_URL='postgresql://manifest_migration_owner:owner-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_API_DATABASE_URL='postgresql://manifest_api:api-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_WORKER_DATABASE_URL='postgresql://manifest_worker:worker-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
+    POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
+    POLKASWAP_CHAIN_START_BLOCK=14000000 \
+    POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE=true \
+    POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=false \
+    POLKASWAP_MOBILE_CONFIG_POLKAMARKT_VISIBLE=true \
+    POLKASWAP_MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE=false \
+    POLKASWAP_MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE=true \
       "${compose_command[@]}" -f "$PRODUCTION_COMPOSE" config --format json 2>/dev/null
   )"; then
     if ! node "$RESOLVED_AUDIT_SCRIPT" <<<"$resolved_compose"; then
