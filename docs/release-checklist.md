@@ -77,7 +77,14 @@ Use this checklist for every Polkaswap indexer release PR from `develop` to
 - Confirm any database migration has a tested backup, restore, and rollback
   path. Stop or quiesce writers before a destructive storage cutover. Confirm
   the migration-owner role can atomically provision the exact runtime ACLs,
-  the credential preflight completes before DDL, the one-shot migration exits
+  the credential preflight completes before DDL, and the migration's read-only
+  preflight verifies `indexer_documents` uses `C` collation for `collection`
+  and `id` and has a valid primary key. For an existing nonempty database, it
+  must find a valid legacy or current `chainState` and the exact matching
+  `networkSnapshots` `BLOCK` row by collection and ID. The only allowed
+  no-checkpoint startup states contain a worker heartbeat, a valid immutable
+  `chainIdentity`, or both, with no other documents. Any failure must leave
+  schema objects untouched. Confirm the one-shot migration exits
   successfully, and its credential is absent from the API and worker
   containers. The API and worker credentials are transiently present in the
   one-shot container only so it can prove all three live session roles and the
