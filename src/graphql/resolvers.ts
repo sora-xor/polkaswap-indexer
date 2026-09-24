@@ -15,7 +15,10 @@ import {
   isOpaqueRepositoryCursor,
   normalizeRepositoryCursorValue,
 } from '../repository/cursor.js';
-import { assertValidDocumentId } from '../repository/validation.js';
+import {
+  assertValidDocumentId,
+  parseRuntimeUInt32,
+} from '../repository/validation.js';
 import {
   isStoredSoraChainStateCoherent,
   parseStoredSoraChainIdentity,
@@ -26,7 +29,13 @@ import {
 import { isAfterOrderPosition, matchesFilter, sortDocuments } from './filter.js';
 import { getOrderField, NUMERIC_ORDER_FIELDS } from './order.js';
 import { validatePublicConnectionQuery } from './query-policy.js';
-import { CursorScalar, FilterScalars, JSONScalar, OrderByScalar } from './scalars.js';
+import {
+  CursorScalar,
+  FilterScalars,
+  JSONScalar,
+  OrderByScalar,
+  UInt32Scalar,
+} from './scalars.js';
 import { typeDefs } from './schema.js';
 
 import type {
@@ -656,6 +665,8 @@ const ACCOUNT_ACTIVITY_PAGE_SIZE = 1_000;
 const ACCOUNT_ACTIVITY_PAGE_MAX_BYTES = 8 * 1_024 * 1_024;
 export const NETWORK_ACCOUNT_ACTIVITY_MAX_DOCUMENTS = 100_000;
 export const NETWORK_ACCOUNT_ACTIVITY_MAX_RANGE_SECONDS = 366 * 24 * 60 * 60;
+export const POLKAMARKT_SIGNALS_MAX_DOCUMENTS = 100_000;
+const POLKAMARKT_SIGNALS_PAGE_SIZE = 1_000;
 
 type RangeScanBudget = {
   remaining: number;
@@ -848,10 +859,163 @@ const exploreStatsResolver = async (_parent: unknown, _args: unknown, context: C
   };
 };
 
-const signalNumber = (value: unknown): number => {
+const readNumber = (value: unknown): number | null => {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  if (typeof value === 'string' && (value.trim() === '' || value.trim() !== value)) return null;
   const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
+  return Number.isFinite(parsed) ? parsed : null;
 };
+
+const signalNumber = (value: unknown): number => readNumber(value) ?? 0;
+
+const MAX_CANONICAL_DECIMAL_DIGITS = 1_024;
+
+const expandScientificDecimal = (value: string): string | null => {
+  const match = /^(\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/.exec(value);
+  if (!match) return null;
+
+  const integer = match[1]!;
+  const fraction = match[2] ?? '';
+  const exponent = Number(match[3]);
+  if (!Number.isSafeInteger(exponent)) return null;
+
+  const digits = `${integer}${fraction}`;
+  const decimalIndex = integer.length + exponent;
+  if (decimalIndex <= 0) return `0.${'0'.repeat(-decimalIndex)}${digits}`;
+  if (decimalIndex >= digits.length) return `${digits}${'0'.repeat(decimalIndex - digits.length)}`;
+  return `${digits.slice(0, decimalIndex)}.${digits.slice(decimalIndex)}`;
+};
+
+/**
+ * Produces the plain, unsigned decimal wire representation expected by the
+ * mobile PI clients. String-backed quantities never pass through Number;
+ * numeric support exists only to project legacy JSON documents safely.
+ */
+const canonicalUnsignedDecimalString = (value: unknown): string | null => {
+  let text: string;
+  if (typeof value === 'string') {
+    text = value;
+  } else if (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    (!Number.isInteger(value) || Number.isSafeInteger(value))
+  ) {
+    const numericText = String(value);
+    text = /[eE]/.test(numericText) ? (expandScientificDecimal(numericText) ?? '') : numericText;
+  } else {
+    return null;
+  }
+
+  if (!text || text.length > MAX_CANONICAL_DECIMAL_DIGITS || !/^\d+(?:\.\d+)?$/.test(text)) {
+    return null;
+  }
+  const [rawInteger, rawFraction = ''] = text.split('.');
+  const integer = rawInteger!.replace(/^0+(?=\d)/, '');
+  const fraction = rawFraction.replace(/0+$/, '');
+  return fraction ? `${integer}.${fraction}` : integer;
+};
+
+const canonicalDecimalFromCoefficient = (coefficient: bigint, scale: number): string => {
+  if (scale === 0) return coefficient.toString();
+  const digits = coefficient.toString().padStart(scale + 1, '0');
+  const split = digits.length - scale;
+  const fraction = digits.slice(split).replace(/0+$/, '');
+  return fraction ? `${digits.slice(0, split)}.${fraction}` : digits.slice(0, split);
+};
+
+const invalidIndexedDecimal = (): GraphQLError =>
+  new GraphQLError('Indexed decimal quantity is invalid.', {
+    extensions: { code: 'INDEXED_DECIMAL_INVALID' },
+  });
+
+const requireCanonicalIndexedDecimal = (value: unknown): string => {
+  const canonical = canonicalUnsignedDecimalString(value);
+  if (canonical === null) throw invalidIndexedDecimal();
+  return canonical;
+};
+
+const sumCanonicalUnsignedDecimals = (values: readonly unknown[]): string => {
+  let coefficient = 0n;
+  let scale = 0;
+
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    const decimal = canonicalUnsignedDecimalString(value);
+    if (decimal === null) throw invalidIndexedDecimal();
+    const [integer, fraction = ''] = decimal.split('.');
+    const nextCoefficient = BigInt(`${integer}${fraction}`);
+    const nextScale = fraction.length;
+    if (nextScale > scale) {
+      coefficient *= 10n ** BigInt(nextScale - scale);
+      scale = nextScale;
+      coefficient += nextCoefficient;
+    } else {
+      coefficient += nextCoefficient * 10n ** BigInt(scale - nextScale);
+    }
+  }
+
+  return canonicalDecimalFromCoefficient(coefficient, scale);
+};
+
+const canonicalDecimalOrZero = (value: unknown): string => {
+  if (value === null || value === undefined) return '0';
+  return requireCanonicalIndexedDecimal(value);
+};
+
+const canonicalDecimalField = (field: string) => (parent: Record<string, unknown>): string | null => {
+  const value = parent[field];
+  if (value === null || value === undefined) return null;
+  return requireCanonicalIndexedDecimal(value);
+};
+
+const canonicalSignedDecimalString = (value: unknown): string | null => {
+  let negative = false;
+  let magnitude = value;
+  if (typeof value === 'string' && value.startsWith('-')) {
+    negative = true;
+    magnitude = value.slice(1);
+  } else if (typeof value === 'number' && value < 0) {
+    negative = true;
+    magnitude = -value;
+  }
+  const canonical = canonicalUnsignedDecimalString(magnitude);
+  if (canonical === null) return null;
+  return negative && canonical !== '0' ? `-${canonical}` : canonical;
+};
+
+const canonicalSignedDecimalField =
+  (field: string) =>
+  (parent: Record<string, unknown>): string | null => {
+    const value = parent[field];
+    if (value === null || value === undefined) return null;
+    const canonical = canonicalSignedDecimalString(value);
+    if (canonical === null) throw invalidIndexedDecimal();
+    return canonical;
+  };
+
+const canonicalDecimalFields = (fields: readonly string[]) =>
+  Object.fromEntries(fields.map((field) => [field, canonicalDecimalField(field)]));
+
+const canonicalSignedDecimalFields = (fields: readonly string[]) =>
+  Object.fromEntries(fields.map((field) => [field, canonicalSignedDecimalField(field)]));
+
+const canonicalDecimalIsAtMost = (value: string, integerMaximum: string): boolean => {
+  const [integer, fraction = ''] = value.split('.');
+  if (integer!.length !== integerMaximum.length) return integer!.length < integerMaximum.length;
+  if (integer !== integerMaximum) return integer! < integerMaximum;
+  return [...fraction].every((digit) => digit === '0');
+};
+
+const boundedCanonicalDecimalField =
+  (field: string, integerMaximum: string) =>
+  (parent: Record<string, unknown>): string | null => {
+    const value = parent[field];
+    if (value === null || value === undefined) return null;
+    const canonical = requireCanonicalIndexedDecimal(value);
+    if (!canonicalDecimalIsAtMost(canonical, integerMaximum)) throw invalidIndexedDecimal();
+    return canonical;
+  };
 
 const signalString = (value: unknown): string | null => {
   if (typeof value !== 'string' && typeof value !== 'number') return null;
@@ -866,9 +1030,12 @@ const signalOutcome = (value: unknown): 'YES' | 'NO' | null => {
   return normalized === 'YES' || normalized === 'NO' ? normalized : null;
 };
 
-const signalInteger = (value: unknown): number | null => {
-  const parsed = typeof value === 'number' ? value : Number.parseInt(String(value ?? '').replace(/,/g, ''), 10);
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+const signalUInt32 = (value: unknown): number | null => {
+  try {
+    return parseRuntimeUInt32(value, 'indexed Polkamarkt signal marketId');
+  } catch {
+    return null;
+  }
 };
 
 const signalTimestampLabel = (value: unknown): string => {
@@ -883,20 +1050,22 @@ const signalTimestampLabel = (value: unknown): string => {
   }).format(new Date(millis));
 };
 
-const coerceSignalProbability = (value: unknown): number | null => {
+const coerceSignalPercentage = (value: unknown): number | null => {
   const parsed = readNumber(value);
-  if (parsed === null) return null;
-  const percentage = parsed <= 1 ? parsed * 100 : parsed;
+  return parsed !== null && parsed >= 0 && parsed <= 100 ? parsed : null;
+};
 
-  return Math.max(0, Math.min(100, percentage));
+const coerceSignalUnitPrice = (value: unknown): number | null => {
+  const parsed = readNumber(value);
+  return parsed !== null && parsed >= 0 && parsed <= 1 ? parsed * 100 : null;
 };
 
 const scorePolkamarktSignalMarket = async (
   repository: IndexerRepository,
   market: IndexerDocument
 ): Promise<Record<string, unknown> | null> => {
-  const marketId = signalInteger(market.data.marketId ?? market.id);
-  const closeBlock = signalInteger(market.data.closeBlock);
+  const marketId = signalUInt32(market.data.marketId ?? market.id);
+  const closeBlock = signalUInt32(market.data.closeBlock);
   const title = signalString(market.data.title);
   const outcome = signalOutcome(market.data.resolutionOutcome);
 
@@ -910,7 +1079,11 @@ const scorePolkamarktSignalMarket = async (
       blockHeight: { lessThanOrEqualTo: closeBlock },
     },
   });
-  const yesProbability = coerceSignalProbability(snapshot?.data.probability ?? snapshot?.data.priceYes);
+  const indexedProbability = snapshot?.data.probability;
+  const yesProbability =
+    indexedProbability === null || indexedProbability === undefined
+      ? coerceSignalUnitPrice(snapshot?.data.priceYes)
+      : coerceSignalPercentage(indexedProbability);
   if (yesProbability === null || yesProbability === 50) return null;
 
   const predictedOutcome = yesProbability > 50 ? 'YES' : 'NO';
@@ -1005,23 +1178,111 @@ const addSignalAccount = (accounts: Set<string>, value: unknown): void => {
   if (account) accounts.add(account);
 };
 
-const polkamarktSignalsResolver = async (_parent: unknown, _args: unknown, context: Context) => {
-  const [marketResult, activityResult, snapshotResult] = await Promise.all([
-    queryDocuments(context.repository, collection('markets'), { first: 1_000 }, {}, ['VOLUME_USD_DESC'], {
+const ACTIVE_POLKAMARKT_STATUSES = new Set(['open', 'active', 'live']);
+
+const visitPolkamarktSignalDocuments = async (
+  repository: IndexerRepository,
+  collectionName: IndexerCollection,
+  filter: Record<string, unknown>,
+  maxBytes: number,
+  visit: (document: IndexerDocument) => void
+): Promise<void> => {
+  const seenIds = new Set<string>();
+  const visitUnique = (document: IndexerDocument): void => {
+    if (seenIds.has(document.id)) {
+      throw new Error(`polkamarktSignals received a repeated ${collectionName} document while paginating`);
+    }
+    seenIds.add(document.id);
+    visit(document);
+  };
+
+  if (!repository.query) {
+    const documents = sortDocuments(
+      (await repository.list(collectionName)).filter((document) => matchesFilter(document.data, filter)),
+      ['ID_ASC']
+    );
+    if (documents.length > POLKAMARKT_SIGNALS_MAX_DOCUMENTS) {
+      throw new Error(
+        `polkamarktSignals exceeds its ${POLKAMARKT_SIGNALS_MAX_DOCUMENTS}-document ${collectionName} scan budget`
+      );
+    }
+    documents.forEach(visitUnique);
+    return;
+  }
+
+  let keyset: RepositoryQueryArgs['keyset'];
+  let scanned = 0;
+  const orderBy = ['ID_ASC'];
+  const keysetScope = createRepositoryCursorScope(collectionName, orderBy, filter);
+
+  while (true) {
+    const result = await repository.query(collectionName, {
+      first: POLKAMARKT_SIGNALS_PAGE_SIZE,
       includeTotalCount: false,
-      trustedMaxPageSize: 1_000,
-      maxBytes: context.graphqlQueryMaxBytes,
+      orderBy,
+      filter,
+      keyset,
+      maxBytes,
+    });
+    const hasNextPage = result.hasNextPage ?? result.items.length >= POLKAMARKT_SIGNALS_PAGE_SIZE;
+    const remaining = POLKAMARKT_SIGNALS_MAX_DOCUMENTS - scanned;
+    if (result.items.length > remaining || (result.items.length === remaining && hasNextPage)) {
+      throw new Error(
+        `polkamarktSignals exceeds its ${POLKAMARKT_SIGNALS_MAX_DOCUMENTS}-document ${collectionName} scan budget`
+      );
+    }
+
+    result.items.forEach(visitUnique);
+    scanned += result.items.length;
+    if (!hasNextPage) return;
+
+    const last = result.items.at(-1);
+    if (!last) {
+      throw new Error(`polkamarktSignals received an empty ${collectionName} page with hasNextPage=true`);
+    }
+    keyset = {
+      scope: keysetScope,
+      field: 'id',
+      value: last.id,
+      id: last.id,
+      direction: 'asc',
+      numeric: false,
+    };
+  }
+};
+
+const polkamarktSignalsResolver = async (_parent: unknown, _args: unknown, context: Context) => {
+  let marketCount = 0;
+  let marketStatusCount = 0;
+  let activeMarketCount = 0;
+  let totalVolumeUsd = '0';
+  let liquidityUsd = '0';
+  const accounts = new Set<string>();
+  const resolvedMarkets: IndexerDocument[] = [];
+  const maxBytes = context.graphqlQueryMaxBytes ?? DEFAULT_GRAPHQL_QUERY_MAX_BYTES;
+
+  const [, , snapshotResult] = await Promise.all([
+    visitPolkamarktSignalDocuments(context.repository, collection('markets'), {}, maxBytes, (market) => {
+      marketCount += 1;
+      totalVolumeUsd = sumCanonicalUnsignedDecimals([totalVolumeUsd, market.data.volumeUSD]);
+      liquidityUsd = sumCanonicalUnsignedDecimals([liquidityUsd, market.data.liquidityUSD]);
+      addSignalAccount(accounts, market.data.creator);
+
+      const status = signalStatus(market.data.status);
+      if (status) {
+        marketStatusCount += 1;
+        if (ACTIVE_POLKAMARKT_STATUSES.has(status)) activeMarketCount += 1;
+      }
+      if (status === 'resolved' && signalOutcome(market.data.resolutionOutcome)) resolvedMarkets.push(market);
     }),
-    queryDocuments(
+    visitPolkamarktSignalDocuments(
       context.repository,
       collection('historyElements'),
-      { first: 1_000 },
       { module: { equalTo: 'polkamarkt' } },
-      ['TIMESTAMP_DESC'],
-      {
-        includeTotalCount: false,
-        trustedMaxPageSize: 1_000,
-        maxBytes: context.graphqlQueryMaxBytes,
+      maxBytes,
+      (event) => {
+        addSignalAccount(accounts, event.data.address);
+        addSignalAccount(accounts, event.data.dataFrom);
       }
     ),
     queryDocuments(context.repository, collection('networkSnapshots'), { first: 8 }, {}, ['TIMESTAMP_DESC'], {
@@ -1029,37 +1290,25 @@ const polkamarktSignalsResolver = async (_parent: unknown, _args: unknown, conte
       maxBytes: context.graphqlQueryMaxBytes,
     }),
   ]);
-  const markets = marketResult.items;
   const snapshots = snapshotResult.items
     .map((document) => ({
       timestamp: toTimestamp(document),
       accounts: signalNumber(document.data.accounts),
-      liquidityUsd: signalNumber(document.data.liquidityUSD),
-      volumeUsd: signalNumber(document.data.volumeUSD),
+      liquidityUsd: canonicalDecimalOrZero(document.data.liquidityUSD),
+      volumeUsd: canonicalDecimalOrZero(document.data.volumeUSD),
     }))
     .sort((left, right) => left.timestamp - right.timestamp);
   const latestSnapshot = snapshots.at(-1);
-  const statuses = markets.map((market) => signalStatus(market.data.status)).filter(Boolean);
-  const openMarketCount = statuses.length ? statuses.filter((status) => status === 'open').length : null;
-  const accounts = new Set<string>();
-
-  for (const market of markets) addSignalAccount(accounts, market.data.creator);
-  for (const event of activityResult.items) {
-    addSignalAccount(accounts, event.data.address);
-    addSignalAccount(accounts, event.data.dataFrom);
-  }
-
-  const accuracy = await buildPolkamarktSignalAccuracy(context.repository, markets);
+  const accuracy = await buildPolkamarktSignalAccuracy(
+    context.repository,
+    sortDocuments(resolvedMarkets, ['TIMESTAMP_ASC'])
+  );
 
   return {
-    totalVolumeUsd: markets.length
-      ? markets.reduce((total, market) => total + signalNumber(market.data.volumeUSD), 0)
-      : latestSnapshot?.volumeUsd ?? 0,
-    activeMarkets: openMarketCount ?? marketResult.totalCount ?? markets.length,
+    totalVolumeUsd: marketCount ? totalVolumeUsd : latestSnapshot?.volumeUsd ?? '0',
+    activeMarkets: marketStatusCount ? activeMarketCount : marketCount,
     activeAccounts: accounts.size || latestSnapshot?.accounts || 0,
-    liquidityUsd: markets.length
-      ? markets.reduce((total, market) => total + signalNumber(market.data.liquidityUSD), 0)
-      : latestSnapshot?.liquidityUsd ?? 0,
+    liquidityUsd: marketCount ? liquidityUsd : latestSnapshot?.liquidityUsd ?? '0',
     liquiditySeries: snapshots.map((snapshot) => ({
       label: signalTimestampLabel(snapshot.timestamp),
       value: snapshot.liquidityUsd,
@@ -1167,12 +1416,6 @@ const readString = (value: unknown): string | null => {
   if (typeof value !== 'string' && typeof value !== 'number') return null;
   const text = String(value).trim();
   return text.length ? text : null;
-};
-
-const readNumber = (value: unknown): number | null => {
-  if (value === null || value === undefined || value === '') return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
 };
 
 const readEqualFilterValue = (value: unknown): string | null => {
@@ -1373,6 +1616,39 @@ const timestampIso = (value: unknown): string | null => {
   return new Date(milliseconds).toISOString();
 };
 
+const indexedRuntimeUInt32OrNull = (value: unknown): number | null => {
+  if (value === null || value === undefined) return null;
+  try {
+    return parseRuntimeUInt32(value, 'indexed Polkamarkt marketId');
+  } catch {
+    throw new GraphQLError('Indexed Polkamarkt market identifier is invalid', {
+      extensions: { code: 'INDEXED_UINT32_INVALID' },
+    });
+  }
+};
+
+const indexedRuntimeUInt32ListOrNull = (value: unknown): number[] | null => {
+  if (value === null || value === undefined) return null;
+  if (!Array.isArray(value) || value.length === 0 || value.length > 24) {
+    throw new GraphQLError('Indexed Polkamarkt market identifiers are invalid', {
+      extensions: { code: 'INDEXED_UINT32_INVALID' },
+    });
+  }
+  const marketIds = value.map(indexedRuntimeUInt32OrNull);
+  if (marketIds.some((marketId) => marketId === null)) {
+    throw new GraphQLError('Indexed Polkamarkt market identifiers are invalid', {
+      extensions: { code: 'INDEXED_UINT32_INVALID' },
+    });
+  }
+  const canonicalMarketIds = marketIds as number[];
+  if (new Set(canonicalMarketIds).size !== canonicalMarketIds.length) {
+    throw new GraphQLError('Indexed Polkamarkt market identifiers are invalid', {
+      extensions: { code: 'INDEXED_UINT32_INVALID' },
+    });
+  }
+  return canonicalMarketIds;
+};
+
 const toAccountTradeNode = (
   historyDocument: IndexerDocument | null | undefined,
   account: string,
@@ -1384,7 +1660,17 @@ const toAccountTradeNode = (
   const firstCall = calls[0] ?? {};
   const firstCallData = isRecord(firstCall.data) ? firstCall.data : {};
   const records = [source, payload, firstCall, firstCallData];
-  const marketId = readNumber(firstValue(records, ['marketId', 'market_id', 'conditionId', 'condition_id']));
+  const marketId = indexedRuntimeUInt32OrNull(
+    firstValue(records, ['marketId', 'market_id', 'conditionId', 'condition_id'])
+  );
+  const marketIds = indexedRuntimeUInt32ListOrNull(
+    firstValue(records, ['marketIds', 'market_ids'])
+  );
+  if (marketIds && (marketId === null || marketIds[0] !== marketId)) {
+    throw new GraphQLError('Indexed Polkamarkt market identifiers are inconsistent', {
+      extensions: { code: 'INDEXED_UINT32_INVALID' },
+    });
+  }
   const timestamp = firstValue(records, ['timestamp']) ?? historyDocument?.timestamp ?? accountTransaction?.timestamp;
   const blockNumber = readNumber(
     firstValue(records, ['blockNumber', 'block', 'blockHeight']) ??
@@ -1402,21 +1688,22 @@ const toAccountTradeNode = (
     id,
     account,
     marketId,
+    marketIds: marketIds ?? [],
     side: normalizeSide(firstValue(records, ['side', 'action', 'method'])),
     outcome: readString(firstValue(records, ['outcome', 'direction'])),
     fromOutcome: readString(firstValue(records, ['fromOutcome', 'from_outcome', 'outcomeIn', 'outcome_in'])),
     toOutcome: readString(firstValue(records, ['toOutcome', 'to_outcome', 'outcomeOut', 'outcome_out', 'outcome', 'direction'])),
-    collateralUsd: readString(firstValue(records, ['collateralUsd', 'collateralUSD', 'collateralAmountUsd', 'amountUsd'])),
-    collateralAmountUsd: readString(firstValue(records, ['collateralAmountUsd', 'collateralUsd', 'amountUsd'])),
-    shares: readString(firstValue(records, ['shares', 'sharesAmount', 'shareAmount'])),
-    sharesAmount: readString(firstValue(records, ['sharesAmount', 'shares', 'shareAmount'])),
-    sharesIn: readString(firstValue(records, ['sharesIn', 'shares_in', 'sharesAmountIn', 'sharesAmount', 'shares', 'shareAmount'])),
-    sharesOut: readString(firstValue(records, ['sharesOut', 'shares_out', 'sharesAmountOut'])),
-    price: readString(firstValue(records, ['price', 'executionPrice', 'avgPrice'])),
-    executionPrice: readString(firstValue(records, ['executionPrice', 'price', 'avgPrice'])),
-    feeUsd: readString(firstValue(records, ['feeUsd', 'feeUSD', 'feeAmountUsd'])),
-    feeAmountUsd: readString(firstValue(records, ['feeAmountUsd', 'feeUsd', 'feeUSD'])),
-    realizedPnlUsd: readString(firstValue(records, ['realizedPnlUsd', 'realizedPnlUSD', 'pnlUsd'])),
+    collateralUsd: firstValue(records, ['collateralUsd', 'collateralUSD', 'collateralAmountUsd', 'amountUsd']),
+    collateralAmountUsd: firstValue(records, ['collateralAmountUsd', 'collateralUsd', 'amountUsd']),
+    shares: firstValue(records, ['shares', 'sharesAmount', 'shareAmount']),
+    sharesAmount: firstValue(records, ['sharesAmount', 'shares', 'shareAmount']),
+    sharesIn: firstValue(records, ['sharesIn', 'shares_in', 'sharesAmountIn', 'sharesAmount', 'shares', 'shareAmount']),
+    sharesOut: firstValue(records, ['sharesOut', 'shares_out', 'sharesAmountOut']),
+    price: firstValue(records, ['price', 'executionPrice', 'avgPrice']),
+    executionPrice: firstValue(records, ['executionPrice', 'price', 'avgPrice']),
+    feeUsd: firstValue(records, ['feeUsd', 'feeUSD', 'feeAmountUsd']),
+    feeAmountUsd: firstValue(records, ['feeAmountUsd', 'feeUsd', 'feeUSD']),
+    realizedPnlUsd: firstValue(records, ['realizedPnlUsd', 'realizedPnlUSD', 'pnlUsd']),
     timestamp: timestampIso(timestamp),
     blockNumber,
     blockHash: readString(source.blockHash),
@@ -1466,7 +1753,14 @@ const accountTradesResolver = async (
   const account = readAccountFromArgs(args);
   if (!account) return buildConnection(collection('accountTrades'), [], normalizedArgs);
 
-  const transactionFilter = { accountId: { equalTo: account } };
+  // Account transaction rows also drive network activity. Restrict this
+  // connection to the worker's canonical Polkamarkt projection so unrelated
+  // transfers cannot surface as trades with a null market identifier.
+  const transactionFilter = {
+    accountId: { equalTo: account },
+    module: { equalTo: 'polkamarkt' },
+    marketId: { greaterThanOrEqualTo: 0 },
+  };
   const accountTransactionResult = await queryDocuments(
     context.repository,
     collection('accountTransactions'),
@@ -1896,6 +2190,7 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
       JSON: JSONScalar,
       Cursor: CursorScalar,
       OrderBy: OrderByScalar,
+      UInt32: UInt32Scalar,
       ...FilterScalars,
       Query: {
         _health: healthResolver,
@@ -1935,6 +2230,101 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
         calls: (parent: Record<string, unknown>) => ({
           nodes: Array.isArray(parent.calls) ? parent.calls : [],
         }),
+        networkFee: canonicalDecimalField('networkFee'),
+      },
+      Asset: {
+        ...canonicalDecimalFields(['priceUSD', 'supply', 'liquidity', 'liquidityBooks']),
+        ...canonicalDecimalFields(['volumeDayUSD', 'volumeWeekUSD']),
+      },
+      PoolXYK: {
+        ...canonicalDecimalFields([
+          'baseAssetReserves',
+          'targetAssetReserves',
+          'chameleonAssetReserves',
+          'priceUSD',
+          'strategicBonusApy',
+          'poolTokenSupply',
+          'poolTokenPriceUSD',
+          'liquidityUSD',
+        ]),
+      },
+      ReferrerReward: {
+        amount: canonicalDecimalField('amount'),
+      },
+      XorBurn: {
+        amount: canonicalDecimalField('amount'),
+      },
+      AccountPosition: {
+        ...canonicalDecimalFields([
+          'shares',
+          'yesShares',
+          'noShares',
+          'netCollateralPaid',
+          'costBasisUsd',
+          'yesCostBasisUsd',
+          'noCostBasisUsd',
+          'marketValueUsd',
+          'claimablePayoutUsd',
+        ]),
+        ...canonicalSignedDecimalFields(['realizedPnlUsd', 'unrealizedPnlUsd']),
+      },
+      AccountTrade: {
+        ...canonicalDecimalFields([
+          'collateralUsd',
+          'collateralAmountUsd',
+          'shares',
+          'sharesAmount',
+          'sharesIn',
+          'sharesOut',
+          'price',
+          'executionPrice',
+          'feeUsd',
+          'feeAmountUsd',
+        ]),
+        ...canonicalSignedDecimalFields(['realizedPnlUsd']),
+      },
+      Market: {
+        ...canonicalDecimalFields([
+          'creatorFees',
+          'liquidityUSD',
+          'volumeUSD',
+          'virtualDepth',
+          'dpmCollateral',
+          'realYesShares',
+          'realNoShares',
+          'collateral',
+          'yesShares',
+          'noShares',
+        ]),
+        probability: boundedCanonicalDecimalField('probability', '100'),
+        priceYes: boundedCanonicalDecimalField('priceYes', '1'),
+        priceNo: boundedCanonicalDecimalField('priceNo', '1'),
+      },
+      MarketSnapshot: {
+        ...canonicalDecimalFields([
+          'virtualDepth',
+          'dpmCollateral',
+          'realYesShares',
+          'realNoShares',
+          'collateral',
+          'yesShares',
+          'noShares',
+          'liquidityUSD',
+          'volumeUSD',
+        ]),
+        probability: boundedCanonicalDecimalField('probability', '100'),
+        priceYes: boundedCanonicalDecimalField('priceYes', '1'),
+        priceNo: boundedCanonicalDecimalField('priceNo', '1'),
+      },
+      PolkamarktSignals: {
+        totalVolumeUsd: canonicalDecimalField('totalVolumeUsd'),
+        liquidityUsd: canonicalDecimalField('liquidityUsd'),
+      },
+      PolkamarktSignalPoint: {
+        value: canonicalDecimalField('value'),
+      },
+      PolkamarktSignalAnswerBreakdown: {
+        volumeUsd: canonicalDecimalField('volumeUsd'),
       },
       Subscription: {
         updatesStreams: pollingSubscription(collection('updatesStreams')),

@@ -2,6 +2,7 @@ export const typeDefs = /* GraphQL */ `
   scalar JSON
   scalar Cursor
   scalar OrderBy
+  scalar UInt32
   scalar AccountFilter
   scalar AccountLiquiditySnapshotFilter
   scalar AccountPositionFilter
@@ -175,8 +176,8 @@ export const typeDefs = /* GraphQL */ `
     liquidityBooks: String
     priceChangeDay: Float
     priceChangeWeek: Float
-    volumeDayUSD: Float
-    volumeWeekUSD: Float
+    volumeDayUSD: String
+    volumeWeekUSD: String
     velocity: Float
   }
 
@@ -346,17 +347,17 @@ export const typeDefs = /* GraphQL */ `
 
   type PolkamarktSignalPoint {
     label: String!
-    value: Float!
+    value: String!
   }
 
   type PolkamarktSignalAnswerBreakdown {
     answer: String!
-    volumeUsd: Float!
+    volumeUsd: String!
     markets: Int!
   }
 
   type PolkamarktSignalAccuracyMarket {
-    marketId: Int!
+    marketId: UInt32!
     title: String!
     outcome: String!
     predictedOutcome: String!
@@ -383,10 +384,10 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type PolkamarktSignals {
-    totalVolumeUsd: Float!
+    totalVolumeUsd: String!
     activeMarkets: Int!
     activeAccounts: Int!
-    liquidityUsd: Float!
+    liquidityUsd: String!
     liquiditySeries: [PolkamarktSignalPoint!]!
     answerBreakdown: [PolkamarktSignalAnswerBreakdown!]!
     accuracySummary: PolkamarktSignalAccuracySummary
@@ -396,7 +397,7 @@ export const typeDefs = /* GraphQL */ `
   type AccountPosition {
     id: String!
     account: String
-    marketId: Int
+    marketId: UInt32
     outcome: String
     shares: String
     yesShares: String
@@ -429,7 +430,8 @@ export const typeDefs = /* GraphQL */ `
   type AccountTrade {
     id: String!
     account: String
-    marketId: Int
+    marketId: UInt32
+    marketIds: [UInt32!]!
     side: String
     outcome: String
     fromOutcome: String
@@ -465,8 +467,8 @@ export const typeDefs = /* GraphQL */ `
 
   type Market {
     id: String!
-    marketId: Int
-    conditionId: Int
+    marketId: UInt32
+    conditionId: UInt32
     title: String
     category: String
     tags: String
@@ -476,7 +478,7 @@ export const typeDefs = /* GraphQL */ `
     rulesUri: String
     oracle: String
     resolutionSource: String
-    closeBlock: Int
+    closeBlock: UInt32
     status: String
     mechanism: String
     creator: String
@@ -484,9 +486,12 @@ export const typeDefs = /* GraphQL */ `
     creatorFees: String
     liquidityUSD: String
     volumeUSD: String
-    probability: Float
-    priceYes: Float
-    priceNo: Float
+    """Exact decimal percentage in the closed interval 0 through 100."""
+    probability: String
+    """Exact YES unit price in the closed interval 0 through 1."""
+    priceYes: String
+    """Exact NO unit price in the closed interval 0 through 1."""
+    priceNo: String
     virtualDepth: String
     dpmCollateral: String
     realYesShares: String
@@ -530,13 +535,16 @@ export const typeDefs = /* GraphQL */ `
 
   type MarketSnapshot {
     id: String!
-    marketId: Int
+    marketId: UInt32
     timestamp: Int
     blockHeight: Int
     type: SnapshotType
-    probability: Float
-    priceYes: Float
-    priceNo: Float
+    """Exact decimal percentage in the closed interval 0 through 100."""
+    probability: String
+    """Exact YES unit price in the closed interval 0 through 1."""
+    priceYes: String
+    """Exact NO unit price in the closed interval 0 through 1."""
+    priceNo: String
     virtualDepth: String
     dpmCollateral: String
     realYesShares: String

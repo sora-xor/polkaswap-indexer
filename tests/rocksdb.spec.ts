@@ -1529,7 +1529,7 @@ describe('RocksRepository', () => {
       orderBy: ['BLOCK_HEIGHT_DESC'],
       filter: {
         // Numeric compact equality prefixes canonicalize number/string forms.
-        marketId: { equalTo: '7.00' },
+        marketId: { equalTo: '7' },
         type: { equalTo: 'DEFAULT' },
         blockHeight: { lessThanOrEqualTo: 100 },
       },

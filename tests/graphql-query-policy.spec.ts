@@ -285,6 +285,26 @@ describe('public GraphQL repository query policy', () => {
     ).toThrow('non-negative safe integer');
   });
 
+  it('restricts Polkamarkt market identifier filters to the runtime u32 domain', () => {
+    const validate = (value: unknown) =>
+      validatePublicConnectionQuery('accountPositions', ['TIMESTAMP_DESC'], {
+        account: { equalTo: 'alice' },
+        marketId: { equalTo: value },
+      });
+
+    expect(() => validate(4_294_967_295)).not.toThrow();
+    expect(() => validate('4294967295')).not.toThrow();
+    for (const invalid of [-1, -0, 1.5, 4_294_967_296, '4294967296', '01', '1.0']) {
+      expect(() => validate(invalid)).toThrow('runtime u32 integer');
+    }
+    expect(() =>
+      validatePublicConnectionQuery('accountPositions', ['TIMESTAMP_DESC'], {
+        account: { equalTo: 'alice' },
+        marketId: { in: [0, 4_294_967_295, 4_294_967_296] },
+      })
+    ).toThrow('runtime u32 integer');
+  });
+
   it('restricts public JSON containment to bounded history string values', () => {
     const validate = (contains: unknown) =>
       validatePublicConnectionQuery('historyElements', ['TIMESTAMP_ASC'], {

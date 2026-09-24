@@ -23,6 +23,7 @@ describe('production container contract', () => {
     expect(dockerfile).toContain('COPY --from=production-dependencies --chown=node:node /app/node_modules');
     expect(dockerfile).toContain('RUN install -d -o node -g node /data');
     expect(dockerfile).toContain('ROCKSDB_PATH=/data/polkaswap-indexer.rocksdb');
+    expect(dockerfile).toContain('MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE=true');
     expect(dockerfile).toContain('COPY --chown=node:node LICENSE ./LICENSE');
     expect(dockerfile).toMatch(/\nUSER node\n/);
     expect(dockerfile).toContain('STOPSIGNAL SIGTERM');

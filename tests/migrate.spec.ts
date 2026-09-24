@@ -176,6 +176,9 @@ describe('migrate', () => {
     expect(statements).toContain(
       'drop index if exists public."indexer_documents_collection_id_c_idx";'
     );
+    expect(statements).toContain(
+      'alter table public.indexer_documents drop constraint if exists "indexer_documents_polkamarkt_u32_v1_check";'
+    );
     expect(
       statements.some((sql) =>
         sql.includes(
@@ -201,6 +204,30 @@ describe('migrate', () => {
         name
       ).toBe(true);
     }
+    const polkamarktUInt32 = POSTGRES_DOCUMENT_CHECK_CONSTRAINTS.find(
+      ({ name }) => name === 'indexer_documents_polkamarkt_u32_v2_check'
+    );
+    expect(polkamarktUInt32?.expression).toContain("data->>'marketId'");
+    expect(polkamarktUInt32?.expression).toContain("data->>'conditionId'");
+    expect(polkamarktUInt32?.expression).toContain("data->>'closeBlock'");
+    expect(polkamarktUInt32?.expression).toContain("data->'marketIds'");
+    expect(polkamarktUInt32?.expression).toContain('public.indexer_json_runtime_u32_array_is_valid_v1');
+    expect(polkamarktUInt32?.expression).toContain("data->'marketIds'->>0 = data->>'marketId'");
+    expect(polkamarktUInt32?.expression).toContain('between 0 and 4294967295');
+    expect(
+      statements.some((sql) =>
+        sql.includes('create or replace function public.indexer_json_runtime_u32_array_is_valid_v1')
+      )
+    ).toBe(true);
+    expect(
+      statements.findIndex((sql) =>
+        sql.includes('validate constraint "indexer_documents_polkamarkt_u32_v2_check"')
+      )
+    ).toBeLessThan(
+      statements.indexOf(
+        'alter table public.indexer_documents drop constraint if exists "indexer_documents_polkamarkt_u32_v1_check";'
+      )
+    );
   });
 
   it('retries validation without rebuilding a correctly manifested unvalidated constraint', async () => {

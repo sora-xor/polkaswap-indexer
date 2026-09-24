@@ -131,6 +131,12 @@ connections also enforce collection-specific filter/order policies; unsupported
 shapes fail before repository execution. Scan/sort fallbacks remain available
 only to bounded, trusted internal repository callers.
 
+`polkamarktSignals` likewise uses stable ID-keyset pagination rather than a
+top-1,000 approximation. It detects repeated pages and enforces a separate
+100,000-document ceiling for markets and Polkamarkt activity; exceeding either
+ceiling fails the field instead of publishing incomplete volume, liquidity,
+market, account, or accuracy aggregates.
+
 ## Production Notes
 
 Run the API and worker as separate processes against the same PostgreSQL
@@ -210,6 +216,64 @@ the correctly manifested constraint and retries validation without dropping and
 re-adding it; PostgreSQL restarts that constraint's table scan. Set a positive
 migration timeout only when an operator intentionally wants to cap these
 production-scale scans and concurrent index builds.
+
+In the GraphQL market contract, `probability` is an exact decimal percentage
+from 0 through 100, while `priceYes` and `priceNo` are exact unit prices from 0
+through 1. Every mobile-consumed balance, fee, pool, market, position, and trade
+quantity is serialized through an explicit canonical decimal resolver; unsafe
+legacy JavaScript numbers fail the GraphQL field instead of being rounded into
+a string. Realized and unrealized P&L accept a minus sign; volumes and all other
+mobile quantities remain unsigned. Asset price-change percentages remain
+presentation-only GraphQL floats and are never used for balances or mutations.
+Polkamarkt market identifiers, condition identifiers, and close blocks use the
+custom `UInt32` scalar so the complete runtime `u32` domain remains
+representable beyond GraphQL's signed 32-bit `Int` ceiling.
+
+Batch-claim account trade rows expose every claimed market through the bounded,
+ordered `marketIds` list while retaining `marketId` as the first market for
+legacy clients. Worker projection, repository writes, GraphQL reads, and the
+PostgreSQL check constraint all require those two representations to agree.
+Successful trade and claim rows must have a canonical `marketId`; no-op batch
+claim transactions still count as network activity but are excluded from the
+account-trade connection. The migration removes the superseded v1 Polkamarkt
+u32 constraint under its schema advisory lock only after installing and
+validating the scoped v2 contract, so writes never pass through an unprotected
+replacement gap.
+
+The versioned `accountTransactionsBackfill-v2` projection repairs
+already-indexed history instead of trusting a completed v1 marker. It first
+pages source history and upserts canonical rows in bounded calls, then makes one
+finalized-cutoff `ID_ASC` keyset pass over `accountTransactions`. Each bounded
+transaction page loads only its referenced source-history rows and removes
+obsolete v1-derived identifiers; rows whose source history is missing or cannot
+reconstruct any canonical local account are retained for recovery. The
+validated repository history key is authoritative over any conflicting
+denormalized `data.id`, so corrupt payload metadata cannot redirect projection
+or cleanup identifiers. Every canonical account projection is read back in
+bounded batches after its idempotent upsert; stale-write rejection or partial
+persistence aborts without a completion marker and before focused deletion.
+
+Every keyset/seek page must advance monotonically; repeated, overlapping,
+out-of-order, or invalid-cursor pages abort without a completion marker.
+Reconstruction and pruning share the startup finalized-block cutoff, which is
+recorded in the receipt; history finalized while the repair is running is left
+to normal indexing and cannot abort the fixed snapshot or make it prune newer
+account rows. The completion marker is written only after the full prune pass,
+so interruption remains retry-safe and excluded external identifiers cannot
+remain visible to active-account statistics after a completed upgrade.
+
+Both migration receipts must agree with their validated envelope block;
+malformed receipts are removed before conservative replay so a corrupt high
+block cannot defeat stale-write protection. An account-projection receipt ahead
+of startup finality is removed and replayed, while any source-history row ahead
+of that checkpoint aborts without publishing completion. A structurally valid
+bridge checkpoint ahead of endpoint finality is a hard identity/availability
+error rather than permission to skip history. The later bridge-history repair
+also derives obsolete account-row IDs directly from each verified history
+record, re-reads those candidates in bounded batches, and removes only rows that
+still reference that exact source after its canonical rows are durable. History
+and account writes are independently call-capped; missing or inconsistent rows
+are retained, and the repair never falls back to an unindexed collection scan.
 
 Use `CHAIN_STATE_REFRESH_INTERVAL_BLOCKS` to control how often storage-derived
 collections are refreshed during block processing, and
