@@ -1,0 +1,91 @@
+{
+  "recordedAt": "2026-10-01T07:55:13Z",
+  "scope": "read-only-release-route-inspection",
+  "deployed": false,
+  "originalRepositories": [
+    {
+      "path": "/Users/takemiyamakoto/dev/polkaswap-indexer",
+      "remote": "git@github.com:sora-xor/polkaswap-indexer.git",
+      "branch": "master",
+      "commit": "176e695d3520eba21ee090d813542f96f5f9a4a8",
+      "dirtyEntries": 58,
+      "modifiedByReleaseInspection": false
+    },
+    {
+      "path": "/Users/takemiyamakoto/dev/polkaswap-exchange-web",
+      "remote": "git@github.com:sora-xor/polkaswap-exchange-web.git",
+      "branch": "ui-updates",
+      "commit": "893783ba6a19c33043eb5dabe42d949c14d0f257",
+      "dirtyEntries": 932,
+      "modifiedByReleaseInspection": false
+    }
+  ],
+  "host": {
+    "approvedAddress": "208.83.1.62",
+    "account": "administrator",
+    "uid": 501,
+    "os": "Darwin",
+    "node": "v25.9.0",
+    "npm": "11.12.1",
+    "plainYarn": "1.22.22",
+    "corepackAvailable": true,
+    "diskAvailableReported": "193Gi",
+    "port4380ListenerObserved": false,
+    "existingOperatorAuthenticationVerified": true,
+    "newCredentialsCreated": false,
+    "mutationsPerformed": false
+  },
+  "nginx": {
+    "configurationPath": "/opt/homebrew/etc/nginx/servers/pi.soramitsu.io.conf",
+    "owner": "administrator:admin",
+    "mode": "0644",
+    "masterAccount": "administrator",
+    "existingRoutes": ["/graphql", "/metrics", "/ipfs/"],
+    "proposedPrefix": "/polkaswap-chatgpt/",
+    "proposedLoopbackUpstream": "http://127.0.0.1:4380/"
+  },
+  "liveIndexerHealth": {
+    "ok": true,
+    "repositoryReady": true,
+    "serviceId": "pi.soramitsu.io",
+    "chainId": "sora:mainnet",
+    "network": "mainnet",
+    "publicBaseUrl": "https://pi.soramitsu.io/graphql",
+    "genesisHash": "0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5",
+    "latestIndexedBlock": 27852856,
+    "latestIndexedBlockHash": "0xbbfa5800b9855fa0d1b38f371480e90092b57f2eef6ab9efb9351b93d91bcc93",
+    "latestIndexedAt": 1790840700,
+    "workerAvailable": true,
+    "workerReady": true,
+    "workerLifecycle": "running",
+    "workerStartupComplete": true,
+    "workerLatestFinalizedBlock": 27852860,
+    "workerLatestIndexedBlock": 27852856,
+    "workerLag": 4,
+    "workerLastSuccessfulIndexTimestamp": 1790840728,
+    "workerLastError": null
+  },
+  "publicationState": {
+    "githubCliAuthenticated": false,
+    "publisherVerificationInspected": false,
+    "domainChallengeCompleted": false,
+    "pluginInstalledInChatGPT": false,
+    "submittedForReview": false,
+    "directoryApprovalReceived": false,
+    "publishedInDirectory": false
+  },
+  "validation": [
+    "5 Python nginx tests passed",
+    "3 isolated activation failure/rollback tests passed",
+    "bash syntax validation passed",
+    "LaunchAgent plist validation passed",
+    "Python compile validation passed"
+  ],
+  "officialDocs": [
+    "https://developers.openai.com/plugins/build/plugins",
+    "https://developers.openai.com/plugins/deploy/connect-chatgpt",
+    "https://developers.openai.com/plugins/deploy/submission",
+    "https://developers.openai.com/plugins/deploy/app-review",
+    "https://developers.openai.com/plugins/plugin-guidelines"
+  ]
+}

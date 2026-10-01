@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Polkaswap · Chain evidence</title>
+  <style>
+    :root { color-scheme: light; --surface:#fdf7fb; --page:#faf4f8; --ink:#2a171f; --muted:#6e6168; --line:#ede4e7; --accent:#f8087b; --action:#bf065f; --on-action:#fff; --soft:#fff0f6; --purple:#330066; --success:#166e53; --warn:#805700; --focus:#ab0555; }
+    :root[data-theme="dark"] { color-scheme:dark; --surface:#592d71; --page:#492067; --ink:#f0d7dc; --muted:#dcc2d4; --line:#75488d; --accent:#f24197; --action:#f24197; --on-action:#2f0a49; --soft:#693d81; --purple:#f0d7dc; --success:#83dbbe; --warn:#f5c778; --focus:#ffa0cc; }
+    * { box-sizing:border-box; } body { margin:0; background:transparent; color:var(--ink); font:14px/1.55 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    button,input,select { font:inherit; } button,summary,select { -webkit-tap-highlight-color:transparent; } button { cursor:pointer; } button:disabled { cursor:wait; opacity:.65; }
+    button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible { outline:3px solid var(--focus); outline-offset:3px; }
+    .workspace { background:var(--page); border:1px solid var(--line); border-radius:24px; overflow:hidden; max-width:920px; margin:auto; }
+    .brand { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:22px 26px 18px; border-bottom:1px solid var(--line); }
+    .logo { display:block; width:155px; height:auto; } .logo svg { display:block; width:100%; height:auto; } [data-theme="dark"] .logo path[fill="#306"] { fill:var(--ink); }
+    .scope { color:var(--muted); font-size:11px; text-align:right; letter-spacing:.05em; text-transform:uppercase; }
+    .scope span { display:block; color:var(--ink); font-size:12px; letter-spacing:0; text-transform:none; }
+    .content { padding:25px 26px 22px; } h1 { font-size:25px; line-height:1.22; letter-spacing:-.045em; font-weight:650; margin:8px 0 12px; overflow-wrap:anywhere; } h2 { margin:0; font-size:15px; letter-spacing:-.015em; font-weight:650; } p { margin:0; } .subtle { color:var(--muted); }
+    .eyebrow { color:var(--action); font-size:10px; font-weight:700; letter-spacing:.12em; text-transform:uppercase; }
+    .summary { max-width:68ch; font-size:14px; color:var(--muted); margin-bottom:22px; overflow-wrap:anywhere; }
+    .status { display:inline-flex; align-items:center; gap:7px; font-size:12px; font-weight:650; margin:0 0 8px; color:var(--muted); } .status::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; } .status.success { color:var(--success); } .status.failure { color:var(--action); } .status.warning { color:var(--warn); }
+    .facts { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px 22px; border-block:1px solid var(--line); padding:17px 0; margin:0 0 19px; } .fact { min-width:0; } .fact dt,.label { font-size:11px; color:var(--muted); margin-bottom:5px; } .fact dd { margin:0; font-size:14px; font-weight:600; overflow-wrap:anywhere; } .fact dd.large { font-size:20px; letter-spacing:-.035em; }
+    .mono { font:12px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+    .hash-line { display:flex; gap:12px; justify-content:space-between; align-items:start; margin-bottom:20px; } .hash-line .mono { color:var(--muted); flex:1; min-width:0; } .quiet { color:var(--action); background:none; border:0; padding:3px 0; font-size:12px; white-space:nowrap; }
+    .section { margin-top:20px; } .section-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0 0 12px; } .count { font-size:12px; color:var(--muted); }
+    .rows { width:100%; border-collapse:collapse; font-size:12px; } .rows th { font-size:10px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); font-weight:500; text-align:left; padding:0 8px 9px 0; } .rows td { padding:13px 8px 13px 0; border-top:1px solid var(--line); vertical-align:top; overflow-wrap:anywhere; } .rows th:last-child,.rows td:last-child { padding-right:0; } .rows .number { text-align:right; font-variant-numeric:tabular-nums; white-space:normal; } .asset { display:flex; align-items:center; gap:10px; } .asset-mark { display:grid; place-items:center; background:var(--soft); color:var(--action); width:30px; height:30px; border-radius:50%; font-size:11px; font-weight:700; flex-shrink:0; } .asset-name { font-size:13px; font-weight:650; } .asset-id { max-width:25ch; color:var(--muted); font-size:10px; margin-top:2px; }
+    .balance-meta { display:flex; gap:14px; font-size:10px; color:var(--muted); margin-top:4px; flex-wrap:wrap; justify-content:flex-end; } .amount { font-size:14px; font-weight:600; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+    .position { padding:15px 0; border-top:1px solid var(--line); } .position-header { display:flex; align-items:start; gap:10px; justify-content:space-between; } .pair { font-size:15px; font-weight:650; letter-spacing:-.025em; min-width:0; overflow-wrap:anywhere; } .position-amount { text-align:right; min-width:0; max-width:55%; } .position-meta { margin-top:8px; display:flex; gap:18px; color:var(--muted); font-size:11px; flex-wrap:wrap; } .position .mono { font-size:10px; margin-top:8px; color:var(--muted); }
+    .history-item { display:flex; gap:13px; padding:14px 0; border-top:1px solid var(--line); } .history-dot { width:7px; height:7px; border-radius:50%; background:var(--accent); margin-top:7px; flex-shrink:0; } .history-main { flex:1; min-width:0; } .history-title { font-weight:600; font-size:13px; overflow-wrap:anywhere; } .history-meta { display:flex; flex-wrap:wrap; gap:5px 16px; color:var(--muted); font-size:11px; margin-top:4px; } .history-id { color:var(--muted); font-size:10px; margin-top:4px; }
+    .notice { padding:12px 14px; background:var(--soft); border-left:3px solid var(--accent); border-radius:0 8px 8px 0; color:var(--muted); font-size:12px; margin:14px 0 0; overflow-wrap:anywhere; } .notice ul { padding-left:17px; margin:0; } .notice li+li { margin-top:6px; }
+    .empty { padding:25px 0 9px; color:var(--muted); font-size:13px; } .empty strong { display:block; color:var(--ink); font-size:15px; font-weight:600; margin-bottom:6px; }
+    details { border-top:1px solid var(--line); margin-top:20px; } summary { display:flex; align-items:center; justify-content:space-between; list-style:none; cursor:pointer; padding:14px 0; font-size:12px; font-weight:600; color:var(--muted); } summary::-webkit-details-marker { display:none; } summary::after { content:"+"; color:var(--action); font-size:18px; font-weight:400; transition:transform .16s; } details[open]>summary::after { transform:rotate(45deg); }
+    .provenance { display:grid; grid-template-columns:120px minmax(0,1fr); font-size:11px; margin:0 0 12px; gap:7px 16px; } .provenance dt { color:var(--muted); } .provenance dd { margin:0; overflow-wrap:anywhere; } pre { white-space:pre-wrap; overflow-wrap:anywhere; font:11px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace; padding:14px; margin:0 0 15px; border-radius:10px; background:var(--surface); max-height:320px; overflow:auto; }
+    .lookup { margin-top:23px; } .lookup details { margin-top:0; } .lookup-form { padding-bottom:4px; } .lookup-modes { display:flex; gap:0; border-bottom:1px solid var(--line); margin-bottom:16px; } .mode { color:var(--muted); padding:9px 0 12px; margin-right:23px; background:none; border:0; border-bottom:2px solid transparent; font-size:12px; font-weight:600; } .mode[aria-selected="true"] { border-bottom-color:var(--accent); color:var(--ink); }
+    .input-row { display:flex; align-items:stretch; gap:9px; } input,select { background:var(--surface); color:var(--ink); border:1px solid var(--line); border-radius:10px; padding:11px 12px; min-width:0; } input { flex:1; font-size:12px; } select { width:100%; margin:0 0 10px; font-size:12px; } .primary { background:var(--action); color:var(--on-action); border:0; border-radius:10px; padding:10px 17px; font-size:12px; font-weight:650; transition:background .15s,transform .15s; } .primary:hover { filter:brightness(.94); transform:translateY(-1px); } .primary:active { transform:translateY(0); } .help { color:var(--muted); font-size:10px; margin-top:8px; } .form-error { color:var(--action); font-size:11px; margin-top:9px; } [hidden] { display:none !important; }
+    .footer { display:flex; gap:10px; justify-content:space-between; align-items:center; border-top:1px solid var(--line); padding:12px 26px; font-size:10px; color:var(--muted); background:var(--surface); } .footer span:first-child { display:flex; align-items:center; gap:6px; } .readonly-dot { width:5px; height:5px; border-radius:50%; background:var(--accent); } .footer span:last-child { text-align:right; }
+    #result { animation:reveal .22s ease-out both; } details[open] .detail-content { animation:reveal .17s ease-out both; } @keyframes reveal { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+    @media(prefers-reduced-motion:reduce) { *,*::before,*::after { animation:none !important; transition:none !important; } }
+    @media(max-width:480px) { .workspace { border-radius:18px; } .brand { padding:17px 18px 14px; } .logo { width:137px; } .content { padding:20px 18px 18px; } h1 { font-size:23px; } .facts { grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; } .fact dd.large { font-size:18px; } .footer { padding:12px 18px; } .scope { font-size:9px; } .scope span { font-size:11px; } .position-header { gap:9px; } .position-amount .amount { font-size:12px; } .provenance { grid-template-columns:95px minmax(0,1fr); gap:7px 10px; } .asset-id { max-width:18ch; } .input-row { flex-direction:column; } .primary { min-height:42px; } .balance-meta { gap:4px 12px; } }
+  </style>
+</head>
+<body>
+  <main class="workspace" aria-label="Polkaswap chain evidence">
+    <header class="brand">
+      <div class="logo" role="img" aria-label="Polkaswap">__POLKASWAP_LOGO__</div>
+      <div class="scope">SORA2<span>Public chain evidence</span></div>
+    </header>
+    <div class="content">
+      <div id="result" aria-live="polite">
+        <div class="eyebrow">Read-only explorer</div>
+        <h1>Understand what happened.</h1>
+        <p class="summary">Inspect a transaction, public wallet balances, or liquidity positions with their source and retrieval time.</p>
+      </div>
+      <section id="lookup" class="lookup" aria-label="New chain lookup"></section>
+    </div>
+    <footer class="footer"><span><i class="readonly-dot" aria-hidden="true"></i>Read-only · No wallet connection</span><span id="freshness">Waiting for chain data</span></footer>
+  </main>
+  <script type="module">__WIDGET_SCRIPT__</script>
+</body>
+</html>

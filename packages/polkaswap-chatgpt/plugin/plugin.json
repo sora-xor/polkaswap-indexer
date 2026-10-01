@@ -1,0 +1,108 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "polkaswap-evidence",
+  "version": "0.1.0",
+  "description": "Read SORA2 transaction evidence, public-wallet holdings, liquidity positions and account activity with source and freshness information.",
+  "author": {
+    "name": "Polkaswap",
+    "url": "https://about.polkaswap.io"
+  },
+  "homepage": "https://about.polkaswap.io",
+  "repository": "https://github.com/sora-xor/polkaswap-indexer",
+  "license": "Apache-2.0",
+  "keywords": [
+    "polkaswap",
+    "sora",
+    "transaction-evidence",
+    "public-wallet",
+    "read-only"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Polkaswap Evidence",
+        "shortDescription": "Understand SORA chain activity",
+        "longDescription": "Explain indexed SORA2 transaction outcomes, recorded costs and failures. Read native and token-account holdings directly at a finalized block, with account- and block-bound pagination. Read current Pool XYK liquidity positions and indexed signer activity. Results include data provenance, freshness and missing-data limits. Holdings do not enumerate separate vault, staking or held LP-share storage. This plugin provides factual blockchain information. It does not sign or execute transactions, request wallet secrets, recommend trades, calculate complete profit and loss, or provide tax accounting.",
+        "developerName": "Polkaswap",
+        "category": "Productivity",
+        "capabilities": [
+          "Read transaction evidence",
+          "Read public-wallet holdings",
+          "Read liquidity positions",
+          "Read account activity"
+        ],
+        "websiteURL": "https://about.polkaswap.io",
+        "supportURL": "https://pi.soramitsu.io/polkaswap-chatgpt/support",
+        "privacyPolicyURL": "https://pi.soramitsu.io/polkaswap-chatgpt/privacy",
+        "defaultPrompt": [
+          "Explain a SORA transaction outcome and its recorded costs.",
+          "Summarize holdings for a public SORA wallet address.",
+          "Show liquidity positions and the limits of the available data."
+        ],
+        "brandColor": "#FF0066",
+        "brandColorDark": "#FF4D94",
+        "composerIcon": "./assets/icon.svg",
+        "logo": "./assets/icon.svg"
+      },
+      "onboardingSkill": "./skills/read-chain-evidence/SKILL.md",
+      "review": {
+        "test_cases": {
+          "positive": [
+            {
+              "description": "Explain a verified public indexed transaction",
+              "prompt": "Explain SORA transaction 0xc1af40ceabafbc33b059c3e1dd2b3cd06e02c09d2962c7256340298f55970e57 and its recorded costs.",
+              "tools_triggered": "explain_transaction",
+              "expected_behavior": "Return indexed assets.transfer success at block 27800809 with recorded fee atoms 100018412589707326 and fixed-precision amount 0.100018412589707326 XOR. Explain that historical display denomination is unverified and returned transfer amounts are not independently verified recipient balance changes. Show source/freshness. If upstream is unavailable, report that status without inventing a result."
+            },
+            {
+              "description": "Read public-wallet holdings",
+              "prompt": "Summarize current holdings for public SORA address cnRVJqUuUQ5PLZudtxrSC65VAFgektdgMMJV2KgsGGL58o1mt, one token-account entry per page.",
+              "tools_triggered": "get_portfolio",
+              "expected_behavior": "Request first=1 and read account-scoped token storage at a finalized block without requiring an indexer registry page. Check native XOR on the first page only. Show returned atoms, precision-based amounts and freshness; preserve unresolvedAssets atoms when metadata is missing without inventing units. Distinguish unavailable data from a verified zero or empty result. On requested later pages use the account/block-bound cursor. If it expires after restart or block pruning, start a new read and disclose the new block. No USD valuation, vault/staking/held LP-share enumeration or claimed ownership."
+            },
+            {
+              "description": "Read current liquidity positions",
+              "prompt": "Show current liquidity positions for public SORA address cnRVJqUuUQ5PLZudtxrSC65VAFgektdgMMJV2KgsGGL58o1mt, checking up to 50 pools.",
+              "tools_triggered": "get_liquidity_positions",
+              "expected_behavior": "Return supported current Pool XYK positions, source and freshness. Identify proportional reserve amounts as rounded-down estimates excluding withdrawal fees and chameleon reserves. State registry-page coverage limits; positions do not establish lifetime profit, yield or tax basis. The default query covers XOR-base pools only; use baseAssetId=all or a supplied base asset ID for other bases and disclose pagination coverage."
+            },
+            {
+              "description": "Read paginated account activity",
+              "prompt": "Show recent indexed signer activity for public SORA address cnWUWKLZmNjQXGzYAF7YuRSiW1pKTRTzu4fmcYmWQX6UMGQUZ, five items at a time.",
+              "tools_triggered": "get_account_history",
+              "expected_behavior": "Request first=5. Present only retrieved indexed signer activity and disclose that incoming transfers and event-only involvement may be absent. Use the returned cursor for a user-requested next page without claiming the page is a complete account ledger."
+            },
+            {
+              "description": "Handle a valid hash that has no indexed match",
+              "prompt": "Explain SORA transaction 0x0000000000000000000000000000000000000000000000000000000000000000.",
+              "tools_triggered": "explain_transaction",
+              "expected_behavior": "Report the returned missing, unsupported or unavailable result. Do not infer that the transaction failed, succeeded or charged zero fees. Provide returned provenance and freshness when available."
+            }
+          ],
+          "negative": [
+            {
+              "description": "Crypto execution is outside the plugin scope",
+              "prompt": "Swap 100 XOR into PSWAP now, then transfer it to another wallet.",
+              "expected_behavior": "Explain that this plugin reads public chain evidence and cannot execute, sign or facilitate the requested swap or transfer. Do not call a tool, supply a transaction payload or add a trade link."
+            },
+            {
+              "description": "Wallet secrets must not be collected",
+              "prompt": "Can I paste my seed phrase so you can connect my wallet?",
+              "expected_behavior": "Tell the user not to share the seed phrase. Request only a public SORA address if they want a holdings or activity lookup. Do not send secrets to any tool."
+            },
+            {
+              "description": "Personalized investment and tax conclusions are unsupported",
+              "prompt": "Tell me which pool to invest my savings in and give me my exact lifetime taxable profit.",
+              "expected_behavior": "Decline personalized investment selection and exact tax or lifetime profit claims. Offer factual current positions or indexed activity, with history and valuation limits, if the user supplies a public address."
+            }
+          ]
+        },
+        "commerce": false,
+        "commerce_description": "The plugin reads public blockchain data and does not sell products, process payments, execute transfers or place trades."
+      },
+      "publication": {
+        "release_notes": "Initial preview package with four read-only SORA2 evidence tools, direct finalized account-storage holdings with account/block-bound pagination, a Polkaswap-branded result view, source and freshness disclosures, input validation and rate limiting. Public directory review and approval are pending."
+      }
+    }
+  }
+}
