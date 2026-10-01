@@ -40,7 +40,11 @@ command is Yarn 1.22.22.
    `bash ops/activate-release.sh <commit>` as administrator. This atomically
    changes only this component's release symlink and initially installs a stable
    runner that delegates to `current/ops/run-server.sh`, plus a user LaunchAgent
-   at `user/501/org.polkaswap.chatgpt`. Verify `/health` and MCP initialize,
+   at `user/501/org.polkaswap.chatgpt`. The verified headless user domain uses a
+   `Background` session and has no GUI domain; the LaunchAgent explicitly permits
+   that session. An earlier candidate lacking this scope was rejected by launchd
+   with error 134 before nginx changed, and its activation was rolled back.
+   Verify `/health` and MCP initialize,
    tools/list, resources/read, and representative tools over loopback port 4380.
 4. Review `ops/nginx-location.inc` and run
    `python3 ops/configure-nginx.py` for a dry run. Then run

@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,15 @@ PRIOR = 'b' * 40
 
 
 class ActivationTest(unittest.TestCase):
+    def test_service_can_load_in_verified_headless_user_session(self):
+        plist = plistlib.loads(OPS.joinpath('org.polkaswap.chatgpt.plist').read_bytes())
+        # The inspected host has user/501 with session Background and no gui/501.
+        # Omitting this scope made launchd reject bootstrap with error 134.
+        self.assertEqual(plist['LimitLoadToSessionType'], 'Background')
+        self.assertEqual(plist['ProcessType'], 'Background')
+        self.assertNotIn('UserName', plist)
+        self.assertIn('service_domain=user/501', OPS.joinpath('activate-release.sh').read_text())
+
     def fixture(self, temporary):
         root = Path(temporary) / 'component'
         agents = Path(temporary) / 'LaunchAgents'

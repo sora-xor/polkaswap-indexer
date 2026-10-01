@@ -8,6 +8,7 @@
   <key>WorkingDirectory</key><string>/Users/administrator/apps/polkaswap-chatgpt/current</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>LimitLoadToSessionType</key><string>Background</string>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>/Users/administrator/apps/polkaswap-chatgpt/logs/server.out.log</string>

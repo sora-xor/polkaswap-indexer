@@ -3,10 +3,12 @@ import { cp, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 
 // Verify runtime dependencies outside this repository and its ancestor modules.
 const isolated = await mkdtemp(path.join(tmpdir(), 'polkaswap-production-'));
 let server;
+const marker = randomBytes(20).toString('hex');
 try {
   for (const name of ['package.json', 'yarn.lock', '.yarnrc.yml', 'dist', 'public', 'plugin']) await cp(name, path.join(isolated, name), { recursive: true });
   const yarnJs = process.env.POLKASWAP_YARN_JS;
@@ -28,19 +30,20 @@ try {
 } finally { await client.close(); }
 `);
   let output = '';
-  server = spawn(process.execPath, ['dist/src/server.js'], { cwd: isolated, env: { ...process.env, HOST: '127.0.0.1', PORT: '4381' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  server = spawn(process.execPath, ['dist/src/server.js'], { cwd: isolated, env: { ...process.env, HOST: '127.0.0.1', PORT: '4381', RELEASE_COMMIT: marker }, stdio: ['ignore', 'pipe', 'pipe'] });
   server.stdout.on('data', data => { output += data; });
   server.stderr.on('data', data => { output += data; });
   let ready = false;
   for (let attempt = 0; attempt < 50; attempt++) {
     if (server.exitCode !== null) throw new Error(`Production server exited: ${output}`);
-    try { const response = await fetch('http://127.0.0.1:4381/health'); ready = response.ok && (await response.json()).readOnly === true; } catch { /* Await only this isolated process. */ }
+    try { const response = await fetch('http://127.0.0.1:4381/health'); const health = await response.json(); ready = response.ok && health.readOnly === true && health.service === 'polkaswap-evidence' && health.commit === marker; } catch { /* Await only this isolated process. */ }
     if (ready) break;
     await new Promise(resolve => setTimeout(resolve, 200));
   }
   assert(ready, `Production server did not become ready: ${output}`);
   const contract = spawnSync(process.execPath, ['runtime-check.mjs'], { cwd: isolated, encoding: 'utf8', timeout: 30_000 });
   assert.equal(contract.status, 0, contract.stderr || contract.error?.message || contract.stdout);
+  assert.equal(server.exitCode, null, `Production candidate exited during verification: ${output}`);
   console.log('Clean production-only install, runtime imports, health, MCP tools and UI resource passed.');
 } finally {
   if (server && server.exitCode === null) { server.kill('SIGTERM'); await new Promise(resolve => server.once('exit', resolve)); }
