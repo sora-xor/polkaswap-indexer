@@ -15,10 +15,12 @@
     "test": "vitest run",
     "test:integration": "node scripts/live-smoke.mjs",
     "test:ui": "node scripts/ui-qa.mjs",
+    "test:production": "node scripts/check-production.mjs",
     "start": "node dist/src/server.js",
     "package": "node scripts/package.mjs"
   },
   "dependencies": {
+    "@babel/runtime": "7.29.7",
     "@modelcontextprotocol/ext-apps": "1.7.5",
     "@modelcontextprotocol/sdk": "1.31.0",
     "@polkadot/api": "16.5.6",

@@ -29,6 +29,7 @@ jobs:
       - run: yarn typecheck
       - run: yarn test
       - run: yarn build
+      - run: node scripts/check-production.mjs
       - run: yarn package
       - run: python3 -m unittest discover -s ops -p 'test_*.py'
       - run: bash -n ops/run-server.sh ops/activate-release.sh ops/rollback.sh
