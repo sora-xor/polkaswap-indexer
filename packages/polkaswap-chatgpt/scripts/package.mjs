@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const submission = process.argv.includes('--submission');
 const pluginRoot = resolve(packageRoot, 'plugin');
 const allowlist = [
   'LICENSE',
@@ -47,6 +48,15 @@ for (const [field, max] of [['displayName', 30], ['shortDescription', 30], ['lon
 }
 for (const field of ['websiteURL', 'supportURL', 'privacyPolicyURL']) httpsUrl(view[field], field);
 if (view.termsOfServiceURL) httpsUrl(view.termsOfServiceURL, 'termsOfServiceURL');
+if (submission) {
+  httpsUrl(view.termsOfServiceURL, 'termsOfServiceURL');
+  assert(typeof openai.review?.demo_recording_url === 'string', 'Submission requires the actual reviewer-accessible demo recording URL');
+  httpsUrl(openai.review.demo_recording_url, 'demo_recording_url');
+  for (const name of ['privacy', 'support', 'terms']) {
+    const policy = await readFile(resolve(packageRoot, 'public', `${name}.html`), 'utf8');
+    assert(policy.length > 0, `Submission requires a populated ${name} page`);
+  }
+}
 assert(Array.isArray(view.defaultPrompt) && view.defaultPrompt.length <= 3);
 assert(view.defaultPrompt.every((prompt) => typeof prompt === 'string' && prompt.length > 0 && prompt.length <= 128));
 assert.match(view.brandColor, /^#[0-9A-Fa-f]{6}$/);
@@ -83,4 +93,6 @@ const check = spawnSync('unzip', ['-Z1', output], { encoding: 'utf8' });
 assert.equal(check.status, 0, check.stderr || 'ZIP inspection failed');
 assert.deepEqual(check.stdout.trim().split('\n').sort(), [...allowlist].sort());
 console.log(`Local package checks passed; created ${output}`);
-console.log('Preview only: publisher/domain verification, operator-approved policies, ChatGPT test evidence, video and public review remain required.');
+console.log(submission
+  ? 'Submission artifact checks passed. This does not certify policy accuracy, ChatGPT test outcomes, publisher/domain verification, portal scans or OpenAI approval.'
+  : 'Preview only: publisher/domain verification, operator-approved policies, ChatGPT test evidence, video and public review remain required.');

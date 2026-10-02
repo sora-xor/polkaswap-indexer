@@ -57,6 +57,6 @@ Initial preview: four read-only SORA2 evidence tools, direct finalized account-s
 - [Plugin guidelines](https://developers.openai.com/plugins/plugin-guidelines)
 - [Official branding and community links](https://about.polkaswap.io)
 
-The current manifest intentionally omits an unverified terms URL, publisher email, demo recording URL, app-reference ID and domain challenge token. Local structural validation can pass while submission is blocked on these actual requirements.
+The manifest declares the intended `/terms` URL; it does not prove an approved page is deployed there. Publisher email, demo recording URL, app-reference ID and domain challenge token remain omitted when unverified. Run `yarn package:submission` only after supplying the actual recording URL and completed privacy, support and terms pages. This stricter artifact check does not certify policy accuracy, actual ChatGPT test results, portal verification or review approval.
 
 Liquidity base coverage: `get_liquidity_positions` defaults to native XOR-base pools. Set `baseAssetId` to a supplied public asset ID or `all` to inspect other/all indexed base assets. Keep the same filter when following a cursor. Each result identifies the selected filter and page coverage.

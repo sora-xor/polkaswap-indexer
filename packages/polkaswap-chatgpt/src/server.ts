@@ -17,7 +17,7 @@ const readers = { indexer: new IndexerReader(), chain: new ChainReader(process.e
 const rate = new RateLimiter();
 const jobs = new ConcurrencyLimit();
 let activeRequests = 0;
-const staticFiles: Record<string, [string, string]> = { '/': ['dist/widget.html', 'text/html'], '/preview': ['dist/widget.html', 'text/html'], '/privacy': ['public/privacy.html', 'text/html'], '/support': ['public/support.html', 'text/html'], '/logo.svg': ['plugin/assets/logo.svg', 'image/svg+xml'] };
+const staticFiles: Record<string, [string, string]> = { '/': ['dist/widget.html', 'text/html'], '/preview': ['dist/widget.html', 'text/html'], '/privacy': ['public/privacy.html', 'text/html'], '/support': ['public/support.html', 'text/html'], '/terms': ['public/terms.html', 'text/html'], '/logo.svg': ['plugin/assets/logo.svg', 'image/svg+xml'] };
 
 /** Isolated loopback HTTP service. Proxy access logs are disabled for this prefix. */
 const http = createServer(async (request, response) => {

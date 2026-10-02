@@ -13,7 +13,10 @@ try {
   await client.connect(transport);
   const list = await client.listTools();
   assert.deepEqual(list.tools.map(tool => tool.name).sort(), ['explain_transaction', 'get_account_history', 'get_liquidity_positions', 'get_portfolio']);
-  for (const tool of list.tools) assert.deepEqual(tool.annotations, { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true });
+  for (const tool of list.tools) {
+    assert.deepEqual(tool.annotations, { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true });
+    assert.deepEqual(tool._meta?.securitySchemes, [{ type: 'noauth' }]);
+  }
   const resource = await client.readResource({ uri: 'ui://polkaswap-evidence/v1.html' });
   assert(resource.contents[0].text.includes('Polkaswap'));
   const results = {};

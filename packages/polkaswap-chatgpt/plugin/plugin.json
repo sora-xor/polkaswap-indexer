@@ -34,6 +34,7 @@
         "websiteURL": "https://about.polkaswap.io",
         "supportURL": "https://pi.soramitsu.io/polkaswap-chatgpt/support",
         "privacyPolicyURL": "https://pi.soramitsu.io/polkaswap-chatgpt/privacy",
+        "termsOfServiceURL": "https://pi.soramitsu.io/polkaswap-chatgpt/terms",
         "defaultPrompt": [
           "Explain a SORA transaction outcome and its recorded costs.",
           "Summarize holdings for a public SORA wallet address.",

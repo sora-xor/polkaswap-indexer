@@ -25,7 +25,9 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 const client = new Client({name:'isolated-production-check',version:'0.1.0'});
 try {
   await client.connect(new StreamableHTTPClientTransport(new URL('http://127.0.0.1:4381/mcp')));
-  assert.equal((await client.listTools()).tools.length, 4);
+  const tools = (await client.listTools()).tools;
+  assert.equal(tools.length, 4);
+  for (const tool of tools) assert.deepEqual(tool._meta?.securitySchemes, [{type:'noauth'}]);
   assert((await client.readResource({uri:'ui://polkaswap-evidence/v1.html'})).contents[0].text.includes('Polkaswap'));
 } finally { await client.close(); }
 `);
