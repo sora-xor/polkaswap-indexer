@@ -18,10 +18,9 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['tests/**/*.spec.ts'],
-    // PostgreSQL integration files share one migrated database and several
-    // intentionally global tables/advisory locks. Running those files in
-    // parallel makes a neighboring truncate race otherwise-correct fencing
-    // assertions. Unit-only runs keep Vitest's normal file parallelism.
-    fileParallelism: !process.env.POSTGRES_TEST_DATABASE_URL,
+    // PostgreSQL integration files share migrated state and advisory locks.
+    // RocksDB backup and restore files also compete for native I/O resources;
+    // parallel files can exceed their test deadlines on release runners.
+    fileParallelism: false,
   },
 });

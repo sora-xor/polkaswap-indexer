@@ -1,0 +1,14 @@
+[
+  {
+    "source": "INDEXER-PRODUCTION-RECOVERY-20260924.md",
+    "destination": "polkaswap-indexer/docs/workspace-cleanup-20261009/reports/INDEXER-PRODUCTION-RECOVERY-20260924.md",
+    "sha256": "d22af1ef0ff9486733f9b99b3bbdca02562d4950a79c02922956926953c485ee",
+    "storage": "tracked"
+  },
+  {
+    "source": "PRODUCTION-READINESS-EVIDENCE/indexer-recovery-20260925",
+    "destination": "polkaswap-indexer/.local/workspace-cleanup-20261009/production-readiness-evidence/indexer-recovery-20260925",
+    "sha256": null,
+    "storage": "local-evidence"
+  }
+]
