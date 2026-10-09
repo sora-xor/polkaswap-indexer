@@ -1109,24 +1109,88 @@ const sourceForDirectIdSet = (
   };
 };
 
-const exactNumericFilterOccurrences = (
+const dedupeIndexRanges = (ranges: IndexRange[]): IndexRange[] => {
+  const deduped: IndexRange[] = [];
+  for (const range of ranges) {
+    if (!deduped.some((candidate) => isDeepStrictEqual(candidate, range))) deduped.push(range);
+  }
+  return deduped;
+};
+
+/**
+ * Returns a bounded union that is guaranteed to cover every document matching
+ * the filter. Filter object fields and `and` members are conjunctive, so any
+ * one bounded child is a sufficient source. Every `or` branch must have its
+ * own bounded source or the projection is unsafe and the caller must fall
+ * back to another plan.
+ */
+const boundedIdProjectionRanges = (
+  collection: IndexerCollection,
   filter: RepositoryQueryArgs['filter'],
-  field: string
-): ExactNumericRangeBounds[] => {
-  if (!filter || !isFilterRecord(filter)) return [];
-  const results: ExactNumericRangeBounds[] = [];
-  if (field in filter) {
-    const bounds = collectExactNumericRangeBounds({ [field]: filter[field] }, field);
-    if (bounds.lower || bounds.upper) results.push(bounds);
-  }
-  for (const logical of ['and', 'or'] as const) {
-    const nested = filter[logical];
-    if (!Array.isArray(nested)) continue;
-    for (const item of nested) {
-      results.push(...exactNumericFilterOccurrences(item as RepositoryQueryArgs['filter'], field));
+  numericFields: ReadonlySet<string>
+): IndexRange[] | null => {
+  if (!filter || !isFilterRecord(filter)) return null;
+  const conjunctiveSources: IndexRange[][] = [];
+
+  for (const [field, condition] of Object.entries(filter)) {
+    if (field === 'and') {
+      if (!Array.isArray(condition)) continue;
+      for (const item of condition) {
+        const ranges = boundedIdProjectionRanges(
+          collection,
+          item as RepositoryQueryArgs['filter'],
+          numericFields
+        );
+        if (ranges) conjunctiveSources.push(ranges);
+      }
+      continue;
     }
+
+    if (field === 'or') {
+      if (!Array.isArray(condition) || !condition.length) continue;
+      const branches = condition.map((item) =>
+        boundedIdProjectionRanges(collection, item as RepositoryQueryArgs['filter'], numericFields)
+      );
+      if (branches.every((ranges): ranges is IndexRange[] => ranges !== null)) {
+        conjunctiveSources.push(dedupeIndexRanges(branches.flat()));
+      }
+      continue;
+    }
+
+    if (field === 'id') {
+      const values = compactFilterValues({ id: condition }, 'id');
+      if (values?.length) {
+        conjunctiveSources.push(
+          [...new Set(values.map(String))].map((id) => ({
+            keyKind: 'document' as const,
+            options: { key: documentKey(collection, id) },
+          }))
+        );
+      }
+      continue;
+    }
+
+    if (!numericFields.has(field)) continue;
+    const bounds = collectExactNumericRangeBounds({ [field]: condition }, field);
+    if (!bounds.lower && !bounds.upper) continue;
+    conjunctiveSources.push([
+      {
+        keyKind: 'index',
+        options: rangeForOrderedPrefix(
+          compactIndexPrefix(collection, `n:${field}`),
+          'asc',
+          bounds,
+          null,
+          numericSortKey,
+          '3'
+        ),
+      },
+    ]);
   }
-  return results;
+
+  if (!conjunctiveSources.length) return null;
+  conjunctiveSources.sort((left, right) => left.length - right.length);
+  return dedupeIndexRanges(conjunctiveSources[0]!);
 };
 
 const sourceForNumericIdProjection = (
@@ -1135,20 +1199,8 @@ const sourceForNumericIdProjection = (
   fields: readonly string[],
   reason: string
 ): QuerySource | null => {
-  const ranges = fields.flatMap((field) =>
-    exactNumericFilterOccurrences(filter, field).map((bounds) => ({
-      keyKind: 'index' as const,
-      options: rangeForOrderedPrefix(
-        compactIndexPrefix(collection, `n:${field}`),
-        'asc',
-        bounds,
-        null,
-        numericSortKey,
-        '3'
-      ),
-    }))
-  );
-  if (!ranges.length) return null;
+  const ranges = boundedIdProjectionRanges(collection, filter, new Set(fields));
+  if (!ranges?.length) return null;
   return { ranges, preservesOrder: false, boundedSort: true, reason };
 };
 
@@ -2186,7 +2238,14 @@ export class RocksRepository implements IndexerRepository {
     const rows: IndexerDocument[] = [];
     const requestedLimit = queryLimit ?? Number.POSITIVE_INFINITY;
     const { field: orderField } = getOrderField(args.orderBy);
-    const keysetAppliedByDocumentRange = keyset !== null && source.reason === 'document' && orderField === 'id';
+    // rocksdb-js currently treats a reverse range's exact start as inclusive
+    // even when exclusiveStart is set. Recheck descending document cursors in
+    // userland so the cursor row cannot be emitted twice.
+    const keysetAppliedByDocumentRange =
+      keyset !== null &&
+      keyset.direction === 'asc' &&
+      source.reason === 'document' &&
+      orderField === 'id';
     const maxBytes = args.maxBytes ?? null;
     let retainedBytes = 0;
     let byteLimitReached = false;
@@ -2258,7 +2317,11 @@ export class RocksRepository implements IndexerRepository {
       pageStart,
       hasNextPage:
         byteLimitReached ||
-        (totalCount === null ? hasOverfetched : logicalOffset + windowRows.length < totalCount),
+        (exactTotalCount !== null
+          ? logicalOffset + windowRows.length < exactTotalCount
+          : totalCount === null
+            ? hasOverfetched
+            : logicalOffset + windowRows.length < totalCount),
       hasPreviousPage: keyset !== null || pageStart > 0,
     };
   }
