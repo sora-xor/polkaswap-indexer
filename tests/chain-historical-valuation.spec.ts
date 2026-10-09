@@ -4,6 +4,7 @@ import { readConfig } from '../src/config.js';
 import { MemoryRepository } from '../src/repository/memory.js';
 import { SORA_MAINNET_GENESIS_HASH } from '../src/soraIdentity.js';
 import { ChainIndexer, summarizeExactPoolLiquidity } from '../src/worker/chain.js';
+import { assetHourlyCloseId, directXorPoolEvidence, HOURLY_HISTORY_ASSETS, selectHourlyHistoryTargets } from '../src/worker/hourly-history.js';
 
 const SCALE = 10n ** 18n;
 const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000';
@@ -91,6 +92,7 @@ const fetchedBlock = (
         header: {
           number: { toNumber: () => height },
           hash: { toString: () => requestedHash },
+          parentHash: { toString: () => `0x${(height - 1).toString(16).padStart(64, '0')}` },
         },
         extrinsics,
       },
@@ -129,6 +131,12 @@ const historicalState = (blockHeight = 9) => ({
   },
   orderBookLiquidityComplete: false,
 });
+
+/** Models ValueQuery: missing storage decodes to zero, but its pinned size is zero. */
+const poolStorage = (stored: Map<string, string[]>) => Object.assign(
+  vi.fn(async (base: string, target: string) => stored.get(`${base}\0${target}`) ?? ['0', '0']),
+  { size: vi.fn(async (base: string, target: string) => ({ toString: (): string => stored.has(`${base}\0${target}`) ? '32' : '0' })) },
+);
 
 const prepareState = (indexer: ChainIndexer, blockHeight = 9) => {
   (indexer as unknown as { observedGenesisHash: string }).observedGenesisHash =
@@ -171,7 +179,8 @@ describe('historical valuation state', () => {
     const account = await repository.get('accountMeta', 'alice');
     expect(history?.data.data).toMatchObject({ amountUSD: '2' });
     expect(network?.data).toMatchObject({
-      volumeUSD: '2',
+      volumeUSD: '0',
+      swaps: 0,
       poolLiquidityUSD: '400',
       liquidityUSD: null,
       orderBookLiquidityUSD: null,
@@ -199,7 +208,7 @@ describe('historical valuation state', () => {
     });
     indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({
       assets: {},
-      poolXYK: { reserves },
+      poolXYK: { reserves: Object.assign(reserves, { size: async (base: string, target: string) => base === XOR && target === KUSD ? 32 : 0 }) },
     }));
 
     await indexer.indexFetchedBlock(
@@ -218,7 +227,7 @@ describe('historical valuation state', () => {
     expect(state.blockHeight).toBe(10);
     expect(state.prices.get(XOR)).toBe(4n * SCALE);
     expect(maximumActiveReads).toBe(1);
-    expect(reserves).toHaveBeenCalledTimes(2);
+    expect(reserves).toHaveBeenCalledTimes(1);
 
     await indexer.indexFetchedBlock(
       fetchedBlock(
@@ -247,10 +256,7 @@ describe('historical valuation state', () => {
     indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({
       assets: {},
       poolXYK: {
-        reserves: async (base: string, target: string) =>
-          base === XOR && target === KUSD
-            ? [(100n * SCALE).toString(), (400n * SCALE).toString()]
-            : { isNone: true },
+        reserves: poolStorage(new Map([[`${XOR}\0${KUSD}`, [(100n * SCALE).toString(), (400n * SCALE).toString()]]])),
       },
     }));
     vi.spyOn(repository, 'upsertMany').mockRejectedValueOnce(new Error('atomic write failed'));
@@ -269,6 +275,147 @@ describe('historical valuation state', () => {
     expect(state.blockHeight).toBe(9);
     expect(state.prices.get(XOR)).toBe(2n * SCALE);
     expect(await repository.get('updatesStreams', 'chainState')).toBeNull();
+  });
+
+  it('removes absent ValueQuery reverse keys without creating duplicate hourly evidence', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const state = prepareState(indexer);
+    const reserves = poolStorage(new Map([[`${XOR}\0${KUSD}`, ['100', '200']]]));
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    const advance = await indexer.prepareHistoricalValuationAdvance(state, 10, [], [
+      eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD }),
+    ]);
+    expect(reserves.size).toHaveBeenCalledWith(XOR, KUSD);
+    expect(reserves.size).toHaveBeenCalledWith(KUSD, XOR);
+    expect(reserves).not.toHaveBeenCalledWith(KUSD, XOR);
+    expect(advance.pools).toContainEqual({ id: `${KUSD}\0${XOR}`, value: null });
+    indexer.applyHistoricalValuationAdvance(state, advance);
+    expect(state.pools.size).toBe(1);
+    expect(() => selectHourlyHistoryTargets(state.assets, [...state.pools.values()], HOURLY_HISTORY_ASSETS)).not.toThrow();
+  });
+
+  it('retains an explicitly stored zero-reserve pool as real direct XOR evidence', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const state = prepareState(indexer);
+    const reserves = poolStorage(new Map([[`${XOR}\0${KUSD}`, ['0', '0']]]));
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    const advance = await indexer.prepareHistoricalValuationAdvance(state, 10, [], [
+      eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD }),
+    ]);
+    indexer.applyHistoricalValuationAdvance(state, advance);
+    expect(state.pools.size).toBe(1);
+    expect(directXorPoolEvidence(KUSD, { assets: state.assets, pools: [...state.pools.values()], xorPoolsComplete: true }))
+      .toMatchObject({ baseAssetReserves: '0', targetAssetReserves: '0' });
+  });
+
+  it('represents reversed remove/recreate and later removal from the same pinned storage presence', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const state = prepareState(indexer);
+    const stored = new Map([[`${KUSD}\0${XOR}`, ['200', '100']]]);
+    const reserves = poolStorage(stored);
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    const events = [eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD })];
+    indexer.applyHistoricalValuationAdvance(state, await indexer.prepareHistoricalValuationAdvance(state, 10, [], events));
+    expect([...state.pools.keys()]).toEqual([`${KUSD}\0${XOR}`]);
+    stored.clear();
+    indexer.applyHistoricalValuationAdvance(state, await indexer.prepareHistoricalValuationAdvance(state, 11, [], events));
+    expect(state.pools.size).toBe(0);
+    stored.set(`${XOR}\0${KUSD}`, ['0', '0']);
+    indexer.applyHistoricalValuationAdvance(state, await indexer.prepareHistoricalValuationAdvance(state, 12, [], events));
+    expect([...state.pools.keys()]).toEqual([`${XOR}\0${KUSD}`]);
+  });
+
+  it.each(['size', 'value'])('fails atomically on a %s query error and retries the same block', async (failure) => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as any;
+    const state = prepareState(indexer);
+    const original = structuredClone(state);
+    const reserves = poolStorage(new Map([[`${XOR}\0${KUSD}`, ['100', '400']]]));
+    if (failure === 'size') reserves.size.mockRejectedValueOnce(new Error('pinned size unavailable'));
+    else reserves.mockRejectedValueOnce(new Error('pinned value unavailable'));
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    const block = fetchedBlock(10, [], [eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD })]);
+    const writes = vi.spyOn(repository, 'upsertMany');
+    await expect(indexer.indexFetchedBlock(block, { historicalValuationState: state })).rejects.toThrow(/pinned .* unavailable/);
+    expect(state).toEqual(original);
+    expect(writes).not.toHaveBeenCalled();
+    expect(await repository.get('updatesStreams', 'chainState')).toBeNull();
+    await indexer.indexFetchedBlock(block, { historicalValuationState: state });
+    expect(state.blockHeight).toBe(10);
+    expect(state.pools.size).toBe(1);
+    expect((await repository.get('updatesStreams', 'chainState'))?.blockHeight).toBe(10);
+  });
+
+  it('requires a pinned presence capability instead of falling back to decoded reserve amounts', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const state = prepareState(indexer);
+    const reserves = vi.fn(async () => ['0', '0']);
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    await expect(indexer.prepareHistoricalValuationAdvance(state, 10, [], [
+      eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD }),
+    ])).rejects.toThrow('point and size reads are required');
+    expect(reserves).not.toHaveBeenCalled();
+    expect(state.blockHeight).toBe(9);
+  });
+
+  it.each(['-1', 'NaN', '9007199254740992', ''])('rejects malformed pinned size %j without treating it as absence', async (size) => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const state = prepareState(indexer);
+    const reserves = poolStorage(new Map());
+    reserves.size.mockResolvedValue({ toString: () => size });
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    await expect(indexer.prepareHistoricalValuationAdvance(state, 10, [], [
+      eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD }),
+    ])).rejects.toThrow('invalid storage size');
+    expect(reserves).not.toHaveBeenCalled();
+    expect(state.blockHeight).toBe(9);
+  });
+
+  it('still rejects genuinely stored duplicate XOR orientations at an hourly boundary', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as any;
+    const state = prepareState(indexer);
+    const reserves = poolStorage(new Map([[`${XOR}\0${KUSD}`, ['0', '0']], [`${KUSD}\0${XOR}`, ['0', '0']]]));
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    const advance = await indexer.prepareHistoricalValuationAdvance(state, 10, [], [
+      eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD }),
+    ]);
+    indexer.applyHistoricalValuationAdvance(state, advance);
+    expect(state.pools.size).toBe(2);
+    expect(() => selectHourlyHistoryTargets(state.assets, [...state.pools.values()], HOURLY_HISTORY_ASSETS)).toThrow('Ambiguous direct XOR pool evidence');
+  });
+
+  it('retries a failed hour-boundary read and commits the close and checkpoint exactly once', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as any;
+    const state = prepareState(indexer);
+    indexer.api = { genesisHash: { toString: () => SORA_MAINNET_GENESIS_HASH } };
+    indexer.previousHourlyHistoryBlock = { height: 9, hash: `0x${'9'.padStart(64, '0')}`, timestamp: 7198 };
+    const reserves = poolStorage(new Map([[`${XOR}\0${KUSD}`, [(100n * SCALE).toString(), (400n * SCALE).toString()]]]));
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({
+      poolXYK: { reserves }, denomination: { denominator: async () => ({ toString: (): string => '100000000000000000000000000000000000000' }) },
+    }));
+    const events = [eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD })];
+    await indexer.indexFetchedBlock(fetchedBlock(10, [], events, 7199), { historicalValuationState: state, refreshDerivedState: false });
+    expect(state.pools.size).toBe(1);
+    const closeId = assetHourlyCloseId(KUSD, 7199);
+    const block = fetchedBlock(11, [], events, 7201);
+    reserves.size.mockRejectedValueOnce(new Error('boundary size unavailable'));
+    await expect(indexer.indexFetchedBlock(block, { historicalValuationState: state, refreshDerivedState: false })).rejects.toThrow('boundary size unavailable');
+    expect(state.blockHeight).toBe(10);
+    expect(indexer.previousHourlyHistoryBlock.height).toBe(10);
+    expect((await repository.get('updatesStreams', 'chainState'))?.blockHeight).toBe(10);
+    expect(await repository.get('assetSnapshots', closeId)).toBeNull();
+    const writes = vi.spyOn(repository, 'upsertMany');
+    await indexer.indexFetchedBlock(block, { historicalValuationState: state, refreshDerivedState: false });
+    const commits = writes.mock.calls.filter(([documents]) => documents.some(({ id }) => id === 'chainState'));
+    expect(commits).toHaveLength(1);
+    expect(commits[0]![0].map(({ id }) => id)).toContain(closeId);
+    expect((await repository.get('assetSnapshots', closeId))?.data.closeEvidence).toMatchObject({
+      xorPool: { baseAssetReserves: (100n * SCALE).toString(), targetAssetReserves: (400n * SCALE).toString() },
+    });
+    expect((await repository.get('updatesStreams', 'chainState'))?.blockHeight).toBe(11);
+    expect(state.pools.size).toBe(1);
   });
 
   it('collects every event and nested-call pool touch, probes reverse keys, and invalidates ambiguity', () => {

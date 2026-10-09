@@ -1,4 +1,5 @@
 import { getOrderField } from './order.js';
+import { finiteNumberToPlainDecimal } from '../decimal-number.js';
 import {
   assertValidNativePositionQueryValue,
   NATIVE_POSITION_FIELDS,
@@ -8,7 +9,7 @@ import {
 import type { IndexerCollection } from '../repository/types.js';
 
 type PublicConnectionName = IndexerCollection | 'accountTrades';
-type ComparisonKind = 'identifier' | 'numeric' | 'set' | 'search' | 'contains' | 'structuredContains';
+type ComparisonKind = 'identifier' | 'numeric' | 'numericSet' | 'set' | 'search' | 'contains' | 'structuredContains';
 
 type PublicQueryPolicy = {
   filterFields: Readonly<Record<string, ComparisonKind>>;
@@ -49,12 +50,17 @@ const SET_OPERATORS = new Set([
   'notIn',
   'not_in',
 ]);
+const NUMERIC_SET_OPERATORS = new Set([...NUMERIC_OPERATORS, ...SET_OPERATORS]);
 const CONTAINS_OPERATORS = new Set(['contains']);
 const SEARCH_OPERATORS = new Set([...SET_OPERATORS, 'equalToInsensitive', 'includesInsensitive']);
 const LOGICAL_FIELDS = new Set(['and', 'or']);
 const DECIMAL_PATTERN = /^-?([0-9]+)(?:\.([0-9]+))?$/;
 const MAX_DECIMAL_INTEGER_DIGITS = 80;
 const MAX_DECIMAL_FRACTION_DIGITS = 40;
+const ASSET_NUMERIC_FIELDS = [
+  'priceUSD', 'supply', 'liquidity', 'liquidityBooks', 'priceChangeDay',
+  'priceChangeWeek', 'volumeDayUSD', 'volumeWeekUSD', 'velocity',
+] as const;
 
 const fields = <T extends Record<string, ComparisonKind>>(value: T): T => value;
 const orders = (...value: string[]): ReadonlySet<string> => new Set(['id', ...value]);
@@ -112,17 +118,19 @@ const PUBLIC_QUERY_POLICIES: Partial<Record<PublicConnectionName, PublicQueryPol
     filterFields: fields({ account: 'identifier', accountId: 'identifier' }),
   },
   assets: {
-    orderFields: orders(),
+    orderFields: orders(...ASSET_NUMERIC_FIELDS),
     filterFields: fields({
-      id: 'identifier',
-      liquidity: 'numeric',
-      liquidityBooks: 'numeric',
+      id: 'set',
+      supply: 'numericSet',
+      liquidity: 'numericSet',
+      liquidityBooks: 'numericSet',
       liquidityUSD: 'numeric',
-      priceUSD: 'numeric',
-      priceChangeDay: 'numeric',
-      priceChangeWeek: 'numeric',
-      volumeDayUSD: 'numeric',
-      volumeWeekUSD: 'numeric',
+      priceUSD: 'numericSet',
+      priceChangeDay: 'numericSet',
+      priceChangeWeek: 'numericSet',
+      volumeDayUSD: 'numericSet',
+      volumeWeekUSD: 'numericSet',
+      velocity: 'numericSet',
     }),
   },
   assetSnapshots: {
@@ -184,6 +192,8 @@ const PUBLIC_QUERY_POLICIES: Partial<Record<PublicConnectionName, PublicQueryPol
       timestamp: 'numeric',
       blockHeight: 'numeric',
       liquidityUSD: 'numeric',
+      fees: 'numeric',
+      volumeUSD: 'numeric',
     }),
   },
   orderBooks: {
@@ -304,11 +314,12 @@ const PUBLIC_QUERY_POLICIES: Partial<Record<PublicConnectionName, PublicQueryPol
 };
 
 /**
- * Non-empty filters must select a compact source, not merely use a field that
+ * Most non-empty filters must select a compact source, not merely use a field that
  * happens to be valid for the collection. This prevents combinations such as
  * an ID sort plus an unrelated numeric predicate from degenerating into a
  * collection scan. Empty filters remain safe because every advertised order
- * field above has a direct ordered source.
+ * field above has a storage plan. Assets additionally admit their declared
+ * numeric fields through the native repository's configured row-scan budget.
  */
 const PUBLIC_FILTER_PLANS: Partial<Record<PublicConnectionName, readonly PublicFilterPlan[]>> = {
   accountLiquiditySnapshots: [
@@ -332,6 +343,14 @@ const PUBLIC_FILTER_PLANS: Partial<Record<PublicConnectionName, readonly PublicF
       requiredAll: fieldSet('priceUSD'),
       requiredRangeFields: fieldSet('priceUSD'),
     }),
+    // Preserve the indexed eligibility plans above. Price/liquidity ordering
+    // uses existing numeric keys; other declared Asset orders and residual
+    // predicates use the bounded native fallback. Both ordered and fallback
+    // loops enforce ROCKSDB_QUERY_MAX_SCANNED_ROWS for every examined row,
+    // including count queries. Page/byte/cursor limits remain independent.
+    ...['id', ...ASSET_NUMERIC_FIELDS].map((orderField) =>
+      plan(orderField, ['id', ...ASSET_NUMERIC_FIELDS])
+    ),
   ],
   assetSnapshots: [
     plan('timestamp', ['assetId', 'type', 'timestamp'], { requiredExactAll: fieldSet('assetId', 'type') }),
@@ -369,6 +388,13 @@ const PUBLIC_FILTER_PLANS: Partial<Record<PublicConnectionName, readonly PublicF
       requiredBoundedRangeFields: fieldSet('timestamp'),
     }),
     plan('blockHeight', ['type', 'blockHeight'], { requiredExactAll: fieldSet('type') }),
+    // Shipped NetworkBlockFees/Volume queries use the type/timestamp index;
+    // metric predicates are residual filters within their bounded time window.
+    plan('timestamp', ['type', 'timestamp', 'fees', 'volumeUSD'], {
+      requiredExactAll: fieldSet('type'),
+      requiredAll: fieldSet('timestamp'),
+      requiredBoundedRangeFields: fieldSet('timestamp'),
+    }),
   ],
   orderBooks: [
     plan('id', ['baseAssetId', 'status'], { requiredIndexedAll: fieldSet('baseAssetId') }),
@@ -432,9 +458,10 @@ const assertScalar = (value: unknown, label: string): void => {
   }
 };
 
-const assertNumeric = (value: unknown, label: string): void => {
+const assertNumeric = (value: unknown, label: string, allowNumberExponent = false): void => {
   if ((typeof value === 'number' && Number.isFinite(value)) || typeof value === 'string') {
-    const match = DECIMAL_PATTERN.exec(String(value));
+    const text = allowNumberExponent && typeof value === 'number' ? finiteNumberToPlainDecimal(value) : String(value);
+    const match = text === null ? null : DECIMAL_PATTERN.exec(text);
     if (
       match &&
       match[1]!.length <= MAX_DECIMAL_INTEGER_DIGITS &&
@@ -446,7 +473,7 @@ const assertNumeric = (value: unknown, label: string): void => {
   throw new Error(`${label} must be a finite decimal value`);
 };
 
-const assertNumericFieldValue = (field: string, value: unknown, label: string): void => {
+const assertNumericFieldValue = (field: string, value: unknown, label: string, allowNumberExponent = false): void => {
   if (field === 'marketId') {
     try {
       parseRuntimeUInt32(value, 'marketId');
@@ -456,7 +483,7 @@ const assertNumericFieldValue = (field: string, value: unknown, label: string): 
     return;
   }
   if (!NATIVE_POSITION_FIELDS.has(field)) {
-    assertNumeric(value, label);
+    assertNumeric(value, label, allowNumberExponent);
     return;
   }
   try {
@@ -467,6 +494,7 @@ const assertNumericFieldValue = (field: string, value: unknown, label: string): 
 };
 
 const operatorsForKind = (kind: ComparisonKind): ReadonlySet<string> => {
+  if (kind === 'numericSet') return NUMERIC_SET_OPERATORS;
   if (kind === 'numeric') return NUMERIC_OPERATORS;
   if (kind === 'set') return SET_OPERATORS;
   if (kind === 'search') return SEARCH_OPERATORS;
@@ -516,14 +544,14 @@ const validateComparisonValue = (
     const effective = expected.filter((value) => !isNullish(value));
     if (!effective.length) throw new Error(`${label} must contain at least one non-null value`);
     for (const value of effective) {
-      if (kind === 'numeric') assertNumericFieldValue(field, value, label);
+      if (kind === 'numeric' || kind === 'numericSet') assertNumericFieldValue(field, value, label, kind === 'numericSet');
       else assertScalar(value, label);
     }
     return;
   }
 
   if (isNullish(expected)) throw new Error(`${label} must not be null`);
-  if (kind === 'numeric') assertNumericFieldValue(field, expected, label);
+  if (kind === 'numeric' || kind === 'numericSet') assertNumericFieldValue(field, expected, label, kind === 'numericSet');
   else assertScalar(expected, label);
 };
 
@@ -546,7 +574,7 @@ const validateFilter = (
 
     if (!isRecord(condition)) {
       if (isNullish(condition)) throw new Error(`${connectionName} filter field ${field} must not be null`);
-      if (kind === 'numeric') assertNumericFieldValue(field, condition, `${connectionName}.${field}`);
+      if (kind === 'numeric' || kind === 'numericSet') assertNumericFieldValue(field, condition, `${connectionName}.${field}`, kind === 'numericSet');
       else assertScalar(condition, `${connectionName}.${field}`);
       continue;
     }
@@ -586,15 +614,18 @@ const hasIndexedCondition = (condition: unknown, allowIn: boolean): boolean => {
   return allowIn && Array.isArray(condition.in) && condition.in.some((value) => !isNullish(value));
 };
 
-/** Finds equality anchors outside OR branches, matching the repository planner. */
+/** A singleton OR is a conjunction; multi-branch OR does not supply a common anchor. */
 const hasConjunctiveField = (
   filter: Record<string, unknown>,
   field: string,
   predicate: (condition: unknown) => boolean = () => true
 ): boolean => {
   if (field in filter && predicate(filter[field])) return true;
-  if (!Array.isArray(filter.and)) return false;
-  return filter.and.some((nested) => isRecord(nested) && hasConjunctiveField(nested, field, predicate));
+  if (Array.isArray(filter.and) && filter.and.some((nested) => isRecord(nested) && hasConjunctiveField(nested, field, predicate))) {
+    return true;
+  }
+  return Array.isArray(filter.or) && filter.or.length === 1 && isRecord(filter.or[0]) &&
+    hasConjunctiveField(filter.or[0], field, predicate);
 };
 
 /**
@@ -684,6 +715,7 @@ const numericFieldHasBoundedConjunctiveRange = (filter: Record<string, unknown>,
     if (Array.isArray(candidate.and)) {
       for (const nested of candidate.and) if (isRecord(nested)) visit(nested);
     }
+    if (Array.isArray(candidate.or) && candidate.or.length === 1 && isRecord(candidate.or[0])) visit(candidate.or[0]);
   };
   visit(filter);
   return lower && upper;
@@ -701,9 +733,8 @@ const collectConjunctiveExactValues = (
   values = new Map<string, string | number | boolean>()
 ): Map<string, string | number | boolean> => {
   for (const [field, condition] of Object.entries(filter)) {
-    if (field === 'or') continue;
-    if (field === 'and') {
-      if (Array.isArray(condition)) {
+    if (LOGICAL_FIELDS.has(field)) {
+      if (Array.isArray(condition) && (field === 'and' || condition.length === 1)) {
         for (const nested of condition) if (isRecord(nested)) collectConjunctiveExactValues(nested, values);
       }
       continue;
@@ -712,6 +743,26 @@ const collectConjunctiveExactValues = (
     if (value !== null) values.set(field, value);
   }
   return values;
+};
+
+/**
+ * Published Swap History uses the operation/asset timestamp index. Require a
+ * conjunctive timestamp floor so RocksDB seeks the range, and retain its
+ * row-scan budget for every examined swap, including residual misses and
+ * total-count requests.
+ */
+const historySwapTimestampPlanSupported = (
+  filter: Record<string, unknown>,
+  selectedFields: ReadonlySet<string>
+): boolean => {
+  const allowedFields = fieldSet('module', 'method', 'dataAssets', 'timestamp');
+  if ([...selectedFields].some((field) => !allowedFields.has(field))) return false;
+  const values = collectConjunctiveExactValues(filter);
+  return values.get('module') === 'liquidityProxy' && values.get('method') === 'swap' &&
+    hasConjunctiveField(filter, 'dataAssets', (condition) => isRecord(condition) && 'contains' in condition) &&
+    hasConjunctiveField(filter, 'timestamp', (condition) => !isRecord(condition) ||
+      ['equalTo', 'eq', 'greaterThan', 'gt', 'greaterThanOrEqualTo', 'gte'].some((operator) => !isNullish(condition[operator]))) &&
+    numericFieldUsesOnlyRangePredicates(filter, 'timestamp');
 };
 
 const findConjunctiveOrBranches = (filter: Record<string, unknown>): Record<string, unknown>[] | null => {
@@ -759,6 +810,7 @@ const historySignaturePlanSupported = (filter: Record<string, unknown>): boolean
 };
 
 const GLOBAL_ORDERED_SOURCES: Partial<Record<PublicConnectionName, ReadonlySet<string>>> = {
+  assets: fieldSet(...ASSET_NUMERIC_FIELDS),
   accountTrades: fieldSet('timestamp'),
   assetSnapshots: fieldSet('timestamp'),
   networkSnapshots: fieldSet('timestamp'),
@@ -839,7 +891,7 @@ export const validatePublicConnectionQuery = (
       Object.keys(filter).length &&
       hasConjunctiveField(filter, 'id', (condition) => hasIndexedCondition(condition, true))
   );
-  if (!policy.orderFields.has(field) && !boundedDirectId) {
+  if (!policy.orderFields.has(field) && (connectionName === 'assets' || !boundedDirectId)) {
     throw new Error(`${connectionName} orderBy field ${field} is not supported by the public query plan`);
   }
   if (!filter || !Object.keys(filter).length) {
@@ -857,6 +909,10 @@ export const validatePublicConnectionQuery = (
   // Primary ID equality/IN is a bounded set of direct document reads for any
   // requested output order; residual predicates only reduce that set.
   if (boundedDirectId) return;
+
+  if (connectionName === 'historyElements' && field === 'timestamp' && historySwapTimestampPlanSupported(filter, selectedFields)) {
+    return;
+  }
 
   if (
     connectionName === 'historyElements' &&

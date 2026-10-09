@@ -19,24 +19,71 @@ any separately valued fee asset must have the same verified coefficient. Missing
 or inconsistent evidence must reduce reported coverage or stop the backtest; it
 must not be interpreted as coefficient one.
 
-## Release and historical coverage
+## Completed hourly evidence
 
-This is an additive schema/document change. There is no SQL migration, collection
-change, new index, writer reset, or destructive backfill. Deploy the API and worker
-from the same release following `docs/release-checklist.md`; the usual production
-smoke against `https://pi.soramitsu.io/graphql` remains required. New worker
-snapshots acquire evidence on the next scheduled snapshot refresh. Updating an
-existing bucket attaches evidence to its newly derived CLOSE price, not to an old
-price. Existing closed historical buckets remain unverified (`null`).
+The worker starts with XOR, VAL, PSWAP, DAI, KUSD, LLD and LLM, and adds assets
+from complete finalized XOR pool state when both reserves are positive and the
+XOR reserve exceeds one natural XOR. This covers a superset of the frontend's
+whitelist-based eligibility without consulting a market API. A validated catalogue
+of at most 512 distinct IDs is stored in `updatesStreams/hourlyHistoryTargets-v1`.
+Already tracked or explicitly imported targets remain tracked if their pools later
+disappear or lose liquidity. The catalogue and completed hourly rows are committed
+with the finalized block transaction; failed transactions cannot advance tracking.
 
-Do not stamp old snapshots with the present coefficient to accelerate rollout.
-Backfill requires exact historical state at each recorded snapshot block, or a
-separately validated complete denomination-event history anchored to finalized
-chain state. This release does not perform that backfill. The frontend has a
-legacy-query fallback while servers roll out the optional field; legacy historical
-verification still requires unchanged archival denomination state (or a current
-cumulative coefficient of one).
+Each completed UTC hour uses the actual adjacent finalized blocks, the preceding immutable
+valuation state and its denomination. `assetSnapshots.closeEvidence` records
+that source and the same-state direct XOR pool reserves and precision when
+available. It corrects CLOSE while retaining existing open/high/low, volume and
+supply fields. Unavailable metadata or prices remain explicit; chain halts create
+no synthetic observations. Ordinary projections cannot replace a finalized CLOSE,
+and rolling retention preserves all tracked assets' HOUR rows. The production
+`all` retention mode continues preserving every historical snapshot.
 
-Rollback to the prior API/worker is safe: documents may retain the additional
-field, the old schema ignores it, and clients can use the legacy query. Keep all
-existing deployment evidence and worker-health requirements intact.
+`assetHourlyCoverage(assetId: String!, start: Int!, end: Int!)` reports metadata
+for 1–2160 completed UTC hours from indexed storage. Missing, legacy, invalid,
+unknown-pool, absent-pool and zero-reserve buckets remain distinct. Verified
+boundary evidence and usable direct pools are separate counts; clients must join
+the relevant assets by matching block and denomination evidence. The API makes
+no chain RPC and returns no prices or strategy results from this field.
+It accepts canonical asset IDs outside the initial seven; missing history remains
+missing. Historical metadata supplies each token's actual symbol and precision,
+including symbol changes, while the canonical original assets retain identity checks.
+
+## Explicit historical repair
+
+Prepare a bounded public artifact from the approved SORA mainnet archive:
+
+```sh
+node dist/src/scripts/backfill-hourly-history.js --hours=369 --end=2026-10-01T00:00:00Z --output=/absolute/private/prepared-hours.jsonl
+```
+
+Without an explicit target catalogue, artifact version 1 continues to mean the
+original seven assets. To collect a different bounded scope, pass
+`--targets=/absolute/private/targets.json`, containing an array of
+`{"id":"0x…","symbol":"TOKEN"}` descriptors. The collector writes a version 2
+manifest with that exact target scope; incidental USD pricing-route assets do not
+become targets. The target catalogue validates before chain reads, and the complete
+artifact validates before database writes. Each hour has one document per target,
+including explicit unavailable metadata or price evidence. Existing version 1
+artifacts and completion receipts retain their original scope and interpretation.
+Completed version 2 imports merge their targets into the worker's durable catalogue
+only after every imported hour verifies. Preparation remains subject to the existing
+artifact, line, pool and route budgets; split a larger request into bounded artifacts.
+
+Use an exact completed UTC hour supported by the archive. Preparation is read-only
+and checks mainnet identity, the reviewed anchor, adjacent blocks and historical
+state. Keep the resulting SHA-256 and complete artifact; partial output cannot
+authorize application. Preserve a native database checkpoint before repair.
+
+`CHAIN_HOURLY_REPAIR_FILE` and `CHAIN_HOURLY_REPAIR_SHA256` activate that verified
+artifact through the existing combined worker's one repository handle before
+normal catchup. The entire artifact validates before writing; each hour writes
+atomically and is reread. Interrupted repair safely resumes and records completion
+only after every hour verifies. It leaves `chainState` and current asset projections
+unchanged and never assigns current denomination to legacy prices. Do not open
+another RocksDB writer or run the PostgreSQL standalone worker against native data.
+
+Deploy the API and worker together, retaining the usual health, source custody and
+rollback controls. The additions require no collection or index migration. Repair
+is an explicit operation; restoring the API does not upgrade historical evidence.
+After repair, query the same bounded coverage window and preserve its gap statuses.

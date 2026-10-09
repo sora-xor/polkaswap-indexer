@@ -457,8 +457,19 @@ const canonicalPosition = (
   data: Record<string, unknown>
 ): number | null | undefined => {
   const dataHasValue = Object.hasOwn(data, name);
-  const dataValue = dataHasValue ? data[name] : undefined;
+  let dataValue = dataHasValue ? data[name] : undefined;
   assertValidDocumentPosition(name, envelopeValue);
+  // PostgreSQL may retain a decimal string in JSONB alongside its numeric
+  // position column. Compare the exact safe value without changing the JSON
+  // payload; an absent envelope must never derive a position from such a string.
+  if (
+    typeof dataValue === 'string' &&
+    envelopeValue !== null && envelopeValue !== undefined &&
+    /^(0|[1-9][0-9]*)$/.test(dataValue) &&
+    Number.isSafeInteger(Number(dataValue))
+  ) {
+    dataValue = Number(dataValue);
+  }
   if (dataHasValue) assertValidDocumentPosition(name, dataValue);
 
   if (envelopeValue !== null && envelopeValue !== undefined) {

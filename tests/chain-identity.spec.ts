@@ -834,14 +834,15 @@ describe('PI archive endpoint identity', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllEnvs();
     if (originalArchiveEndpoint === undefined) delete process.env.SORA_ARCHIVE_WS_ENDPOINT;
     else process.env.SORA_ARCHIVE_WS_ENDPOINT = originalArchiveEndpoint;
     vi.restoreAllMocks();
     vi.resetModules();
   });
 
-  const loadArchiveWorker = async () => {
-    process.env.SORA_ARCHIVE_WS_ENDPOINT = 'wss://archive-mainnet-label.invalid';
+  const loadArchiveWorker = async (endpoint = 'wss://archive-mainnet-label.invalid') => {
+    process.env.SORA_ARCHIVE_WS_ENDPOINT = endpoint;
     vi.resetModules();
     const [{ ApiPromise: RuntimeApiPromise }, { ChainIndexer: RuntimeChainIndexer }, { MemoryRepository: RuntimeMemoryRepository }] =
       await Promise.all([
@@ -851,6 +852,65 @@ describe('PI archive endpoint identity', () => {
       ]);
     return { RuntimeApiPromise, RuntimeChainIndexer, RuntimeMemoryRepository };
   };
+
+  it('keeps the primary and exact hash while reading pruned timestamps from a verified archive', async () => {
+    const { RuntimeApiPromise, RuntimeChainIndexer, RuntimeMemoryRepository } = await loadArchiveWorker();
+    const primary = startApi(SORA_MAINNET_GENESIS_HASH);
+    primary.query.timestamp.now.at.mockRejectedValue(new Error('4003: State already discarded'));
+    const archive = startApi(SORA_MAINNET_GENESIS_HASH);
+    vi.spyOn(RuntimeApiPromise, 'create').mockResolvedValue(archive as never);
+    const indexer = new RuntimeChainIndexer(config, new RuntimeMemoryRepository()) as unknown as TestIndexer;
+    indexer.api = primary;
+    await expect(indexer.fetchBlockTimestamp(CHECKPOINT_HASH)).resolves.toBe(FINALIZED_TIMESTAMP);
+    expect(primary.query.timestamp.now.at).toHaveBeenCalledWith(CHECKPOINT_HASH);
+    expect(archive.query.timestamp.now.at).toHaveBeenCalledWith(CHECKPOINT_HASH);
+    expect(archive.rpc.chain.getBlockHash).toHaveBeenCalledWith(0);
+    expect(archive.rpc.chain.getBlockHash).toHaveBeenCalledWith(SORA_LEGACY_IDENTITY_ANCHOR.block);
+    expect(indexer.api).toBe(primary);
+    await indexer.stop();
+  });
+
+  it.each(['connection refused', 'unknown Block'])(
+    'does not redirect primary timestamp failure %s to an archive', async (failure) => {
+      const { RuntimeApiPromise, RuntimeChainIndexer, RuntimeMemoryRepository } = await loadArchiveWorker();
+      const primary = startApi(SORA_MAINNET_GENESIS_HASH);
+      primary.query.timestamp.now.at.mockRejectedValue(new Error(failure));
+      const create = vi.spyOn(RuntimeApiPromise, 'create');
+      const indexer = new RuntimeChainIndexer(config, new RuntimeMemoryRepository()) as unknown as TestIndexer;
+      indexer.api = primary;
+      await expect(indexer.fetchBlockTimestamp(CHECKPOINT_HASH)).rejects.toThrow(failure);
+      expect(create).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects a pruned timestamp fallback from an archive with the wrong chain identity', async () => {
+    const { RuntimeApiPromise, RuntimeChainIndexer, RuntimeMemoryRepository } = await loadArchiveWorker();
+    const primary = startApi(SORA_MAINNET_GENESIS_HASH);
+    primary.query.timestamp.now.at.mockRejectedValue(new Error('State already discarded'));
+    const archive = startApi(hash('4'));
+    vi.spyOn(RuntimeApiPromise, 'create').mockResolvedValue(archive as never);
+    const indexer = new RuntimeChainIndexer(config, new RuntimeMemoryRepository()) as unknown as TestIndexer;
+    indexer.api = primary;
+    await expect(indexer.fetchBlockTimestamp(CHECKPOINT_HASH)).rejects.toThrow('does not match the reviewed SORA mainnet identity');
+    expect(archive.query.timestamp.now.at).not.toHaveBeenCalled();
+  });
+
+  it('still rejects an archive timestamp that conflicts with the persisted identity', async () => {
+    const { RuntimeApiPromise, RuntimeChainIndexer, RuntimeMemoryRepository } = await loadArchiveWorker();
+    const repository = new RuntimeMemoryRepository();
+    await repository.upsert(chainIdentityDocument());
+    const primary = startApi(SORA_MAINNET_GENESIS_HASH);
+    primary.query.timestamp.now.at.mockRejectedValue(new Error('State already discarded'));
+    const archive = startApi(SORA_MAINNET_GENESIS_HASH);
+    archive.query.timestamp.now.at.mockResolvedValue(codec(123000));
+    vi.spyOn(RuntimeApiPromise, 'create').mockResolvedValue(archive as never);
+    const indexer = new RuntimeChainIndexer(config, repository) as unknown as TestIndexer;
+    indexer.api = primary;
+    indexer.observedGenesisHash = SORA_MAINNET_GENESIS_HASH;
+    await expect(indexer.ensureChainIdentity(FINALIZED_BLOCK)).rejects.toThrow(/timestamp/);
+    expect(await repository.get('updatesStreams', 'chainIdentity')).toEqual(chainIdentityDocument());
+    await indexer.stop();
+  });
 
   it('rejects an archive endpoint whose convincing label hides the wrong genesis', async () => {
     const { RuntimeApiPromise, RuntimeChainIndexer, RuntimeMemoryRepository } = await loadArchiveWorker();
@@ -906,6 +966,39 @@ describe('PI archive endpoint identity', () => {
     indexer.api = {};
 
     await expect(indexer.getBlockDataApi()).resolves.toBe(archiveApi);
+    expect(archiveApi.rpc.chain.getBlockHash).toHaveBeenCalledWith(0);
+    expect(archiveApi.rpc.chain.getBlockHash).toHaveBeenCalledWith(SORA_LEGACY_IDENTITY_ANCHOR.block);
+    await indexer.stop();
+    expect(archiveApi.disconnect).toHaveBeenCalledOnce();
+  });
+
+  it('verifies a separate archive handle when both production roles use mof2', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('SORA_WS_ENDPOINT', 'wss://mof2.sora.org');
+    vi.stubEnv('CHAIN_START_BLOCK', String(SORA_LEGACY_IDENTITY_ANCHOR.block));
+    const { RuntimeApiPromise, RuntimeChainIndexer, RuntimeMemoryRepository } =
+      await loadArchiveWorker('wss://mof2.sora.org');
+    const archiveApi = {
+      disconnect: vi.fn(async () => undefined),
+      rpc: {
+        chain: {
+          getBlockHash: vi.fn(async (block: number) => codec(
+            block === 0 ? SORA_MAINNET_GENESIS_HASH : SORA_LEGACY_IDENTITY_ANCHOR.hash,
+          )),
+        },
+      },
+    };
+    vi.spyOn(RuntimeApiPromise, 'create').mockResolvedValue(archiveApi as never);
+    const indexer = new RuntimeChainIndexer({
+      ...config,
+      soraWsEndpoint: 'wss://mof2.sora.org',
+      soraArchiveWsEndpoint: 'wss://mof2.sora.org',
+    }, new RuntimeMemoryRepository()) as unknown as TestIndexer;
+    const primaryApi = {};
+    indexer.api = primaryApi;
+
+    await expect(indexer.getBlockDataApi()).resolves.toBe(archiveApi);
+    expect(archiveApi).not.toBe(primaryApi);
     expect(archiveApi.rpc.chain.getBlockHash).toHaveBeenCalledWith(0);
     expect(archiveApi.rpc.chain.getBlockHash).toHaveBeenCalledWith(SORA_LEGACY_IDENTITY_ANCHOR.block);
     await indexer.stop();

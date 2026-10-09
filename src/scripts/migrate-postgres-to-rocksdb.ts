@@ -6,7 +6,13 @@ import { readConfig } from '../config.js';
 import { POSTGRES_TRUSTED_SESSION_OPTIONS } from '../postgres-session.js';
 import { parseExactJsonObject } from '../repository/json-numeric.js';
 import { decodePostgresDocument, decodePostgresDocumentText } from '../repository/postgres-document.js';
-import { ROCKSDB_FORMAT_METADATA_KEY, RocksRepository } from '../repository/rocksdb.js';
+import {
+  ROCKSDB_FORMAT_METADATA_KEY,
+  ROCKSDB_FORMAT_VERSION,
+  ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY,
+  RocksRepository,
+  rocksSwapAssetIndexIsReady,
+} from '../repository/rocksdb.js';
 import {
   indexerDocumentJsonBytes,
   MAX_REPOSITORY_WRITE_BATCH_JSON_BYTES,
@@ -155,8 +161,51 @@ const saveState = async (repository: RocksRepository, state: PostgresRocksdbMigr
 const loadState = (repository: RocksRepository): PostgresRocksdbMigrationState | null =>
   parsePostgresRocksdbMigrationState(repository.getMetadata(POSTGRES_ROCKSDB_MIGRATION_STATE_KEY));
 
+/** Records failure without rewinding progress saved inside export/replay loops. */
+export const persistMigrationFailureState = async (
+  repository: RocksRepository,
+  state: PostgresRocksdbMigrationState,
+  error: unknown
+): Promise<PostgresRocksdbMigrationState> => {
+  try {
+    const durable = loadState(repository);
+    if (!durable) throw new Error('Latest durable RocksDB migration checkpoint is missing');
+    const bindingFields = [
+      'sourceId',
+      'sourceDatabaseIdentity',
+      'destinationId',
+      'runId',
+      'captureStartSeq',
+      'captureStartHash',
+    ] as const;
+    if (bindingFields.some((field) => durable[field] !== state[field])) {
+      throw new Error('Latest durable RocksDB migration checkpoint belongs to a different source or run');
+    }
+    if (durable.rows < state.rows || BigInt(durable.lastReplayedSeq) < BigInt(state.lastReplayedSeq)) {
+      throw new Error('Latest durable RocksDB migration checkpoint regressed behind the active state');
+    }
+    if (durable.status === 'validated_complete') return durable;
+    const failed: PostgresRocksdbMigrationState = {
+      ...durable,
+      status: 'failed',
+      lastError: migrationCheckpointErrorMessage(error),
+    };
+    await saveState(repository, failed);
+    return failed;
+  } catch (checkpointError) {
+    // A corrupt, foreign, or unavailable checkpoint must remain untouched;
+    // receipt diagnostics must never mask the original migration failure.
+    console.error('Unable to persist the latest RocksDB migration failure checkpoint', checkpointError);
+    return state;
+  }
+};
+
 const destinationHasUntrackedContent = async (repository: RocksRepository): Promise<boolean> =>
   repository.inspectCurrentSnapshot((db) => {
+    if (db.getSync(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY]) !== ROCKSDB_FORMAT_VERSION ||
+        !rocksSwapAssetIndexIsReady(db.getSync(['m', 'metadata', ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY]))) {
+      return true;
+    }
     for (const entry of db.getRange({ values: false })) {
       const key = entry?.key;
       if (
@@ -164,7 +213,7 @@ const destinationHasUntrackedContent = async (repository: RocksRepository): Prom
         key.length === 3 &&
         key[0] === 'm' &&
         key[1] === 'metadata' &&
-        key[2] === ROCKSDB_FORMAT_METADATA_KEY
+        (key[2] === ROCKSDB_FORMAT_METADATA_KEY || key[2] === ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY)
       ) {
         continue;
       }
@@ -501,12 +550,7 @@ export const runPostgresToRocksdbMigration = async (): Promise<void> => {
     console.info(`PostgreSQL-to-RocksDB migration ${state.runId} completed through seq ${state.sealedSeq}`);
   } catch (error) {
     if (state && state.status !== 'validated_complete') {
-      state = {
-        ...state,
-        status: 'failed',
-        lastError: migrationCheckpointErrorMessage(error),
-      };
-      await saveState(repository, state).catch(() => undefined);
+      state = await persistMigrationFailureState(repository, state, error);
     }
     throw error;
   } finally {

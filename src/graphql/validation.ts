@@ -41,6 +41,7 @@ const ROOT_QUERY_FIELD_BASE_COST: Readonly<Record<string, number>> = {
   exploreStats: 10_000,
   networkAccountActivity: 75_000,
   polkamarktSignals: 75_000,
+  assetHourlyCoverage: 75_000,
 };
 
 const limitError = (message: string, nodes?: ASTNode | readonly ASTNode[]): GraphQLError =>
@@ -94,7 +95,8 @@ const fieldDefinition = (parentType: GraphQLCompositeType | undefined, fieldName
 };
 
 const connectionPageSize = (field: FieldNode, maxCost: number): number => {
-  const first = field.arguments?.find((argument) => argument.name.value === 'first')?.value;
+  const first = field.arguments?.find((argument) => argument.name.value === 'first')?.value ??
+    field.arguments?.find((argument) => argument.name.value === 'last')?.value;
   if (!first) return DEFAULT_CONNECTION_PAGE_SIZE;
   if (first.kind === Kind.VARIABLE) return MAX_CONNECTION_PAGE_SIZE;
   if (first.kind !== Kind.INT) return MAX_CONNECTION_PAGE_SIZE;

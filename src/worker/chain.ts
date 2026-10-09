@@ -1,14 +1,29 @@
 import { isDeepStrictEqual } from 'node:util';
+import { createHash } from 'node:crypto';
 
 import { ApiPromise, WsProvider } from '@polkadot/api';
 import { types as soraTypes } from '@sora-substrate/type-definitions';
 import { readSnapshotDenominator } from './denomination.js';
+import { isDiscardedTimestampState } from './historicalTimestamp.js';
+import {
+  assetHourlyCloseId,
+  buildAssetHourlyCloseDocumentsAtBoundary,
+  deriveAssetPrices,
+  HOURLY_HISTORY_ASSETS,
+  HOURLY_HISTORY_GENESIS,
+  HOUR_SECONDS,
+  selectHourlyHistoryTargets,
+  validateHourlyHistoryTargets,
+  type HourlyBoundaryBlock,
+  type HourlyHistoryTarget,
+  type HourlyPoolReserves,
+} from './hourly-history.js';
+import { assertLegacyCheckpointBlockRepair, createCheckpointProjectionCapture, type LegacyCheckpointBlockRepair } from './checkpointRepair.js';
 
 import { uniqueIndexedAccountIds } from '../account-activity.js';
 import { estimateRetainedValueBytes } from '../cache-weight.js';
 import {
   assertExplicitProductionWorkerChainInputs,
-  assertIndependentSoraRpcEndpoints,
   type AppConfig,
 } from '../config.js';
 import { matchesFilter, sortDocuments } from '../graphql/filter.js';
@@ -222,15 +237,40 @@ type NetworkBackfillFlowTotals = Pick<
   'accounts' | 'transactions' | 'fees' | 'volumeUSD' | 'swaps' | 'bridgeIncomingTransactions' | 'bridgeOutgoingTransactions'
 >;
 
+/** Exact flow totals retain independent calendar semantics beside legacy rolling totals. */
+type NetworkCalendarBucket = {
+  bucketStart: number;
+  bucketEnd: number;
+  firstBlock: number;
+  throughBlock: number;
+  throughTimestamp: number;
+  blocks: number;
+  totals: NetworkBackfillFlowTotals;
+};
+
+type NetworkCalendarFlows = Omit<NetworkBackfillFlowTotals, 'fees' | 'volumeUSD'> & {
+  version: 1;
+  bucketStart: number;
+  bucketEnd: number;
+  throughBlock: number;
+  throughTimestamp: number;
+  complete: boolean;
+  fees: string;
+  volumeUSD: string;
+};
+
 type NetworkBackfillWindow = {
   type: SnapshotTypeName;
   blocks: NetworkBackfillBlock[];
   windowStart: number;
   totals: NetworkBackfillFlowTotals;
   pendingDocument: IndexerDocument | null;
+  calendarBucket?: NetworkCalendarBucket;
+  calendarPredecessor?: number;
 };
 
 type Analytics = {
+  networkCalendarCache?: RollingNetworkInputCache;
   assets: Map<string, Map<SnapshotTypeName, AssetAggregate>>;
   pools: Map<string, Map<SnapshotTypeName, PoolAggregate>>;
   orderBooks: Map<string, Map<SnapshotTypeName, OrderBookAggregate>>;
@@ -283,6 +323,7 @@ type RollingNetworkInputCache = {
   blocksById: Map<string, RollingNetworkBlock>;
   blockStarts: Map<SnapshotTypeName, number>;
   totals: Map<SnapshotTypeName, NetworkBackfillFlowTotals>;
+  calendarBuckets: Map<string, NetworkCalendarBucket>;
 };
 
 type AnalyticsInputCacheMetrics = {
@@ -300,6 +341,13 @@ type AnalyticsRetainedLoadBudget = {
   maximumBytes: number;
   retainedBytes: number;
 };
+
+class AnalyticsRetainedLoadLimitError extends Error {
+  constructor(maximumBytes: number, collectionName: IndexerCollection) {
+    super(`Cold analytics input exceeds its ${maximumBytes} byte retained-load limit while reading ${collectionName}`);
+    this.name = 'AnalyticsRetainedLoadLimitError';
+  }
+}
 
 type RollingNetworkInputMetrics = {
   fullBuilds: number;
@@ -625,8 +673,8 @@ const FEE_REFERRER_WEIGHT = 10;
 const FEE_XOR_BURNED_WEIGHT = 20;
 const FEE_VAL_BURNED_WEIGHT = 50;
 const FEE_KUSD_BURNED_WEIGHT = 5;
-const PERSISTED_CHART_SNAPSHOT_TYPES: readonly SnapshotTypeName[] = ['DEFAULT', 'HOUR', 'DAY', 'MONTH'];
-const AGGREGATE_SNAPSHOT_TYPES = PERSISTED_CHART_SNAPSHOT_TYPES;
+const AGGREGATE_SNAPSHOT_TYPES: readonly SnapshotTypeName[] = ['DEFAULT', 'HOUR', 'DAY', 'MONTH'];
+const ALL_CHART_SNAPSHOT_TYPES: readonly SnapshotTypeName[] = [...AGGREGATE_SNAPSHOT_TYPES, 'BLOCK'];
 const RETAINED_CHART_SNAPSHOT_TYPES: readonly RetainedChartSnapshotType[] = ['DEFAULT', 'HOUR'];
 const CHART_SNAPSHOT_RETENTION_SECONDS: Readonly<Record<RetainedChartSnapshotType, number>> = {
   DEFAULT: 48 * 60 * 60,
@@ -702,9 +750,21 @@ const emptyNetworkTransactionCounters = (): NetworkTransactionCounters => ({
   bridgeOutgoingTransactions: 0,
 });
 
+const LIQUIDITY_PROXY_SWAP_METHODS = new Set(['swap', 'swapTransfer', 'swapTransferBatch']);
+
+/**
+ * Identifies the public liquidity-proxy calls that can execute user exchange
+ * legs. The exact allow-list deliberately excludes other successful
+ * liquidity-proxy operations and also covers the same calls inside utility
+ * batches.
+ */
 const isLiquidityProxySwap = (module: string, method: string, callNames: string[] = []): boolean =>
-  (module === 'liquidityProxy' && (method === 'swap' || method === 'swapTransfer')) ||
-  callNames.some((name) => name === 'liquidityProxy.swap' || name === 'liquidityProxy.swapTransfer');
+  (module === 'liquidityProxy' && LIQUIDITY_PROXY_SWAP_METHODS.has(method)) ||
+  callNames.some((name) => {
+    const [callModule, callMethod] = name.split('.');
+    return callModule === 'liquidityProxy' && LIQUIDITY_PROXY_SWAP_METHODS.has(callMethod ?? '');
+  });
+
 
 const isBridgeOutgoing = (module: string, method: string): boolean =>
   module === 'ethBridge' || (module === 'bridgeProxy' && method === 'burn');
@@ -2275,6 +2335,14 @@ const snapshotDocumentTimestamp = (document: IndexerDocument): number => {
   return Number.isFinite(timestamp) ? timestamp : 0;
 };
 
+const HOURLY_HISTORY_TARGETS_ID = 'hourlyHistoryTargets-v1';
+
+// Preserve close provenance even when a legacy row needs further validation.
+// GraphQL independently validates the complete proof before using the candle.
+const hasFinalizedHourlyCloseEvidence = (document: IndexerDocument | undefined): boolean =>
+  document?.collection === 'assetSnapshots' && document.data.type === 'HOUR' &&
+  isRecord(document.data.closeEvidence) && document.data.closeEvidence.kind === 'finalized-hour-close';
+
 const priceOhlcValues = (price: unknown): bigint[] | null => {
   if (!price || typeof price !== 'object') return null;
 
@@ -2492,6 +2560,8 @@ const isPolkamarktTradeContext = (context: BlockExtrinsicContext): boolean => {
 
 export class ChainIndexer {
   private readonly config: AppConfig;
+  private networkCalendarHistorySealed = false;
+  private networkCalendarSealedThrough = 0;
   private api: ApiPromise | null = null;
   private primaryProvider: WsProvider | null = null;
   private observedGenesisHash: string | null = null;
@@ -2524,6 +2594,9 @@ export class ChainIndexer {
   private networkLiquidityStats = emptyNetworkLiquidityStats();
   private networkLiquidityStatsBlockHeight = -1;
   private liveValuationState: HistoricalValuationState | null = null;
+  private previousHourlyHistoryBlock: HourlyBoundaryBlock | null = null;
+  private hourlyHistoryTargets = validateHourlyHistoryTargets([...HOURLY_HISTORY_ASSETS]);
+  private hourlyRetentionSeek: RepositoryQueryArgs['seek'];
   private pendingFinalizedBlock = 0;
   private finalizedHeadDrainRunning = false;
   private finalizedHeadRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2603,6 +2676,7 @@ export class ChainIndexer {
       '';
     this.config = {
       fullReconciliationIntervalBlocks: 250,
+      snapshotRetentionMode: 'all',
       chainShutdownTimeoutMs: CHAIN_DISCONNECT_TIMEOUT_MS,
       chainRpcTimeoutMs: CHAIN_RPC_TIMEOUT_MS,
       chainRpcMaxInFlight: 256,
@@ -2627,7 +2701,6 @@ export class ChainIndexer {
       if (!this.archiveSoraWsEndpoint) {
         throw new Error('SORA_ARCHIVE_WS_ENDPOINT is required for the production worker.');
       }
-      assertIndependentSoraRpcEndpoints(this.config.soraWsEndpoint, this.archiveSoraWsEndpoint);
     }
     this.publishStatusMetrics();
   }
@@ -2736,6 +2809,111 @@ export class ChainIndexer {
   }
 
   /**
+   * Prepares one genuinely derived missing legacy BLOCK without starting any
+   * maintenance, heartbeat, subscription, or catch-up work. The source remains
+   * read-only; even the normal kernel writes only to an audited capture.
+   */
+  async prepareLegacyCheckpointBlockRepair(targetBlock: number): Promise<LegacyCheckpointBlockRepair> {
+    if (this.lifecycleState !== 'idle' || this.api || this.startPromise) {
+      throw new Error('Checkpoint repair requires a fresh offline indexer instance');
+    }
+    if (!Number.isSafeInteger(targetBlock) || targetBlock <= SORA_LEGACY_IDENTITY_ANCHOR.block ||
+        targetBlock >= TONSWAP_START_BLOCK ||
+        this.config.soraWsEndpoint !== 'wss://mof2.sora.org' ||
+        this.archiveSoraWsEndpoint !== 'wss://mof2.sora.org') {
+      throw new Error('Checkpoint repair requires a bounded pre-TONSWAP legacy checkpoint and explicit approved mof2 RPC roles');
+    }
+    try {
+      const provider = new WsProvider(this.config.soraWsEndpoint);
+      this.primaryProvider = provider;
+      this.api = await this.withRpcTimeout(
+        () => ApiPromise.create({ provider }),
+        'checkpoint repair primary connection',
+        undefined,
+        (lateApi) => this.disconnectResource(lateApi, 'late checkpoint repair API')
+      );
+      this.observedGenesisHash = await this.requireMainnetIdentity(this.api, 'checkpoint repair primary');
+      await this.requireReviewedMainnetAnchor(this.api, 'checkpoint repair primary', true);
+      const finalizedBlock = await this.getIndexableFinalizedBlock();
+      if (targetBlock > finalizedBlock) throw new Error('Checkpoint repair target is not finalized');
+
+      const legacyCheckpoint = await this.repository.get('updatesStreams', CHAIN_STATE_ID);
+      if (!legacyCheckpoint || this.parseLegacyChainState(legacyCheckpoint) !== targetBlock ||
+          await this.repository.get('updatesStreams', CHAIN_IDENTITY_ID)) {
+        throw new Error('Checkpoint repair requires the exact existing legacy checkpoint without a chain identity');
+      }
+      if (await this.repository.get('networkSnapshots', `block-${targetBlock}`)) {
+        throw new Error('Checkpoint repair refuses to overwrite an existing BLOCK');
+      }
+      await this.requireMatchingBlockSnapshot(SORA_LEGACY_IDENTITY_ANCHOR.block, SORA_LEGACY_IDENTITY_ANCHOR.timestamp);
+      const anchorSnapshot = (await this.repository.get('networkSnapshots', `block-${SORA_LEGACY_IDENTITY_ANCHOR.block}`))!;
+      const priorSnapshot = await this.repository.get('networkSnapshots', `block-${targetBlock - 1}`);
+      if (!priorSnapshot || !Number.isSafeInteger(priorSnapshot.timestamp) || Number(priorSnapshot.timestamp) <= 0) {
+        throw new Error('Checkpoint repair requires an existing timestamped prior BLOCK');
+      }
+      await this.requireMatchingBlockSnapshot(targetBlock - 1, Number(priorSnapshot.timestamp));
+      const prior = await this.fetchBlockByNumber(targetBlock - 1);
+      if (prior.timestamp !== priorSnapshot.timestamp) throw new Error('Checkpoint repair prior BLOCK timestamp does not match the chain');
+      const fetched = await this.fetchBlockByNumber(targetBlock);
+      const parentHash = fetched.signedBlock.block.header.parentHash?.toString?.() ?? '';
+      if (parentHash !== prior.requestedHash || fetched.timestamp <= prior.timestamp ||
+          fetched.timestamp > Number(legacyCheckpoint.timestamp)) {
+        throw new Error('Checkpoint repair target has an inconsistent parent link or timestamp');
+      }
+      const extrinsics = fetched.signedBlock.block.extrinsics;
+      const extrinsic = extrinsics[0];
+      const event = fetched.events[0];
+      const timestampIdentity = await this.fetchBlockTimestampIdentity(fetched.requestedHash, this.api);
+      if (extrinsics.length !== 1 || extrinsic.isSigned !== false ||
+          extrinsic.method.section !== 'timestamp' || extrinsic.method.method !== 'set' ||
+          extrinsic.method.args?.length !== 1 ||
+          extrinsic.method.args[0]?.toString?.() !== timestampIdentity.milliseconds ||
+          timestampIdentity.seconds !== fetched.timestamp || fetched.events.length !== 1 ||
+          event.event.section !== 'system' || event.event.method !== 'ExtrinsicSuccess' ||
+          event.phase?.isApplyExtrinsic !== true || event.phase.asApplyExtrinsic?.toNumber?.() !== 0) {
+        throw new Error('Checkpoint repair requires exactly one unsigned timestamp.set and its sole success event');
+      }
+      const historyId = extrinsic.hash?.toString?.() ?? '';
+      if (!isNonzeroCanonicalSubstrateHash(historyId)) throw new Error('Checkpoint repair timestamp extrinsic has no canonical hash');
+      const baseline = await this.loadHistoricalValuationBaseline(targetBlock - 1, 'checkpoint-repair', parentHash);
+      const capture = createCheckpointProjectionCapture(targetBlock, fetched.requestedHash, fetched.timestamp, historyId, timestampIdentity.milliseconds);
+      const kernel = new ChainIndexer(this.config, capture.repository);
+      kernel.observedGenesisHash = this.observedGenesisHash;
+      await kernel.indexFetchedBlock(fetched, { refreshDerivedState: false, historicalValuationState: baseline });
+      const { document, history } = capture.result();
+      const existingHistory = await this.repository.get('historyElements', historyId);
+      if (existingHistory && !isDeepStrictEqual(existingHistory, history)) {
+        throw new Error('Checkpoint repair conflicts with the existing timestamp history projection');
+      }
+      const repair: LegacyCheckpointBlockRepair = {
+        document,
+        legacyCheckpoint,
+        priorSnapshot,
+        anchorSnapshot,
+        proof: {
+          genesisHash: this.observedGenesisHash,
+          blockHash: fetched.requestedHash,
+          parentHash,
+          timestampMilliseconds: timestampIdentity.milliseconds,
+          finalizedBlock,
+          blockSha256: createHash('sha256').update(Buffer.from(canonicalCodecHex(fetched.signedBlock.block, 'checkpoint repair block').slice(2), 'hex')).digest('hex'),
+          eventsSha256: createHash('sha256').update(Buffer.from(canonicalCodecHex(fetched.events, 'checkpoint repair events').slice(2), 'hex')).digest('hex'),
+          baselineBlock: targetBlock - 1,
+          baselineHash: parentHash,
+          baselineAssets: baseline.assets.size,
+          baselinePools: baseline.pools.size,
+          projection: 'current-kernel-parent-assets-pools-v1',
+          unavailableStockFields: ['liquidityUSD', 'orderBookLiquidityUSD', 'activeOrderBooks'],
+        },
+      };
+      assertLegacyCheckpointBlockRepair(repair);
+      return repair;
+    } finally {
+      await this.stop();
+    }
+  }
+
+  /**
    * Stops new indexing work, releases subscriptions/connections, and waits a
    * bounded amount of time for already-running work to settle. The caller may
    * safely close the shared repository after this promise resolves.
@@ -2785,6 +2963,17 @@ export class ChainIndexer {
       await this.persistWorkerStatusBestEffort();
 
       this.updateFinalizedStatus(finalizedBlock);
+      if (this.config.hourlyRepairFile) {
+        const { applyHourlyBackfillFile } = await import('../scripts/backfill-hourly-history.js');
+        await applyHourlyBackfillFile(this.repository, {
+          path: this.config.hourlyRepairFile,
+          sha256: this.config.hourlyRepairSha256!,
+          genesisHash: api.genesisHash.toString(),
+          finalizedHeight: finalizedBlock,
+        });
+      }
+      // A verified import can extend the catalogue through this same owner handle.
+      this.hourlyHistoryTargets = (await this.readHourlyHistoryTargets()).targets;
       const indexedAny = await this.backfill();
       if (this.isStopping()) return;
 
@@ -3391,6 +3580,19 @@ export class ChainIndexer {
     this.setLifecycle(terminalLifecycle);
   }
 
+  /** Keep startup projections on the same canonical clock as their indexed source block. */
+  private async indexedProjectionTimestamp(blockHeight: number): Promise<number> {
+    const expectedId = `block-${blockHeight}`;
+    const snapshot = await this.repository.get(collection('networkSnapshots'), expectedId);
+    const timestamp = snapshot?.timestamp;
+    if (!snapshot || snapshot.collection !== 'networkSnapshots' || snapshot.id !== expectedId ||
+        snapshot.blockHeight !== blockHeight || !Number.isSafeInteger(timestamp) || Number(timestamp) <= 0 ||
+        snapshot.data.id !== expectedId || snapshot.data.type !== 'BLOCK' || snapshot.data.timestamp !== timestamp) {
+      throw new Error(`Cannot refresh derived state without a canonical timestamped BLOCK ${blockHeight}`);
+    }
+    return Number(timestamp);
+  }
+
   private async runStartupMaintenance(finalizedBlock: number): Promise<number> {
     const latestIndexedBlock = await this.getLastIndexedBlock();
     if (this.isStopping()) return latestIndexedBlock;
@@ -3399,9 +3601,10 @@ export class ChainIndexer {
     // state. Historical events are already handled by the normal block
     // backfill, so a fresh release has no one-time compatibility scans.
     const maintenanceBlock = Math.max(finalizedBlock, latestIndexedBlock);
+    const timestamp = await this.indexedProjectionTimestamp(maintenanceBlock);
     await this.refreshDerivedState(
       maintenanceBlock,
-      Math.floor(Date.now() / 1_000),
+      timestamp,
       true,
       true
     );
@@ -3430,9 +3633,11 @@ export class ChainIndexer {
       backfilledNetworkAggregates
     ) {
       const latestIndexedBlock = await this.getLastIndexedBlock();
+      const maintenanceBlock = Math.max(finalizedBlock, latestIndexedBlock);
+      const timestamp = await this.indexedProjectionTimestamp(maintenanceBlock);
       this.requestDerivedStateRefresh(
-        Math.max(finalizedBlock, latestIndexedBlock),
-        Math.floor(Date.now() / 1_000),
+        maintenanceBlock,
+        timestamp,
         true,
         true
       );
@@ -3769,7 +3974,7 @@ export class ChainIndexer {
       group.sort((left, right) => snapshotDocumentTimestamp(left) - snapshotDocumentTimestamp(right));
 
       for (const document of group) {
-        if (isAssetSnapshotPriceOutlier(document, group)) {
+        if (!hasFinalizedHourlyCloseEvidence(document) && isAssetSnapshotPriceOutlier(document, group)) {
           outlierIds.add(document.id);
         }
       }
@@ -5332,6 +5537,12 @@ export class ChainIndexer {
     const valuationLiquidityStats =
       historicalValuationState?.networkLiquidityStats ?? this.networkLiquidityStats;
     const documents: IndexerDocument[] = [];
+    let preparedHourlyTargets: HourlyHistoryTarget[] | null = null;
+    if (historicalValuationState) {
+      const hourly = await this.prepareAssetHourlyCloseDocuments(signedBlock, timestamp, historicalValuationState);
+      documents.push(...hourly.documents);
+      preparedHourlyTargets = hourly.targets;
+    }
     const touchedAccounts = new Set<string>();
     let totalFees = 0n;
     let feePayingSignedTransactions = 0;
@@ -5365,9 +5576,22 @@ export class ChainIndexer {
       if (extrinsic.isSigned && fee > 0n) feePayingSignedTransactions += 1;
       const currentAccounts = historyIndexedAccounts(extrinsic.method.section, extrinsic.method.method, address, history);
       totalFees += fee;
-      if (!failed) volumeUSD += this.extractVolumeUSD(history.data);
       if (!failed && isLiquidityProxySwap(extrinsic.method.section, extrinsic.method.method, callNames)) {
+        const exchangeVolumeUSD = this.extractExecutedExchangeVolumeUSD(
+          eventsForExtrinsic,
+          valuationPrices,
+          valuationAssets
+        );
+        volumeUSD += exchangeVolumeUSD;
         swaps += 1;
+        // Keep the event-derived natural decimal beside the persisted call
+        // payload so future snapshot repairs do not require archive event
+        // replay. This also covers utility and swapTransferBatch rows whose
+        // generic call arguments do not otherwise contain executed USD legs.
+        history.data = {
+          ...(isRecord(history.data) ? history.data : { value: history.data }),
+          exchangeVolumeUSD: scaledToString(exchangeVolumeUSD, 8),
+        };
       }
       if (!failed && extrinsic.method.section === 'bridgeMultisig') bridgeIncomingTransactions += 1;
       if (!failed && isBridgeOutgoing(extrinsic.method.section, extrinsic.method.method)) {
@@ -5392,7 +5616,6 @@ export class ChainIndexer {
 
       const incomingContext = createBridgeProxyIncomingContext(context, args, valuationPrices, valuationAssets);
       if (incomingContext) {
-        volumeUSD += this.extractVolumeUSD(incomingContext.history.data);
         bridgeIncomingTransactions += 1;
         incomingContext.accounts.forEach((account) => touchedAccounts.add(account));
         extrinsicContexts.push(incomingContext);
@@ -5526,6 +5749,8 @@ export class ChainIndexer {
     // oversized block must fail before any document is written, because
     // chunking would make a crash retry double-apply those totals.
     await this.repository.upsertMany(preparedDocuments);
+    if (preparedHourlyTargets) this.hourlyHistoryTargets = preparedHourlyTargets;
+    this.previousHourlyHistoryBlock = { height: blockHeight, hash: blockHash, timestamp };
     if (historicalValuationState && historicalValuationAdvance) {
       this.applyHistoricalValuationAdvance(historicalValuationState, historicalValuationAdvance);
     }
@@ -5568,6 +5793,89 @@ export class ChainIndexer {
     ) {
       this.requestPriceStreamRefresh(blockHeight, timestamp);
     }
+  }
+
+  /**
+   * Read imported and previously tracked targets without advancing mutable worker
+   * state. Malformed persisted catalogues stop indexing and destructive cleanup.
+   */
+  private async readHourlyHistoryTargets(): Promise<{
+    targets: HourlyHistoryTarget[];
+    stored: IndexerDocument | null;
+  }> {
+    const stored = await this.repository.get('updatesStreams', HOURLY_HISTORY_TARGETS_ID);
+    if (stored && (stored.collection !== 'updatesStreams' || stored.id !== HOURLY_HISTORY_TARGETS_ID ||
+      stored.data.id !== HOURLY_HISTORY_TARGETS_ID ||
+      typeof stored.blockHeight !== 'number' || !Number.isSafeInteger(stored.blockHeight) || stored.blockHeight < 0)) {
+      throw new Error('Malformed persisted hourly history target catalogue');
+    }
+    const prior = stored ? validateHourlyHistoryTargets(stored.data.targets) : [];
+    const targets = new Map(this.hourlyHistoryTargets.map((target) => [target.id, { ...target }]));
+    for (const target of prior) {
+      const previous = targets.get(target.id);
+      if (previous && previous.symbol !== target.symbol) throw new Error('Persisted hourly history target descriptor changed');
+      targets.set(target.id, target);
+    }
+    for (const target of HOURLY_HISTORY_ASSETS) if (!targets.has(target.id)) targets.set(target.id, { ...target });
+    return {
+      targets: validateHourlyHistoryTargets([...targets.values()].sort((left, right) => compareLexical(left.id, right.id))),
+      stored,
+    };
+  }
+
+  /**
+   * Finalize the actual previous block's hourly CLOSE before advancing its immutable
+   * valuation state. This runs in the block transaction, independently of projection
+   * cadence and queue coalescing. Whole halted hours produce no synthetic observations.
+   */
+  private async prepareAssetHourlyCloseDocuments(
+    signedBlock: FetchedBlock['signedBlock'],
+    timestamp: number,
+    state: HistoricalValuationState
+  ): Promise<{ documents: IndexerDocument[]; targets: HourlyHistoryTarget[] | null }> {
+    const genesisHash = this.api?.genesisHash?.toString();
+    if (genesisHash !== HOURLY_HISTORY_GENESIS || state.blockHeight < 1) return { documents: [], targets: null };
+    const header = signedBlock.block.header;
+    const height = header.number.toNumber();
+    const parentHash = header.parentHash?.toString();
+    if (typeof parentHash !== 'string' || !/^0x[0-9a-f]{64}$/.test(parentHash)) throw new Error('Hourly history parent hash is unavailable');
+    let before = this.previousHourlyHistoryBlock;
+    if (!before || before.height !== height - 1) {
+      const stored = await this.repository.get('networkSnapshots', `block-${height - 1}`);
+      let priorTimestamp = Number(stored?.timestamp ?? stored?.data.timestamp);
+      if (!Number.isSafeInteger(priorTimestamp) || priorTimestamp <= 0) {
+        const api = await this.getBlockDataApi();
+        priorTimestamp = await this.fetchBlockTimestamp(parentHash, api);
+      }
+      before = { height: height - 1, hash: parentHash, timestamp: priorTimestamp };
+    }
+    if (before.height !== state.blockHeight || before.hash !== parentHash) throw new Error('Hourly history pre-state identity mismatch');
+    if (Math.floor(timestamp / HOUR_SECONDS) <= Math.floor(before.timestamp / HOUR_SECONDS)) return { documents: [], targets: null };
+    const catalogue = await this.readHourlyHistoryTargets();
+    const pools = [...state.pools.values()];
+    const targets = selectHourlyHistoryTargets(state.assets, pools, catalogue.targets);
+    const query = await this.getHistoricalValuationQueryAt(before.height);
+    const denominator = await this.readPinnedSnapshotDenominator(
+      query, `denomination.denominator(${before.height}) for hourly close`
+    );
+    if (!denominator) throw new Error('Hourly history requires the exact historical denomination');
+    const previous = await this.repository.getMany('assetSnapshots', targets.map(({ id }) => assetHourlyCloseId(id, before!.timestamp)));
+    const priceRoutes = new Map<string, HourlyPoolReserves[]>();
+    const prices = deriveAssetPrices(state.assets, pools, priceRoutes);
+    const documents = buildAssetHourlyCloseDocumentsAtBoundary({
+      before,
+      after: { height, hash: header.hash.toString(), timestamp },
+      genesisHash, denominator, assets: state.assets, prices,
+      pools, priceRoutes, previous, xorPoolsComplete: true, targets,
+    });
+    if (!catalogue.stored || !isDeepStrictEqual(catalogue.stored.data.targets, targets)) {
+      documents.push({
+        collection: 'updatesStreams', id: HOURLY_HISTORY_TARGETS_ID,
+        blockHeight: Math.max(height, catalogue.stored?.blockHeight ?? 0), timestamp,
+        data: { id: HOURLY_HISTORY_TARGETS_ID, targets },
+      });
+    }
+    return { documents, targets };
   }
 
   private mergeDerivedStateRefreshRequests(
@@ -6691,7 +6999,23 @@ export class ChainIndexer {
     return (await this.fetchApiAtFrom(this.api, hashText, `derived state block ${blockHeight}`)).query as any;
   }
 
-  private async getHistoricalValuationQueryAt(blockHeight: number): Promise<any> {
+  /** Keep unknown denomination semantics while bounding and attributing the actual wire read. */
+  private readPinnedSnapshotDenominator(
+    query: { denomination?: { denominator?: () => Promise<{ toString(): string }> } },
+    label: string
+  ): Promise<string | null> {
+    const denominator = query.denomination?.denominator;
+    if (typeof denominator !== 'function') return readSnapshotDenominator(query);
+    return readSnapshotDenominator({
+      denomination: {
+        denominator: () => this.withRpcTimeout(
+          () => denominator.call(query.denomination), label
+        ),
+      },
+    });
+  }
+
+  private async getHistoricalValuationQueryAt(blockHeight: number, expectedHash?: string): Promise<any> {
     const blockApi = await this.getBlockDataApi();
     const chain = (blockApi as unknown as { rpc?: { chain?: Record<string, unknown> } }).rpc?.chain;
     const getBlockHash = chain?.getBlockHash;
@@ -6705,6 +7029,15 @@ export class ChainIndexer {
     const hashText = hash?.toString?.() ?? String(hash ?? '');
     if (!hashText || /^0x0+$/.test(hashText)) {
       throw new Error(`No SORA block hash is available for historical valuation at block ${blockHeight}`);
+    }
+    if (expectedHash !== undefined) {
+      const primaryHash = (await this.withRpcTimeout(
+        () => this.api!.rpc.chain.getBlockHash(blockHeight),
+        `primary.chain.getBlockHash(${blockHeight}) for checkpoint repair baseline`
+      ))?.toString?.() ?? '';
+      if (!isNonzeroCanonicalSubstrateHash(expectedHash) || hashText !== expectedHash || primaryHash !== expectedHash) {
+        throw new Error('Checkpoint repair historical baseline does not match the verified parent hash');
+      }
     }
 
     return (
@@ -6730,7 +7063,9 @@ export class ChainIndexer {
     if (unwrapped === null) return null;
     const human = toHuman(unwrapped);
     if (!isRecord(human)) throw new Error(`Historical asset metadata for ${id} is not an object`);
-    const decimals = Number(human.precision ?? human.decimals ?? DECIMALS);
+    const precision = human.precision ?? human.decimals;
+    const decimals = typeof precision === 'number' || (typeof precision === 'string' && /^(?:0|[1-9]\d{0,2})$/.test(precision))
+      ? Number(precision) : Number.NaN;
     if (!Number.isSafeInteger(decimals) || decimals < 0 || decimals > 255) {
       throw new Error(`Historical asset metadata for ${id} has invalid precision`);
     }
@@ -6804,10 +7139,11 @@ export class ChainIndexer {
 
   private async loadHistoricalValuationBaseline(
     blockHeight: number,
-    reason = 'baseline'
+    reason = 'baseline',
+    expectedHash?: string,
   ): Promise<HistoricalValuationState> {
     return this.withDerivedStorageLoadBudget(async () => {
-      const query = await this.getHistoricalValuationQueryAt(blockHeight);
+      const query = await this.getHistoricalValuationQueryAt(blockHeight, expectedHash);
       const assets = new Map<string, AssetInfo>();
       await this.consumeStorageEntriesPaged(
         query.assets?.assetInfosV2,
@@ -7016,8 +7352,8 @@ export class ChainIndexer {
       if (touches.assets.size && typeof assetStorage !== 'function') {
         throw new Error('assets.assetInfosV2 point reads are required for historical valuation');
       }
-      if (touches.pools.size && typeof poolStorage !== 'function') {
-        throw new Error('poolXYK.reserves point reads are required for historical valuation');
+      if (touches.pools.size && (typeof poolStorage !== 'function' || typeof poolStorage.size !== 'function')) {
+        throw new Error('poolXYK.reserves point and size reads are required for historical valuation');
       }
       const reads: Array<
         | { kind: 'asset'; id: string; raw: unknown }
@@ -7049,7 +7385,19 @@ export class ChainIndexer {
               this.retainDerivedStorageConversion(value, update, budget, 'assets.assetInfosV2');
               return { ok: true as const, update };
             }
-            const value = await this.withRpcTimeout(
+            // ValueQuery decodes an absent key as [0, 0], just like a stored
+            // zero-reserve pool. The size method on this api.at query uses the
+            // same pinned hash and distinguishes absence without guessing from
+            // reserve amounts, including when a pair changes orientation.
+            const size = await this.withRpcTimeout(
+              () => poolStorage.size(read.baseAsset, read.targetAsset),
+              `poolXYK.reserves.size(${read.id}) at ${blockHeight}`
+            );
+            const sizeText = String(size);
+            if (!/^(0|[1-9][0-9]*)$/.test(sizeText) || !Number.isSafeInteger(Number(sizeText))) {
+              throw new Error(`Historical pool ${read.id} has an invalid storage size`);
+            }
+            const value = sizeText === '0' ? null : await this.withRpcTimeout(
               () => poolStorage.call(query.poolXYK, read.baseAsset, read.targetAsset),
               `poolXYK.reserves(${read.id}) at ${blockHeight}`
             );
@@ -7120,8 +7468,17 @@ export class ChainIndexer {
     }
   }
 
+  /** Reads a primary-selected hash, using the verified archive only for explicitly pruned state. */
   private async fetchBlockTimestamp(hash: string, api = this.api): Promise<number> {
-    return (await this.fetchBlockTimestampIdentity(hash, api)).seconds;
+    try {
+      return (await this.fetchBlockTimestampIdentity(hash, api)).seconds;
+    } catch (error) {
+      if (!isDiscardedTimestampState(error) || api !== this.api || !this.archiveSoraWsEndpoint) throw error;
+      const archive = await this.getBlockDataApi();
+      // Keep the primary's exact hash and let the caller enforce its persisted
+      // timestamp. Archive identity is independently checked by getBlockDataApi.
+      return (await this.fetchBlockTimestampIdentity(hash, archive)).seconds;
+    }
   }
 
   private async fetchBlockTimestampIdentity(
@@ -7164,6 +7521,49 @@ export class ChainIndexer {
     }
 
     return max;
+  }
+
+  /**
+   * Values authoritative liquidity-proxy `Exchange` events for one successful
+   * swap extrinsic. Each executed exchange leg contributes its larger USD side,
+   * preserving the existing transaction-volume convention without treating
+   * unrelated `amountUSD` history fields as trading volume.
+   *
+   * `swapTransferBatch` can include direct transfers or reused output assets;
+   * those legs intentionally contribute zero unless the runtime emitted an
+   * `Exchange` event. Utility-wrapped swaps use the same scoped event stream, so
+   * their volume is available even though the utility history payload itself is
+   * not swap-enriched.
+   */
+  private extractExecutedExchangeVolumeUSD(
+    events: EventRecord[],
+    prices: Map<string, bigint>,
+    assets: Map<string, AssetInfo>
+  ): bigint {
+    return findEvents(events, 'liquidityProxy', 'Exchange').reduce((total, exchange) => {
+      const inputAssetId = firstString(exchange, ['inputAssetId', 'baseAssetId', 'arg2']);
+      const outputAssetId = firstString(exchange, ['outputAssetId', 'targetAssetId', 'arg3']);
+      const inputAmount = firstPresentValue(exchange, ['inputAmount', 'baseAssetAmount', 'arg4']) ?? 0;
+      const outputAmount = firstPresentValue(exchange, ['outputAmount', 'targetAssetAmount', 'arg5']) ?? 0;
+      const inputAmountUSD = decimalStringToScaled(
+        codecUsd(
+          inputAssetId,
+          codecToBigInt(inputAmount),
+          prices,
+          assets.get(inputAssetId)?.decimals ?? DECIMALS
+        )
+      );
+      const outputAmountUSD = decimalStringToScaled(
+        codecUsd(
+          outputAssetId,
+          codecToBigInt(outputAmount),
+          prices,
+          assets.get(outputAssetId)?.decimals ?? DECIMALS
+        )
+      );
+
+      return total + (inputAmountUSD > outputAmountUSD ? inputAmountUSD : outputAmountUSD);
+    }, 0n);
   }
 
   private async createAccountDocuments(
@@ -7855,6 +8255,7 @@ export class ChainIndexer {
     _blockHeight: number,
     timestamp: number
   ): Promise<void> {
+    if (this.config.snapshotRetentionMode !== 'rolling') return Promise.resolve();
     const previous = this.chartSnapshotRetentionQueue;
     const run = previous
       .catch(() => undefined)
@@ -7867,6 +8268,7 @@ export class ChainIndexer {
     groups: readonly ChartSnapshotRetentionGroup[],
     timestamp: number
   ): Promise<void> {
+    if (this.config.snapshotRetentionMode !== 'rolling') return;
     const processed = new Set<string>();
 
     for (const group of groups) {
@@ -7909,6 +8311,13 @@ export class ChainIndexer {
   ): Promise<{ documents: number; pages: number; exhausted: boolean }> {
     if (!this.repository.query) return { documents: 0, pages: 0, exhausted: true };
 
+    const protectedHours = collectionName === 'assetSnapshots' && type === 'HOUR';
+    const trackedIds = protectedHours ? (await this.readHourlyHistoryTargets()).targets.map(({ id }) => id) : [];
+    // Most protected assets are excluded by the indexed filter. A conservative
+    // proof check also preserves unregistered legacy evidence. Seek past those
+    // rows, retaining bounded scan progress across refreshes until exhaustion.
+    let seek = protectedHours ? this.hourlyRetentionSeek : undefined;
+
     let documents = 0;
     let pages = 0;
     let exhausted = false;
@@ -7917,14 +8326,20 @@ export class ChainIndexer {
         first: SNAPSHOT_RETIREMENT_DELETE_BATCH_SIZE,
         maxBytes: WORKER_REPOSITORY_QUERY_PAGE_MAX_BYTES,
         offset: null,
+        ...(protectedHours ? { seek } : {}),
         orderBy: ['TIMESTAMP_ASC'],
         filter: {
-          and: [{ type: { equalTo: type } }, { timestamp: { lessThan: cutoff } }],
+          and: [
+            { type: { equalTo: type } },
+            { timestamp: { lessThan: cutoff } },
+            ...(protectedHours
+              ? [{ assetId: { notIn: trackedIds } }]
+              : []),
+          ],
         },
         includeTotalCount: false,
       });
-      const ids = page.items.map((document) => document.id);
-      if (!ids.length) {
+      if (!page.items.length) {
         if (page.hasNextPage) {
           throw new Error(`Repository reported expired ${collectionName} rows without a deletion cursor`);
         }
@@ -7932,17 +8347,34 @@ export class ChainIndexer {
         break;
       }
 
+      if (protectedHours) {
+        let position = seek;
+        for (const document of page.items) {
+          const value = Number(document.timestamp ?? document.data.timestamp);
+          if (!Number.isFinite(value) || (position &&
+            (value < position.value || (value === position.value && compareLexical(document.id, position.id) <= 0)))) {
+            throw new Error('Repository expired assetSnapshots page did not advance');
+          }
+          position = { field: 'timestamp', value, id: document.id, direction: 'asc' };
+        }
+        seek = position;
+      }
+      const ids = page.items.filter((document) => !protectedHours || !hasFinalizedHourlyCloseEvidence(document)).map((document) => document.id);
+
       await this.deleteDocumentIdsInCallChunks(collectionName, ids);
       pages += 1;
       documents += ids.length;
+      if (protectedHours) this.hourlyRetentionSeek = seek;
       if (
         page.hasNextPage === false ||
-        (page.hasNextPage === undefined && ids.length < SNAPSHOT_RETIREMENT_DELETE_BATCH_SIZE)
+        (page.hasNextPage === undefined && page.items.length < SNAPSHOT_RETIREMENT_DELETE_BATCH_SIZE)
       ) {
         exhausted = true;
         break;
       }
     }
+
+    if (protectedHours && exhausted) this.hourlyRetentionSeek = undefined;
 
     return { documents, pages, exhausted };
   }
@@ -7955,6 +8387,7 @@ export class ChainIndexer {
    * successful pages expose the next oldest rows without offset drift.
    */
   private async retireExpiredNetworkBlockSnapshots(timestamp: number): Promise<void> {
+    if (this.config.snapshotRetentionMode !== 'rolling') return;
     const cutoff = timestamp - NETWORK_BLOCK_SNAPSHOT_RETENTION_SECONDS;
     if (cutoff <= 0) return;
     const result = await this.deleteExpiredSnapshotPages(
@@ -8155,6 +8588,11 @@ export class ChainIndexer {
         this.fetchStorageEntries(query.kensetsu.cdpDepository, 'kensetsu.cdpDepository')
       ),
     ]);
+    // These RPCs overlap the market projection below. Observe their rejection
+    // immediately: it can precede the later await, or that await can be skipped
+    // when the market projection fails. Keep the original rejecting promise so
+    // its error still reaches the refresh caller and the existing retry path.
+    void auxiliaryStoragePromise.catch(() => undefined);
     const [assetStorage, poolStorage, orderBookLoad, polkamarktStorage, farmingPoolFarmers] =
       await Promise.all([
         this.loadAssetStorageDomain(blockHeight, forceStorageReconciliation, query),
@@ -8342,10 +8780,15 @@ export class ChainIndexer {
       ...polkamarktMarketDocuments,
       ...polkamarktPositionDocuments,
       ...this.createNetworkSnapshotDocuments(analytics, effectiveBlockHeight, timestamp, includeSnapshots),
+      ...await this.createCompletedNetworkCalendarDocuments(analytics, timestamp, includeSnapshots),
       ...this.createUpdateStreams(poolStates, assets, prices, apyByPool, effectiveBlockHeight, timestamp),
     ];
 
     await this.upsertDocumentsInCallChunks(marketDocuments);
+    if (includeSnapshots && analytics.networkCalendarCache) {
+      this.networkCalendarHistorySealed = true;
+      this.networkCalendarSealedThrough = Math.max(this.networkCalendarSealedThrough, timestamp);
+    }
     if (assetMetadataAuthoritative) {
       this.queueAuthoritativeReconciliation(
         collection('assets'),
@@ -8927,9 +9370,7 @@ export class ChainIndexer {
         collection: collectionName,
         reason: 'byte-budget',
       });
-      throw new Error(
-        `Cold analytics input exceeds its ${budget.maximumBytes} byte retained-load limit while reading ${collectionName}`
-      );
+      throw new AnalyticsRetainedLoadLimitError(budget.maximumBytes, collectionName);
     }
     budget.retainedBytes += estimatedBytes;
     metrics.setGauge('indexer_worker_analytics_cold_load_retained_bytes', {}, budget.retainedBytes);
@@ -8945,7 +9386,11 @@ export class ChainIndexer {
     for await (const page of this.queryPages(collectionName, {
       ...args,
       maxBytes: WORKER_REPOSITORY_QUERY_PAGE_MAX_BYTES,
-    }, () => budget.maximumBytes - budget.retainedBytes)) {
+    }, () => {
+      const remaining = budget.maximumBytes - budget.retainedBytes;
+      if (remaining <= 0) throw new AnalyticsRetainedLoadLimitError(budget.maximumBytes, collectionName);
+      return remaining;
+    })) {
       for (const document of page) {
         documents.push(this.retainAnalyticsValueWithinBudget(document, budget, collectionName));
       }
@@ -9057,6 +9502,47 @@ export class ChainIndexer {
     };
   }
 
+  private analyticsInputQuery(
+    collectionName: IndexerCollection,
+    since: number,
+    timestamp: number,
+    sourceVersion?: number
+  ): RepositoryQueryArgs {
+    const type = collectionName === 'networkSnapshots'
+      ? 'BLOCK'
+      : collectionName === 'assetSnapshots' || collectionName === 'orderBookSnapshots'
+        ? 'DAY'
+        : null;
+    return {
+      filter: {
+        and: [
+          ...(type === null ? [] : [{ type: { equalTo: type } }]),
+          { timestamp: { greaterThanOrEqualTo: since, lessThanOrEqualTo: timestamp } },
+          ...(sourceVersion === undefined ? [] : [{ blockHeight: { lessThanOrEqualTo: sourceVersion } }]),
+        ],
+      },
+      orderBy: ['TIMESTAMP_ASC'],
+    };
+  }
+
+  private async *streamAnalyticsInputDocuments(
+    collectionName: IndexerCollection,
+    since: number,
+    timestamp: number,
+    sourceVersion?: number
+  ): AsyncGenerator<IndexerDocument> {
+    for await (const page of this.queryPages(
+      collectionName,
+      this.analyticsInputQuery(collectionName, since, timestamp, sourceVersion)
+    )) {
+      this.analyticsInputCacheMetrics.documentsRead += page.length;
+      metrics.increment('indexer_worker_analytics_input_documents_read_total', { mode: 'streaming' }, page.length);
+      // The consumer folds each row into aggregate totals before the next
+      // bounded page is read. No complete history horizon is retained.
+      yield* page;
+    }
+  }
+
   private async loadAnalyticsInputDocuments(
     timestamp: number,
     sourceVersion?: number
@@ -9081,46 +9567,11 @@ export class ChainIndexer {
     const orderBookSnapshotSince = canLoadIncrementally
       ? Math.max(orderBookDaySince, cached!.refreshedAt - ANALYTICS_INPUT_CACHE_OVERLAP_SECONDS)
       : orderBookDaySince;
-    const timestampRange = (from: number): Record<string, unknown> => ({
-      greaterThanOrEqualTo: from,
-      lessThanOrEqualTo: timestamp,
-    });
-    const throughSourceVersion =
-      sourceVersion === undefined ? [] : [{ blockHeight: { lessThanOrEqualTo: sourceVersion } }];
-    const blockSnapshotQuery: RepositoryQueryArgs = {
-      filter: {
-        and: [{ type: { equalTo: 'BLOCK' } }, { timestamp: timestampRange(historySince) }, ...throughSourceVersion],
-      },
-      orderBy: ['TIMESTAMP_ASC'],
-    };
-    const historyQuery: RepositoryQueryArgs = {
-      filter: { and: [{ timestamp: timestampRange(historySince) }, ...throughSourceVersion] },
-      orderBy: ['TIMESTAMP_ASC'],
-    };
-    const orderBookOrderQuery: RepositoryQueryArgs = {
-      filter: { and: [{ timestamp: timestampRange(historySince) }, ...throughSourceVersion] },
-      orderBy: ['TIMESTAMP_ASC'],
-    };
-    const assetSnapshotQuery: RepositoryQueryArgs = {
-      filter: {
-        and: [
-          { type: { equalTo: 'DAY' } },
-          { timestamp: timestampRange(assetSnapshotSince) },
-          ...throughSourceVersion,
-        ],
-      },
-      orderBy: ['TIMESTAMP_ASC'],
-    };
-    const orderBookSnapshotQuery: RepositoryQueryArgs = {
-      filter: {
-        and: [
-          { type: { equalTo: 'DAY' } },
-          { timestamp: timestampRange(orderBookSnapshotSince) },
-          ...throughSourceVersion,
-        ],
-      },
-      orderBy: ['TIMESTAMP_ASC'],
-    };
+    const blockSnapshotQuery = this.analyticsInputQuery(collection('networkSnapshots'), historySince, timestamp, sourceVersion);
+    const historyQuery = this.analyticsInputQuery(collection('historyElements'), historySince, timestamp, sourceVersion);
+    const orderBookOrderQuery = this.analyticsInputQuery(collection('orderBookOrders'), historySince, timestamp, sourceVersion);
+    const assetSnapshotQuery = this.analyticsInputQuery(collection('assetSnapshots'), assetSnapshotSince, timestamp, sourceVersion);
+    const orderBookSnapshotQuery = this.analyticsInputQuery(collection('orderBookSnapshots'), orderBookSnapshotSince, timestamp, sourceVersion);
     let history: IndexerDocument[];
     let blockSnapshots: IndexerDocument[];
     let orderBookOrders: IndexerDocument[];
@@ -9446,8 +9897,10 @@ export class ChainIndexer {
       blocksById: new Map(blocks.map((block) => [block.id, block])),
       blockStarts: new Map(),
       totals: new Map(),
+      calendarBuckets: new Map(),
     };
     this.recalculateRollingNetworkWindows(cache, timestamp);
+    this.rebuildNetworkCalendarBuckets(cache);
 
     this.rollingNetworkInputMetrics.fullBuilds += 1;
     this.rollingNetworkInputMetrics.blockDocumentsProcessed += blocks.length;
@@ -9496,6 +9949,7 @@ export class ChainIndexer {
       const unchanged =
         existing.blockHeight === block.blockHeight &&
         existing.timestamp === block.timestamp &&
+        existing.accounts === block.accounts &&
         existing.transactions === block.transactions &&
         existing.fees === block.fees &&
         existing.volumeUSD === block.volumeUSD &&
@@ -9509,11 +9963,13 @@ export class ChainIndexer {
       this.insertRollingEntry(cache.blocks, block);
       cache.blocksById.set(block.id, block);
       this.recalculateRollingNetworkWindows(cache, timestamp);
+      this.rebuildNetworkCalendarBuckets(cache);
       return true;
     }
 
     const index = this.insertRollingEntry(cache.blocks, block);
     cache.blocksById.set(block.id, block);
+    this.addNetworkCalendarCacheBlock(cache, block);
 
     for (const type of AGGREGATE_SNAPSHOT_TYPES) {
       const cutoff = timestamp - SNAPSHOT_WINDOW_SECONDS[type];
@@ -9539,6 +9995,10 @@ export class ChainIndexer {
     };
 
     trimTimeline(cache.blocks, cache.blocksById, cache.blockStarts);
+    const oldestTimestamp = cache.blocks[0]?.timestamp ?? 0;
+    for (const [id, bucket] of cache.calendarBuckets) {
+      if (bucket.bucketEnd <= oldestTimestamp) cache.calendarBuckets.delete(id);
+    }
   }
 
   private updateRollingNetworkInputCache(
@@ -9604,9 +10064,35 @@ export class ChainIndexer {
     sourceVersion?: number
   ): Promise<Analytics> {
     const analytics = emptyAnalytics();
-    const inputLoad = await this.loadAnalyticsInputDocuments(timestamp, sourceVersion);
-    const { history, orderBookOrders, assetDaySnapshots, orderBookDaySnapshots } = inputLoad.documents;
-    const { rollingNetworkInputs } = inputLoad;
+    let inputLoad: AnalyticsInputLoad | null;
+    try {
+      inputLoad = await this.loadAnalyticsInputDocuments(timestamp, sourceVersion);
+    } catch (error) {
+      if (!(error instanceof AnalyticsRetainedLoadLimitError)) throw error;
+      // Capacity is a cache concern, not a reason to omit analytics or stop
+      // a worker with a complete retained history. Release the unsuccessful
+      // load and fold the identical ordered horizon a page at a time.
+      this.invalidateAnalyticsInputCache();
+      this.analyticsInputCacheMetrics.fullLoads += 1;
+      this.analyticsInputCacheMetrics.capacityBypasses += 1;
+      metrics.increment('indexer_worker_analytics_input_loads_total', { mode: 'streaming' });
+      metrics.increment('indexer_worker_analytics_input_cache_bypasses_total', { reason: 'retained-load-budget' });
+      metrics.setGauge('indexer_worker_analytics_cold_load_retained_bytes', {}, 0);
+      inputLoad = null;
+    }
+    const monthSince = Math.max(0, timestamp - SNAPSHOT_WINDOW_SECONDS.MONTH);
+    const history = inputLoad?.documents.history ??
+      this.streamAnalyticsInputDocuments(collection('historyElements'), monthSince, timestamp, sourceVersion);
+    const orderBookOrders = inputLoad?.documents.orderBookOrders ??
+      this.streamAnalyticsInputDocuments(collection('orderBookOrders'), monthSince, timestamp, sourceVersion);
+    const assetDaySnapshots = inputLoad?.documents.assetDaySnapshots ??
+      this.streamAnalyticsInputDocuments(collection('assetSnapshots'), Math.max(0, timestamp - 7 * 86_400), timestamp, sourceVersion);
+    const orderBookDaySnapshots = inputLoad?.documents.orderBookDaySnapshots ??
+      this.streamAnalyticsInputDocuments(collection('orderBookSnapshots'), Math.max(0, timestamp - 86_400), timestamp, sourceVersion);
+    const networkTotals = inputLoad?.rollingNetworkInputs.totals ??
+      new Map<SnapshotTypeName, NetworkBackfillFlowTotals>();
+    // Retain exact evidence only on the existing bounded cache path; streaming keeps its memory bound.
+    if (inputLoad) Object.defineProperty(analytics, 'networkCalendarCache', { value: inputLoad.rollingNetworkInputs });
     const poolById = new Map(pools.map((pool) => [pool.id, pool]));
 
     for (const asset of assets.values()) {
@@ -9615,7 +10101,7 @@ export class ChainIndexer {
       analytics.assetWeekOpenPrice.set(asset.id, currentPrice);
     }
 
-    for (const snapshot of assetDaySnapshots) {
+    for await (const snapshot of assetDaySnapshots) {
       const assetId = String(snapshot.data.assetId ?? '');
       const price = snapshot.data.priceUSD as Record<string, unknown> | undefined;
       const open = String(price?.open ?? price?.close ?? '');
@@ -9629,14 +10115,14 @@ export class ChainIndexer {
       }
     }
 
-    for (const snapshot of orderBookDaySnapshots) {
+    for await (const snapshot of orderBookDaySnapshots) {
       const orderBookId = String(snapshot.data.orderBookId ?? '');
       const price = snapshot.data.price as Record<string, unknown> | undefined;
       const open = String(price?.open ?? price?.close ?? '');
       if (orderBookId && open) analytics.orderBookDayOpenPrice.set(orderBookId, open);
     }
 
-    for (const document of history) {
+    for await (const document of history) {
       const eventTimestamp = Number(document.data.timestamp ?? document.timestamp ?? 0);
       const eventData = (document.data.data ?? {}) as Record<string, unknown>;
       const module = String(document.data.module ?? '');
@@ -9745,8 +10231,21 @@ export class ChainIndexer {
       }
     }
 
+    if (inputLoad === null) {
+      for await (const document of this.streamAnalyticsInputDocuments(
+        collection('networkSnapshots'), monthSince, timestamp, sourceVersion
+      )) {
+        const block = this.rollingBlockFromSnapshot(document);
+        for (const type of activeAggregateSnapshotTypes(block.timestamp, timestamp)) {
+          const totals = networkTotals.get(type) ?? this.emptyNetworkBackfillFlowTotals();
+          this.addNetworkBackfillBlock(totals, block);
+          networkTotals.set(type, totals);
+        }
+      }
+    }
+
     for (const type of AGGREGATE_SNAPSHOT_TYPES) {
-      const totals = rollingNetworkInputs.totals.get(type) ?? this.emptyNetworkBackfillFlowTotals();
+      const totals = networkTotals.get(type) ?? this.emptyNetworkBackfillFlowTotals();
       const current = analytics.network.get(type) ?? newNetworkAggregate(0, liquidityStats);
       current.accounts += totals.accounts;
       current.transactions += totals.transactions;
@@ -9759,7 +10258,7 @@ export class ChainIndexer {
       analytics.network.set(type, current);
     }
 
-    for (const document of orderBookOrders) {
+    for await (const document of orderBookOrders) {
       const eventTimestamp = Number(document.data.timestamp ?? document.timestamp ?? 0);
       const orderBookId = String(document.data.orderBookId ?? '');
       const [dexId, baseAssetId, quoteAssetId] = orderBookId.split('-');
@@ -9848,6 +10347,10 @@ export class ChainIndexer {
     }
   }
 
+  private get persistedChartSnapshotTypes(): readonly SnapshotTypeName[] {
+    return this.config.snapshotRetentionMode === 'rolling' ? AGGREGATE_SNAPSHOT_TYPES : ALL_CHART_SNAPSHOT_TYPES;
+  }
+
   private async createAssetDocuments(
     assets: Map<string, AssetInfo>,
     prices: Map<string, bigint>,
@@ -9863,7 +10366,7 @@ export class ChainIndexer {
       ? await this.repository.getMany(
           collection('assetSnapshots'),
           [...assets.values()].flatMap((asset) =>
-            PERSISTED_CHART_SNAPSHOT_TYPES.map((type) => snapshotId('asset', asset.id, type, timestamp, blockHeight))
+            this.persistedChartSnapshotTypes.map((type) => snapshotId('asset', asset.id, type, timestamp, blockHeight))
           )
         )
       : new Map<string, IndexerDocument>();
@@ -9898,10 +10401,14 @@ export class ChainIndexer {
       });
 
       if (includeSnapshots) {
-        for (const type of PERSISTED_CHART_SNAPSHOT_TYPES) {
+        for (const type of this.persistedChartSnapshotTypes) {
           const id = snapshotId('asset', asset.id, type, timestamp, blockHeight);
           const aggregate = analytics.assets.get(asset.id)?.get(type) ?? newAssetAggregate(priceUSD);
           const previous = previousSnapshots.get(id);
+          // Keep ordinary observations while the hour is open, but never replace
+          // its finalized close. A projection built before closure also loses to
+          // the successor-height write version if its write arrives later.
+          if (type === 'HOUR' && hasFinalizedHourlyCloseEvidence(previous)) continue;
           const priceSnapshot = mergePriceOhlc(previous?.data.priceUSD, priceUSD);
           documents.push({
             collection: collection('assetSnapshots'),
@@ -9949,7 +10456,7 @@ export class ChainIndexer {
       ? await this.repository.getMany(
           collection('poolSnapshots'),
           pools.flatMap((pool) =>
-            PERSISTED_CHART_SNAPSHOT_TYPES.map((type) => snapshotId('pool', pool.id, type, timestamp, blockHeight))
+            this.persistedChartSnapshotTypes.map((type) => snapshotId('pool', pool.id, type, timestamp, blockHeight))
           )
         )
       : new Map<string, IndexerDocument>();
@@ -9981,7 +10488,7 @@ export class ChainIndexer {
       });
 
       if (includeSnapshots) {
-        for (const type of PERSISTED_CHART_SNAPSHOT_TYPES) {
+        for (const type of this.persistedChartSnapshotTypes) {
           const id = snapshotId('pool', pool.id, type, timestamp, blockHeight);
           const aggregate = analytics.pools.get(pool.id)?.get(type) ?? newPoolAggregate(pool.priceUSD);
           const previous = previousSnapshots.get(id);
@@ -10439,7 +10946,7 @@ export class ChainIndexer {
 
       const marketSnapshotDocuments: IndexerDocument[] =
         includeSnapshots && dpmState.probability !== null
-          ? PERSISTED_CHART_SNAPSHOT_TYPES.map((type) => {
+          ? this.persistedChartSnapshotTypes.map((type) => {
               const id = snapshotId('market', String(marketId), type, timestamp, blockHeight);
 
               return {
@@ -10645,7 +11152,7 @@ export class ChainIndexer {
     const orderBookSnapshotIds = includeSnapshots
       ? orderBooks.flatMap(([key]) => {
           const idString = orderBookIdString(parseOrderBookId(key.args[0]));
-          return PERSISTED_CHART_SNAPSHOT_TYPES.map((type) =>
+          return this.persistedChartSnapshotTypes.map((type) =>
             snapshotId('orderBook', idString, type, timestamp, blockHeight)
           );
         })
@@ -10696,7 +11203,7 @@ export class ChainIndexer {
       });
 
       if (includeSnapshots) {
-        for (const type of PERSISTED_CHART_SNAPSHOT_TYPES) {
+        for (const type of this.persistedChartSnapshotTypes) {
           const snapshot = snapshotId('orderBook', idString, type, timestamp, blockHeight);
           const typeAggregate = analytics.orderBooks.get(idString)?.get(type) ?? newOrderBookAggregate(price);
           const previous = previousSnapshots.get(snapshot);
@@ -10797,6 +11304,9 @@ export class ChainIndexer {
       const aggregate =
         analytics.network.get(type) ?? newNetworkAggregate(0, this.networkLiquidityStats);
       const id = snapshotId('network', 'all', type, timestamp, blockHeight);
+      const calendarFlows = analytics.networkCalendarCache
+        ? this.networkCalendarFlows(analytics.networkCalendarCache, type, snapshotBucket(type, timestamp))
+        : null;
 
       return {
         collection: collection('networkSnapshots'),
@@ -10810,6 +11320,7 @@ export class ChainIndexer {
           accounts: aggregate.accounts,
           transactions: aggregate.transactions,
           fees: aggregate.fees.toString(),
+          ...(calendarFlows ? { calendarFlows } : {}),
           liquidityUSD: aggregate.liquidityUSD,
           poolLiquidityUSD: aggregate.poolLiquidityUSD,
           orderBookLiquidityUSD: aggregate.orderBookLiquidityUSD,
@@ -10823,6 +11334,99 @@ export class ChainIndexer {
         },
       };
     });
+  }
+
+  /** Fold a canonical block into a calendar bucket using exact integer amounts. */
+  private addNetworkCalendarBucketBlock(bucket: NetworkCalendarBucket, block: NetworkBackfillBlock): void {
+    this.addNetworkBackfillBlock(bucket.totals, block);
+    bucket.firstBlock = Math.min(bucket.firstBlock, block.blockHeight);
+    if (block.blockHeight >= bucket.throughBlock) {
+      bucket.throughBlock = block.blockHeight;
+      bucket.throughTimestamp = block.timestamp;
+    }
+    bucket.blocks += 1;
+  }
+
+  /** Initialize a bucket without claiming coverage until its neighboring blocks are checked. */
+  private newNetworkCalendarBucket(type: SnapshotTypeName, block: NetworkBackfillBlock): NetworkCalendarBucket {
+    const bucketStart = snapshotBucket(type, block.timestamp);
+    return {
+      bucketStart, bucketEnd: bucketStart + SNAPSHOT_WINDOW_SECONDS[type],
+      firstBlock: block.blockHeight, throughBlock: block.blockHeight, throughTimestamp: block.timestamp,
+      blocks: 0, totals: this.emptyNetworkBackfillFlowTotals(),
+    };
+  }
+
+  /** Maintain bounded calendar aggregates alongside the already retained rolling inputs. */
+  private addNetworkCalendarCacheBlock(cache: RollingNetworkInputCache, block: RollingNetworkBlock): void {
+    for (const type of AGGREGATE_SNAPSHOT_TYPES) {
+      const id = snapshotId('network', 'all', type, block.timestamp);
+      const bucket = cache.calendarBuckets.get(id) ?? this.newNetworkCalendarBucket(type, block);
+      this.addNetworkCalendarBucketBlock(bucket, block);
+      cache.calendarBuckets.set(id, bucket);
+    }
+  }
+
+  /** Rebuild once on cold load or a replaced canonical input, never on routine refreshes. */
+  private rebuildNetworkCalendarBuckets(cache: RollingNetworkInputCache): void {
+    cache.calendarBuckets.clear();
+    for (const block of cache.blocks) this.addNetworkCalendarCacheBlock(cache, block);
+  }
+
+  /** Serialize only a contiguous, fully observed bucket prefix; complete requires its successor. */
+  private serializeNetworkCalendarBucket(bucket: NetworkCalendarBucket, complete: boolean): NetworkCalendarFlows {
+    return {
+      version: 1, bucketStart: bucket.bucketStart, bucketEnd: bucket.bucketEnd,
+      throughBlock: bucket.throughBlock, throughTimestamp: bucket.throughTimestamp, complete,
+      ...bucket.totals, fees: bucket.totals.fees.toString(), volumeUSD: scaledToString(bucket.totals.volumeUSD, 8),
+    };
+  }
+
+  /** Verify retained block continuity and boundary evidence before publishing exact calendar totals. */
+  private networkCalendarFlows(cache: RollingNetworkInputCache, type: SnapshotTypeName, start: number): NetworkCalendarFlows | null {
+    const bucket = cache.calendarBuckets.get(snapshotId('network', 'all', type, start));
+    if (!bucket || bucket.blocks !== bucket.throughBlock - bucket.firstBlock + 1) return null;
+    const before = cache.blocks[this.rollingLowerBound(cache.blocks, bucket.bucketStart) - 1];
+    if (!before || before.blockHeight !== bucket.firstBlock - 1) return null;
+    const after = cache.blocks[this.rollingLowerBound(cache.blocks, bucket.bucketEnd)];
+    const complete = Boolean(after && after.blockHeight === bucket.throughBlock + 1);
+    if (after && !complete) return null;
+    return this.serializeNetworkCalendarBucket(bucket, complete);
+  }
+
+  /** Seal the preceding bucket after its final blocks arrive while preserving existing rolling and stock data. */
+  private async createCompletedNetworkCalendarDocuments(analytics: Analytics, timestamp: number, includeSnapshots: boolean): Promise<IndexerDocument[]> {
+    const cache = analytics.networkCalendarCache;
+    if (!includeSnapshots || !cache) return [];
+    const flows = new Map<string, NetworkCalendarFlows>();
+    for (const type of AGGREGATE_SNAPSHOT_TYPES) {
+      const start = snapshotBucket(type, timestamp) - SNAPSHOT_WINDOW_SECONDS[type];
+      const value = this.networkCalendarFlows(cache, type, start);
+      if (value?.complete) flows.set(snapshotId('network', 'all', type, start), value);
+    }
+    // Seal retained hourly/daily history on startup, then every newly completed interval even after a refresh gap.
+    // Existing rolling fields and stock observations remain unchanged, and no missing rows are invented.
+    for (const [id, bucket] of cache.calendarBuckets) {
+      if (this.networkCalendarHistorySealed && bucket.bucketEnd <= this.networkCalendarSealedThrough) continue;
+      const type = id.startsWith('network-all-HOUR-') ? 'HOUR' : id.startsWith('network-all-DAY-') ? 'DAY' : null;
+      if (!type) continue;
+      const value = this.networkCalendarFlows(cache, type, bucket.bucketStart);
+      if (value?.complete) flows.set(id, value);
+    }
+    const documents: IndexerDocument[] = [];
+    const ids = [...flows.keys()];
+    for (let offset = 0; offset < ids.length; offset += 100) {
+      const batch = ids.slice(offset, offset + 100);
+      const existing = await this.repository.getMany('networkSnapshots', batch);
+      for (const id of batch) {
+        const document = existing.get(id);
+        const calendarFlows = flows.get(id)!;
+        if (document && !isDeepStrictEqual(document.data.calendarFlows, calendarFlows)) {
+          documents.push({ ...document, data: { ...document.data, calendarFlows } });
+        }
+      }
+    }
+    return documents;
   }
 
   private emptyNetworkBackfillFlowTotals(): NetworkBackfillFlowTotals {
@@ -10887,6 +11491,25 @@ export class ChainIndexer {
   }
 
   private advanceNetworkBackfillWindow(window: NetworkBackfillWindow, block: NetworkBackfillBlock): IndexerDocument {
+    const priorBlock = window.blocks.at(-1);
+    const start = snapshotBucket(window.type, block.timestamp);
+    if (!window.calendarBucket || window.calendarBucket.bucketStart !== start) {
+      const prior = window.calendarBucket;
+      if (prior && window.pendingDocument && window.calendarPredecessor === prior.firstBlock - 1 &&
+          prior.blocks === prior.throughBlock - prior.firstBlock + 1 && block.blockHeight === prior.throughBlock + 1 &&
+          block.timestamp >= prior.bucketEnd) {
+        window.pendingDocument.data = {
+          ...window.pendingDocument.data, calendarFlows: this.serializeNetworkCalendarBucket(prior, true),
+        };
+      }
+      window.calendarBucket = this.newNetworkCalendarBucket(window.type, block);
+      window.calendarPredecessor = priorBlock && priorBlock.timestamp < start ? priorBlock.blockHeight : undefined;
+    }
+    this.addNetworkCalendarBucketBlock(window.calendarBucket, block);
+    const bucket = window.calendarBucket;
+    const calendarFlows = window.calendarPredecessor === bucket.firstBlock - 1 &&
+      bucket.blocks === bucket.throughBlock - bucket.firstBlock + 1
+      ? this.serializeNetworkCalendarBucket(bucket, false) : null;
     window.blocks.push(block);
     this.addNetworkBackfillBlock(window.totals, block);
 
@@ -10914,6 +11537,7 @@ export class ChainIndexer {
         accounts: window.totals.accounts,
         transactions: window.totals.transactions,
         fees: window.totals.fees.toString(),
+        ...(calendarFlows ? { calendarFlows } : {}),
         volumeUSD: scaledToString(window.totals.volumeUSD, 8),
         swaps: window.totals.swaps,
         bridgeIncomingTransactions: window.totals.bridgeIncomingTransactions,
@@ -10926,6 +11550,7 @@ export class ChainIndexer {
     document: IndexerDocument,
     retentionTimestamp: number | undefined
   ): boolean {
+    if (this.config.snapshotRetentionMode !== 'rolling') return true;
     if (retentionTimestamp === undefined) return true;
     const type = String(document.data.type ?? '');
     if (type !== 'DEFAULT' && type !== 'HOUR') return true;

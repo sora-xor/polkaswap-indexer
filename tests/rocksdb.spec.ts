@@ -385,7 +385,7 @@ describe('RocksRepository', () => {
     const internal = repository as unknown as { db: RocksDatabase };
     expect([...internal.db.getRange({ ...compactRange(['i']), values: false })]).toHaveLength(0);
     expect([...internal.db.getRange({ ...compactRange(['x']), values: false })].length).toBeGreaterThan(0);
-    expect(repository.formatVersion()).toBe(1);
+    expect(repository.formatVersion()).toBe(2);
     await expect(repository.prepare()).resolves.toBeUndefined();
   });
 
@@ -425,7 +425,7 @@ describe('RocksRepository', () => {
   it.each([
     { name: 'unversioned document', version: undefined, legacyIndex: false },
     { name: 'zero version', version: 0, legacyIndex: false },
-    { name: 'future version', version: 2, legacyIndex: false },
+    { name: 'future version', version: 3, legacyIndex: false },
     { name: 'string version', version: '1', legacyIndex: false },
     { name: 'fractional version', version: 1.5, legacyIndex: false },
     { name: 'legacy index residue', version: 1, legacyIndex: true },
@@ -943,6 +943,117 @@ describe('RocksRepository', () => {
     await memory.close();
   });
 
+  it('serves the shipped Swap History intersection with timestamp seeking, exact counts and ID tie order', async () => {
+    const floor = 1790175600;
+    const xor = '0x0200000000000000000000000000000000000000000000000000000000000000';
+    const history = (id: string, timestamp: number, module = 'liquidityProxy', method = 'swap', dataAssets = [xor]): IndexerDocument => ({
+      collection: 'historyElements', id, timestamp,
+      data: { id, timestamp, module, method, dataAssets },
+    });
+    const memory = new MemoryRepository();
+    const documents = [
+      history('at-floor', floor), history('before-floor', floor - 1),
+      history('match-a', floor + 1), history('match-b', floor + 1), history('match-c', floor + 2),
+      history('other-module', floor + 3, 'assets'), history('other-method', floor + 4, 'liquidityProxy', 'swapTransfer'),
+      history('other-asset', floor + 5, 'liquidityProxy', 'swap', ['val']),
+    ];
+    await Promise.all([memory.upsertMany(documents), repository.upsertMany(documents)]);
+    const args = {
+      first: 100, offset: 0, orderBy: ['TIMESTAMP_DESC', 'ID_DESC'],
+      filter: { and: [
+        { or: [{ method: { equalTo: 'swap' }, module: { equalTo: 'liquidityProxy' } }] },
+        { dataAssets: { contains: xor } }, { timestamp: { greaterThan: floor } },
+      ] },
+      includeTotalCount: true,
+    };
+    try {
+      metrics.reset();
+      const [expected, actual] = await Promise.all([memory.query('historyElements', args), repository.query('historyElements', args)]);
+      expect(actual.items.map(({ id }) => id)).toEqual(['match-c', 'match-b', 'match-a']);
+      expect(actual).toMatchObject({ totalCount: 3, hasNextPage: false, hasPreviousPage: false });
+      expect(actual.items).toEqual(expected.items);
+      expect(actual.totalCount).toBe(expected.totalCount);
+      expect(metrics.render()).toContain('indexer_rocksdb_query_scanned_rows_total{collection="historyElements",source="x:s-a-t"} 3');
+      expect(metrics.render()).not.toContain('indexer_rocksdb_query_fast_count_total{collection="historyElements"');
+      const first = await repository.query('historyElements', { ...args, first: 1, offset: undefined, includeTotalCount: false });
+      expect(first.items.map(({ id }) => id)).toEqual(['match-c']);
+      expect(first.hasNextPage).toBe(true);
+      const next = await repository.query('historyElements', { ...args, first: 1, offset: undefined, keyset: decodeRepositoryCursor(first.itemCursors?.[0]), includeTotalCount: false });
+      expect(next.items.map(({ id }) => id)).toEqual(['match-b']);
+      expect(next.hasNextPage).toBe(true);
+      expect((await repository.query('historyElements', { ...args, first: 1, offset: 2 })).items.map(({ id }) => id)).toEqual(['match-a']);
+    } finally {
+      await memory.close();
+    }
+  });
+
+  it('extracts singleton OR equality and timestamp bounds without scanning unrelated history', async () => {
+    const bounded = new RocksRepository({ ...createConfig(join(tempDir, 'singleton-history.rocksdb')), rocksdbQueryMaxScannedRows: 2 });
+    await bounded.prepare();
+    const history = (id: string, timestamp: number, address: string): IndexerDocument => ({
+      collection: 'historyElements', id, timestamp, data: { id, timestamp, address },
+    });
+    try {
+      await bounded.upsertMany([
+        ...Array.from({ length: 500 }, (_, index) => history(`other-${index}`, 100 + index, 'bob')),
+        history('alice-a', 100, 'alice'), history('alice-b', 101, 'alice'), history('alice-old', 99, 'alice'),
+      ]);
+      metrics.reset();
+      const result = await bounded.query('historyElements', {
+        first: 100, orderBy: ['TIMESTAMP_DESC', 'ID_DESC'], includeTotalCount: true,
+        filter: { and: [{ or: [{ address: { equalTo: 'alice' } }] }, { or: [{ timestamp: { greaterThanOrEqualTo: 100 } }] }] },
+      });
+      expect(result.items.map(({ id }) => id)).toEqual(['alice-b', 'alice-a']);
+      expect(result.totalCount).toBe(2);
+      expect(metrics.render()).toContain('indexer_rocksdb_query_scanned_rows_total{collection="historyElements",source="x:a-t"} 2');
+      const byId = await bounded.query('historyElements', {
+        first: 100, orderBy: ['TIMESTAMP_DESC', 'ID_DESC'], includeTotalCount: true,
+        filter: { or: [{ id: { in: ['alice-a', 'alice-b'] } }] },
+      });
+      expect(byId.items.map(({ id }) => id)).toEqual(['alice-b', 'alice-a']);
+      expect(byId.totalCount).toBe(2);
+      const prefixCount = await bounded.query('historyElements', {
+        first: 1, orderBy: ['TIMESTAMP_DESC', 'ID_DESC'], includeTotalCount: true,
+        filter: { or: [{ address: { equalTo: 'alice' } }] },
+      });
+      expect(prefixCount.items.map(({ id }) => id)).toEqual(['alice-b']);
+      expect(prefixCount.totalCount).toBe(3);
+      expect(metrics.render()).toContain('indexer_rocksdb_query_fast_count_total{collection="historyElements",source="x:a-t"} 1');
+    } finally {
+      await bounded.close();
+    }
+  });
+
+  it('enforces the Swap History scan budget for residual misses and total counts', async () => {
+    const floor = 1790175600;
+    const xor = '0x0200000000000000000000000000000000000000000000000000000000000000';
+    const bounded = new RocksRepository({ ...createConfig(join(tempDir, 'swap-history-budget.rocksdb')), rocksdbQueryMaxScannedRows: 2 });
+    await bounded.prepare();
+    const history = (id: string, timestamp: number, assets: string[] = [xor, 'val']): IndexerDocument => ({
+      collection: 'historyElements', id, timestamp, data: { id, timestamp, module: 'liquidityProxy', method: 'swap', dataAssets: assets },
+    });
+    const filter = { and: [
+      { or: [{ module: { equalTo: 'liquidityProxy' }, method: { equalTo: 'swap' } }] },
+      { dataAssets: { contains: [xor, 'val'] } }, { timestamp: { greaterThan: floor } },
+    ] };
+    try {
+      await bounded.upsertMany([
+        ...Array.from({ length: 500 }, (_, index) => history(`old-${index}`, floor - index)),
+        history('match-a', floor + 1), history('match-b', floor + 2),
+      ]);
+      await expect(bounded.query('historyElements', { first: 100, offset: 0, orderBy: ['TIMESTAMP_DESC', 'ID_DESC'], filter, includeTotalCount: true }))
+        .resolves.toMatchObject({ totalCount: 2, items: [expect.objectContaining({ id: 'match-b' }), expect.objectContaining({ id: 'match-a' })] });
+      await bounded.upsertMany([history('miss-a', floor + 3, [xor]), history('miss-b', floor + 4, [xor])]);
+      for (const includeTotalCount of [false, true]) {
+        await expect(bounded.query('historyElements', { first: 100, offset: 0, orderBy: ['TIMESTAMP_DESC', 'ID_DESC'], filter, includeTotalCount }))
+          .rejects.toThrow(/2 row scan limit/);
+      }
+      expect(metrics.render()).toContain('indexer_rocksdb_query_scan_limit_total{collection="historyElements",source="x:s-a-t"} 2');
+    } finally {
+      await bounded.close();
+    }
+  });
+
   it('bounds exact history-signature scans independently of unrelated collection cardinality', async () => {
     const boundedRepository = new RocksRepository({
       ...createConfig(join(tempDir, 'history-signature-budget.rocksdb')),
@@ -1417,6 +1528,117 @@ describe('RocksRepository', () => {
 
     expect(firstPage.items.map((document) => document.id)).toEqual(['a', 'b']);
     expect(secondPage.items.map((document) => document.id)).toEqual(['c', 'd']);
+  });
+
+  it.each([
+    ['ASC', true], ['DESC', true], ['ASC', false], ['DESC', false],
+  ] as const)('excludes every document-key cursor boundary in %s pagination (count=%s)', async (direction, includeTotalCount) => {
+    const ids = Array.from({ length: 217 }, (_, index) => `staker-${String(index).padStart(3, '0')}`);
+    await repository.upsertMany(ids.map((id) => ({ collection: 'stakingStakers', id, data: { id } })));
+    const expected = direction === 'DESC' ? [...ids].reverse() : ids;
+    const query = { first: 100, orderBy: [`ID_${direction}`], includeTotalCount };
+    let keyset = null;
+    const observed: string[] = [];
+
+    for (let offset = 0; offset < expected.length; offset += query.first) {
+      const page = await repository.query('stakingStakers', { ...query, keyset });
+      const pageIds = page.items.map((document) => document.id);
+      expect(pageIds).toEqual(expected.slice(offset, offset + query.first));
+      expect(page.hasNextPage).toBe(offset + query.first < expected.length);
+      observed.push(...pageIds);
+      keyset = decodeRepositoryCursor(page.itemCursors?.at(-1));
+      expect(keyset?.id).toBe(pageIds.at(-1));
+    }
+
+    expect(observed).toEqual(expected);
+    expect(new Set(observed).size).toBe(ids.length);
+    const terminal = await repository.query('stakingStakers', { ...query, keyset });
+    expect(terminal.items).toEqual([]);
+    expect(terminal.hasNextPage).toBe(false);
+    expect(terminal.hasPreviousPage).toBe(true);
+  });
+
+  it.each([
+    ['ASC', true], ['DESC', true], ['ASC', false], ['DESC', false],
+  ] as const)('keeps compact numeric cursor pages and tied IDs exact in %s order (count=%s)', async (direction, includeTotalCount) => {
+    const ids = Array.from({ length: 13 }, (_, index) => `row-${String(index).padStart(2, '0')}`);
+    const documents = ids.flatMap((id, index): IndexerDocument[] => {
+      const position = Math.floor(index / 3);
+      return [
+        assetSnapshot(id, 'xor', position),
+        { collection: 'assets', id, data: { id, priceUSD: `${9_007_199_254_740_993n + BigInt(position)}.25` } },
+        { collection: 'vaults', id, data: { id, ownerId: 'owner', updatedAtBlock: position } },
+      ];
+    });
+    await repository.upsertMany(documents);
+    const cases = [
+      { collection: 'assetSnapshots', field: 'TIMESTAMP', filter: { assetId: { equalTo: 'xor' }, type: { equalTo: 'DAY' } } },
+      { collection: 'assetSnapshots', field: 'BLOCK_HEIGHT', filter: { assetId: { equalTo: 'xor' } } },
+      { collection: 'assets', field: 'PRICE_USD', filter: null },
+      { collection: 'vaults', field: 'UPDATED_AT_BLOCK', filter: { ownerId: { equalTo: 'owner' } } },
+    ] as const;
+    const expected = direction === 'DESC' ? [...ids].reverse() : ids;
+
+    for (const { collection, field, filter } of cases) {
+      const query = { first: 2, orderBy: [`${field}_${direction}`], filter, includeTotalCount };
+      let keyset = null;
+      const observed: string[] = [];
+      for (let offset = 0; offset < expected.length; offset += query.first) {
+        const page = await repository.query(collection, { ...query, keyset });
+        expect(page.items.map((document) => document.id)).toEqual(expected.slice(offset, offset + query.first));
+        expect(page.hasNextPage).toBe(offset + query.first < expected.length);
+        observed.push(...page.items.map((document) => document.id));
+        keyset = decodeRepositoryCursor(page.itemCursors?.at(-1));
+      }
+      expect(observed).toEqual(expected);
+      const terminal = await repository.query(collection, { ...query, keyset });
+      expect(terminal.items).toEqual([]);
+      expect(terminal.hasNextPage).toBe(false);
+      expect(terminal.hasPreviousPage).toBe(true);
+    }
+    await repository.validateCompactIndexes();
+  });
+
+  it.each([
+    ['ASC', true], ['DESC', true], ['ASC', false], ['DESC', false],
+  ] as const)('keeps legacy repository offsets and page flags exact in %s order (count=%s)', async (direction, includeTotalCount) => {
+    const ids = Array.from({ length: 7 }, (_, index) => `id-${index}`);
+    await repository.upsertMany(ids.map((id) => ({ collection: 'stakingStakers', id, data: { id } })));
+    const expected = direction === 'DESC' ? [...ids].reverse() : ids;
+    const query = { first: 3, orderBy: [`ID_${direction}`], includeTotalCount };
+    for (const after of ['2', 2, '5', 5, '6', 6] as const) {
+      const offset = Number(after) + 1;
+      const page = await repository.query('stakingStakers', { ...query, after });
+      expect(page.items.map((document) => document.id)).toEqual(expected.slice(offset, offset + query.first));
+      expect(page.hasNextPage).toBe(offset + query.first < ids.length);
+      expect(page.hasPreviousPage).toBe(true);
+      expect(page.totalCount).toBe(includeTotalCount ? ids.length : null);
+    }
+  });
+
+  it.each([
+    ['ASC', true], ['DESC', true], ['ASC', false], ['DESC', false],
+  ] as const)('uses remaining rows for compact seek page flags in %s order (count=%s)', async (direction, includeTotalCount) => {
+    const ids = Array.from({ length: 7 }, (_, index) => `seek-${index}`);
+    await repository.upsertMany(ids.map((id, index) => assetSnapshot(id, 'xor', Math.floor(index / 2))));
+    const expected = direction === 'DESC' ? [...ids].reverse() : ids;
+    for (const field of ['timestamp', 'blockHeight'] as const) {
+      const orderField = field === 'timestamp' ? 'TIMESTAMP' : 'BLOCK_HEIGHT';
+      const filter = field === 'timestamp'
+        ? { assetId: { equalTo: 'xor' }, type: { equalTo: 'DAY' } }
+        : { assetId: { equalTo: 'xor' } };
+      for (const offset of [2, 6, 7]) {
+        const previous = expected[offset - 1];
+        const page = await repository.query('assetSnapshots', {
+          first: 2, orderBy: [`${orderField}_${direction}`], filter, includeTotalCount,
+          seek: { field, value: Math.floor(ids.indexOf(previous) / 2), id: previous, direction: direction === 'DESC' ? 'desc' : 'asc' },
+        });
+        expect(page.items.map((document) => document.id)).toEqual(expected.slice(offset, offset + 2));
+        expect(page.hasNextPage).toBe(offset + 2 < ids.length);
+        expect(page.hasPreviousPage).toBe(true);
+        expect(page.totalCount).toBe(includeTotalCount ? ids.length : null);
+      }
+    }
   });
 
   it('keeps filtered fallback ID pages in binary key order', async () => {

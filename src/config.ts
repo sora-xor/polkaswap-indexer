@@ -51,6 +51,8 @@ export type AppConfig = {
   storageEngine: 'postgres' | 'rocksdb';
   databaseUrl: string;
   skipPostgresMigration: boolean;
+  hourlyRepairFile?: string;
+  hourlyRepairSha256?: string;
   postgresPoolMax: number;
   postgresListenPoolMax: number;
   postgresConnectionTimeoutMs: number;
@@ -72,12 +74,14 @@ export type AppConfig = {
   rocksdbQueryMaxScannedRows: number;
   rocksdbCompactionMinFreeGb: number;
   soraWsEndpoint: string;
-  /** Compatibility alias used by the independently verified archive path. */
+  /** Compatibility alias used by the verified archive path. */
   soraArchiveWsEndpoint?: string | null;
   chainStartBlock: number;
   chainBatchSize: number;
   stateRefreshIntervalBlocks: number;
   snapshotIntervalBlocks: number;
+  /** readConfig supplies this; programmatic worker configurations default to all. */
+  snapshotRetentionMode?: 'all' | 'rolling';
   fullReconciliationIntervalBlocks: number;
   chainShutdownTimeoutMs: number;
   chainRpcTimeoutMs: number;
@@ -387,14 +391,6 @@ export function readSoraArchiveWsEndpoint(requireConfigured = false): string | n
   return validateSoraWsUrl('SORA_ARCHIVE_WS_ENDPOINT', configured);
 }
 
-export function assertIndependentSoraRpcEndpoints(primary: string, archive: string): void {
-  const canonicalHostname = (value: string): string =>
-    new URL(value).hostname.toLowerCase().replace(/\.$/, '');
-  if (canonicalHostname(primary) === canonicalHostname(archive)) {
-    throw new Error('SORA primary and archive endpoints must use different reviewed hosts.');
-  }
-}
-
 /** Reads and strictly validates all long-lived runtime configuration. */
 export function readConfig(): AppConfig {
   const nodeEnvironment = readNodeEnvironment();
@@ -499,7 +495,16 @@ export function readConfig(): AppConfig {
     invalid('MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE', 'requires MOBILE_CONFIG_POLKAMARKT_VISIBLE=true');
   }
 
+  const hourlyRepairFile = process.env.CHAIN_HOURLY_REPAIR_FILE;
+  const hourlyRepairSha256 = process.env.CHAIN_HOURLY_REPAIR_SHA256;
+  if ((hourlyRepairFile === undefined) !== (hourlyRepairSha256 === undefined)) {
+    invalid('CHAIN_HOURLY_REPAIR_FILE/CHAIN_HOURLY_REPAIR_SHA256', 'both values are required together');
+  }
+  if (hourlyRepairFile !== undefined && (!hourlyRepairFile.trim() || !/^[a-f0-9]{64}$/.test(hourlyRepairSha256!))) {
+    invalid('CHAIN_HOURLY_REPAIR_FILE/CHAIN_HOURLY_REPAIR_SHA256', 'requires a nonempty path and lowercase SHA-256');
+  }
   return {
+    ...(hourlyRepairFile !== undefined ? { hourlyRepairFile, hourlyRepairSha256 } : {}),
     host,
     port: readInteger('PORT', 4350, { minimum: 1, maximum: 65_535 }),
     graphqlPath: validateGraphqlPath(readString('GRAPHQL_PATH', '/graphql')),
@@ -672,6 +677,7 @@ export function readConfig(): AppConfig {
     chainBatchSize: readInteger('CHAIN_BATCH_SIZE', 25, { minimum: 1, maximum: 1_000 }),
     stateRefreshIntervalBlocks: readInteger('CHAIN_STATE_REFRESH_INTERVAL_BLOCKS', 25, { minimum: 1 }),
     snapshotIntervalBlocks: readInteger('CHAIN_SNAPSHOT_INTERVAL_BLOCKS', 25, { minimum: 1 }),
+    snapshotRetentionMode: readEnum<'all' | 'rolling'>('CHAIN_SNAPSHOT_RETENTION_MODE', 'all', ['all', 'rolling']),
     fullReconciliationIntervalBlocks: readInteger('CHAIN_STATE_FULL_RECONCILIATION_INTERVAL_BLOCKS', 250, {
       minimum: 1,
     }),

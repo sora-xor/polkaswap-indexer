@@ -138,6 +138,7 @@ describe('Polkaswap indexer schema', () => {
 
     await expect(healthField?.resolve?.({}, {}, { repository: new MemoryRepository() }, {} as never)).resolves.toEqual({
       ok: false,
+      checkpointCoherent: false,
       repositoryReady: true,
       service: 'polkaswap-indexer',
       serviceId: 'pi.soramitsu.io',
@@ -175,6 +176,7 @@ describe('Polkaswap indexer schema', () => {
 
     await expect(healthField?.resolve?.({}, {}, { repository }, {} as never)).resolves.toEqual({
       ok: false,
+      checkpointCoherent: false,
       repositoryReady: false,
       service: 'polkaswap-indexer',
       serviceId: 'pi.soramitsu.io',
@@ -587,7 +589,7 @@ describe('Polkaswap indexer schema', () => {
 
     expect(resolve('Asset', 'priceUSD', { priceUSD: '0001.2500' })).toBe('1.25');
     expect(String((schema.getType('Asset') as GraphQLObjectType).getFields().priceChangeDay?.type)).toBe('Float');
-    expect(String((schema.getType('Asset') as GraphQLObjectType).getFields().volumeDayUSD?.type)).toBe('String');
+    expect(String((schema.getType('Asset') as GraphQLObjectType).getFields().volumeDayUSD?.type)).toBe('Float');
     expect(resolve('Asset', 'volumeDayUSD', { volumeDayUSD: '999999999999999999999.1' })).toBe(
       '999999999999999999999.1'
     );
@@ -1951,7 +1953,7 @@ describe('Polkaswap indexer schema', () => {
         {} as never
       )
     ).rejects.toThrow('maximum input node count');
-    for (const after of [0, '0', 'psc1.legacy']) {
+    for (const after of [0, '-1', 'psc1.legacy']) {
       await expect(
         assetsField?.resolve?.({}, { first: 1, after, orderBy: ['ID_ASC'] }, { repository }, {} as never)
       ).rejects.toThrow(/cursor/i);
@@ -2160,7 +2162,7 @@ describe('Polkaswap indexer schema', () => {
     });
   });
 
-  it('exposes only bounded forward pagination and rejects removed legacy arguments defensively', async () => {
+  it('exposes bounded legacy windows alongside forward opaque pagination', async () => {
     const repository = new MemoryRepository();
     await repository.upsertMany(
       ['asset-a', 'asset-b', 'asset-c', 'asset-d'].map((id) => ({
@@ -2177,16 +2179,16 @@ describe('Polkaswap indexer schema', () => {
 
     const schema = createSchema();
     const assetsField = schema.getQueryType()?.getFields().assets;
-    expect(assetsField?.args.map((argument) => argument.name)).toEqual(['first', 'after', 'orderBy', 'filter']);
+    expect(assetsField?.args.map((argument) => argument.name)).toEqual(['first', 'last', 'offset', 'after', 'before', 'orderBy', 'filter']);
     await expect(
       assetsField?.resolve?.({}, { first: 3, last: 2, orderBy: ['ID_ASC'] }, { repository }, {} as never)
-    ).rejects.toThrow('last pagination is not supported');
+    ).resolves.toMatchObject({ nodes: [{ id: 'asset-b' }, { id: 'asset-c' }] });
     await expect(
       assetsField?.resolve?.({}, { first: 1, offset: 100_001, orderBy: ['ID_ASC'] }, { repository }, {} as never)
     ).rejects.toThrow('offset must be an integer');
     await expect(
       assetsField?.resolve?.({}, { first: 1, before: 'cursor', orderBy: ['ID_ASC'] }, { repository }, {} as never)
-    ).rejects.toThrow('before pagination is not supported');
+    ).resolves.toMatchObject({ nodes: [{ id: 'asset-a' }] });
   });
 
   it('returns empty page info for filtered-out connection results', async () => {

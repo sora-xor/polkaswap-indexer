@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   assertExplicitProductionWorkerChainInputs,
-  assertIndependentSoraRpcEndpoints,
   readConfig,
   readRuntimeSecurityConfig,
   readSoraArchiveWsEndpoint,
@@ -10,6 +9,8 @@ import {
 
 const CONFIG_ENV_KEYS = [
   'NODE_ENV',
+  'CHAIN_HOURLY_REPAIR_FILE',
+  'CHAIN_HOURLY_REPAIR_SHA256',
   'NODE_OPTIONS',
   'NODE_TLS_REJECT_UNAUTHORIZED',
   'PGOPTIONS',
@@ -81,6 +82,7 @@ const CONFIG_ENV_KEYS = [
   'CHAIN_BATCH_SIZE',
   'CHAIN_STATE_REFRESH_INTERVAL_BLOCKS',
   'CHAIN_SNAPSHOT_INTERVAL_BLOCKS',
+  'CHAIN_SNAPSHOT_RETENTION_MODE',
   'CHAIN_STATE_FULL_RECONCILIATION_INTERVAL_BLOCKS',
   'CHAIN_SHUTDOWN_TIMEOUT_MS',
   'CHAIN_RPC_TIMEOUT_MS',
@@ -193,6 +195,7 @@ describe('runtime configuration', () => {
       chainBatchSize: 25,
       stateRefreshIntervalBlocks: 25,
       snapshotIntervalBlocks: 25,
+      snapshotRetentionMode: 'all',
       fullReconciliationIntervalBlocks: 250,
       chainShutdownTimeoutMs: 30_000,
       chainRpcTimeoutMs: 15_000,
@@ -311,13 +314,23 @@ describe('runtime configuration', () => {
     expect(() => assertExplicitProductionWorkerChainInputs()).not.toThrow();
   });
 
-  it('rejects primary/archive hostname aliases regardless of case or a trailing dot', () => {
-    expect(() =>
-      assertIndependentSoraRpcEndpoints(
-        'wss://PRIMARY.example.invalid:443',
-        'wss://primary.example.invalid.:9944'
-      )
-    ).toThrow(/must use different reviewed hosts/);
+  it('accepts an explicitly configured historical node for both production RocksDB roles', () => {
+    setEnv({
+      NODE_ENV: 'production',
+      STORAGE_ENGINE: 'rocksdb',
+      ROCKSDB_PATH: '/tmp/polkaswap-indexer-config-test',
+      SORA_WS_ENDPOINT: 'wss://mof2.sora.org',
+      SORA_ARCHIVE_WS_ENDPOINT: 'wss://mof2.sora.org',
+      CHAIN_START_BLOCK: '26872383',
+    });
+
+    expect(() => assertExplicitProductionWorkerChainInputs()).not.toThrow();
+    expect(readConfig()).toMatchObject({
+      storageEngine: 'rocksdb',
+      soraWsEndpoint: 'wss://mof2.sora.org',
+      archiveSoraWsEndpoint: 'wss://mof2.sora.org',
+    });
+    expect(readSoraArchiveWsEndpoint(true)).toBe('wss://mof2.sora.org');
   });
 
   it('parses every supported override without coercing its type', () => {
@@ -478,6 +491,7 @@ describe('runtime configuration', () => {
       chainBatchSize: 50,
       stateRefreshIntervalBlocks: 60,
       snapshotIntervalBlocks: 75,
+      snapshotRetentionMode: 'all',
       fullReconciliationIntervalBlocks: 300,
       chainShutdownTimeoutMs: 45_000,
       chainRpcTimeoutMs: 12_000,
@@ -658,18 +672,6 @@ describe('runtime configuration', () => {
   ])('rejects malformed archive endpoint %j', (value, expected) => {
     process.env.SORA_ARCHIVE_WS_ENDPOINT = value;
     expect(readSoraArchiveWsEndpoint).toThrow(expected);
-  });
-
-  it('requires independent primary and archive hosts regardless of case, port, or path', () => {
-    expect(() => assertIndependentSoraRpcEndpoints(
-      'wss://Mof2.Sora.org:443/primary',
-      'wss://mof2.sora.org:9443/archive',
-    )).toThrow('must use different reviewed hosts');
-
-    expect(() => assertIndependentSoraRpcEndpoints(
-      'wss://mof2.sora.org',
-      'wss://ws.mof.sora.org',
-    )).not.toThrow();
   });
 
   it('rejects malformed and unsafe security-limit settings', () => {
@@ -879,6 +881,16 @@ describe('runtime configuration', () => {
     expect(readConfig().finalizedCatchupPrefetchConcurrency).toBe(7);
   });
 
+  it.each(['all', 'rolling'])('accepts the explicit %s snapshot retention mode', (mode) => {
+    process.env.CHAIN_SNAPSHOT_RETENTION_MODE = mode;
+    expect(readConfig().snapshotRetentionMode).toBe(mode);
+  });
+
+  it.each(['', 'none', 'all,rolling'])('rejects invalid snapshot retention mode %j', (mode) => {
+    process.env.CHAIN_SNAPSHOT_RETENTION_MODE = mode;
+    expect(() => readConfig()).toThrow(/Invalid CHAIN_SNAPSHOT_RETENTION_MODE:.*all, rolling/);
+  });
+
   it('rejects HTTP timeout relationships that allow slow or ambiguous connection teardown', () => {
     process.env.HTTP_HEADERS_TIMEOUT_MS = '75000';
     expect(() => readConfig()).toThrow(/Invalid HTTP_HEADERS_TIMEOUT_MS:.*greater than HTTP_KEEP_ALIVE_TIMEOUT_MS/);
@@ -894,5 +906,16 @@ describe('runtime configuration', () => {
     expect(() => readConfig()).toThrow(
       /Invalid POSTGRES_WATCH_RECONNECT_MAX_DELAY_MS:.*POSTGRES_WATCH_RECONNECT_MIN_DELAY_MS/
     );
+  });
+});
+
+describe('checked hourly repair startup configuration', () => {
+  it('requires the explicit artifact path and SHA together', () => {
+    process.env.CHAIN_HOURLY_REPAIR_FILE = '/tmp/checked-history.jsonl';
+    expect(() => readConfig()).toThrow('both values');
+    process.env.CHAIN_HOURLY_REPAIR_SHA256 = 'not-a-checksum';
+    expect(() => readConfig()).toThrow('lowercase SHA-256');
+    process.env.CHAIN_HOURLY_REPAIR_SHA256 = 'a'.repeat(64);
+    expect(readConfig()).toMatchObject({ hourlyRepairFile: '/tmp/checked-history.jsonl', hourlyRepairSha256: 'a'.repeat(64) });
   });
 });

@@ -60,6 +60,14 @@ audited anchor as an immutable `chainIdentity` checkpoint, and validates every
 configured archive endpoint independently. There is no environment override or
 skip switch for this proof.
 
+The startup identity preflight reads the pinned anchor's `Timestamp.Now` storage
+key directly and accepts only its exact eight-byte SCALE `u64` millisecond value.
+It retains the fixed genesis, anchor hash, and audited timestamp checks without
+downloading historical runtime metadata merely to decode that one known value.
+Connection and individual RPC calls remain bounded at 15 seconds, with no
+automatic reconnect. Normal block indexing still uses runtime metadata and its
+separately configured `CHAIN_RPC_TIMEOUT_MS` budget.
+
 The direct `@babel/runtime` dependency is intentional: the published
 `@sora-substrate/type-definitions` CommonJS build imports Babel helpers at
 runtime without declaring that package itself.
@@ -113,9 +121,53 @@ schema projects those documents into the fields consumed by Polkaswap:
 When `STORAGE_ENGINE=rocksdb`, the same document model is stored in RocksDB
 under `ROCKSDB_PATH`. The RocksDB repository keeps secondary indexes for common
 timestamp, block-height, equality, and numeric sort query shapes. Public
-GraphQL connections accept only the supported, indexed filter/order policies
-and fail closed before repository execution for unsupported shapes. Bounded
-scan/sort fallback is reserved for trusted internal repository callers.
+GraphQL connections validate supported filter and order shapes before repository
+execution. Asset connections support all declared numeric fields for filtering
+and ordering: price and liquidity orders use existing indexes, while other Asset
+orders and residual filters obey the configured native row-scan limit. Other
+collections retain their indexed query policies.
+
+Swap History seeks a compact timestamp/ID index for each distinct string asset
+on `liquidityProxy.swap` documents. Its exact counts and remaining filter
+predicates retain the configured row-scan limit. Existing address and address-OR
+query plans retain priority over the new asset prefix. On the first writable open,
+`prepare()` derives this index from existing history before the API or worker is
+ready. Each native transaction processes at most 256 documents and stops after
+an 8 MiB retained-value estimate (one larger document remains atomic). Index
+keys and the resume position commit together, so interrupted preparation resumes
+without rewriting history or chain checkpoints. Subsequent opens use its
+completion marker; malformed markers fail closed. A read-only open requires the
+index preparation to have completed. Preparation adds one key per distinct
+string asset in a swap and does not duplicate document payloads.
+Asset prefixes are fixed text of at most 43 characters, keeping keys small even
+for large valid payloads. Ordinary prefixes are 43-character base64url digests. Well-formed strings without U+FFFD hash their exact
+UTF-16 code units. Strings containing U+FFFD or an unpaired surrogate share one
+distinct conservative bucket because the existing native document codec may replace lone
+surrogates during persistence. Every candidate still passes the full filter,
+preserving the existing persisted/cached results and exact counts while charging
+all alias collisions and residual misses to the same scan limit.
+The writable format-1 upgrade atomically sets storage format 2 and the initial
+index progress marker before adding keys. Earlier indexer binaries reject format
+2, preventing an older writer from invalidating the derived index. Rolling back
+to an earlier binary requires restoration of a verified complete pre-upgrade
+database backup; manually downgrading the format marker is unsafe.
+
+Collection connections accept `first`, `last`, `offset`, and `after`. Both page
+sizes are limited to 100, and explicit offsets and numeric continuation positions
+are bounded by 100,000. Returned opaque cursors are scoped to the connection,
+order, and filter; existing safe numeric positions remain accepted. `last` selects
+the tail of the requested window before its response byte budget is applied.
+`before` retains the previous API's ignored-argument behavior; it does not select
+a backward cursor window. Asset day/week USD volumes retain their GraphQL `Float`
+output types while their stored decimal values remain lossless.
+
+Bots uses `assetHourlyCoverage` and `AssetSnapshot.closeEvidence` to distinguish
+verified finalized hourly closes from missing, legacy, or invalid history.
+Coverage reads at most 2160 completed UTC hours for one canonical asset ID through
+bounded indexed pages. The worker commits each close with its adjacent finalized
+block evidence and retains its tracked hourly rows in either retention
+mode. Historical repair requires captured, verified archive evidence; see
+[`docs/bot-history.md`](docs/bot-history.md).
 
 The chain worker reads finalized SORA blocks for transaction history and uses
 SORA storage refreshes to maintain the current asset, pool, order-book,
@@ -128,8 +180,8 @@ accounts from that collection over a requested timestamp range for the exchange
 stats page. It rejects ranges longer than 366 days and enforces one 100,000-row
 scan budget across all pages and source collections. Public collection
 connections also enforce collection-specific filter/order policies; unsupported
-shapes fail before repository execution. Scan/sort fallbacks remain available
-only to bounded, trusted internal repository callers.
+shapes fail before repository execution. The Asset query paths and trusted
+internal scan/sort fallbacks retain the native row-scan and response byte limits.
 
 `polkamarktSignals` likewise uses stable ID-keyset pagination rather than a
 top-1,000 approximation. It detects repeated pages and enforces a separate
@@ -189,11 +241,15 @@ the development database fallback.
 For a fresh production deployment, set `CHAIN_START_BLOCK` to the earliest
 block you need indexed; a full-chain backfill is intentionally long. Primary
 and archive SORA URLs must be
-credential-free `wss:` endpoints without query strings or fragments, on
-different hosts. The production worker requires `SORA_ARCHIVE_WS_ENDPOINT`.
+credential-free `wss:` endpoints without query strings or fragments. The
+production worker requires an explicit `SORA_ARCHIVE_WS_ENDPOINT`; it may equal
+`SORA_WS_ENDPOINT` when that node serves the required historical blocks,
+metadata, events, timestamps, and storage. Both RPC handles retain the same
+identity and payload checks when they use one endpoint, but this provides no
+independent operator verification.
 After the chain-neutral schema migration completes and before constructing,
 reading, or writing its runtime repository, the worker proves the reviewed SORA
-mainnet genesis and immutable history anchor independently on both endpoints.
+mainnet genesis and immutable history anchor on both RPC handles.
 The in-process worker repeats the primary proof and validates a self-consistent
 finalized head before it may persist even its first heartbeat. Every archived
 block then has to match the primary endpoint by height/hash, raw SCALE block and
@@ -295,16 +351,23 @@ state alone, so `liquidityUSD`, `orderBookLiquidityUSD`, and
 `activeOrderBooks` are `null` until a pinned full projection has recomputed raw
 orders at the same height. The worker never substitutes a misleading zero.
 
-Public asset, pool, order-book, market, and network chart snapshots use only
-`DEFAULT`, `HOUR`, `DAY`, and `MONTH`; per-block entity chart snapshots are not
-stored. `DEFAULT` buckets are retained for 48 hours and `HOUR` buckets for 8
-days, while `DAY` and `MONTH` remain available for all-time charts.
-Account-liquidity snapshots use `DEFAULT` and the same 48-hour horizon. Raw
-network `BLOCK` rows used by rolling analytics are retained for 31 days.
-Cleanup queries the type/timestamp indexes and deletes a bounded number of
-pages per refresh. Successful deletion is its durable progress marker, so an
-interrupted page is still visible to the next refresh; no retention cursor or
-migration state document is stored.
+`CHAIN_SNAPSHOT_RETENTION_MODE=all` is the default. It preserves historical
+snapshots without age-based deletion and persists completed historical network
+buckets during backfill. Asset, pool, order-book, and market chart projections
+produce `DEFAULT`, `HOUR`, `DAY`, `MONTH`, and `BLOCK` at the configured snapshot
+cadence. Network aggregates use the four time buckets, with a separate network
+`BLOCK` row committed for every indexed block. Account-liquidity snapshots use
+`DEFAULT`. Rolling analytics still reads its bounded time horizon without
+deleting the historical inputs.
+
+Explicitly setting `CHAIN_SNAPSHOT_RETENTION_MODE=rolling` changes history
+availability: entity chart projections omit `BLOCK`, `DEFAULT` buckets are
+retained for 48 hours, `HOUR` for 8 days, and network `BLOCK` inputs for 31 days.
+`DAY` and `MONTH` remain available for all-time charts. Cleanup queries the
+type/timestamp indexes and deletes bounded pages per refresh. Interrupted pages
+remain visible to the next refresh; no retention cursor or migration state
+document is stored. Use `all` when retaining existing historical queries is
+required.
 
 Worker backfill controls are parsed once into each indexer instance's runtime
 configuration. `CHAIN_BACKFILL_PREFETCH_CONCURRENCY` defaults to `1`; finalized
@@ -551,6 +614,23 @@ The capture protocol protects ordinary DML and `TRUNCATE`, not a privileged
 DDL and trigger-management privileges to the migration operator; the runtime
 worker role should have only the DML privileges it needs.
 
+For an existing legacy checkpoint whose exact current `BLOCK` is missing,
+`storage:repair:rocksdb-legacy-checkpoint` can add one derived row after the
+complete migration, original-row parity checks, and an independent backup.
+Stop the service first. Set `ROCKSDB_CHECKPOINT_REPAIR_BLOCK` to the existing
+checkpoint height, `ROCKSDB_CHECKPOINT_REPAIR_CONFIRM=add-derived-block-<height>`,
+and `ROCKSDB_CHECKPOINT_REPAIR_RECEIPT` to an absolute path in an existing
+owner-only directory outside the database. Both explicit RPC roles must use
+`wss://mof2.sora.org`. The tool requires the exact prior `BLOCK` and audited
+anchor, proves finalized history and a single unsigned timestamp inherent with
+only its success event, then captures the normal kernel using verified parent
+asset metadata and pool reserves. It persists only the missing `BLOCK`, with
+zero flows and derived pool stocks. Unavailable order-book stocks remain null.
+The private receipt records a separate one-row addition and supports recovery
+after a crash; it does not claim to recover the legacy asynchronous cache or
+renew PostgreSQL/RocksDB equality. Every original row, migration receipt, and
+legacy `chainState` remains intact for the unchanged startup identity checks.
+
 RocksDB maintenance commands:
 
 ```sh
@@ -752,3 +832,35 @@ yarn test:deployment-evidence-audit
 yarn audit:deployment-evidence --require-ready
 POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production
 ```
+
+### Pruned primary timestamp verification
+
+A local pruned SORA primary remains authoritative for canonical hashes and
+finality. If historical `timestamp.now.at` explicitly reports `State already
+discarded`, identity and checkpoint checks may read that exact hash from the
+configured `SORA_ARCHIVE_WS_ENDPOINT`. The archive must independently prove the
+reviewed mainnet genesis and history anchor, and the timestamp must still match
+the audited anchor or stored checkpoint. Connection failures, unknown hashes,
+malformed timestamps, and conflicting identity never trigger this fallback.
+All archive connection and query operations retain their existing time bounds.
+
+This timestamp fallback does not permit replay through a pruned primary:
+`fetchBlockByHash` still requires primary/archive agreement on the complete
+block, events, and timestamp. A restored checkpoint older than the primary's
+retention therefore needs an explicitly approved historical recovery primary.
+Keep that replay isolated from public routing, record the temporary endpoint,
+and retain all identity and payload checks. A return to a pruned primary remains vulnerable to the next gap beyond its
+retention. Use the approved archival endpoint for durable worker reads unless
+a local node retains the full required recovery history. API/database placement
+and the frontend RPC endpoint can remain local. Two handles to the same archive
+retain consistency checks but do not provide independent operator verification.
+Verify fresh progress and complete API qualification before public cutover.
+
+
+The current Pi deployment is on the MOF MacStadium host `207.254.29.218`.
+Its local SORA RPC node uses constrained `--pruning 256`; it is not an archive.
+The approved OVH MOF2 node (`51.161.218.175`, `wss://mof2.sora.org`) uses
+`--state-pruning archive-canonical --blocks-pruning archive-canonical`, retaining
+both canonical state and blocks. The durable MOF Pi worker uses this archive for
+both configured chain endpoints, including after catch-up. Recovery stays
+isolated from public routing until its data and API checks pass.

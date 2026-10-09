@@ -527,17 +527,32 @@ export class PostgresRepository implements IndexerRepository {
       const { field, direction } = getOrderField(args.orderBy);
       const orderExpression = sqlOrderExpression(field);
       const keyset = args.offset === null || args.offset === undefined ? (args.keyset ?? null) : null;
-      const offset = args.seek || keyset ? 0 : Math.max(Number(args.offset ?? afterToOffset(args.after)), 0);
-      const logicalOffset = offset;
+      let offset = args.seek || keyset ? 0 : Math.max(Number(args.offset ?? afterToOffset(args.after)), 0);
       const first = args.first ?? null;
-      const last = args.last ?? null;
-      const limit = first === null || first === undefined ? null : Math.max(first, 0);
-      const shouldOverfetch = (args.includeTotalCount === false || keyset !== null) && limit !== null;
-      const queryLimit = shouldOverfetch ? limit + 1 : limit;
+      let last = args.last ?? null;
+      let limit = first === null || first === undefined ? null : Math.max(first, 0);
       // Validate and bind every potentially throwing keyset component before
       // dispatching either independent database query.
       const queryValues = [...countValues];
       const keysetWhere = keysetCondition(keyset, field, direction, orderExpression, queryValues);
+      let tailCountResult: { rows: Array<{ count: number }> } | null = null;
+      if (last !== null) {
+        // Determine the selected tail in SQL before applying the payload byte
+        // budget. No unlimited document result is sent to the application.
+        tailCountResult = await this.pool.query(
+          `select count(*)::int as count from indexer_documents
+           where collection = $1 and ${where} and (${keysetWhere})`,
+          queryValues
+        );
+        const remainingCount = Number(tailCountResult.rows[0]?.count ?? 0);
+        const end = limit === null ? remainingCount : Math.min(offset + limit, remainingCount);
+        offset = Math.max(end - Math.max(last, 0), offset);
+        limit = Math.max(end - offset, 0);
+        last = null;
+      }
+      const logicalOffset = offset;
+      const shouldOverfetch = (args.includeTotalCount === false || keyset !== null) && limit !== null;
+      const queryLimit = shouldOverfetch ? limit! + 1 : limit;
       queryValues.push(queryLimit);
       const limitIndex = queryValues.length;
       queryValues.push(offset);
@@ -548,7 +563,9 @@ export class PostgresRepository implements IndexerRepository {
       const countPromise =
         args.includeTotalCount === false
           ? Promise.resolve(null)
-          : this.pool.query(
+          : tailCountResult !== null && keyset === null
+            ? Promise.resolve(tailCountResult)
+            : this.pool.query(
               `select count(*)::int as count
                from indexer_documents
                where collection = $1 and ${where}`,

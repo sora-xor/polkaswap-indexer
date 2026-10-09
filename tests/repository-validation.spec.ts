@@ -13,6 +13,32 @@ import {
 } from '../src/repository/validation.js';
 
 describe('persisted repository document validation', () => {
+  it.each(['blockHeight', 'timestamp'] as const)(
+    'preserves canonical payload %s strings only when they exactly match a numeric envelope', (field) => {
+      for (const value of [0, 26_309_250, Number.MAX_SAFE_INTEGER]) {
+        const candidate = { collection: 'referrerRewards', id: 'reward', [field]: value,
+          data: { id: 'reward', [field]: String(value) } };
+        const normalized = normalizeIndexerDocument(candidate);
+        expect(normalized[field]).toBe(value);
+        expect(normalized.data[field]).toBe(String(value));
+        expect(candidate.data[field]).toBe(String(value));
+        expect(normalizeIndexerDocument(normalized)).toEqual(normalized);
+      }
+      expect(() => normalizeIndexerDocument({ collection: 'referrerRewards', id: 'conflict',
+        [field]: 1, data: { [field]: '2' } })).toThrow(/conflicts with the canonical/);
+      for (const value of ['01', '1.0', '1e0', '+1', '-0', '-1', ' 1', '1 ', '9007199254740992', 'not-an-integer']) {
+        expect(() => normalizeIndexerDocument({ collection: 'referrerRewards', id: 'invalid',
+          [field]: 1, data: { [field]: value } })).toThrow(/expected a non-negative safe integer/);
+      }
+      for (const envelope of [{}, { [field]: null }, { [field]: undefined }]) {
+        expect(() => normalizeIndexerDocument({ collection: 'referrerRewards', id: 'missing-envelope',
+          ...envelope, data: { [field]: '1' } })).toThrow(/expected a non-negative safe integer/);
+      }
+      expect(() => normalizeIndexerDocument({ collection: 'referrerRewards', id: 'string-envelope',
+        [field]: '1', data: { [field]: '1' } })).toThrow(/expected a non-negative safe integer/);
+    }
+  );
+
   it('accepts bounded JSON data including nested arrays and null-prototype records', () => {
     const nested = Object.assign(Object.create(null) as Record<string, unknown>, {
       scalar: 'value',

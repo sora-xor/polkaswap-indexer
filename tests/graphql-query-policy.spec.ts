@@ -4,6 +4,60 @@ import { validatePublicConnectionQuery } from '../src/graphql/query-policy.js';
 import { createPinnedWalletHistoryFilter } from './pinned-wallet-history-fixture.js';
 
 describe('public GraphQL repository query policy', () => {
+  it('admits the shipped Polkaswap Swap History filter and singleton logical wrappers', () => {
+    // PolkaswapHistoryElements from the published frontend's Swap History tab.
+    const filter = {
+      and: [
+        { or: [{ method: { equalTo: 'swap' }, module: { equalTo: 'liquidityProxy' } }] },
+        { dataAssets: { contains: '0x0200000000000000000000000000000000000000000000000000000000000000' } },
+        { timestamp: { greaterThan: 1790175600 } },
+      ],
+    };
+    expect(() => validatePublicConnectionQuery('historyElements', ['TIMESTAMP_DESC', 'ID_DESC'], filter)).not.toThrow();
+    expect(() =>
+      validatePublicConnectionQuery('historyElements', ['TIMESTAMP_DESC', 'ID_DESC'], {
+        or: [{ and: filter.and.map((nested) => ({ or: [{ and: [nested] }] })) }],
+      })
+    ).not.toThrow();
+    expect(() =>
+      validatePublicConnectionQuery('historyElements', ['TIMESTAMP_DESC', 'ID_DESC'], {
+        or: [{ address: { equalTo: 'alice' } }],
+      })
+    ).not.toThrow();
+    expect(() =>
+      validatePublicConnectionQuery('historyElements', ['TIMESTAMP_DESC', 'ID_DESC'], {
+        or: [{ id: { in: ['history-a', 'history-b'] } }],
+      })
+    ).not.toThrow();
+  });
+
+  it.each([
+    { module: { equalTo: 'liquidityProxy' }, method: { equalTo: 'swap' }, dataAssets: { contains: 'xor' } },
+    { timestamp: { greaterThan: 100 }, dataAssets: { contains: 'xor' } },
+    { timestamp: { greaterThan: 100 }, module: { equalTo: 'liquidityProxy' }, method: { equalTo: 'swap' } },
+    { timestamp: { lessThan: 100 }, module: { equalTo: 'liquidityProxy' }, method: { equalTo: 'swap' }, dataAssets: { contains: 'xor' } },
+    { timestamp: { greaterThan: 100 }, module: { includesInsensitive: 'liquidity' }, method: { equalTo: 'swap' }, dataAssets: { contains: 'xor' } },
+    { timestamp: { greaterThan: 100 }, module: { equalTo: 'poolXYK' }, method: { equalTo: 'swap' }, dataAssets: { contains: 'xor' } },
+    {
+      and: [
+        { or: [{ module: { equalTo: 'liquidityProxy' }, method: { equalTo: 'swap' } }, { module: { equalTo: 'assets' }, method: { equalTo: 'mint' } }] },
+        { timestamp: { greaterThan: 100 }, dataAssets: { contains: 'xor' } },
+      ],
+    },
+    {
+      module: { equalTo: 'liquidityProxy' }, method: { equalTo: 'swap' }, timestamp: { greaterThan: 100 },
+      or: [{ dataAssets: { contains: 'xor' } }, { method: { equalTo: 'swap' } }],
+    },
+    {
+      module: { equalTo: 'liquidityProxy' }, method: { equalTo: 'swap' }, dataAssets: { contains: 'xor' },
+      or: [{ timestamp: { greaterThan: 100 } }, { method: { equalTo: 'swap' } }],
+    },
+  ])('rejects an unanchored or broadened Swap History filter %#', (filter) => {
+    expect(() => validatePublicConnectionQuery('historyElements', ['TIMESTAMP_DESC', 'ID_DESC'], filter)).toThrow(
+      'not backed by a bounded public storage plan'
+    );
+  });
+
   it('admits the indexed UI query shapes', () => {
     expect(() =>
       validatePublicConnectionQuery('assetSnapshots', ['TIMESTAMP_DESC'], {
@@ -196,12 +250,12 @@ describe('public GraphQL repository query policy', () => {
     ).toThrow('at most 100 values');
   });
 
-  it('rejects valid fields combined into an unindexed storage shape', () => {
+  it('admits bounded Asset residual predicates while retaining high-volume plan requirements', () => {
     expect(() =>
       validatePublicConnectionQuery('assets', ['LIQUIDITY_DESC'], {
         priceUSD: { greaterThan: '1' },
       })
-    ).toThrow();
+    ).not.toThrow();
     expect(() =>
       validatePublicConnectionQuery('poolSnapshots', ['TIMESTAMP_DESC'], {
         poolId: { equalTo: 'pool-a' },

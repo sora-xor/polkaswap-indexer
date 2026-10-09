@@ -23,6 +23,8 @@
     "storage:migrate:postgres-to-rocksdb:dist": "node dist/src/scripts/migrate-postgres-to-rocksdb.js",
     "storage:verify:rocksdb": "tsx src/scripts/verify-rocksdb.ts",
     "storage:verify:rocksdb:dist": "node dist/src/scripts/verify-rocksdb.js",
+    "storage:repair:rocksdb-legacy-checkpoint": "tsx src/scripts/repair-rocksdb-legacy-checkpoint.ts",
+    "storage:repair:rocksdb-legacy-checkpoint:dist": "node dist/src/scripts/repair-rocksdb-legacy-checkpoint.js",
     "storage:backup:rocksdb": "tsx src/scripts/backup-rocksdb.ts",
     "storage:backup:rocksdb:dist": "node dist/src/scripts/backup-rocksdb.js",
     "storage:restore:rocksdb": "tsx src/scripts/restore-rocksdb.ts",

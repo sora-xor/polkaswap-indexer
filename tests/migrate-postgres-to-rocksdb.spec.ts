@@ -1,12 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   assertMigrationFollowModeAllowed,
   exportPostgresRows,
   migrationCheckpointErrorMessage,
+  persistMigrationFailureState,
   readBoundedPositiveInteger,
   selectByteBoundedMigrationPrefix,
 } from '../src/scripts/migrate-postgres-to-rocksdb.js';
+import { captureSentinelHash } from '../src/scripts/postgres-rocksdb-capture.js';
+import { createPostgresRocksdbMigrationState } from '../src/scripts/rocksdb-migration-state.js';
 
 import type pg from 'pg';
 import type { RocksRepository } from '../src/repository/rocksdb.js';
@@ -143,5 +146,105 @@ describe('PostgreSQL-to-RocksDB byte-bounded fetch planning', () => {
       /cannot be represented exactly/
     );
     expect(writes).toBe(0);
+  });
+});
+
+describe('durable migration failure receipts', () => {
+  const initialState = (): PostgresRocksdbMigrationState => {
+    const sourceId = '11111111-1111-4111-8111-111111111111';
+    return createPostgresRocksdbMigrationState({
+      version: 1,
+      sourceId,
+      sourceDatabaseIdentity: 'a'.repeat(64),
+      headSeq: '0',
+      headHash: captureSentinelHash(sourceId),
+      sealed: false,
+      sealedSeq: null,
+      sealedHash: null,
+      cutoverRunId: null,
+      cutoverDestinationId: null,
+      cutoverSeq: null,
+      cutoverHash: null,
+    });
+  };
+
+  it('marks the latest saved export and replay progress failed instead of the stale outer state', async () => {
+    const initial = initialState();
+    const durable = {
+      ...initial, rows: 4, collection: 'assets', id: 'd', lastReplayedSeq: '2', lastReplayedHash: 'b'.repeat(64),
+    };
+    const write = vi.fn(async () => undefined);
+    const repository = { getMetadata: () => durable, setMetadata: write } as unknown as RocksRepository;
+    const result = await persistMigrationFailureState(repository, initial, new Error('original batch failure'));
+    expect(result).toEqual({ ...durable, status: 'failed', lastError: 'original batch failure' });
+    expect(write).toHaveBeenCalledExactlyOnceWith('postgresToRocksdbMigration', result);
+  });
+
+  it.each(['sourceId', 'sourceDatabaseIdentity', 'destinationId', 'runId'] as const)(
+    'leaves a checkpoint with foreign %s untouched', async (field) => {
+      const initial = initialState();
+      const durable = { ...initial, [field]: field === 'sourceDatabaseIdentity'
+        ? 'b'.repeat(64) : '44444444-4444-4444-8444-444444444444' };
+      const write = vi.fn(async () => undefined);
+      const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      try {
+        const repository = { getMetadata: () => durable, setMetadata: write } as unknown as RocksRepository;
+        await expect(persistMigrationFailureState(repository, initial, new Error('original failure'))).resolves.toBe(initial);
+        expect(write).not.toHaveBeenCalled();
+        expect(diagnostic).toHaveBeenCalledOnce();
+      } finally { diagnostic.mockRestore(); }
+    }
+  );
+
+  it.each([
+    () => undefined,
+    () => ({ version: 1, unexpected: true }),
+    () => { throw new Error('native metadata read failed'); },
+  ])('does not overwrite missing, malformed or unreadable durable metadata %#', async (getMetadata) => {
+    const initial = initialState();
+    const write = vi.fn(async () => undefined);
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const repository = { getMetadata, setMetadata: write } as unknown as RocksRepository;
+      await expect(persistMigrationFailureState(repository, initial, new Error('original failure'))).resolves.toBe(initial);
+      expect(write).not.toHaveBeenCalled();
+    } finally { diagnostic.mockRestore(); }
+  });
+
+  it('does not replace the original failure when writing its receipt fails', async () => {
+    const initial = initialState();
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const repository = { getMetadata: () => initial,
+        setMetadata: async () => { throw new Error('native metadata write failed'); } } as unknown as RocksRepository;
+      await expect(persistMigrationFailureState(repository, initial, new Error('original failure'))).resolves.toBe(initial);
+    } finally { diagnostic.mockRestore(); }
+  });
+
+  it.each(['export', 'replay'] as const)('leaves regressed durable %s progress untouched', async (phase) => {
+    const initial = initialState();
+    const active: PostgresRocksdbMigrationState = { ...initial, rows: 2, collection: 'assets', id: 'b',
+      exportCompleted: phase === 'replay', lastReplayedSeq: '2', lastReplayedHash: 'b'.repeat(64) };
+    const durable = phase === 'export' ? { ...active, rows: 1, id: 'a' }
+      : { ...active, lastReplayedSeq: '1', lastReplayedHash: 'c'.repeat(64) };
+    const write = vi.fn(async () => undefined);
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const repository = { getMetadata: () => durable, setMetadata: write } as unknown as RocksRepository;
+      await expect(persistMigrationFailureState(repository, active, new Error('original failure'))).resolves.toBe(active);
+      expect(write).not.toHaveBeenCalled();
+      expect(diagnostic.mock.calls[0]?.[1]).toMatchObject({ message: expect.stringMatching(/regressed/) });
+    } finally { diagnostic.mockRestore(); }
+  });
+
+  it('never downgrades a durable completed receipt', async () => {
+    const initial = initialState();
+    const durable: PostgresRocksdbMigrationState = { ...initial, status: 'validated_complete',
+      rows: 1, collection: 'assets', id: 'a', exportCompleted: true, sealedSeq: '0',
+      sealedHash: initial.lastReplayedHash, validatedAt: new Date(0).toISOString() };
+    const write = vi.fn(async () => undefined);
+    const repository = { getMetadata: () => durable, setMetadata: write } as unknown as RocksRepository;
+    await expect(persistMigrationFailureState(repository, initial, new Error('late failure'))).resolves.toEqual(durable);
+    expect(write).not.toHaveBeenCalled();
   });
 });

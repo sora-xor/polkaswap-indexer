@@ -47,7 +47,10 @@ const opaqueScalar = (name: string, description: string) =>
   });
 
 const parseCursor = (value: unknown): string => {
-  if (typeof value !== 'string') throw new GraphQLError('Cursor must be an opaque string');
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && !Object.is(value, -0)) {
+    return String(value);
+  }
+  if (typeof value !== 'string') throw new GraphQLError('Cursor must be a string or non-negative safe integer');
   // SubQuery clients use the empty string as their first-page sentinel.
   if (value.length > MAX_REPOSITORY_CURSOR_LENGTH) {
     throw new GraphQLError(`Cursor must contain at most ${MAX_REPOSITORY_CURSOR_LENGTH} characters`);
@@ -57,11 +60,12 @@ const parseCursor = (value: unknown): string => {
 
 export const CursorScalar = new GraphQLScalarType({
   name: 'Cursor',
-  description: 'Opaque, connection-scoped keyset pagination cursor.',
+  description: 'Connection-scoped opaque cursor or bounded legacy numeric position.',
   serialize: parseCursor,
   parseValue: parseCursor,
   parseLiteral: (ast) => {
-    if (ast.kind !== Kind.STRING) throw new GraphQLError('Cursor literal must be a string');
+    if (ast.kind === Kind.INT) return parseCursor(Number(ast.value));
+    if (ast.kind !== Kind.STRING) throw new GraphQLError('Cursor literal must be a string or integer');
     return parseCursor(ast.value);
   },
 });

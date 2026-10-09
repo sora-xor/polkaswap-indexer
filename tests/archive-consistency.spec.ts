@@ -80,15 +80,40 @@ type ConsistencyIndexer = {
 const subjectWith = (
   primary: unknown,
   archive: unknown,
-  repository = new MemoryRepository()
+  repository = new MemoryRepository(),
+  endpointConfig = config,
 ): ConsistencyIndexer => {
-  const subject = new ChainIndexer(config, repository) as unknown as ConsistencyIndexer;
+  const subject = new ChainIndexer(endpointConfig, repository) as unknown as ConsistencyIndexer;
   subject.api = primary;
   subject.legacyBlockApi = archive;
   return subject;
 };
 
 describe('primary/archive raw block agreement', () => {
+  it.each([
+    ['matching bytes', {}, false],
+    ['different block bytes', { blockHex: '0x9999' }, true],
+    ['different event bytes', { eventsHex: '0x9999' }, true],
+    ['different timestamps', { timestampMilliseconds: BLOCK_TIMESTAMP * 1_000 + 1 }, true],
+  ])('checks both handles using the same mof2 URL with %s', async (_label, archiveOverrides, rejects) => {
+    const primary = apiPayload();
+    const archive = apiPayload(archiveOverrides);
+    const subject = subjectWith(primary, archive, new MemoryRepository(), {
+      ...config,
+      soraWsEndpoint: 'wss://mof2.sora.org',
+      soraArchiveWsEndpoint: 'wss://mof2.sora.org',
+    });
+    const fetched = subject.fetchBlockByHash(BLOCK_HASH);
+
+    if (rejects) {
+      await expect(fetched).rejects.toThrow('returned different payloads');
+    } else {
+      await expect(fetched).resolves.toMatchObject({ timestamp: BLOCK_TIMESTAMP });
+    }
+    expect(primary.rpc.chain.getBlock).toHaveBeenCalledWith(BLOCK_HASH);
+    expect(archive.rpc.chain.getBlock).toHaveBeenCalledWith(BLOCK_HASH);
+  });
+
   it('accepts independently decoded payloads only when block SCALE, events SCALE, and timestamp agree', async () => {
     const exactRawTimestamp = BLOCK_TIMESTAMP * 1_000 + 123;
     const primary = apiPayload({ source: 'primary', timestampMilliseconds: exactRawTimestamp });

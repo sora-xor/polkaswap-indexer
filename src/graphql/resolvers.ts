@@ -13,6 +13,7 @@ import {
   decodeRepositoryCursor,
   encodeRepositoryCursor,
   isOpaqueRepositoryCursor,
+  MAX_REPOSITORY_CURSOR_LENGTH,
   normalizeRepositoryCursorValue,
 } from '../repository/cursor.js';
 import {
@@ -37,6 +38,8 @@ import {
   UInt32Scalar,
 } from './scalars.js';
 import { typeDefs } from './schema.js';
+import { assertNetworkFlowQuery, networkFlowRepositoryFilter, projectNetworkSnapshotFlows, requestsNetworkFlows } from './network-flow.js';
+import { assetHourlyCoverage } from './hourly-history.js';
 
 import type {
   IndexerCollection,
@@ -293,6 +296,7 @@ const paginationKeyset = (
   filter: Record<string, unknown> | null | undefined
 ): RepositoryQueryArgs['keyset'] => {
   if (args.after === null || args.after === undefined || args.after === '') return null;
+  if (/^(0|[1-9][0-9]*)$/.test(args.after)) return null;
   if (typeof args.after !== 'string' || !isOpaqueRepositoryCursor(args.after)) {
     throw badUserInput('Pagination cursor must be an opaque cursor returned by this connection');
   }
@@ -321,7 +325,7 @@ const repositoryPaginationArgs = (
   const keyset = paginationKeyset(args, collectionName, orderBy, filter);
 
   return {
-    offset: args.offset ?? null,
+    offset: args.offset ?? (args.after && !keyset ? Number(args.after) + 1 : null),
     after: null,
     before: null,
     keyset,
@@ -376,9 +380,11 @@ const cursorForNode = (
 };
 
 const paginationWindow = (args: ConnectionArgs, totalCount: number) => {
-  const first = args.first ?? DEFAULT_CONNECTION_PAGE_SIZE;
-  const pageStart = Math.max(args.offset ?? 0, 0);
-  return { end: Math.min(pageStart + Math.max(first, 0), totalCount), pageStart };
+  const first = args.first ?? (args.last === null || args.last === undefined ? DEFAULT_CONNECTION_PAGE_SIZE : null);
+  const start = args.offset ?? (args.after && /^(0|[1-9][0-9]*)$/.test(args.after) ? Number(args.after) + 1 : 0);
+  const end = first === null ? totalCount : Math.min(start + first, totalCount);
+  const pageStart = args.last === null || args.last === undefined ? start : Math.max(end - args.last, start);
+  return { end, pageStart };
 };
 
 const selectionIncludesField = (info: GraphQLResolveInfo | undefined, fieldName: string): boolean => {
@@ -447,11 +453,11 @@ const normalizeConnectionArgs = (
   maximumPageSize = MAX_CONNECTION_PAGE_SIZE
 ): ConnectionArgs => {
   const raw = args as ConnectionArgs & Record<string, unknown>;
-  if (args.last !== undefined && args.last !== null) {
-    throw badUserInput('last pagination is not supported; use first/after keyset pagination');
-  }
-  if (args.before !== undefined && args.before !== null && args.before !== '') {
-    throw badUserInput('before pagination is not supported; use first/after keyset pagination');
+  // The deployed baseline advertised before without applying it to the window.
+  // Keep that compatibility argument; do not imply backward cursor semantics.
+  if (args.before !== null && args.before !== undefined &&
+      (typeof args.before !== 'string' || args.before.length > MAX_REPOSITORY_CURSOR_LENGTH)) {
+    throw badUserInput('before must be a bounded string cursor');
   }
   const requestedOffset = args.offset ?? null;
   if (
@@ -461,21 +467,30 @@ const normalizeConnectionArgs = (
     throw badUserInput(`offset must be an integer between 0 and ${MAX_CONNECTION_OFFSET}`);
   }
 
-  const requestedFirst = args.first ?? DEFAULT_CONNECTION_PAGE_SIZE;
-  if (!Number.isSafeInteger(requestedFirst) || requestedFirst < 0) {
+  const requestedLast = args.last ?? null;
+  if (requestedLast !== null && (!Number.isSafeInteger(requestedLast) || requestedLast < 0 || requestedLast > maximumPageSize)) {
+    throw badUserInput(`last must be an integer between 0 and ${maximumPageSize}`);
+  }
+  const requestedFirst = args.first ?? (requestedLast === null ? DEFAULT_CONNECTION_PAGE_SIZE : null);
+  if (requestedFirst !== null && (!Number.isSafeInteger(requestedFirst) || requestedFirst < 0)) {
     throw badUserInput('first must be a non-negative integer');
   }
-  if (requestedFirst > maximumPageSize) {
+  if (requestedFirst !== null && requestedFirst > maximumPageSize) {
     throw badUserInput(`first must not exceed ${maximumPageSize}`);
   }
   if (args.after !== undefined && args.after !== null && typeof args.after !== 'string') {
-    throw badUserInput('after must be an opaque string cursor');
+    throw badUserInput('after must be a string cursor');
   }
-  if (requestedOffset !== null && args.after !== undefined && args.after !== null && args.after !== '') {
+  const numericAfter = args.after && /^(0|[1-9][0-9]*)$/.test(args.after) ? Number(args.after) : null;
+  if (numericAfter !== null && (!Number.isSafeInteger(numericAfter) || numericAfter >= MAX_CONNECTION_OFFSET)) {
+    throw badUserInput(`numeric after must be an integer between 0 and ${MAX_CONNECTION_OFFSET - 1}`);
+  }
+  if (requestedOffset !== null && args.after !== undefined && args.after !== null && args.after !== '' && numericAfter === null) {
     throw badUserInput('offset and after pagination cannot be combined');
   }
-  if (requestedOffset !== null && requestedOffset + requestedFirst > MAX_CONNECTION_OFFSET) {
-    throw badUserInput(`offset plus first must not exceed ${MAX_CONNECTION_OFFSET}`);
+  const effectiveOffset = requestedOffset ?? (numericAfter === null ? null : numericAfter + 1);
+  if (effectiveOffset !== null && effectiveOffset + (requestedFirst ?? requestedLast ?? 0) > MAX_CONNECTION_OFFSET) {
+    throw badUserInput(`pagination offset plus page size must not exceed ${MAX_CONNECTION_OFFSET}`);
   }
   const orderTokens = args.orderBy === undefined || args.orderBy === null
     ? []
@@ -508,6 +523,7 @@ const normalizeConnectionArgs = (
   return {
     ...args,
     first: connectionSelectionNeedsItems(info) ? requestedFirst : 0,
+    last: connectionSelectionNeedsItems(info) ? requestedLast : null,
     offset: requestedOffset,
   };
 };
@@ -524,8 +540,8 @@ const buildConnection = (
   const totalCount = filtered.length;
   const keyset = paginationKeyset(args, collectionName, args.orderBy, args.filter);
   const remaining = keyset ? filtered.filter((item) => isAfterOrderPosition(item, keyset)) : filtered;
-  const end = Math.min(args.first ?? DEFAULT_CONNECTION_PAGE_SIZE, remaining.length);
-  const pageItems = remaining.slice(0, end);
+  const { end, pageStart } = paginationWindow(args, remaining.length);
+  const pageItems = remaining.slice(pageStart, end);
   const edges: Edge[] = pageItems.map((node) => ({
     cursor: cursorForNode(collectionName, node, args.orderBy, args.filter),
     node,
@@ -537,7 +553,7 @@ const buildConnection = (
     totalCount,
     pageInfo: {
       hasNextPage: end < remaining.length,
-      hasPreviousPage: keyset !== null,
+      hasPreviousPage: keyset !== null || pageStart > 0,
       startCursor: edges[0]?.cursor ?? null,
       endCursor: edges[edges.length - 1]?.cursor ?? null,
     },
@@ -1333,17 +1349,20 @@ const createConnectionResolver =
   async (_parent: unknown, args: ConnectionArgs, context: Context, info?: GraphQLResolveInfo) => {
     const normalizedArgs = normalizeConnectionArgs(args, info);
     assertPublicConnectionQuery(collectionName, normalizedArgs.orderBy, normalizedArgs.filter);
+    const projectFlows = collectionName === 'networkSnapshots' && requestsNetworkFlows(info);
+    if (collectionName === 'networkSnapshots') assertNetworkFlowQuery(normalizedArgs.filter, normalizedArgs.orderBy);
     const resolveConnection = async () => {
       if (context.repository.query) {
         const includeTotalCount = selectionIncludesField(info, 'totalCount');
+        const queryFilter = projectFlows ? await networkFlowRepositoryFilter(context.repository, normalizedArgs.filter) : normalizedArgs.filter;
+        const pagination = repositoryPaginationArgs(normalizedArgs, collectionName, normalizedArgs.orderBy, normalizedArgs.filter);
+        if (pagination.keyset && queryFilter !== normalizedArgs.filter) pagination.keyset = {
+          ...pagination.keyset, scope: createRepositoryCursorScope(collectionName, normalizedArgs.orderBy, queryFilter),
+        };
         const result = await context.repository.query(collectionName, {
           ...normalizedArgs,
-          ...repositoryPaginationArgs(
-            normalizedArgs,
-            collectionName,
-            normalizedArgs.orderBy,
-            normalizedArgs.filter
-          ),
+          ...pagination,
+          filter: queryFilter,
           includeTotalCount,
           maxBytes: queryMaxBytes,
         });
@@ -1351,10 +1370,13 @@ const createConnectionResolver =
           result.totalCount ?? (result.pageStart ?? 0) + result.items.length + (result.hasNextPage ? 1 : 0);
         const { end, pageStart: fallbackPageStart } = paginationWindow(normalizedArgs, fallbackTotalCount);
         const pageStart = result.pageStart ?? fallbackPageStart;
-        const nodes = result.items.map((document) => toConnectionNode(collectionName, document));
+        const projected = projectFlows
+          ? await projectNetworkSnapshotFlows(context.repository, result.items, normalizedArgs.filter)
+          : result.items;
+        const nodes = projected.map((document) => toConnectionNode(collectionName, document));
         const edges: Edge[] = result.items.map((document, index) => ({
           cursor:
-            result.itemCursors?.[index] ??
+            (!projectFlows ? result.itemCursors?.[index] : undefined) ??
             cursorForDocument(
               collectionName,
               document,
@@ -1388,7 +1410,7 @@ const createConnectionResolver =
     if (!shouldCacheConnection(collectionName, normalizedArgs)) return resolveConnection();
 
     const includeTotalCount = selectionIncludesField(info, 'totalCount');
-    const key = `connection:${collectionName}:${stableJson({ ...normalizedArgs, includeTotalCount })}`;
+    const key = `connection:${collectionName}:${stableJson({ ...normalizedArgs, includeTotalCount, projectFlows })}`;
 
     return cache.getOrSet(`connection_${collectionName}`, key, resolveConnection);
   };
@@ -1528,6 +1550,7 @@ const queryDocuments = async (
   validateConnectionInputValue(filter, 'filter');
   const queryArgs: RepositoryQueryArgs = {
     first: normalizedArgs.first,
+    last: normalizedArgs.last,
     ...repositoryPaginationArgs(normalizedArgs, collectionName, orderBy, filter),
     orderBy,
     filter,
@@ -2198,6 +2221,8 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
         account: documentResolver(collection('accounts')),
         assets: connectionResolver(collection('assets')),
         assetSnapshots: connectionResolver(collection('assetSnapshots')),
+        assetHourlyCoverage: (_parent: unknown, args: Parameters<typeof assetHourlyCoverage>[1], context: Context) =>
+          assetHourlyCoverage(context.repository, args),
         accountLiquiditySnapshots: connectionResolver(collection('accountLiquiditySnapshots')),
         market: documentResolver(collection('markets')),
         markets: connectionResolver(collection('markets')),
