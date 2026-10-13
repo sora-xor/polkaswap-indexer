@@ -95,6 +95,13 @@ const seedValidChainCheckpoint = async (repository: MemoryRepository, timestamp:
         }),
       },
     },
+    {
+      collection: 'networkSnapshots',
+      id: `block-${VALID_CHAIN_STATE_BLOCK}`,
+      blockHeight: VALID_CHAIN_STATE_BLOCK,
+      timestamp,
+      data: { id: `block-${VALID_CHAIN_STATE_BLOCK}`, type: 'BLOCK', timestamp },
+    },
   ]);
 };
 
@@ -2023,11 +2030,11 @@ describe('Polkaswap indexer schema', () => {
     expect(query).toHaveBeenCalledTimes(1);
   });
 
-  it('caches repeated hot singleton resolver queries within the TTL window', async () => {
+  it('caches repeated non-checkpoint singleton resolver queries within the TTL window', async () => {
     const get = vi.fn<IndexerRepository['get']>().mockResolvedValue({
       collection: 'updatesStreams',
-      id: 'chainState',
-      data: { id: 'chainState', block: 123, data: '{"lastIndexedBlock":123}' },
+      id: 'otherState',
+      data: { id: 'otherState', block: 123, data: '{"lastIndexedBlock":123}' },
     });
     const repository: IndexerRepository = {
       list: async () => [],
@@ -2041,7 +2048,7 @@ describe('Polkaswap indexer schema', () => {
     };
     const schema = createSchema();
     const updatesStreamField = schema.getQueryType()?.getFields().updatesStream;
-    const args = { id: 'chainState' };
+    const args = { id: 'otherState' };
 
     await expect(updatesStreamField?.resolve?.({}, args, { repository }, undefined as never)).resolves.toMatchObject({
       block: 123,

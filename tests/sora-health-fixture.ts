@@ -47,4 +47,11 @@ export const createHealthIdentityDocuments = (
       }),
     },
   },
+  {
+    collection: 'networkSnapshots',
+    id: `block-${stateBlock}`,
+    blockHeight: stateBlock,
+    timestamp: now,
+    data: { id: `block-${stateBlock}`, type: 'BLOCK', timestamp: now },
+  },
 ];

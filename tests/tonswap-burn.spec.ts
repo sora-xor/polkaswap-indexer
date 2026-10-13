@@ -35,6 +35,10 @@ const contextFixture = async (age = 0) => {
         lastIndexedBlock: block, genesisHash: SORA_MAINNET_GENESIS_HASH, blockHash: hash, blockTimestamp: now,
       }) },
     },
+    {
+      collection: 'networkSnapshots', id: `block-${block}`, blockHeight: block, timestamp: now,
+      data: { id: `block-${block}`, type: 'BLOCK', timestamp: now },
+    },
     createTonswapBurnCoverage(block, hash, now),
   ]);
   return {

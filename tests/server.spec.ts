@@ -833,7 +833,8 @@ describe('startServer', () => {
       expect((await first).status).toBe(200);
       const admittedAgain = await graphqlRequest(port);
       expect(admittedAgain.status).toBe(200);
-      expect(healthCheck).toHaveBeenCalledTimes(2);
+      // Each admitted checkpoint view verifies readiness on both sides of its fence.
+      expect(healthCheck).toHaveBeenCalledTimes(4);
     } finally {
       releaseHealth?.();
       await server.stop();

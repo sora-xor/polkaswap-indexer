@@ -7,7 +7,8 @@ import { normalizeIndexedAccountId } from '../account-activity.js';
 import { estimateRetainedValueBytes } from '../cache-weight.js';
 import { metrics } from '../metrics.js';
 import { TONSWAP_START_BLOCK, TONSWAP_COVERAGE_ID, parseTonswapBurnCoverage, isExcludedTonswapBurnAccount } from '../tonswap-burn.js';
-import { evaluateServiceReadiness, type WorkerReadinessThresholds } from '../readiness.js';
+import { type WorkerReadinessThresholds } from '../readiness.js';
+import { currentCheckpointView } from './checkpoint-view.js';
 import {
   createRepositoryCursorScope,
   decodeRepositoryCursor,
@@ -1351,6 +1352,13 @@ const createConnectionResolver =
     assertPublicConnectionQuery(collectionName, normalizedArgs.orderBy, normalizedArgs.filter);
     const projectFlows = collectionName === 'networkSnapshots' && requestsNetworkFlows(info);
     if (collectionName === 'networkSnapshots') assertNetworkFlowQuery(normalizedArgs.filter, normalizedArgs.orderBy);
+    // This exact current-head connection shares health's bounded checkpoint
+    // view. Historical/paginated/flow queries retain their existing behavior.
+    const currentBlockConnection = collectionName === 'networkSnapshots' && !projectFlows &&
+      normalizedArgs.first === 1 && !normalizedArgs.last && !normalizedArgs.offset &&
+      !normalizedArgs.before && !normalizedArgs.after &&
+      stableJson(normalizedArgs.orderBy) === stableJson(['TIMESTAMP_DESC']) &&
+      stableJson(normalizedArgs.filter) === stableJson({ type: { equalTo: 'BLOCK' } });
     const resolveConnection = async () => {
       if (context.repository.query) {
         const includeTotalCount = selectionIncludesField(info, 'totalCount');
@@ -1359,13 +1367,24 @@ const createConnectionResolver =
         if (pagination.keyset && queryFilter !== normalizedArgs.filter) pagination.keyset = {
           ...pagination.keyset, scope: createRepositoryCursorScope(collectionName, normalizedArgs.orderBy, queryFilter),
         };
-        const result = await context.repository.query(collectionName, {
+        const checkpoint = currentBlockConnection ? await currentCheckpointView(context) : null;
+        const result = checkpoint?.latestBlock ?? await context.repository.query(collectionName, {
           ...normalizedArgs,
           ...pagination,
           filter: queryFilter,
           includeTotalCount,
           maxBytes: queryMaxBytes,
         });
+        if (checkpoint) {
+          const state = parseStoredSoraChainState(parsedUpdateStreamData(checkpoint.stateDocument, 'chainState'));
+          const block = result.items[0];
+          if (state && (!block || block.id !== `block-${state.lastIndexedBlock}` ||
+              block.data.type !== 'BLOCK' || block.data.timestamp !== state.blockTimestamp)) {
+            throw new GraphQLError('Latest BLOCK snapshot does not match the captured chain checkpoint.', {
+              extensions: { code: 'CHECKPOINT_VIEW_INCONSISTENT' },
+            });
+          }
+        }
         const fallbackTotalCount =
           result.totalCount ?? (result.pageStart ?? 0) + result.items.length + (result.hasNextPage ? 1 : 0);
         const { end, pageStart: fallbackPageStart } = paginationWindow(normalizedArgs, fallbackTotalCount);
@@ -1407,7 +1426,7 @@ const createConnectionResolver =
       );
     };
 
-    if (!shouldCacheConnection(collectionName, normalizedArgs)) return resolveConnection();
+    if (currentBlockConnection || !shouldCacheConnection(collectionName, normalizedArgs)) return resolveConnection();
 
     const includeTotalCount = selectionIncludesField(info, 'totalCount');
     const key = `connection:${collectionName}:${stableJson({ ...normalizedArgs, includeTotalCount, projectFlows })}`;
@@ -1423,6 +1442,10 @@ const createDocumentResolver =
       assertValidDocumentId(args.id);
     } catch {
       throw badUserInput('Document id must be a non-empty bounded printable identifier');
+    }
+    if (collectionName === 'updatesStreams' && (args.id === 'chainState' || args.id === 'chainIdentity')) {
+      const checkpoint = await currentCheckpointView(context);
+      return (args.id === 'chainState' ? checkpoint.stateDocument : checkpoint.identityDocument)?.data ?? null;
     }
     const key = `${collectionName}:${args.id}`;
 
@@ -2026,15 +2049,7 @@ const parsedUpdateStreamData = (document: IndexerDocument | null, expectedId: st
 };
 
 const healthResolver = async (_parent: unknown, _args: unknown, context: Context) => {
-  const [readiness, identityDocument, stateDocument] = await Promise.all([
-    evaluateServiceReadiness(
-      context.repository,
-      context.workerStatusProvider,
-      context.workerReadinessThresholds ?? { maxLagBlocks: 25, maxStalenessSeconds: 120 }
-    ),
-    context.repository.get('updatesStreams', 'chainIdentity').catch(() => null),
-    context.repository.get('updatesStreams', 'chainState').catch(() => null),
-  ]);
+  const { readiness, identityDocument, stateDocument, latestBlock } = await currentCheckpointView(context);
   const workerStatus = readiness.worker.status;
   const identity = parseStoredSoraChainIdentity(parsedUpdateStreamData(identityDocument, 'chainIdentity'));
   const state = parseStoredSoraChainState(parsedUpdateStreamData(stateDocument, 'chainState'));
@@ -2062,7 +2077,13 @@ const healthResolver = async (_parent: unknown, _args: unknown, context: Context
     latestIndexedAt === null
       ? Number.POSITIVE_INFINITY
       : Math.floor(Date.now() / 1_000) - latestIndexedAt;
+  const block = latestBlock?.items[0];
+  const blockCheckpointCoherent = state !== null && block !== undefined &&
+    block.collection === 'networkSnapshots' && block.id === `block-${state.lastIndexedBlock}` &&
+    block.blockHeight === state.lastIndexedBlock && block.timestamp === state.blockTimestamp &&
+    block.data.id === block.id && block.data.type === 'BLOCK' && block.data.timestamp === state.blockTimestamp;
   const checkpointCoherent =
+    blockCheckpointCoherent &&
     identityValid &&
     stateValid &&
     identity !== null &&
@@ -2141,7 +2162,9 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
     // straddle that commit. Retry once; never accept mismatched evidence.
     const readProof = async () => {
       const [health, coverageDocument] = await Promise.all([
-        healthResolver(parent, {}, context),
+        // Campaign coverage has its own bounded proof/retry; do not reuse a
+        // previous attempt's frozen checkpoint when independently rechecking it.
+        healthResolver(parent, {}, { ...context }),
         context.repository.get('updatesStreams', TONSWAP_COVERAGE_ID),
       ]);
       const coverage = parseTonswapBurnCoverage(coverageDocument);

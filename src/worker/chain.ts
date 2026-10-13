@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 
 import { ApiPromise, WsProvider } from '@polkadot/api';
 import { types as soraTypes } from '@sora-substrate/type-definitions';
@@ -9222,6 +9223,7 @@ export class ChainIndexer {
       ).map((document) => document.__document);
       for (let start = 0; start < documents.length; start += pageSize) {
         yield documents.slice(start, start + pageSize);
+        if (start + pageSize < documents.length) await yieldToEventLoop();
       }
       return;
     }
@@ -9343,6 +9345,10 @@ export class ChainIndexer {
         // A byte budget may truncate an offset page before `pageSize`.
         offset += page.items.length;
       }
+      // RocksDB pages can resolve synchronously. Awaiting those promises (or
+      // yielding async-generator rows) only drains microtasks; give HTTP I/O
+      // and timers a real event-loop turn before reading the next bounded page.
+      await yieldToEventLoop();
     }
   }
 

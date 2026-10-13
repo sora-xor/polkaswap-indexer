@@ -798,6 +798,17 @@ redirects, uses a 10-second total deadline, accepts exact JSON media types
 `POLKASWAP_INDEXER_SMOKE_MAX_RESPONSE_BYTES`, and
 `POLKASWAP_INDEXER_SMOKE_MAX_INDEXER_AGE_SEC`.
 
+Current checkpoint fields share one bounded read per GraphQL execution context.
+`_health`, explicit `chainState`/`chainIdentity` reads, and the stock-only latest
+`BLOCK` connection (`first: 1`, `TIMESTAMP_DESC`, exact `type.equalTo: BLOCK`)
+bypass the cross-request TTL cache. The API reads the actual persisted documents
+between state and worker-status fences, retrying only observed movement at most
+three times. Continued movement returns `CHECKPOINT_VIEW_UNAVAILABLE`; a caller
+may issue a new bounded request. A stable disagreement remains unhealthy, and
+missing or mismatched persisted BLOCK evidence cannot produce healthy status.
+Historical connections retain their existing cache behavior. All capture and
+retry reads consume the operation's existing materialization budget.
+
 Production release evidence is tracked in
 `scripts/production-deployment-evidence.json`. The committed manifest must stay
 blocked on `production-deployment-evidence-missing` and
