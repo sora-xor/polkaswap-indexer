@@ -5976,6 +5976,7 @@ export class ChainIndexer {
       const isBuy = String(data.side ?? data.arg2 ?? 'Buy') === 'Buy';
       const amount = codecToBigInt(data.amount ?? data.arg3 ?? 0);
       const price = codecToBigInt(data.price ?? data.arg4 ?? 0);
+      const baseDecimals = assets.get(orderBookId.baseAssetId)?.decimals ?? DECIMALS;
       const status = method === 'LimitOrderPlaced' || method === 'LimitOrderUpdated' ? 'Active' : method === 'LimitOrderFilled' ? 'Filled' : 'Canceled';
       const amountUSD = orderBookAmountUsd(
         orderBookId.baseAssetId,
@@ -6001,12 +6002,12 @@ export class ChainIndexer {
           createdAtBlock: blockHeight,
           timestamp,
           isBuy,
-          amount: decimalToString(amount),
+          amount: decimalToString(amount, baseDecimals),
           price: decimalToString(price),
           amountUSD,
           lifetime: Number(data.lifetime ?? 0),
           expiresAt: Number(data.expiresAt ?? 0),
-          amountFilled: decimalToString(codecToBigInt(data.amountFilled ?? 0)),
+          amountFilled: decimalToString(codecToBigInt(data.amountFilled ?? 0), baseDecimals),
           status,
           updatedAtBlock: blockHeight,
         },
@@ -7788,6 +7789,7 @@ export class ChainIndexer {
       analytics.assetWeekOpenPrice.set(asset.id, currentPrice);
     }
 
+    const assetsWithWeekOpenPrice = new Set<string>();
     for (const snapshot of assetDaySnapshots) {
       const assetId = String(snapshot.data.assetId ?? '');
       const price = snapshot.data.priceUSD as Record<string, unknown> | undefined;
@@ -7797,8 +7799,10 @@ export class ChainIndexer {
       if (Number(snapshot.data.timestamp ?? 0) >= snapshotBucket('DAY', timestamp)) {
         analytics.assetDayOpenPrice.set(assetId, open);
       }
-      if (!analytics.assetWeekOpenPrice.has(assetId) || analytics.assetWeekOpenPrice.get(assetId) === analytics.assetDayOpenPrice.get(assetId)) {
+      // Inputs are chronological; the first observed open is the weekly baseline.
+      if (!assetsWithWeekOpenPrice.has(assetId)) {
         analytics.assetWeekOpenPrice.set(assetId, open);
+        assetsWithWeekOpenPrice.add(assetId);
       }
     }
 
