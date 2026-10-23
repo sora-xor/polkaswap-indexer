@@ -514,8 +514,8 @@ const buildConnection = (
   const totalCount = filtered.length;
   const keyset = paginationKeyset(args, collectionName, args.orderBy, args.filter);
   const remaining = keyset ? filtered.filter((item) => isAfterOrderPosition(item, keyset)) : filtered;
-  const end = Math.min(args.first ?? DEFAULT_CONNECTION_PAGE_SIZE, remaining.length);
-  const pageItems = remaining.slice(0, end);
+  const { end, pageStart } = paginationWindow(args, remaining.length);
+  const pageItems = remaining.slice(pageStart, end);
   const edges: Edge[] = pageItems.map((node) => ({
     cursor: cursorForNode(collectionName, node, args.orderBy, args.filter),
     node,
@@ -527,7 +527,7 @@ const buildConnection = (
     totalCount,
     pageInfo: {
       hasNextPage: end < remaining.length,
-      hasPreviousPage: keyset !== null,
+      hasPreviousPage: keyset !== null || pageStart > 0,
       startCursor: edges[0]?.cursor ?? null,
       endCursor: edges[edges.length - 1]?.cursor ?? null,
     },
@@ -1272,18 +1272,28 @@ const queryDocuments = async (
 
   const documents = await repository.list(collectionName);
   const filtered = sortDocuments(
-    documents.filter((document) => matchesFilter(document.data, filter)),
+    documents.map((document) => ({
+      ...document.data,
+      id: document.id,
+      timestamp: document.timestamp ?? document.data.timestamp,
+      blockHeight: document.blockHeight ?? document.data.blockHeight,
+      document,
+    })).filter((document) => matchesFilter(document, filter)),
     orderBy
   );
   const totalCount = filtered.length;
-  const { end, pageStart } = paginationWindow(normalizedArgs, totalCount);
+  const keyset = queryArgs.keyset;
+  const remaining = keyset ? filtered.filter((document) => isAfterOrderPosition(document, keyset)) : filtered;
+  const { end, pageStart } = paginationWindow(normalizedArgs, remaining.length);
+  const items = remaining.slice(pageStart, end).map(({ document }) => document);
 
   return {
-    items: filtered.slice(pageStart, end),
+    items,
+    itemCursors: items.map((document) => cursorForDocument(collectionName, document, orderBy, filter)),
     totalCount,
     pageStart,
-    hasNextPage: end < totalCount,
-    hasPreviousPage: pageStart > 0,
+    hasNextPage: end < remaining.length,
+    hasPreviousPage: Boolean(keyset) || pageStart > 0,
   };
 };
 
@@ -1542,6 +1552,7 @@ async function* pollSubscription(
   const ids = getSubscriptionIds(args.id);
   const mutations = getSubscriptionMutations(args.mutation);
   const snapshots = new Map<string, string>();
+  let firstPoll = true;
 
   while (!signal.aborted) {
     const seen = new Set<string>();
@@ -1558,11 +1569,13 @@ async function* pollSubscription(
       const fingerprint = subscriptionDocumentFingerprint(document.data);
       if (snapshots.get(document.id) === fingerprint) continue;
 
+      // Preserve the initial snapshot emission; only later appearances are inserts.
+      const mutationType = firstPoll || snapshots.has(document.id) ? 'UPDATE' : 'INSERT';
       snapshots.set(document.id, fingerprint);
       emissions.push({
         collection: collectionName,
         id: document.id,
-        mutationType: 'UPDATE',
+        mutationType,
       });
     }
     for (const id of [...snapshots.keys()]) {
@@ -1570,6 +1583,7 @@ async function* pollSubscription(
       snapshots.delete(id);
       emissions.push({ collection: collectionName, id, mutationType: 'DELETE' });
     }
+    firstPoll = false;
     for (const event of emissions) {
       if (mutations.has(event.mutationType)) yield event;
     }
