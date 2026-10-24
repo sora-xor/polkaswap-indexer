@@ -3866,6 +3866,7 @@ export class ChainIndexer {
     const existingAccountMeta = await this.repository.getMany(collection('accountMeta'), [...touchedAccounts]);
     const orderBookLiquidityComplete =
       historicalValuationState?.orderBookLiquidityComplete ?? true;
+    const vaultEventOccurrences = new Map<string, Map<EventRecord, number>>();
 
     for (const context of extrinsicContexts) {
       const historyDocument = this.createHistoryElementDocument(context, blockHeight, timestamp, blockHash);
@@ -3895,7 +3896,8 @@ export class ChainIndexer {
           timestamp,
           context.address,
           valuationPrices,
-          valuationAssets
+          valuationAssets,
+          vaultEventOccurrences
         )
       );
     }
@@ -5903,11 +5905,13 @@ export class ChainIndexer {
     timestamp: number,
     signer: string,
     prices: Map<string, bigint> = this.prices,
-    assets: Map<string, AssetInfo> = this.assetInfos
+    assets: Map<string, AssetInfo> = this.assetInfos,
+    vaultEventOccurrences = new Map<string, Map<EventRecord, number>>()
   ): IndexerDocument[] {
     const documents: IndexerDocument[] = [];
 
-    for (const { event } of events) {
+    for (const record of events) {
+      const { event } = record;
       if (event.section === 'orderBook' && event.method.includes('LimitOrder')) {
         const data = eventData(event);
         documents.push(
@@ -5926,7 +5930,24 @@ export class ChainIndexer {
 
       if (event.section === 'kensetsu') {
         const data = eventData(event);
-        documents.push(...this.createVaultEventDocuments(event.method, data, blockHeight, timestamp, signer));
+        const vaultDocuments = this.createVaultEventDocuments(event.method, data, blockHeight, timestamp, signer);
+        const vaultEvent = vaultDocuments.find((document) => document.collection === 'vaultEvents');
+        if (vaultEvent) {
+          const occurrences = vaultEventOccurrences.get(vaultEvent.id) ?? new Map<EventRecord, number>();
+          let occurrence = occurrences.get(record);
+          if (occurrence === undefined) {
+            occurrence = occurrences.size;
+            occurrences.set(record, occurrence);
+            vaultEventOccurrences.set(vaultEvent.id, occurrences);
+          }
+          // Keep the original first-event ID; subsequent occurrences must not
+          // overwrite it. Reused records in synthetic contexts keep the same ID.
+          if (occurrence > 0) {
+            vaultEvent.id = `${vaultEvent.id}-${occurrence + 1}`;
+            vaultEvent.data.id = vaultEvent.id;
+          }
+        }
+        documents.push(...vaultDocuments);
         continue;
       }
 

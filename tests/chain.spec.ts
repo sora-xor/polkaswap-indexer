@@ -5118,6 +5118,78 @@ describe('ChainIndexer price derivation', () => {
     );
   });
 
+  it.each(['CollateralDeposit', 'DebtPayment'])(
+    'retains repeated %s vault events within and across extrinsics on replay',
+    async (method) => {
+      const repository = new MemoryRepository();
+      const indexer = new ChainIndexer(config, repository) as unknown as {
+        indexFetchedBlock: (block: unknown, options: { refreshDerivedState: boolean }) => Promise<void>;
+      };
+      markIndexerMainnet(indexer);
+      const requestedHash = canonicalBlockHash(`repeated-vault-${method}`);
+      const fetchedBlock = () => ({
+        requestedHash,
+        signedBlock: {
+          block: {
+            header: {
+              number: { toNumber: () => 99 },
+              hash: { toString: () => requestedHash },
+            },
+            extrinsics: [0, 1].map((index) => ({
+              isSigned: true,
+              signer: { toString: () => 'alice' },
+              hash: { toString: () => `0xvault-${index}` },
+              method: { section: 'utility', method: 'batch', args: [], meta: { args: [] } },
+            })),
+          },
+        },
+        events: [
+          eventRecord('kensetsu', method, { cdpId: 'vault-1', amount: SCALE.toString() }, 0),
+          eventRecord('kensetsu', method, { cdpId: 'vault-1', amount: (2n * SCALE).toString() }, 0),
+          eventRecord('kensetsu', method, { cdpId: 'vault-1', amount: (3n * SCALE).toString() }, 1),
+          eventRecord('kensetsu', method, { cdpId: 'vault-2', amount: (4n * SCALE).toString() }, 1),
+        ],
+        timestamp: 1_700_000_000,
+      });
+
+      await indexer.indexFetchedBlock(fetchedBlock(), { refreshDerivedState: false });
+      const first = await repository.list('vaultEvents');
+      expect(first.map(({ data }) => [data.vaultId, data.amount])).toEqual([
+        ['vault-1', '1'], ['vault-1', '2'], ['vault-1', '3'], ['vault-2', '4'],
+      ]);
+      expect(new Set(first.map(({ id }) => id)).size).toBe(4);
+      expect(first[0]?.id).toBe(`vault-1-99-${method}`);
+      expect(first[3]?.id).toBe(`vault-2-99-${method}`);
+      for (const document of first) expect(document.data.id).toBe(document.id);
+
+      await indexer.indexFetchedBlock(fetchedBlock(), { refreshDerivedState: false });
+      expect(await repository.list('vaultEvents')).toEqual(first);
+    }
+  );
+
+  it('keeps repeated vault event records idempotent across synthetic contexts', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      createEventDocuments: (
+        events: unknown[], blockHeight: number, timestamp: number, signer: string,
+        prices: undefined, assets: undefined, occurrences: Map<string, Map<unknown, number>>
+      ) => IndexerDocument[];
+    };
+    const occurrences = new Map<string, Map<unknown, number>>();
+    const events = [1n, 2n].map((amount) => eventRecord('kensetsu', 'CollateralDeposit', {
+      cdpId: 'vault-1', amount: (amount * SCALE).toString(),
+    }));
+    const documents = (records: unknown[]) => indexer.createEventDocuments(
+      records, 99, 1_700_000_000, 'alice', undefined, undefined, occurrences
+    );
+    await repository.upsertMany(documents(events));
+    const first = await repository.list('vaultEvents');
+    expect(first.map(({ data }) => data.amount)).toEqual(['1', '2']);
+
+    await repository.upsertMany(documents([...events].reverse()));
+    expect(await repository.list('vaultEvents')).toEqual(first);
+  });
+
   it('creates storage-derived staking and referral documents', () => {
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
       createStakingDocuments: (nominators: unknown[], blockHeight: number, timestamp: number) => unknown[];
