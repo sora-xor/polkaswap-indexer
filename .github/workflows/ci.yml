@@ -52,6 +52,9 @@ jobs:
       - name: Install dependencies
         run: yarn install --immutable
 
+      - name: Verify locally owned runtime schemas
+        run: yarn audit:local-runtime
+
       - name: Validate dependency constraints
         run: yarn constraints
 
@@ -143,12 +146,26 @@ jobs:
         run: |
           test "$(docker image inspect --format '{{.Config.User}}' polkaswap-indexer:ci)" = node
           docker run --rm --entrypoint node polkaswap-indexer:ci -e \
-            "const {createRequire}=await import('node:module');const require=createRequire(import.meta.url);for(const name of ['@babel/runtime/helpers/typeof','@graphql-tools/schema','@harperfast/rocksdb-js','@polkadot/api','@sora-substrate/type-definitions','graphql','graphql-ws','graphql-yoga','pg','ws'])require.resolve(name);for(const name of ['tsx','typescript','vitest']){let found=true;try{require.resolve(name)}catch{found=false}if(found)throw new Error('development dependency shipped: '+name)}"
+            "const {createRequire}=await import('node:module');const require=createRequire(import.meta.url);for(const name of ['@graphql-tools/schema','@harperfast/rocksdb-js','@polkadot/api','graphql','graphql-ws','graphql-yoga','pg','ws'])require.resolve(name);for(const name of ['tsx','typescript','vitest','@sora-substrate/type-definitions']){let found=true;try{require.resolve(name)}catch{found=false}if(found)throw new Error('prohibited dependency shipped: '+name)}"
 
       - name: Verify native RocksDB runtime in production container
         run: >-
           docker run --rm --entrypoint node polkaswap-indexer:ci -e
           "import('@harperfast/rocksdb-js').then(async ({RocksDatabase})=>{const db=RocksDatabase.open('/data/ci-native-smoke.rocksdb');await db.put('ready',true);if(db.getSync('ready')!==true)throw new Error('RocksDB native round trip failed');db.close()})"
+
+      - name: Verify runtime package managers and privileged file modes are absent
+        run: |
+          docker run --rm -i --network none --cap-drop ALL --security-opt no-new-privileges \
+            --entrypoint node polkaswap-indexer:ci --input-type=module <<'JS'
+          import {existsSync} from 'node:fs';
+          import {execFileSync} from 'node:child_process';
+          for (const path of ['/usr/local/lib/node_modules/npm', '/usr/local/lib/node_modules/corepack', '/usr/local/bin/npm', '/usr/local/bin/npx', '/usr/local/bin/yarn']) {
+            if (existsSync(path)) throw new Error('runtime package manager shipped: ' + path);
+          }
+          if (execFileSync('find', ['/usr', '-xdev', '-type', 'f', '-perm', '/6000', '-print'], {encoding: 'utf8'}).trim()) {
+            throw new Error('runtime privilege-elevating file mode remains');
+          }
+          JS
 
       - name: Verify production PostgreSQL migration and runtime handoff
         run: POLKASWAP_TEST_IMAGE=polkaswap-indexer:ci yarn test:production-database-deployment

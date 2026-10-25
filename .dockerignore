@@ -58,6 +58,7 @@ yarn-error.log*
 pnpm-debug.log*
 
 # Tests, local tooling, documentation, and generated development artifacts.
+/.local/
 /tests/
 /ops/
 /docs/

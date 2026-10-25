@@ -50,9 +50,13 @@ both complete profiles together because they intentionally publish the same
 host port.
 
 By default the worker reads finalized SORA blocks from `wss://mof2.sora.org`.
-The direct `@babel/runtime` dependency is intentional: the published
-`@sora-substrate/type-definitions` CommonJS build imports Babel helpers at
-runtime without declaring that package itself.
+Legacy archive decoding uses repository-owned, inert SCALE schema data in
+`src/runtime/sora-legacy-types.json`; no external SORA JavaScript package is loaded.
+The API serves the reviewed runtime-130 native aliases at
+`/runtime/sora-mobile-types.json`, and `mobileConfig.substrateTypesUrl` points to
+that route on `https://pi.soramitsu.io`. Ensure the production reverse proxy
+forwards this route to the same API process before deploying the config change.
+See `src/runtime/README.md` for provenance and schema validation.
 
 For the embedded RocksDB backend, migrate existing Postgres documents first and
 then run API and worker in one process so they share the same local database

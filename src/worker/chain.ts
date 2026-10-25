@@ -1,5 +1,5 @@
 import { ApiPromise, WsProvider } from '@polkadot/api';
-import { types as soraTypes } from '@sora-substrate/type-definitions';
+import soraTypes from '../runtime/sora-legacy-types.json' with { type: 'json' };
 
 import {
   uniqueIndexedAccountIds,

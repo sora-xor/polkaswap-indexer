@@ -477,7 +477,7 @@ describe('Polkaswap indexer schema', () => {
     expect(mobileConfigField?.resolve?.({}, {}, { repository: new MemoryRepository() }, {} as never)).toEqual({
       blockExplorerUrl: 'https://sorametrics.org/sorav2?tab=extrinsics&q={transaction}',
       substrateTypesUrl:
-        'https://raw.githubusercontent.com/sora-xor/sora2-substrate-js-library/metadata14ios/packages/types/src/metadata/prod/types_scalecodec_mobile.json',
+        'https://pi.soramitsu.io/runtime/sora-mobile-types.json',
       soracard: false,
       nodes: [{ name: 'Sora', address: 'wss://mof2.sora.org' }],
       nexusAvailable: true,
