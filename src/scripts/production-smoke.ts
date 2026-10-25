@@ -1,4 +1,3 @@
-import assert from 'node:assert/strict';
 import { pathToFileURL } from 'node:url';
 
 import {
@@ -409,8 +408,8 @@ async function fetchGraphQl(
         method: 'POST',
         headers: {
           accept: 'application/graphql-response+json, application/json',
-          'content-type': 'application/json',
           'cache-control': 'no-store',
+          'content-type': 'application/json',
         },
         body: JSON.stringify({ query: PRODUCTION_SMOKE_QUERY }),
         cache: 'no-store',
@@ -493,8 +492,7 @@ function assertHealthContract(health: HealthInfo): void {
       `PI production health is not ready: expected ok=true, received keys ${objectKeys(health)}. ${PI_HEALTH_DEPLOYMENT_HINT}`
     );
   }
-  assert.equal(health.repositoryReady, true, 'health repositoryReady must be true');
-
+  assertHealthField(health.repositoryReady, true, 'health repositoryReady must be true');
   assertHealthField(health.service, 'polkaswap-indexer', 'health service must be polkaswap-indexer');
   assertHealthField(health.serviceId, 'pi.soramitsu.io', 'health serviceId must be pi.soramitsu.io');
   assertHealthField(health.schemaVersion, 1, 'health schemaVersion must be 1');
@@ -508,12 +506,11 @@ function assertHealthContract(health: HealthInfo): void {
     SORA_MAINNET_GENESIS_HASH,
     `health genesisHash must be the reviewed SORA mainnet genesis ${SORA_MAINNET_GENESIS_HASH}`,
   );
-
-  assert.equal(health.workerAvailable, true, 'production health must expose a shared worker status');
-  assert.equal(health.workerReady, true, 'available worker must be ready');
-  assert.equal(health.workerReadinessReason, null, 'ready worker must not have a readiness failure reason');
-  assert.equal(health.workerLifecycle, 'running', 'ready worker lifecycle must be running');
-  assert.equal(health.workerStartupComplete, true, 'ready worker startup must be complete');
+  assertHealthField(health.workerAvailable, true, 'production health must expose a shared worker status');
+  assertHealthField(health.workerReady, true, 'available worker must be ready');
+  assertHealthField(health.workerReadinessReason, null, 'ready worker must not have a readiness failure reason');
+  assertHealthField(health.workerLifecycle, 'running', 'ready worker lifecycle must be running');
+  assertHealthField(health.workerStartupComplete, true, 'ready worker startup must be complete');
 
   for (const [name, value] of [
     ['workerLatestFinalizedBlock', health.workerLatestFinalizedBlock],
@@ -530,7 +527,7 @@ function assertHealthContract(health: HealthInfo): void {
     throw new Error('health workerLatestIndexedBlock must not exceed workerLatestFinalizedBlock');
   }
   const expectedLag = Number(health.workerLatestFinalizedBlock) - Number(health.workerLatestIndexedBlock);
-  assert.equal(health.workerLag, expectedLag, 'health workerLag must match finalized minus indexed blocks');
+  assertHealthField(health.workerLag, expectedLag, 'health workerLag must match finalized minus indexed blocks');
   if (Number(health.workerLastSuccessfulIndexTimestamp) === 0) {
     throw new Error('health workerLastSuccessfulIndexTimestamp must be positive');
   }
@@ -689,7 +686,6 @@ export async function runProductionSmoke(
     state.blockTimestamp,
     'health latestIndexedAt must match chainState',
   );
-
   const latestSnapshot = payload.data.networkSnapshots?.nodes?.[0];
   if (!latestSnapshot || latestSnapshot.type !== 'BLOCK' ||
       latestSnapshot.id !== `block-${state.lastIndexedBlock}` ||

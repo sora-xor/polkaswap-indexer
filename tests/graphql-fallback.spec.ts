@@ -42,6 +42,11 @@ describe('GraphQL repository fallbacks', () => {
       { collection, id: 'middle', timestamp: 20, data: { id: 'middle', [accountField]: 'alice' } },
       { collection, id: 'new', data: { id: 'new', [accountField]: 'alice', timestamp: 30 } },
     ];
+    if (collection === 'accountTransactions') {
+      for (const document of documents) {
+        Object.assign(document.data, { module: 'polkamarkt', marketId: 7 });
+      }
+    }
     const repository = listRepository(documents);
     const field = createSchema().getQueryType()!.getFields()[fieldName]!;
     const args = { first: 1, where: { account_eq: 'alice' }, orderBy: [orderBy] };

@@ -73,6 +73,11 @@ const identityFixture = (options: IdentityFixtureOptions = {}): IndexerDocument[
       lastError: null,
       lastErrorTimestamp: null,
     }, NOW),
+    {
+      collection: 'networkSnapshots', id: `block-${CHECKPOINT_BLOCK}`,
+      blockHeight: CHECKPOINT_BLOCK, timestamp: typeof state.blockTimestamp === 'number' ? state.blockTimestamp : NOW,
+      data: { id: `block-${CHECKPOINT_BLOCK}`, type: 'BLOCK', timestamp: typeof state.blockTimestamp === 'number' ? state.blockTimestamp : NOW },
+    },
   ];
 };
 
@@ -84,6 +89,9 @@ const resolveHealth = async (documents: IndexerDocument[]) => {
   vi.spyOn(repository, 'get').mockImplementation(async (collection, id) =>
     documentsByKey.get(`${collection}\u0000${id}`) ?? null
   );
+  vi.spyOn(repository, 'query').mockResolvedValue({
+    items: documents.filter((document) => document.collection === 'networkSnapshots'), totalCount: 1,
+  });
   const healthField = createSchema().getQueryType()?.getFields()._health;
   return healthField?.resolve?.({}, {}, { repository }, {} as never);
 };
@@ -96,6 +104,7 @@ describe('PI GraphQL mainnet identity health', () => {
 
     await expect(resolveHealth(identityFixture())).resolves.toEqual({
       ok: true,
+      checkpointCoherent: true,
       repositoryReady: true,
       service: 'polkaswap-indexer',
       serviceId: 'pi.soramitsu.io',

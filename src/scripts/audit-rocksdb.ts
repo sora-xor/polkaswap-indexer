@@ -4,8 +4,10 @@ import { readConfig } from '../config.js';
 import {
   ROCKSDB_FORMAT_METADATA_KEY,
   ROCKSDB_FORMAT_VERSION,
+  ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY,
   RocksRepository,
   rocksCompactIndexKeysForDocument,
+  rocksSwapAssetIndexIsReady,
 } from '../repository/rocksdb.js';
 import { decodeRocksDocument } from '../repository/rocksdb-document.js';
 import { INDEXER_COLLECTIONS } from '../repository/types.js';
@@ -162,7 +164,8 @@ export const buildRocksAuditReport = (db: RocksReadView, options: RocksAuditOpti
   const sampleSize = Math.max(Math.trunc(options.sampleSize ?? 1_000), 1);
   const formatVersionValue = readMetadata(db, ROCKSDB_FORMAT_METADATA_KEY);
   const formatVersion = Number.isSafeInteger(formatVersionValue) ? (formatVersionValue as number) : null;
-  const formatReady = formatVersion === ROCKSDB_FORMAT_VERSION;
+  const swapAssetIndexReady = rocksSwapAssetIndexIsReady(readMetadata(db, ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY));
+  const formatReady = formatVersion === ROCKSDB_FORMAT_VERSION && swapAssetIndexReady;
   const verifyMissingIndexes = formatReady;
   const perCollectionSampleSize = Math.max(Math.ceil(sampleSize / INDEXER_COLLECTIONS.length), 1);
   const documentSamplesByCollection = Object.fromEntries(
@@ -295,6 +298,7 @@ export const buildRocksAuditReport = (db: RocksReadView, options: RocksAuditOpti
       version: formatVersion,
       expectedVersion: ROCKSDB_FORMAT_VERSION,
       ready: formatReady,
+      swapAssetIndexReady,
       unexpectedIndexNamespaceKeys: unsupportedIndexKeys,
     },
     chainState,

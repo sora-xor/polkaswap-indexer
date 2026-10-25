@@ -20,14 +20,14 @@ const safeNullableInteger = (value: unknown, field: string): number | null => {
   if (value === null || value === undefined) return null;
   if (
     (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'bigint') ||
-    (typeof value === 'string' && !/^-?[0-9]+$/.test(value))
+    (typeof value === 'string' && !/^(?:0|[1-9][0-9]*)$/.test(value))
   ) {
-    throw new Error(`Postgres document ${field} must be an integer or null`);
+    throw new Error(`Postgres document ${field} must be a canonical non-negative safe integer or null`);
   }
 
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 0) {
-    throw new Error(`Postgres document ${field} must be a non-negative safe integer`);
+    throw new Error(`Postgres document ${field} must be a canonical non-negative safe integer or null`);
   }
   return parsed;
 };

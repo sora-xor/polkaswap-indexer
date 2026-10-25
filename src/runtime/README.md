@@ -28,5 +28,6 @@ The API serves the mobile JSON at `/runtime/sora-mobile-types.json`; GET and HEA
 are supported under the normal request rate limits, with no external fetch.
 The GraphQL `mobileConfig` uses the canonical Pi HTTPS URL. A deployment must
 forward this route through the same reverse proxy as the GraphQL API. The JSON
-imports are copied into `dist/src/runtime` by TypeScript, so both normal and
-container builds include the same reviewed data.
+imports are emitted into `dist/src/runtime` by TypeScript. The build then restores
+the exact source JSON bytes alongside their provenance and license, so normal
+and container artifacts can be checked against the same reviewed digests.

@@ -1,0 +1,48 @@
+{
+  "date": "2026-10-25",
+  "purpose": "Consolidate current master, indexer reliability fixes, and mobile runtime dependency work for release review.",
+  "inputs": {
+    "master": "3426757",
+    "localReliability": "c2cb5fd",
+    "dependencyAndRuntimeSnapshot": "03d8a48"
+  },
+  "compatibility": [
+    "Preserves current master history, hourly analytics, query/storage, chain-identity, and deployment changes.",
+    "Keeps complete account trade predicates while excluding non-Polkamarkt transfers.",
+    "Preserves local pagination, repeated vault event, bridge counter, order precision, and weekly baseline fixes.",
+    "Serves repository-owned runtime schemas and preserves their exact reviewed bytes in build artifacts."
+  ],
+  "validation": {
+    "node": "24.19.0",
+    "yarn": "4.10.3",
+    "testFilesPassed": 89,
+    "testsPassed": 2108,
+    "testsSkipped": 0,
+    "postgres": "16, isolated disposable database",
+    "build": "passed",
+    "packagingRegressionTestsPassed": 18,
+    "immutableInstall": "passed",
+    "localRuntimeAudit": "passed",
+    "dependencyAudits": "all and production: no audit suggestions",
+    "branchPublicArtifactAndTodoAudits": "passed",
+    "deploymentManifestAssertions": "passed",
+    "container": {
+      "platform": "linux/arm64",
+      "manifestDigest": "sha256:737a0d1cd6c9afaadce0ba2d14edcaa5e3fc1f092d19a911173a04038213b53f",
+      "nativeRocksDB": "passed",
+      "schemaDigestsAndCompiledServer": "passed",
+      "nonRootAndDependencyBoundaries": "passed",
+      "tlsDatabaseHandoff": "passed"
+    }
+  },
+  "releaseBoundary": {
+    "deployed": false,
+    "releasePublished": false,
+    "independentReview": "pending",
+    "deploymentNotes": [
+      "Forward /runtime/sora-mobile-types.json through the API reverse proxy before deploying its mobileConfig URL.",
+      "Preserve the production RocksDB path and use the existing backup, restore and repair runbooks; no production database was changed.",
+      "Historical audit documents retain their original date and limitations, including vendor-unfixed container OS findings."
+    ]
+  }
+}

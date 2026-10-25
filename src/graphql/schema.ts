@@ -2,6 +2,7 @@ export const typeDefs = /* GraphQL */ `
   scalar JSON
   scalar Cursor
   scalar OrderBy
+  scalar UInt32
   scalar AccountFilter
   scalar AccountLiquiditySnapshotFilter
   scalar AccountPositionFilter
@@ -58,9 +59,9 @@ export const typeDefs = /* GraphQL */ `
     publicBaseUrl: String!
     readOnly: Boolean!
     genesisHash: String
-    latestIndexedBlock: Int
+    latestIndexedBlock: Float
     latestIndexedBlockHash: String
-    latestIndexedAt: Int
+    latestIndexedAt: Float
     workerAvailable: Boolean!
     workerReady: Boolean
     workerReadinessReason: String
@@ -200,6 +201,10 @@ export const typeDefs = /* GraphQL */ `
     supply: String
     mint: String
     burn: String
+    "Cumulative chain denomination at the CLOSE price; null for unverified legacy data."
+    denominator: String
+    "Adjacent finalized block proof for a corrected hourly CLOSE; other OHLC fields retain their original evidence."
+    closeEvidence: JSON
     priceUSD: JSON
     volume: JSON
   }
@@ -214,6 +219,59 @@ export const typeDefs = /* GraphQL */ `
     edges: [AssetSnapshotEdge!]!
     pageInfo: PageInfo!
     totalCount: Int!
+  }
+
+  enum HourlyProofStatus { MISSING LEGACY INVALID VERIFIED }
+  enum HourlyPoolStatus { UNKNOWN ABSENT ZERO_RESERVE USABLE XOR_SELF }
+  enum HourlyGapStatus { MISSING LEGACY INVALID UNKNOWN_POOL ABSENT_POOL ZERO_RESERVE }
+
+  "Validated provenance only; contains no price or reserve values."
+  type AssetHourlyCloseMetadata {
+    hour: Int!
+    proofStatus: HourlyProofStatus!
+    poolStatus: HourlyPoolStatus!
+    completedAt: Int
+    timestamp: Int
+    blockHeight: Int
+    blockHash: String
+    nextTimestamp: Int
+    nextBlockHeight: Int
+    nextBlockHash: String
+    denominator: String
+    decimals: Int
+  }
+
+  "A contiguous range of unusable hourly buckets, with an exclusive end."
+  type AssetHourlyCoverageGap {
+    start: Int!
+    end: Int!
+    hours: Int!
+    status: HourlyGapStatus!
+  }
+
+  type AssetHourlyCoverage {
+    assetId: String!
+    symbol: String!
+    start: Int!
+    end: Int!
+    asOf: Int!
+    expectedHours: Int!
+    observedHours: Int!
+    verifiedHours: Int!
+    poolUsableHours: Int!
+    missingHours: Int!
+    legacyHours: Int!
+    invalidHours: Int!
+    absentPoolHours: Int!
+    zeroReserveHours: Int!
+    unknownPoolHours: Int!
+    "Latest validated canonical boundary in this range, regardless of pool usability."
+    latestCompletedAt: Int
+    "Latest completed bucket with any stored row; this is not a proof of canonical coverage."
+    latestObservedCompletedAt: Int
+    latestUsableCompletedAt: Int
+    hours: [AssetHourlyCloseMetadata!]!
+    gaps: [AssetHourlyCoverageGap!]!
   }
 
   type PoolXYK {
@@ -298,6 +356,13 @@ export const typeDefs = /* GraphQL */ `
     id: String!
     type: SnapshotType
     timestamp: Int
+    "CALENDAR flows are disjoint; LEGACY_ROLLING lacks retained boundary evidence and must not be summed as exact buckets."
+    flowAggregation: String
+    "Inclusive start of the projected flow interval, clipped to the requested time range."
+    flowBucketStart: Int
+    "Exclusive end of the projected flow interval."
+    flowBucketEnd: Int
+    flowThroughBlock: Int
     accounts: Int
     transactions: Int
     fees: String
@@ -344,17 +409,17 @@ export const typeDefs = /* GraphQL */ `
 
   type PolkamarktSignalPoint {
     label: String!
-    value: Float!
+    value: String!
   }
 
   type PolkamarktSignalAnswerBreakdown {
     answer: String!
-    volumeUsd: Float!
+    volumeUsd: String!
     markets: Int!
   }
 
   type PolkamarktSignalAccuracyMarket {
-    marketId: Int!
+    marketId: UInt32!
     title: String!
     outcome: String!
     predictedOutcome: String!
@@ -381,10 +446,10 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type PolkamarktSignals {
-    totalVolumeUsd: Float!
+    totalVolumeUsd: String!
     activeMarkets: Int!
     activeAccounts: Int!
-    liquidityUsd: Float!
+    liquidityUsd: String!
     liquiditySeries: [PolkamarktSignalPoint!]!
     answerBreakdown: [PolkamarktSignalAnswerBreakdown!]!
     accuracySummary: PolkamarktSignalAccuracySummary
@@ -394,7 +459,7 @@ export const typeDefs = /* GraphQL */ `
   type AccountPosition {
     id: String!
     account: String
-    marketId: Int
+    marketId: UInt32
     outcome: String
     shares: String
     yesShares: String
@@ -427,7 +492,8 @@ export const typeDefs = /* GraphQL */ `
   type AccountTrade {
     id: String!
     account: String
-    marketId: Int
+    marketId: UInt32
+    marketIds: [UInt32!]!
     side: String
     outcome: String
     fromOutcome: String
@@ -463,8 +529,8 @@ export const typeDefs = /* GraphQL */ `
 
   type Market {
     id: String!
-    marketId: Int
-    conditionId: Int
+    marketId: UInt32
+    conditionId: UInt32
     title: String
     category: String
     tags: String
@@ -474,7 +540,7 @@ export const typeDefs = /* GraphQL */ `
     rulesUri: String
     oracle: String
     resolutionSource: String
-    closeBlock: Int
+    closeBlock: UInt32
     status: String
     mechanism: String
     creator: String
@@ -482,9 +548,12 @@ export const typeDefs = /* GraphQL */ `
     creatorFees: String
     liquidityUSD: String
     volumeUSD: String
-    probability: Float
-    priceYes: Float
-    priceNo: Float
+    """Exact decimal percentage in the closed interval 0 through 100."""
+    probability: String
+    """Exact YES unit price in the closed interval 0 through 1."""
+    priceYes: String
+    """Exact NO unit price in the closed interval 0 through 1."""
+    priceNo: String
     virtualDepth: String
     dpmCollateral: String
     realYesShares: String
@@ -528,13 +597,16 @@ export const typeDefs = /* GraphQL */ `
 
   type MarketSnapshot {
     id: String!
-    marketId: Int
+    marketId: UInt32
     timestamp: Int
     blockHeight: Int
     type: SnapshotType
-    probability: Float
-    priceYes: Float
-    priceNo: Float
+    """Exact decimal percentage in the closed interval 0 through 100."""
+    probability: String
+    """Exact YES unit price in the closed interval 0 through 1."""
+    priceYes: String
+    """Exact NO unit price in the closed interval 0 through 1."""
+    priceNo: String
     virtualDepth: String
     dpmCollateral: String
     realYesShares: String
@@ -693,6 +765,19 @@ export const typeDefs = /* GraphQL */ `
     timestamp: Int
     txHash: String
     nexusRecipient: String
+    campaign: String
+    extrinsicIndex: Int
+  }
+
+  type TonswapBurnSnapshotConnection {
+    fresh: Boolean!
+    genesisHash: String!
+    startBlock: Int!
+    indexedThroughBlock: Int!
+    checkpointBlock: Int!
+    checkpointTimestamp: Int!
+    nodes: [XorBurn!]!
+    pageInfo: PageInfo!
   }
 
   type XorBurnEdge {
@@ -859,31 +944,34 @@ export const typeDefs = /* GraphQL */ `
     _health: Health!
     mobileConfig: MobileConfig!
     account(id: String!): JSON
-    assets(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AssetFilter): AssetConnection!
-    assetSnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AssetSnapshotFilter): AssetSnapshotConnection!
-    accountLiquiditySnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AccountLiquiditySnapshotFilter): AccountLiquiditySnapshotConnection!
+    assets(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AssetFilter): AssetConnection!
+    assetSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AssetSnapshotFilter): AssetSnapshotConnection!
+    "Uncached metadata for one canonical major asset over 1–2160 completed UTC hours [start, end)."
+    assetHourlyCoverage(assetId: String!, start: Int!, end: Int!): AssetHourlyCoverage!
+    accountLiquiditySnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountLiquiditySnapshotFilter): AccountLiquiditySnapshotConnection!
     market(id: String!): Market
-    markets(first: Int, after: Cursor, orderBy: [OrderBy!], filter: MarketFilter): MarketConnection!
-    marketSnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: MarketSnapshotFilter): MarketSnapshotConnection!
-    networkSnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: NetworkSnapshotFilter): NetworkSnapshotConnection!
-    poolXYKs(first: Int, after: Cursor, orderBy: [OrderBy!], filter: PoolXYKFilter): PoolXYKConnection!
-    poolSnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: PoolSnapshotFilter): PoolSnapshotConnection!
+    markets(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: MarketFilter): MarketConnection!
+    marketSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: MarketSnapshotFilter): MarketSnapshotConnection!
+    networkSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: NetworkSnapshotFilter): NetworkSnapshotConnection!
+    poolXYKs(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: PoolXYKFilter): PoolXYKConnection!
+    poolSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: PoolSnapshotFilter): PoolSnapshotConnection!
     orderBook(id: String!): OrderBook
-    orderBooks(first: Int, after: Cursor, orderBy: [OrderBy!], filter: OrderBookFilter): OrderBookConnection!
-    orderBookOrders(first: Int, after: Cursor, orderBy: [OrderBy!], filter: OrderBookOrderFilter): OrderBookOrderConnection!
-    orderBookSnapshots(first: Int, after: Cursor, orderBy: [OrderBy!], filter: OrderBookSnapshotFilter): OrderBookSnapshotConnection!
+    orderBooks(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: OrderBookFilter): OrderBookConnection!
+    orderBookOrders(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: OrderBookOrderFilter): OrderBookOrderConnection!
+    orderBookSnapshots(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: OrderBookSnapshotFilter): OrderBookSnapshotConnection!
     historyElements(first: Int, last: Int, offset: Int, before: Cursor, after: Cursor, orderBy: [HistoryElementsOrderBy!], filter: HistoryElementFilter): HistoryElementConnection!
-    xorBurns(first: Int, after: Cursor, orderBy: [HistoryElementsOrderBy!], filter: XorBurnFilter): XorBurnConnection!
-    referrerRewards(first: Int, after: Cursor, orderBy: [OrderBy!], filter: ReferrerRewardFilter): ReferrerRewardConnection!
-    stakingStakers(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AccountFilter): StakingStakerConnection!
-    stakingValidators(first: Int, after: Cursor, orderBy: [OrderBy!], filter: StakingValidatorFilter): StakingValidatorConnection!
-    vaults(first: Int, after: Cursor, orderBy: [OrderBy!], filter: VaultFilter): VaultConnection!
-    vaultEvents(first: Int, offset: Int, after: Cursor, orderBy: [OrderBy!], filter: VaultEventFilter): VaultEventConnection!
+    tonswapBurnSnapshot(first: Int, after: Cursor, atBlock: Int, allowStale: Boolean = false): TonswapBurnSnapshotConnection!
+    xorBurns(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [HistoryElementsOrderBy!], filter: XorBurnFilter): XorBurnConnection!
+    referrerRewards(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: ReferrerRewardFilter): ReferrerRewardConnection!
+    stakingStakers(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountFilter): StakingStakerConnection!
+    stakingValidators(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: StakingValidatorFilter): StakingValidatorConnection!
+    vaults(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: VaultFilter): VaultConnection!
+    vaultEvents(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: VaultEventFilter): VaultEventConnection!
     updatesStream(id: String!): UpdatesStream
     accountMeta(id: String!): AccountMeta
-    accountPointSystems(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AccountFilter): AccountPointSystemConnection!
-    accountPositions(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AccountPositionFilter, where: AccountPositionFilter): AccountPositionConnection!
-    accountTrades(first: Int, after: Cursor, orderBy: [OrderBy!], filter: AccountTradeFilter, where: AccountTradeFilter): AccountTradeConnection!
+    accountPointSystems(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountFilter): AccountPointSystemConnection!
+    accountPositions(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountPositionFilter, where: AccountPositionFilter): AccountPositionConnection!
+    accountTrades(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountTradeFilter, where: AccountTradeFilter): AccountTradeConnection!
     exploreStats: ExploreStats!
     polkamarktSignals: PolkamarktSignals!
     networkAccountActivity(from: Int!, to: Int!): NetworkAccountActivity!

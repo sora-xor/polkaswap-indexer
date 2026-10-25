@@ -6,20 +6,21 @@ import { GraphQLError } from 'graphql';
 import { normalizeIndexedAccountId } from '../account-activity.js';
 import { estimateRetainedValueBytes } from '../cache-weight.js';
 import { metrics } from '../metrics.js';
-import { evaluateServiceReadiness, type WorkerReadinessThresholds } from '../readiness.js';
+import { TONSWAP_START_BLOCK, TONSWAP_COVERAGE_ID, parseTonswapBurnCoverage, isExcludedTonswapBurnAccount } from '../tonswap-burn.js';
+import { type WorkerReadinessThresholds } from '../readiness.js';
+import { currentCheckpointView } from './checkpoint-view.js';
 import {
   createRepositoryCursorScope,
   decodeRepositoryCursor,
   encodeRepositoryCursor,
   isOpaqueRepositoryCursor,
+  MAX_REPOSITORY_CURSOR_LENGTH,
   normalizeRepositoryCursorValue,
 } from '../repository/cursor.js';
-import { assertValidDocumentId } from '../repository/validation.js';
-import { isAfterOrderPosition, matchesFilter, sortDocuments } from './filter.js';
-import { getOrderField, NUMERIC_ORDER_FIELDS } from './order.js';
-import { validatePublicConnectionQuery } from './query-policy.js';
-import { CursorScalar, FilterScalars, JSONScalar, OrderByScalar } from './scalars.js';
-import { typeDefs } from './schema.js';
+import {
+  assertValidDocumentId,
+  parseRuntimeUInt32,
+} from '../repository/validation.js';
 import {
   isStoredSoraChainStateCoherent,
   parseStoredSoraChainIdentity,
@@ -27,6 +28,19 @@ import {
   SORA_LEGACY_IDENTITY_ANCHOR,
   SORA_MAINNET_GENESIS_HASH,
 } from '../soraIdentity.js';
+import { isAfterOrderPosition, matchesFilter, sortDocuments } from './filter.js';
+import { getOrderField, NUMERIC_ORDER_FIELDS } from './order.js';
+import { validatePublicConnectionQuery } from './query-policy.js';
+import {
+  CursorScalar,
+  FilterScalars,
+  JSONScalar,
+  OrderByScalar,
+  UInt32Scalar,
+} from './scalars.js';
+import { typeDefs } from './schema.js';
+import { assertNetworkFlowQuery, networkFlowRepositoryFilter, projectNetworkSnapshotFlows, requestsNetworkFlows } from './network-flow.js';
+import { assetHourlyCoverage } from './hourly-history.js';
 
 import type {
   IndexerCollection,
@@ -283,6 +297,7 @@ const paginationKeyset = (
   filter: Record<string, unknown> | null | undefined
 ): RepositoryQueryArgs['keyset'] => {
   if (args.after === null || args.after === undefined || args.after === '') return null;
+  if (/^(0|[1-9][0-9]*)$/.test(args.after)) return null;
   if (typeof args.after !== 'string' || !isOpaqueRepositoryCursor(args.after)) {
     throw badUserInput('Pagination cursor must be an opaque cursor returned by this connection');
   }
@@ -311,7 +326,7 @@ const repositoryPaginationArgs = (
   const keyset = paginationKeyset(args, collectionName, orderBy, filter);
 
   return {
-    offset: args.offset ?? null,
+    offset: args.offset ?? (args.after && !keyset ? Number(args.after) + 1 : null),
     after: null,
     before: null,
     keyset,
@@ -366,9 +381,11 @@ const cursorForNode = (
 };
 
 const paginationWindow = (args: ConnectionArgs, totalCount: number) => {
-  const first = args.first ?? DEFAULT_CONNECTION_PAGE_SIZE;
-  const pageStart = Math.max(args.offset ?? 0, 0);
-  return { end: Math.min(pageStart + Math.max(first, 0), totalCount), pageStart };
+  const first = args.first ?? (args.last === null || args.last === undefined ? DEFAULT_CONNECTION_PAGE_SIZE : null);
+  const start = args.offset ?? (args.after && /^(0|[1-9][0-9]*)$/.test(args.after) ? Number(args.after) + 1 : 0);
+  const end = first === null ? totalCount : Math.min(start + first, totalCount);
+  const pageStart = args.last === null || args.last === undefined ? start : Math.max(end - args.last, start);
+  return { end, pageStart };
 };
 
 const selectionIncludesField = (info: GraphQLResolveInfo | undefined, fieldName: string): boolean => {
@@ -437,11 +454,11 @@ const normalizeConnectionArgs = (
   maximumPageSize = MAX_CONNECTION_PAGE_SIZE
 ): ConnectionArgs => {
   const raw = args as ConnectionArgs & Record<string, unknown>;
-  if (args.last !== undefined && args.last !== null) {
-    throw badUserInput('last pagination is not supported; use first/after keyset pagination');
-  }
-  if (args.before !== undefined && args.before !== null && args.before !== '') {
-    throw badUserInput('before pagination is not supported; use first/after keyset pagination');
+  // The deployed baseline advertised before without applying it to the window.
+  // Keep that compatibility argument; do not imply backward cursor semantics.
+  if (args.before !== null && args.before !== undefined &&
+      (typeof args.before !== 'string' || args.before.length > MAX_REPOSITORY_CURSOR_LENGTH)) {
+    throw badUserInput('before must be a bounded string cursor');
   }
   const requestedOffset = args.offset ?? null;
   if (
@@ -451,21 +468,30 @@ const normalizeConnectionArgs = (
     throw badUserInput(`offset must be an integer between 0 and ${MAX_CONNECTION_OFFSET}`);
   }
 
-  const requestedFirst = args.first ?? DEFAULT_CONNECTION_PAGE_SIZE;
-  if (!Number.isSafeInteger(requestedFirst) || requestedFirst < 0) {
+  const requestedLast = args.last ?? null;
+  if (requestedLast !== null && (!Number.isSafeInteger(requestedLast) || requestedLast < 0 || requestedLast > maximumPageSize)) {
+    throw badUserInput(`last must be an integer between 0 and ${maximumPageSize}`);
+  }
+  const requestedFirst = args.first ?? (requestedLast === null ? DEFAULT_CONNECTION_PAGE_SIZE : null);
+  if (requestedFirst !== null && (!Number.isSafeInteger(requestedFirst) || requestedFirst < 0)) {
     throw badUserInput('first must be a non-negative integer');
   }
-  if (requestedFirst > maximumPageSize) {
+  if (requestedFirst !== null && requestedFirst > maximumPageSize) {
     throw badUserInput(`first must not exceed ${maximumPageSize}`);
   }
   if (args.after !== undefined && args.after !== null && typeof args.after !== 'string') {
-    throw badUserInput('after must be an opaque string cursor');
+    throw badUserInput('after must be a string cursor');
   }
-  if (requestedOffset !== null && args.after !== undefined && args.after !== null && args.after !== '') {
+  const numericAfter = args.after && /^(0|[1-9][0-9]*)$/.test(args.after) ? Number(args.after) : null;
+  if (numericAfter !== null && (!Number.isSafeInteger(numericAfter) || numericAfter >= MAX_CONNECTION_OFFSET)) {
+    throw badUserInput(`numeric after must be an integer between 0 and ${MAX_CONNECTION_OFFSET - 1}`);
+  }
+  if (requestedOffset !== null && args.after !== undefined && args.after !== null && args.after !== '' && numericAfter === null) {
     throw badUserInput('offset and after pagination cannot be combined');
   }
-  if (requestedOffset !== null && requestedOffset + requestedFirst > MAX_CONNECTION_OFFSET) {
-    throw badUserInput(`offset plus first must not exceed ${MAX_CONNECTION_OFFSET}`);
+  const effectiveOffset = requestedOffset ?? (numericAfter === null ? null : numericAfter + 1);
+  if (effectiveOffset !== null && effectiveOffset + (requestedFirst ?? requestedLast ?? 0) > MAX_CONNECTION_OFFSET) {
+    throw badUserInput(`pagination offset plus page size must not exceed ${MAX_CONNECTION_OFFSET}`);
   }
   const orderTokens = args.orderBy === undefined || args.orderBy === null
     ? []
@@ -498,6 +524,7 @@ const normalizeConnectionArgs = (
   return {
     ...args,
     first: connectionSelectionNeedsItems(info) ? requestedFirst : 0,
+    last: connectionSelectionNeedsItems(info) ? requestedLast : null,
     offset: requestedOffset,
   };
 };
@@ -655,6 +682,8 @@ const ACCOUNT_ACTIVITY_PAGE_SIZE = 1_000;
 const ACCOUNT_ACTIVITY_PAGE_MAX_BYTES = 8 * 1_024 * 1_024;
 export const NETWORK_ACCOUNT_ACTIVITY_MAX_DOCUMENTS = 100_000;
 export const NETWORK_ACCOUNT_ACTIVITY_MAX_RANGE_SECONDS = 366 * 24 * 60 * 60;
+export const POLKAMARKT_SIGNALS_MAX_DOCUMENTS = 100_000;
+const POLKAMARKT_SIGNALS_PAGE_SIZE = 1_000;
 
 type RangeScanBudget = {
   remaining: number;
@@ -847,10 +876,163 @@ const exploreStatsResolver = async (_parent: unknown, _args: unknown, context: C
   };
 };
 
-const signalNumber = (value: unknown): number => {
+const readNumber = (value: unknown): number | null => {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  if (typeof value === 'string' && (value.trim() === '' || value.trim() !== value)) return null;
   const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
+  return Number.isFinite(parsed) ? parsed : null;
 };
+
+const signalNumber = (value: unknown): number => readNumber(value) ?? 0;
+
+const MAX_CANONICAL_DECIMAL_DIGITS = 1_024;
+
+const expandScientificDecimal = (value: string): string | null => {
+  const match = /^(\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/.exec(value);
+  if (!match) return null;
+
+  const integer = match[1]!;
+  const fraction = match[2] ?? '';
+  const exponent = Number(match[3]);
+  if (!Number.isSafeInteger(exponent)) return null;
+
+  const digits = `${integer}${fraction}`;
+  const decimalIndex = integer.length + exponent;
+  if (decimalIndex <= 0) return `0.${'0'.repeat(-decimalIndex)}${digits}`;
+  if (decimalIndex >= digits.length) return `${digits}${'0'.repeat(decimalIndex - digits.length)}`;
+  return `${digits.slice(0, decimalIndex)}.${digits.slice(decimalIndex)}`;
+};
+
+/**
+ * Produces the plain, unsigned decimal wire representation expected by the
+ * mobile PI clients. String-backed quantities never pass through Number;
+ * numeric support exists only to project legacy JSON documents safely.
+ */
+const canonicalUnsignedDecimalString = (value: unknown): string | null => {
+  let text: string;
+  if (typeof value === 'string') {
+    text = value;
+  } else if (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    (!Number.isInteger(value) || Number.isSafeInteger(value))
+  ) {
+    const numericText = String(value);
+    text = /[eE]/.test(numericText) ? (expandScientificDecimal(numericText) ?? '') : numericText;
+  } else {
+    return null;
+  }
+
+  if (!text || text.length > MAX_CANONICAL_DECIMAL_DIGITS || !/^\d+(?:\.\d+)?$/.test(text)) {
+    return null;
+  }
+  const [rawInteger, rawFraction = ''] = text.split('.');
+  const integer = rawInteger!.replace(/^0+(?=\d)/, '');
+  const fraction = rawFraction.replace(/0+$/, '');
+  return fraction ? `${integer}.${fraction}` : integer;
+};
+
+const canonicalDecimalFromCoefficient = (coefficient: bigint, scale: number): string => {
+  if (scale === 0) return coefficient.toString();
+  const digits = coefficient.toString().padStart(scale + 1, '0');
+  const split = digits.length - scale;
+  const fraction = digits.slice(split).replace(/0+$/, '');
+  return fraction ? `${digits.slice(0, split)}.${fraction}` : digits.slice(0, split);
+};
+
+const invalidIndexedDecimal = (): GraphQLError =>
+  new GraphQLError('Indexed decimal quantity is invalid.', {
+    extensions: { code: 'INDEXED_DECIMAL_INVALID' },
+  });
+
+const requireCanonicalIndexedDecimal = (value: unknown): string => {
+  const canonical = canonicalUnsignedDecimalString(value);
+  if (canonical === null) throw invalidIndexedDecimal();
+  return canonical;
+};
+
+const sumCanonicalUnsignedDecimals = (values: readonly unknown[]): string => {
+  let coefficient = 0n;
+  let scale = 0;
+
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    const decimal = canonicalUnsignedDecimalString(value);
+    if (decimal === null) throw invalidIndexedDecimal();
+    const [integer, fraction = ''] = decimal.split('.');
+    const nextCoefficient = BigInt(`${integer}${fraction}`);
+    const nextScale = fraction.length;
+    if (nextScale > scale) {
+      coefficient *= 10n ** BigInt(nextScale - scale);
+      scale = nextScale;
+      coefficient += nextCoefficient;
+    } else {
+      coefficient += nextCoefficient * 10n ** BigInt(scale - nextScale);
+    }
+  }
+
+  return canonicalDecimalFromCoefficient(coefficient, scale);
+};
+
+const canonicalDecimalOrZero = (value: unknown): string => {
+  if (value === null || value === undefined) return '0';
+  return requireCanonicalIndexedDecimal(value);
+};
+
+const canonicalDecimalField = (field: string) => (parent: Record<string, unknown>): string | null => {
+  const value = parent[field];
+  if (value === null || value === undefined) return null;
+  return requireCanonicalIndexedDecimal(value);
+};
+
+const canonicalSignedDecimalString = (value: unknown): string | null => {
+  let negative = false;
+  let magnitude = value;
+  if (typeof value === 'string' && value.startsWith('-')) {
+    negative = true;
+    magnitude = value.slice(1);
+  } else if (typeof value === 'number' && value < 0) {
+    negative = true;
+    magnitude = -value;
+  }
+  const canonical = canonicalUnsignedDecimalString(magnitude);
+  if (canonical === null) return null;
+  return negative && canonical !== '0' ? `-${canonical}` : canonical;
+};
+
+const canonicalSignedDecimalField =
+  (field: string) =>
+  (parent: Record<string, unknown>): string | null => {
+    const value = parent[field];
+    if (value === null || value === undefined) return null;
+    const canonical = canonicalSignedDecimalString(value);
+    if (canonical === null) throw invalidIndexedDecimal();
+    return canonical;
+  };
+
+const canonicalDecimalFields = (fields: readonly string[]) =>
+  Object.fromEntries(fields.map((field) => [field, canonicalDecimalField(field)]));
+
+const canonicalSignedDecimalFields = (fields: readonly string[]) =>
+  Object.fromEntries(fields.map((field) => [field, canonicalSignedDecimalField(field)]));
+
+const canonicalDecimalIsAtMost = (value: string, integerMaximum: string): boolean => {
+  const [integer, fraction = ''] = value.split('.');
+  if (integer!.length !== integerMaximum.length) return integer!.length < integerMaximum.length;
+  if (integer !== integerMaximum) return integer! < integerMaximum;
+  return [...fraction].every((digit) => digit === '0');
+};
+
+const boundedCanonicalDecimalField =
+  (field: string, integerMaximum: string) =>
+  (parent: Record<string, unknown>): string | null => {
+    const value = parent[field];
+    if (value === null || value === undefined) return null;
+    const canonical = requireCanonicalIndexedDecimal(value);
+    if (!canonicalDecimalIsAtMost(canonical, integerMaximum)) throw invalidIndexedDecimal();
+    return canonical;
+  };
 
 const signalString = (value: unknown): string | null => {
   if (typeof value !== 'string' && typeof value !== 'number') return null;
@@ -865,9 +1047,12 @@ const signalOutcome = (value: unknown): 'YES' | 'NO' | null => {
   return normalized === 'YES' || normalized === 'NO' ? normalized : null;
 };
 
-const signalInteger = (value: unknown): number | null => {
-  const parsed = typeof value === 'number' ? value : Number.parseInt(String(value ?? '').replace(/,/g, ''), 10);
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+const signalUInt32 = (value: unknown): number | null => {
+  try {
+    return parseRuntimeUInt32(value, 'indexed Polkamarkt signal marketId');
+  } catch {
+    return null;
+  }
 };
 
 const signalTimestampLabel = (value: unknown): string => {
@@ -882,20 +1067,22 @@ const signalTimestampLabel = (value: unknown): string => {
   }).format(new Date(millis));
 };
 
-const coerceSignalProbability = (value: unknown): number | null => {
+const coerceSignalPercentage = (value: unknown): number | null => {
   const parsed = readNumber(value);
-  if (parsed === null) return null;
-  const percentage = parsed <= 1 ? parsed * 100 : parsed;
+  return parsed !== null && parsed >= 0 && parsed <= 100 ? parsed : null;
+};
 
-  return Math.max(0, Math.min(100, percentage));
+const coerceSignalUnitPrice = (value: unknown): number | null => {
+  const parsed = readNumber(value);
+  return parsed !== null && parsed >= 0 && parsed <= 1 ? parsed * 100 : null;
 };
 
 const scorePolkamarktSignalMarket = async (
   repository: IndexerRepository,
   market: IndexerDocument
 ): Promise<Record<string, unknown> | null> => {
-  const marketId = signalInteger(market.data.marketId ?? market.id);
-  const closeBlock = signalInteger(market.data.closeBlock);
+  const marketId = signalUInt32(market.data.marketId ?? market.id);
+  const closeBlock = signalUInt32(market.data.closeBlock);
   const title = signalString(market.data.title);
   const outcome = signalOutcome(market.data.resolutionOutcome);
 
@@ -909,7 +1096,11 @@ const scorePolkamarktSignalMarket = async (
       blockHeight: { lessThanOrEqualTo: closeBlock },
     },
   });
-  const yesProbability = coerceSignalProbability(snapshot?.data.probability ?? snapshot?.data.priceYes);
+  const indexedProbability = snapshot?.data.probability;
+  const yesProbability =
+    indexedProbability === null || indexedProbability === undefined
+      ? coerceSignalUnitPrice(snapshot?.data.priceYes)
+      : coerceSignalPercentage(indexedProbability);
   if (yesProbability === null || yesProbability === 50) return null;
 
   const predictedOutcome = yesProbability > 50 ? 'YES' : 'NO';
@@ -1004,23 +1195,111 @@ const addSignalAccount = (accounts: Set<string>, value: unknown): void => {
   if (account) accounts.add(account);
 };
 
-const polkamarktSignalsResolver = async (_parent: unknown, _args: unknown, context: Context) => {
-  const [marketResult, activityResult, snapshotResult] = await Promise.all([
-    queryDocuments(context.repository, collection('markets'), { first: 1_000 }, {}, ['VOLUME_USD_DESC'], {
+const ACTIVE_POLKAMARKT_STATUSES = new Set(['open', 'active', 'live']);
+
+const visitPolkamarktSignalDocuments = async (
+  repository: IndexerRepository,
+  collectionName: IndexerCollection,
+  filter: Record<string, unknown>,
+  maxBytes: number,
+  visit: (document: IndexerDocument) => void
+): Promise<void> => {
+  const seenIds = new Set<string>();
+  const visitUnique = (document: IndexerDocument): void => {
+    if (seenIds.has(document.id)) {
+      throw new Error(`polkamarktSignals received a repeated ${collectionName} document while paginating`);
+    }
+    seenIds.add(document.id);
+    visit(document);
+  };
+
+  if (!repository.query) {
+    const documents = sortDocuments(
+      (await repository.list(collectionName)).filter((document) => matchesFilter(document.data, filter)),
+      ['ID_ASC']
+    );
+    if (documents.length > POLKAMARKT_SIGNALS_MAX_DOCUMENTS) {
+      throw new Error(
+        `polkamarktSignals exceeds its ${POLKAMARKT_SIGNALS_MAX_DOCUMENTS}-document ${collectionName} scan budget`
+      );
+    }
+    documents.forEach(visitUnique);
+    return;
+  }
+
+  let keyset: RepositoryQueryArgs['keyset'];
+  let scanned = 0;
+  const orderBy = ['ID_ASC'];
+  const keysetScope = createRepositoryCursorScope(collectionName, orderBy, filter);
+
+  while (true) {
+    const result = await repository.query(collectionName, {
+      first: POLKAMARKT_SIGNALS_PAGE_SIZE,
       includeTotalCount: false,
-      trustedMaxPageSize: 1_000,
-      maxBytes: context.graphqlQueryMaxBytes,
+      orderBy,
+      filter,
+      keyset,
+      maxBytes,
+    });
+    const hasNextPage = result.hasNextPage ?? result.items.length >= POLKAMARKT_SIGNALS_PAGE_SIZE;
+    const remaining = POLKAMARKT_SIGNALS_MAX_DOCUMENTS - scanned;
+    if (result.items.length > remaining || (result.items.length === remaining && hasNextPage)) {
+      throw new Error(
+        `polkamarktSignals exceeds its ${POLKAMARKT_SIGNALS_MAX_DOCUMENTS}-document ${collectionName} scan budget`
+      );
+    }
+
+    result.items.forEach(visitUnique);
+    scanned += result.items.length;
+    if (!hasNextPage) return;
+
+    const last = result.items.at(-1);
+    if (!last) {
+      throw new Error(`polkamarktSignals received an empty ${collectionName} page with hasNextPage=true`);
+    }
+    keyset = {
+      scope: keysetScope,
+      field: 'id',
+      value: last.id,
+      id: last.id,
+      direction: 'asc',
+      numeric: false,
+    };
+  }
+};
+
+const polkamarktSignalsResolver = async (_parent: unknown, _args: unknown, context: Context) => {
+  let marketCount = 0;
+  let marketStatusCount = 0;
+  let activeMarketCount = 0;
+  let totalVolumeUsd = '0';
+  let liquidityUsd = '0';
+  const accounts = new Set<string>();
+  const resolvedMarkets: IndexerDocument[] = [];
+  const maxBytes = context.graphqlQueryMaxBytes ?? DEFAULT_GRAPHQL_QUERY_MAX_BYTES;
+
+  const [, , snapshotResult] = await Promise.all([
+    visitPolkamarktSignalDocuments(context.repository, collection('markets'), {}, maxBytes, (market) => {
+      marketCount += 1;
+      totalVolumeUsd = sumCanonicalUnsignedDecimals([totalVolumeUsd, market.data.volumeUSD]);
+      liquidityUsd = sumCanonicalUnsignedDecimals([liquidityUsd, market.data.liquidityUSD]);
+      addSignalAccount(accounts, market.data.creator);
+
+      const status = signalStatus(market.data.status);
+      if (status) {
+        marketStatusCount += 1;
+        if (ACTIVE_POLKAMARKT_STATUSES.has(status)) activeMarketCount += 1;
+      }
+      if (status === 'resolved' && signalOutcome(market.data.resolutionOutcome)) resolvedMarkets.push(market);
     }),
-    queryDocuments(
+    visitPolkamarktSignalDocuments(
       context.repository,
       collection('historyElements'),
-      { first: 1_000 },
       { module: { equalTo: 'polkamarkt' } },
-      ['TIMESTAMP_DESC'],
-      {
-        includeTotalCount: false,
-        trustedMaxPageSize: 1_000,
-        maxBytes: context.graphqlQueryMaxBytes,
+      maxBytes,
+      (event) => {
+        addSignalAccount(accounts, event.data.address);
+        addSignalAccount(accounts, event.data.dataFrom);
       }
     ),
     queryDocuments(context.repository, collection('networkSnapshots'), { first: 8 }, {}, ['TIMESTAMP_DESC'], {
@@ -1028,37 +1307,25 @@ const polkamarktSignalsResolver = async (_parent: unknown, _args: unknown, conte
       maxBytes: context.graphqlQueryMaxBytes,
     }),
   ]);
-  const markets = marketResult.items;
   const snapshots = snapshotResult.items
     .map((document) => ({
       timestamp: toTimestamp(document),
       accounts: signalNumber(document.data.accounts),
-      liquidityUsd: signalNumber(document.data.liquidityUSD),
-      volumeUsd: signalNumber(document.data.volumeUSD),
+      liquidityUsd: canonicalDecimalOrZero(document.data.liquidityUSD),
+      volumeUsd: canonicalDecimalOrZero(document.data.volumeUSD),
     }))
     .sort((left, right) => left.timestamp - right.timestamp);
   const latestSnapshot = snapshots.at(-1);
-  const statuses = markets.map((market) => signalStatus(market.data.status)).filter(Boolean);
-  const openMarketCount = statuses.length ? statuses.filter((status) => status === 'open').length : null;
-  const accounts = new Set<string>();
-
-  for (const market of markets) addSignalAccount(accounts, market.data.creator);
-  for (const event of activityResult.items) {
-    addSignalAccount(accounts, event.data.address);
-    addSignalAccount(accounts, event.data.dataFrom);
-  }
-
-  const accuracy = await buildPolkamarktSignalAccuracy(context.repository, markets);
+  const accuracy = await buildPolkamarktSignalAccuracy(
+    context.repository,
+    sortDocuments(resolvedMarkets, ['TIMESTAMP_ASC'])
+  );
 
   return {
-    totalVolumeUsd: markets.length
-      ? markets.reduce((total, market) => total + signalNumber(market.data.volumeUSD), 0)
-      : latestSnapshot?.volumeUsd ?? 0,
-    activeMarkets: openMarketCount ?? marketResult.totalCount ?? markets.length,
+    totalVolumeUsd: marketCount ? totalVolumeUsd : latestSnapshot?.volumeUsd ?? '0',
+    activeMarkets: marketStatusCount ? activeMarketCount : marketCount,
     activeAccounts: accounts.size || latestSnapshot?.accounts || 0,
-    liquidityUsd: markets.length
-      ? markets.reduce((total, market) => total + signalNumber(market.data.liquidityUSD), 0)
-      : latestSnapshot?.liquidityUsd ?? 0,
+    liquidityUsd: marketCount ? liquidityUsd : latestSnapshot?.liquidityUsd ?? '0',
     liquiditySeries: snapshots.map((snapshot) => ({
       label: signalTimestampLabel(snapshot.timestamp),
       value: snapshot.liquidityUsd,
@@ -1083,28 +1350,52 @@ const createConnectionResolver =
   async (_parent: unknown, args: ConnectionArgs, context: Context, info?: GraphQLResolveInfo) => {
     const normalizedArgs = normalizeConnectionArgs(args, info);
     assertPublicConnectionQuery(collectionName, normalizedArgs.orderBy, normalizedArgs.filter);
+    const projectFlows = collectionName === 'networkSnapshots' && requestsNetworkFlows(info);
+    if (collectionName === 'networkSnapshots') assertNetworkFlowQuery(normalizedArgs.filter, normalizedArgs.orderBy);
+    // This exact current-head connection shares health's bounded checkpoint
+    // view. Historical/paginated/flow queries retain their existing behavior.
+    const currentBlockConnection = collectionName === 'networkSnapshots' && !projectFlows &&
+      normalizedArgs.first === 1 && !normalizedArgs.last && !normalizedArgs.offset &&
+      !normalizedArgs.before && !normalizedArgs.after &&
+      stableJson(normalizedArgs.orderBy) === stableJson(['TIMESTAMP_DESC']) &&
+      stableJson(normalizedArgs.filter) === stableJson({ type: { equalTo: 'BLOCK' } });
     const resolveConnection = async () => {
       if (context.repository.query) {
         const includeTotalCount = selectionIncludesField(info, 'totalCount');
-        const result = await context.repository.query(collectionName, {
+        const queryFilter = projectFlows ? await networkFlowRepositoryFilter(context.repository, normalizedArgs.filter) : normalizedArgs.filter;
+        const pagination = repositoryPaginationArgs(normalizedArgs, collectionName, normalizedArgs.orderBy, normalizedArgs.filter);
+        if (pagination.keyset && queryFilter !== normalizedArgs.filter) pagination.keyset = {
+          ...pagination.keyset, scope: createRepositoryCursorScope(collectionName, normalizedArgs.orderBy, queryFilter),
+        };
+        const checkpoint = currentBlockConnection ? await currentCheckpointView(context) : null;
+        const result = checkpoint?.latestBlock ?? await context.repository.query(collectionName, {
           ...normalizedArgs,
-          ...repositoryPaginationArgs(
-            normalizedArgs,
-            collectionName,
-            normalizedArgs.orderBy,
-            normalizedArgs.filter
-          ),
+          ...pagination,
+          filter: queryFilter,
           includeTotalCount,
           maxBytes: queryMaxBytes,
         });
+        if (checkpoint) {
+          const state = parseStoredSoraChainState(parsedUpdateStreamData(checkpoint.stateDocument, 'chainState'));
+          const block = result.items[0];
+          if (state && (!block || block.id !== `block-${state.lastIndexedBlock}` ||
+              block.data.type !== 'BLOCK' || block.data.timestamp !== state.blockTimestamp)) {
+            throw new GraphQLError('Latest BLOCK snapshot does not match the captured chain checkpoint.', {
+              extensions: { code: 'CHECKPOINT_VIEW_INCONSISTENT' },
+            });
+          }
+        }
         const fallbackTotalCount =
           result.totalCount ?? (result.pageStart ?? 0) + result.items.length + (result.hasNextPage ? 1 : 0);
         const { end, pageStart: fallbackPageStart } = paginationWindow(normalizedArgs, fallbackTotalCount);
         const pageStart = result.pageStart ?? fallbackPageStart;
-        const nodes = result.items.map((document) => toConnectionNode(collectionName, document));
+        const projected = projectFlows
+          ? await projectNetworkSnapshotFlows(context.repository, result.items, normalizedArgs.filter)
+          : result.items;
+        const nodes = projected.map((document) => toConnectionNode(collectionName, document));
         const edges: Edge[] = result.items.map((document, index) => ({
           cursor:
-            result.itemCursors?.[index] ??
+            (!projectFlows ? result.itemCursors?.[index] : undefined) ??
             cursorForDocument(
               collectionName,
               document,
@@ -1135,10 +1426,10 @@ const createConnectionResolver =
       );
     };
 
-    if (!shouldCacheConnection(collectionName, normalizedArgs)) return resolveConnection();
+    if (currentBlockConnection || !shouldCacheConnection(collectionName, normalizedArgs)) return resolveConnection();
 
     const includeTotalCount = selectionIncludesField(info, 'totalCount');
-    const key = `connection:${collectionName}:${stableJson({ ...normalizedArgs, includeTotalCount })}`;
+    const key = `connection:${collectionName}:${stableJson({ ...normalizedArgs, includeTotalCount, projectFlows })}`;
 
     return cache.getOrSet(`connection_${collectionName}`, key, resolveConnection);
   };
@@ -1151,6 +1442,10 @@ const createDocumentResolver =
       assertValidDocumentId(args.id);
     } catch {
       throw badUserInput('Document id must be a non-empty bounded printable identifier');
+    }
+    if (collectionName === 'updatesStreams' && (args.id === 'chainState' || args.id === 'chainIdentity')) {
+      const checkpoint = await currentCheckpointView(context);
+      return (args.id === 'chainState' ? checkpoint.stateDocument : checkpoint.identityDocument)?.data ?? null;
     }
     const key = `${collectionName}:${args.id}`;
 
@@ -1166,12 +1461,6 @@ const readString = (value: unknown): string | null => {
   if (typeof value !== 'string' && typeof value !== 'number') return null;
   const text = String(value).trim();
   return text.length ? text : null;
-};
-
-const readNumber = (value: unknown): number | null => {
-  if (value === null || value === undefined || value === '') return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
 };
 
 const addFilterField = (filter: Record<string, unknown>, field: string, condition: unknown): void => {
@@ -1261,6 +1550,7 @@ const queryDocuments = async (
   validateConnectionInputValue(filter, 'filter');
   const queryArgs: RepositoryQueryArgs = {
     first: normalizedArgs.first,
+    last: normalizedArgs.last,
     ...repositoryPaginationArgs(normalizedArgs, collectionName, orderBy, filter),
     orderBy,
     filter,
@@ -1359,6 +1649,39 @@ const timestampIso = (value: unknown): string | null => {
   return new Date(milliseconds).toISOString();
 };
 
+const indexedRuntimeUInt32OrNull = (value: unknown): number | null => {
+  if (value === null || value === undefined) return null;
+  try {
+    return parseRuntimeUInt32(value, 'indexed Polkamarkt marketId');
+  } catch {
+    throw new GraphQLError('Indexed Polkamarkt market identifier is invalid', {
+      extensions: { code: 'INDEXED_UINT32_INVALID' },
+    });
+  }
+};
+
+const indexedRuntimeUInt32ListOrNull = (value: unknown): number[] | null => {
+  if (value === null || value === undefined) return null;
+  if (!Array.isArray(value) || value.length === 0 || value.length > 24) {
+    throw new GraphQLError('Indexed Polkamarkt market identifiers are invalid', {
+      extensions: { code: 'INDEXED_UINT32_INVALID' },
+    });
+  }
+  const marketIds = value.map(indexedRuntimeUInt32OrNull);
+  if (marketIds.some((marketId) => marketId === null)) {
+    throw new GraphQLError('Indexed Polkamarkt market identifiers are invalid', {
+      extensions: { code: 'INDEXED_UINT32_INVALID' },
+    });
+  }
+  const canonicalMarketIds = marketIds as number[];
+  if (new Set(canonicalMarketIds).size !== canonicalMarketIds.length) {
+    throw new GraphQLError('Indexed Polkamarkt market identifiers are invalid', {
+      extensions: { code: 'INDEXED_UINT32_INVALID' },
+    });
+  }
+  return canonicalMarketIds;
+};
+
 const toAccountTradeNode = (
   historyDocument: IndexerDocument | null | undefined,
   account: string | null,
@@ -1370,7 +1693,17 @@ const toAccountTradeNode = (
   const firstCall = calls[0] ?? {};
   const firstCallData = isRecord(firstCall.data) ? firstCall.data : {};
   const records = [source, payload, firstCall, firstCallData];
-  const marketId = readNumber(firstValue(records, ['marketId', 'market_id', 'conditionId', 'condition_id']));
+  const marketId = indexedRuntimeUInt32OrNull(
+    firstValue(records, ['marketId', 'market_id', 'conditionId', 'condition_id'])
+  );
+  const marketIds = indexedRuntimeUInt32ListOrNull(
+    firstValue(records, ['marketIds', 'market_ids'])
+  );
+  if (marketIds && (marketId === null || marketIds[0] !== marketId)) {
+    throw new GraphQLError('Indexed Polkamarkt market identifiers are inconsistent', {
+      extensions: { code: 'INDEXED_UINT32_INVALID' },
+    });
+  }
   const timestamp = firstValue(records, ['timestamp']) ?? historyDocument?.timestamp ?? accountTransaction?.timestamp;
   const blockNumber = readNumber(
     firstValue(records, ['blockNumber', 'block', 'blockHeight']) ??
@@ -1388,21 +1721,22 @@ const toAccountTradeNode = (
     id,
     account,
     marketId,
+    marketIds: marketIds ?? [],
     side: normalizeSide(firstValue(records, ['side', 'action', 'method'])),
     outcome: readString(firstValue(records, ['outcome', 'direction'])),
     fromOutcome: readString(firstValue(records, ['fromOutcome', 'from_outcome', 'outcomeIn', 'outcome_in'])),
     toOutcome: readString(firstValue(records, ['toOutcome', 'to_outcome', 'outcomeOut', 'outcome_out', 'outcome', 'direction'])),
-    collateralUsd: readString(firstValue(records, ['collateralUsd', 'collateralUSD', 'collateralAmountUsd', 'amountUsd'])),
-    collateralAmountUsd: readString(firstValue(records, ['collateralAmountUsd', 'collateralUsd', 'amountUsd'])),
-    shares: readString(firstValue(records, ['shares', 'sharesAmount', 'shareAmount'])),
-    sharesAmount: readString(firstValue(records, ['sharesAmount', 'shares', 'shareAmount'])),
-    sharesIn: readString(firstValue(records, ['sharesIn', 'shares_in', 'sharesAmountIn', 'sharesAmount', 'shares', 'shareAmount'])),
-    sharesOut: readString(firstValue(records, ['sharesOut', 'shares_out', 'sharesAmountOut'])),
-    price: readString(firstValue(records, ['price', 'executionPrice', 'avgPrice'])),
-    executionPrice: readString(firstValue(records, ['executionPrice', 'price', 'avgPrice'])),
-    feeUsd: readString(firstValue(records, ['feeUsd', 'feeUSD', 'feeAmountUsd'])),
-    feeAmountUsd: readString(firstValue(records, ['feeAmountUsd', 'feeUsd', 'feeUSD'])),
-    realizedPnlUsd: readString(firstValue(records, ['realizedPnlUsd', 'realizedPnlUSD', 'pnlUsd'])),
+    collateralUsd: firstValue(records, ['collateralUsd', 'collateralUSD', 'collateralAmountUsd', 'amountUsd']),
+    collateralAmountUsd: firstValue(records, ['collateralAmountUsd', 'collateralUsd', 'amountUsd']),
+    shares: firstValue(records, ['shares', 'sharesAmount', 'shareAmount']),
+    sharesAmount: firstValue(records, ['sharesAmount', 'shares', 'shareAmount']),
+    sharesIn: firstValue(records, ['sharesIn', 'shares_in', 'sharesAmountIn', 'sharesAmount', 'shares', 'shareAmount']),
+    sharesOut: firstValue(records, ['sharesOut', 'shares_out', 'sharesAmountOut']),
+    price: firstValue(records, ['price', 'executionPrice', 'avgPrice']),
+    executionPrice: firstValue(records, ['executionPrice', 'price', 'avgPrice']),
+    feeUsd: firstValue(records, ['feeUsd', 'feeUSD', 'feeAmountUsd']),
+    feeAmountUsd: firstValue(records, ['feeAmountUsd', 'feeUsd', 'feeUSD']),
+    realizedPnlUsd: firstValue(records, ['realizedPnlUsd', 'realizedPnlUSD', 'pnlUsd']),
     timestamp: timestampIso(timestamp),
     blockNumber,
     blockHash: readString(source.blockHash),
@@ -1448,8 +1782,12 @@ const accountTradesResolver = async (
 ) => {
   const normalizedArgs = normalizeConnectionArgs(args);
   const orderBy = args.orderBy ?? ['TIMESTAMP_DESC'];
-  const transactionFilter = accountTransactionFilterFromArgs(args);
-  assertPublicConnectionQuery('accountTrades', orderBy, transactionFilter);
+  const activityFilter = accountTransactionFilterFromArgs(args);
+  assertPublicConnectionQuery('accountTrades', orderBy, activityFilter);
+  // Preserve every caller filter while limiting results to canonical trades.
+  const transactionFilter = {
+    and: [activityFilter, { module: { equalTo: 'polkamarkt' }, marketId: { greaterThanOrEqualTo: 0 } }],
+  };
   const accountTransactionResult = await queryDocuments(
     context.repository,
     collection('accountTransactions'),
@@ -1678,9 +2016,16 @@ const MAX_HEALTH_AGE_SECONDS = 300;
 const MAX_HEALTH_FUTURE_SKEW_SECONDS = 30;
 
 const parsedUpdateStreamData = (document: IndexerDocument | null, expectedId: string): unknown | null => {
-  if (!document || document.collection !== 'updatesStreams' || document.id !== expectedId ||
-      Object.keys(document.data).sort().join(',') !== 'block,data,id' ||
-      document.data.id !== expectedId || typeof document.data.data !== 'string') return null;
+  if (
+    !document ||
+    document.collection !== 'updatesStreams' ||
+    document.id !== expectedId ||
+    Object.keys(document.data).sort().join(',') !== 'block,data,id' ||
+    document.data.id !== expectedId ||
+    typeof document.data.data !== 'string'
+  ) {
+    return null;
+  }
   try {
     return JSON.parse(document.data.data);
   } catch {
@@ -1689,37 +2034,41 @@ const parsedUpdateStreamData = (document: IndexerDocument | null, expectedId: st
 };
 
 const healthResolver = async (_parent: unknown, _args: unknown, context: Context) => {
-  const [readiness, identityDocument, stateDocument] = await Promise.all([
-    evaluateServiceReadiness(
-      context.repository,
-      context.workerStatusProvider,
-      context.workerReadinessThresholds ?? { maxLagBlocks: 25, maxStalenessSeconds: 120 }
-    ),
-    context.repository.get('updatesStreams', 'chainIdentity').catch(() => null),
-    context.repository.get('updatesStreams', 'chainState').catch(() => null),
-  ]);
+  const { readiness, identityDocument, stateDocument, latestBlock } = await currentCheckpointView(context);
   const workerStatus = readiness.worker.status;
   const identity = parseStoredSoraChainIdentity(parsedUpdateStreamData(identityDocument, 'chainIdentity'));
   const state = parseStoredSoraChainState(parsedUpdateStreamData(stateDocument, 'chainState'));
-  const identityValid = identity !== null && identityDocument !== null &&
+  const identityValid =
+    identity !== null &&
+    identityDocument !== null &&
     identityDocument.data.block === identity.verificationBlock &&
     identityDocument.blockHeight === identity.verificationBlock &&
     identityDocument.timestamp === identity.verificationBlockTimestamp &&
     (identity.migration !== 'legacy-production-anchor-v1' ||
       (identity.verificationBlock === SORA_LEGACY_IDENTITY_ANCHOR.block &&
-       identity.verificationBlockHash === SORA_LEGACY_IDENTITY_ANCHOR.hash &&
-       identity.verificationBlockTimestamp === SORA_LEGACY_IDENTITY_ANCHOR.timestamp));
-  const stateValid = state !== null && stateDocument !== null &&
+        identity.verificationBlockHash === SORA_LEGACY_IDENTITY_ANCHOR.hash &&
+        identity.verificationBlockTimestamp === SORA_LEGACY_IDENTITY_ANCHOR.timestamp));
+  const stateValid =
+    state !== null &&
+    stateDocument !== null &&
     stateDocument.data.block === state.lastIndexedBlock &&
     stateDocument.blockHeight === state.lastIndexedBlock &&
-    Number.isSafeInteger(stateDocument.timestamp) && Number(stateDocument.timestamp) > 0;
+    Number.isSafeInteger(stateDocument.timestamp) &&
+    Number(stateDocument.timestamp) > 0;
   const latestIndexedBlock = stateValid ? state.lastIndexedBlock : null;
   const latestIndexedAt = stateValid ? state.blockTimestamp : null;
   const latestIndexedBlockHash = stateValid ? state.blockHash : null;
-  const stateAge = latestIndexedAt === null
-    ? Number.POSITIVE_INFINITY
-    : Math.floor(Date.now() / 1000) - latestIndexedAt;
+  const stateAge =
+    latestIndexedAt === null
+      ? Number.POSITIVE_INFINITY
+      : Math.floor(Date.now() / 1_000) - latestIndexedAt;
+  const block = latestBlock?.items[0];
+  const blockCheckpointCoherent = state !== null && block !== undefined &&
+    block.collection === 'networkSnapshots' && block.id === `block-${state.lastIndexedBlock}` &&
+    block.blockHeight === state.lastIndexedBlock && block.timestamp === state.blockTimestamp &&
+    block.data.id === block.id && block.data.type === 'BLOCK' && block.data.timestamp === state.blockTimestamp;
   const checkpointCoherent =
+    blockCheckpointCoherent &&
     identityValid &&
     stateValid &&
     identity !== null &&
@@ -1734,6 +2083,7 @@ const healthResolver = async (_parent: unknown, _args: unknown, context: Context
 
   return {
     ok: readiness.ok && checkpointCoherent && checkpointFresh && workerCheckpointCoherent,
+    checkpointCoherent,
     repositoryReady: readiness.repositoryReady,
     service: 'polkaswap-indexer',
     serviceId: POLKASWAP_SERVICE_ID,
@@ -1787,6 +2137,62 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
     cache,
     config.graphqlMaxResultBytes ?? DEFAULT_GRAPHQL_QUERY_MAX_BYTES
   );
+  /** Reads a frozen finalized TS snapshot; coverage and rows deliberately bypass cache. */
+  const tonswapBurnSnapshotResolver = async (
+    parent: unknown,
+    args: { first?: number | null; after?: string | null; atBlock?: number | null; allowStale?: boolean | null },
+    context: Context
+  ) => {
+    // Coverage and the chain checkpoint commit atomically, but separate reads can
+    // straddle that commit. Retry once; never accept mismatched evidence.
+    const readProof = async () => {
+      const [health, coverageDocument] = await Promise.all([
+        // Campaign coverage has its own bounded proof/retry; do not reuse a
+        // previous attempt's frozen checkpoint when independently rechecking it.
+        healthResolver(parent, {}, { ...context }),
+        context.repository.get('updatesStreams', TONSWAP_COVERAGE_ID),
+      ]);
+      const coverage = parseTonswapBurnCoverage(coverageDocument);
+      const coherent = health.repositoryReady && health.checkpointCoherent && coverage !== null &&
+        coverage.indexedThroughBlock === health.latestIndexedBlock &&
+        coverage.blockHash === health.latestIndexedBlockHash &&
+        coverage.blockTimestamp === health.latestIndexedAt &&
+        coverage.blockTimestamp - Math.floor(Date.now() / 1_000) <= 15;
+      return { health, coverage, coherent };
+    };
+    let proof = await readProof();
+    if (!proof.coherent) proof = await readProof();
+    const { health, coverage } = proof;
+    const unavailable = () => new GraphQLError('Complete fresh finalized TONSWAP burn coverage is unavailable', {
+      extensions: { code: 'TONSWAP_COVERAGE_UNAVAILABLE' },
+    });
+    if (!proof.coherent || !coverage) throw unavailable();
+    const fresh = health.ok && health.workerLag !== null && health.workerLag <= 2 &&
+      coverage.indexedThroughBlock === health.workerLatestIndexedBlock &&
+      Math.floor(Date.now() / 1_000) - coverage.blockTimestamp <= 60;
+    // Historical display is opt-in; the default signing preflight still fails closed.
+    if (!fresh && args.allowStale !== true) throw unavailable();
+    const atBlock = args.atBlock ?? coverage.indexedThroughBlock;
+    if (!Number.isSafeInteger(atBlock) || atBlock < TONSWAP_START_BLOCK || atBlock > coverage.indexedThroughBlock ||
+      (args.after && args.atBlock === undefined)) throw badUserInput('A valid frozen campaign snapshot block is required');
+    // The compact ID index is bounded and stable. Page through it without a
+    // scan filter; only finalized TS rows within the frozen horizon are exposed.
+    // An empty TS page still advances over unrelated or ineligible Trust burns.
+    const page = await connectionResolver('xorBurns')(parent, {
+      first: args.first ?? 100, after: args.after, orderBy: ['ID_ASC'],
+    }, context);
+    return {
+      fresh,
+      genesisHash: coverage.genesisHash,
+      startBlock: TONSWAP_START_BLOCK,
+      indexedThroughBlock: atBlock,
+      checkpointBlock: coverage.indexedThroughBlock,
+      checkpointTimestamp: coverage.blockTimestamp,
+      nodes: page.nodes.filter((row) => row.campaign === 'tonswap' && !isExcludedTonswapBurnAccount(row.address) &&
+        Number(row.blockHeight) >= TONSWAP_START_BLOCK && Number(row.blockHeight) <= atBlock),
+      pageInfo: page.pageInfo,
+    };
+  };
   const documentResolver = createDocumentResolver(cache);
   const cachedExploreStatsResolver = (
     parent: unknown,
@@ -1815,6 +2221,7 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
       JSON: JSONScalar,
       Cursor: CursorScalar,
       OrderBy: OrderByScalar,
+      UInt32: UInt32Scalar,
       ...FilterScalars,
       Query: {
         _health: healthResolver,
@@ -1822,6 +2229,8 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
         account: documentResolver(collection('accounts')),
         assets: connectionResolver(collection('assets')),
         assetSnapshots: connectionResolver(collection('assetSnapshots')),
+        assetHourlyCoverage: (_parent: unknown, args: Parameters<typeof assetHourlyCoverage>[1], context: Context) =>
+          assetHourlyCoverage(context.repository, args),
         accountLiquiditySnapshots: connectionResolver(collection('accountLiquiditySnapshots')),
         market: documentResolver(collection('markets')),
         markets: connectionResolver(collection('markets')),
@@ -1835,6 +2244,7 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
         orderBookSnapshots: connectionResolver(collection('orderBookSnapshots')),
         historyElements: connectionResolver(collection('historyElements')),
         xorBurns: connectionResolver(collection('xorBurns')),
+        tonswapBurnSnapshot: tonswapBurnSnapshotResolver,
         referrerRewards: connectionResolver(collection('referrerRewards')),
         stakingStakers: connectionResolver(collection('stakingStakers')),
         stakingValidators: connectionResolver(collection('stakingValidators')),
@@ -1853,6 +2263,101 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
         calls: (parent: Record<string, unknown>) => ({
           nodes: Array.isArray(parent.calls) ? parent.calls : [],
         }),
+        networkFee: canonicalDecimalField('networkFee'),
+      },
+      Asset: {
+        ...canonicalDecimalFields(['priceUSD', 'supply', 'liquidity', 'liquidityBooks']),
+        ...canonicalDecimalFields(['volumeDayUSD', 'volumeWeekUSD']),
+      },
+      PoolXYK: {
+        ...canonicalDecimalFields([
+          'baseAssetReserves',
+          'targetAssetReserves',
+          'chameleonAssetReserves',
+          'priceUSD',
+          'strategicBonusApy',
+          'poolTokenSupply',
+          'poolTokenPriceUSD',
+          'liquidityUSD',
+        ]),
+      },
+      ReferrerReward: {
+        amount: canonicalDecimalField('amount'),
+      },
+      XorBurn: {
+        amount: canonicalDecimalField('amount'),
+      },
+      AccountPosition: {
+        ...canonicalDecimalFields([
+          'shares',
+          'yesShares',
+          'noShares',
+          'netCollateralPaid',
+          'costBasisUsd',
+          'yesCostBasisUsd',
+          'noCostBasisUsd',
+          'marketValueUsd',
+          'claimablePayoutUsd',
+        ]),
+        ...canonicalSignedDecimalFields(['realizedPnlUsd', 'unrealizedPnlUsd']),
+      },
+      AccountTrade: {
+        ...canonicalDecimalFields([
+          'collateralUsd',
+          'collateralAmountUsd',
+          'shares',
+          'sharesAmount',
+          'sharesIn',
+          'sharesOut',
+          'price',
+          'executionPrice',
+          'feeUsd',
+          'feeAmountUsd',
+        ]),
+        ...canonicalSignedDecimalFields(['realizedPnlUsd']),
+      },
+      Market: {
+        ...canonicalDecimalFields([
+          'creatorFees',
+          'liquidityUSD',
+          'volumeUSD',
+          'virtualDepth',
+          'dpmCollateral',
+          'realYesShares',
+          'realNoShares',
+          'collateral',
+          'yesShares',
+          'noShares',
+        ]),
+        probability: boundedCanonicalDecimalField('probability', '100'),
+        priceYes: boundedCanonicalDecimalField('priceYes', '1'),
+        priceNo: boundedCanonicalDecimalField('priceNo', '1'),
+      },
+      MarketSnapshot: {
+        ...canonicalDecimalFields([
+          'virtualDepth',
+          'dpmCollateral',
+          'realYesShares',
+          'realNoShares',
+          'collateral',
+          'yesShares',
+          'noShares',
+          'liquidityUSD',
+          'volumeUSD',
+        ]),
+        probability: boundedCanonicalDecimalField('probability', '100'),
+        priceYes: boundedCanonicalDecimalField('priceYes', '1'),
+        priceNo: boundedCanonicalDecimalField('priceNo', '1'),
+      },
+      PolkamarktSignals: {
+        totalVolumeUsd: canonicalDecimalField('totalVolumeUsd'),
+        liquidityUsd: canonicalDecimalField('liquidityUsd'),
+      },
+      PolkamarktSignalPoint: {
+        value: canonicalDecimalField('value'),
+      },
+      PolkamarktSignalAnswerBreakdown: {
+        volumeUsd: canonicalDecimalField('volumeUsd'),
       },
       Subscription: {
         updatesStreams: pollingSubscription(collection('updatesStreams')),

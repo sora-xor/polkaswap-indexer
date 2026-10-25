@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const config = {
   host: '0.0.0.0',
@@ -95,6 +95,10 @@ const loadWorkerModules = async () => {
 };
 
 describe('chain worker runtime configuration', () => {
+  afterEach(() => {
+    delete process.env.CHAIN_LEGACY_SORA_BLOCK_TYPES;
+  });
+
   it('fails closed when persisted progress is ahead of endpoint finality', async () => {
     const { ChainIndexer, MemoryRepository } = await loadWorkerModules();
     const indexer = new ChainIndexer(config, new MemoryRepository()) as unknown as {
@@ -216,5 +220,23 @@ describe('chain worker runtime configuration', () => {
       })
     );
   });
+
+  it.each(['', '2', 'truthy', 'null'])('fails closed for invalid legacy-codec boolean %j', async (value) => {
+    process.env.CHAIN_LEGACY_SORA_BLOCK_TYPES = value;
+    const { readConfig } = await import('../src/config.js');
+
+    expect(() => readConfig()).toThrow(
+      'CHAIN_LEGACY_SORA_BLOCK_TYPES must be one of true, false, 1, 0, yes, no, on, or off',
+    );
+  });
+
+  it.each(['true', 'TRUE', ' yes ', '1', 'on', 'false', 'FALSE', ' no ', '0', 'off'])(
+    'accepts strict legacy-codec boolean %j',
+    async (value) => {
+      process.env.CHAIN_LEGACY_SORA_BLOCK_TYPES = value;
+      const { readConfig } = await import('../src/config.js');
+      expect(() => readConfig()).not.toThrow();
+    },
+  );
 
 });

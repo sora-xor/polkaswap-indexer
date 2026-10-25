@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   assertValidIndexerDocument,
+  assertValidRepositoryQueryPositions,
   chunkIndexerDocumentJsonPayloads,
   indexerDocumentJsonBytes,
   MAX_DOCUMENT_DATA_DEPTH,
@@ -12,6 +13,32 @@ import {
 } from '../src/repository/validation.js';
 
 describe('persisted repository document validation', () => {
+  it.each(['blockHeight', 'timestamp'] as const)(
+    'preserves canonical payload %s strings only when they exactly match a numeric envelope', (field) => {
+      for (const value of [0, 26_309_250, Number.MAX_SAFE_INTEGER]) {
+        const candidate = { collection: 'referrerRewards', id: 'reward', [field]: value,
+          data: { id: 'reward', [field]: String(value) } };
+        const normalized = normalizeIndexerDocument(candidate);
+        expect(normalized[field]).toBe(value);
+        expect(normalized.data[field]).toBe(String(value));
+        expect(candidate.data[field]).toBe(String(value));
+        expect(normalizeIndexerDocument(normalized)).toEqual(normalized);
+      }
+      expect(() => normalizeIndexerDocument({ collection: 'referrerRewards', id: 'conflict',
+        [field]: 1, data: { [field]: '2' } })).toThrow(/conflicts with the canonical/);
+      for (const value of ['01', '1.0', '1e0', '+1', '-0', '-1', ' 1', '1 ', '9007199254740992', 'not-an-integer']) {
+        expect(() => normalizeIndexerDocument({ collection: 'referrerRewards', id: 'invalid',
+          [field]: 1, data: { [field]: value } })).toThrow(/expected a non-negative safe integer/);
+      }
+      for (const envelope of [{}, { [field]: null }, { [field]: undefined }]) {
+        expect(() => normalizeIndexerDocument({ collection: 'referrerRewards', id: 'missing-envelope',
+          ...envelope, data: { [field]: '1' } })).toThrow(/expected a non-negative safe integer/);
+      }
+      expect(() => normalizeIndexerDocument({ collection: 'referrerRewards', id: 'string-envelope',
+        [field]: '1', data: { [field]: '1' } })).toThrow(/expected a non-negative safe integer/);
+    }
+  );
+
   it('accepts bounded JSON data including nested arrays and null-prototype records', () => {
     const nested = Object.assign(Object.create(null) as Record<string, unknown>, {
       scalar: 'value',
@@ -82,6 +109,159 @@ describe('persisted repository document validation', () => {
         data: { id: 'pool', targetAssetReserves: '9'.repeat(257) },
       })
     ).toThrow(/indexed decimal/);
+  });
+
+  it('preserves only canonical runtime u32 Polkamarkt identifiers', () => {
+    for (const value of [0, 4_294_967_295, '4294967295']) {
+      expect(() =>
+        assertValidIndexerDocument({
+          collection: 'markets',
+          id: String(value),
+          data: {
+            id: String(value),
+            marketId: value,
+            conditionId: value,
+            closeBlock: value,
+          },
+        })
+      ).not.toThrow();
+      expect(() =>
+        assertValidRepositoryQueryPositions({
+          filter: { marketId: { equalTo: value } },
+        })
+      ).not.toThrow();
+    }
+
+    for (const value of [-1, -0, 1.5, 4_294_967_296, '4294967296', '01', '1.0']) {
+      expect(() =>
+        assertValidIndexerDocument({
+          collection: 'markets',
+          id: 'invalid-market',
+          data: { id: 'invalid-market', marketId: value },
+        })
+      ).toThrow(/runtime u32/);
+      expect(() =>
+        assertValidIndexerDocument({
+          collection: 'markets',
+          id: 'invalid-close-block',
+          data: { id: 'invalid-close-block', marketId: 1, closeBlock: value },
+        })
+      ).toThrow(/runtime u32/);
+      expect(() =>
+        assertValidRepositoryQueryPositions({
+          filter: { marketId: { equalTo: value } },
+        })
+      ).toThrow(/runtime u32/);
+    }
+    expect(() =>
+      assertValidRepositoryQueryPositions({
+        filter: { marketId: { in: [0, 4_294_967_296] } },
+      })
+    ).toThrow(/runtime u32/);
+    const marketIdKeyset = {
+      scope: 'a'.repeat(43),
+      field: 'marketId',
+      id: 'market-position',
+      direction: 'asc' as const,
+      numeric: true,
+    };
+    expect(() =>
+      assertValidRepositoryQueryPositions({
+        keyset: { ...marketIdKeyset, value: '4294967295' },
+      })
+    ).not.toThrow();
+    expect(() =>
+      assertValidRepositoryQueryPositions({
+        keyset: { ...marketIdKeyset, value: null },
+      })
+    ).not.toThrow();
+    expect(() =>
+      assertValidRepositoryQueryPositions({
+        keyset: { ...marketIdKeyset, value: '4294967296' },
+      })
+    ).toThrow(/runtime u32/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'historyElements',
+        id: 'invalid-nested-market',
+        data: { module: 'polkamarkt', data: { marketId: 4_294_967_296 } },
+      })
+    ).toThrow(/runtime u32/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'historyElements',
+        id: 'invalid-market-batch',
+        data: { calls: [{ module: 'polkamarkt', data: { marketIds: [0, 4_294_967_296] } }] },
+      })
+    ).toThrow(/runtime u32/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'historyElements',
+        id: 'duplicate-market-batch',
+        data: { module: 'polkamarkt', data: { marketIds: [1, 1] } },
+      })
+    ).toThrow(/duplicate/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'historyElements',
+        id: 'oversized-market-batch',
+        data: {
+          module: 'polkamarkt',
+          data: { marketIds: Array.from({ length: 25 }, (_, index) => index) },
+        },
+      })
+    ).toThrow(/between 1 and 24/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'accountTransactions',
+        id: 'missing-primary-market',
+        data: { id: 'missing-primary-market', module: 'polkamarkt', marketIds: [1, 2] },
+      })
+    ).toThrow(/first market/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'accountTransactions',
+        id: 'mismatched-primary-market',
+        data: {
+          id: 'mismatched-primary-market',
+          module: 'polkamarkt',
+          marketId: 2,
+          marketIds: [1, 2],
+        },
+      })
+    ).toThrow(/first market/);
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'accountTransactions',
+        id: 'matching-primary-market',
+        data: {
+          id: 'matching-primary-market',
+          module: 'polkamarkt',
+          marketId: 1,
+          marketIds: [1, 2],
+        },
+      })
+    ).not.toThrow();
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'historyElements',
+        id: 'unrelated-condition',
+        data: { module: 'otherPallet', data: { conditionId: 'external-condition' } },
+      })
+    ).not.toThrow();
+    expect(() =>
+      assertValidIndexerDocument({
+        collection: 'historyElements',
+        id: 'mixed-batch',
+        data: {
+          module: 'utility',
+          calls: [
+            { module: 'polkamarkt', data: { marketId: 4_294_967_295 } },
+            { module: 'otherPallet', data: { conditionId: 'external-condition' } },
+          ],
+        },
+      })
+    ).not.toThrow();
   });
 
   it('rejects non-scalar equality keys and deep-owns canonicalized data', () => {

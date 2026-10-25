@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import { getOrderField, NUMERIC_ORDER_FIELDS } from '../graphql/order.js';
 import { compareLexical } from '../lexical.js';
+import { finiteNumberToPlainDecimal } from '../decimal-number.js';
 import { assertValidDocumentId } from './validation.js';
 
 import type { IndexerCollection, RepositoryKeyset } from './types.js';
@@ -88,8 +89,9 @@ export const createRepositoryCursorScope = (
 export const normalizeRepositoryCursorValue = (value: unknown, numeric: boolean): string | null => {
   if (value === null || value === undefined) return null;
 
-  const text = String(value);
-  if (!numeric) return text;
+  if (!numeric) return String(value);
+  const text = typeof value === 'number' ? finiteNumberToPlainDecimal(value) : String(value);
+  if (text === null) return null;
 
   return DECIMAL_PATTERN.test(text.trim()) ? text.trim() : null;
 };

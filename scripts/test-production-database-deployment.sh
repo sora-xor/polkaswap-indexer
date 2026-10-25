@@ -67,6 +67,7 @@ run_migration() {
   local api_url="$2"
   local worker_url="$3"
   docker run --rm \
+    --no-healthcheck \
     --network "$NETWORK" \
     --volume "$CERTIFICATE_VOLUME:/certs:ro" \
     --env NODE_EXTRA_CA_CERTS=/certs/ca.crt \
@@ -83,6 +84,7 @@ run_migration_with_process_override() {
   local name="$1"
   local value="$2"
   docker run --rm \
+    --no-healthcheck \
     --network "$NETWORK" \
     --volume "$CERTIFICATE_VOLUME:/certs:ro" \
     --env NODE_EXTRA_CA_CERTS=/certs/ca.crt \

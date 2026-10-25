@@ -110,13 +110,14 @@ describe('repository cursor contract', () => {
     expect(normalizeRepositoryCursorValue('0', true)).toBe('0');
   });
 
-  it('accepts only bounded strings through the GraphQL Cursor scalar', () => {
+  it('accepts bounded strings and safe legacy integers through the GraphQL Cursor scalar', () => {
     const cursor = encodeRepositoryCursor(validKeyset);
     expect(CursorScalar.parseValue(cursor)).toBe(cursor);
     expect(CursorScalar.parseValue('')).toBe('');
     expect(CursorScalar.parseLiteral({ kind: Kind.STRING, value: cursor }, undefined)).toBe(cursor);
-    expect(() => CursorScalar.parseValue(123)).toThrow(/opaque string/);
+    expect(CursorScalar.parseValue(123)).toBe('123');
+    expect(() => CursorScalar.parseValue(-1)).toThrow(/non-negative safe integer/);
     expect(() => CursorScalar.parseValue('x'.repeat(MAX_REPOSITORY_CURSOR_LENGTH + 1))).toThrow(/at most/);
-    expect(() => CursorScalar.parseLiteral({ kind: Kind.INT, value: '1' }, undefined)).toThrow(/literal/);
+    expect(CursorScalar.parseLiteral({ kind: Kind.INT, value: '1' }, undefined)).toBe('1');
   });
 });

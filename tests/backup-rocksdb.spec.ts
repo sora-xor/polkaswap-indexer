@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { RocksDatabase, backups } from '@harperfast/rocksdb-js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { ROCKSDB_FORMAT_METADATA_KEY, ROCKSDB_FORMAT_VERSION } from '../src/repository/rocksdb.js';
+import { ROCKSDB_FORMAT_METADATA_KEY, ROCKSDB_FORMAT_VERSION, ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY } from '../src/repository/rocksdb.js';
 import { createRocksdbBackup } from '../src/scripts/backup-rocksdb.js';
 import {
   rocksdbBackupIntegrityManifestPath,
@@ -40,6 +40,7 @@ const startWriter = async (sourcePath: string): Promise<ChildProcessWithoutNullS
     import { RocksDatabase } from '@harperfast/rocksdb-js';
     const db = RocksDatabase.open(${JSON.stringify(sourcePath)});
     await db.put(['m', 'metadata', ${JSON.stringify(ROCKSDB_FORMAT_METADATA_KEY)}], ${ROCKSDB_FORMAT_VERSION});
+    await db.put(['m', 'metadata', ${JSON.stringify(ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY)}], { version: 1, status: 'ready' });
     await db.put(['d', 'assets', 'before'], { value: 1 });
     await db.put(['d', 'assets', 'after'], { value: 2 });
     process.stdout.write('ready\\n');
@@ -107,6 +108,7 @@ describe('RocksDB backup operation', () => {
     const backupDir = join(root, 'backups');
     const db = RocksDatabase.open(sourcePath);
     await db.put(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY], ROCKSDB_FORMAT_VERSION);
+    await db.put(['m', 'metadata', ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY], { version: 1, status: 'ready' });
     await db.put(['d', 'assets', 'sentinel'], true);
     db.close();
 
@@ -129,6 +131,7 @@ describe('RocksDB backup operation', () => {
     const secondRestore = join(root, 'second-restored.rocksdb');
     let db = RocksDatabase.open(sourcePath);
     await db.put(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY], ROCKSDB_FORMAT_VERSION);
+    await db.put(['m', 'metadata', ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY], { version: 1, status: 'ready' });
     await db.put(['d', 'assets', 'first'], 1);
     db.close();
     const firstId = await createRocksdbBackup(sourcePath, backupDir);
@@ -172,6 +175,7 @@ describe('RocksDB backup operation', () => {
     const sourcePath = join(root, 'live.rocksdb');
     const source = RocksDatabase.open(sourcePath);
     await source.put(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY], ROCKSDB_FORMAT_VERSION);
+    await source.put(['m', 'metadata', ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY], { version: 1, status: 'ready' });
     await source.put(['d', 'assets', 'sentinel'], true);
     source.close();
 
@@ -204,12 +208,14 @@ describe('RocksDB backup operation', () => {
     const formatOnly = join(root, 'format-only.rocksdb');
     const noDocuments = RocksDatabase.open(formatOnly);
     await noDocuments.put(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY], ROCKSDB_FORMAT_VERSION);
+    await noDocuments.put(['m', 'metadata', ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY], { version: 1, status: 'ready' });
     noDocuments.close();
     await expect(createRocksdbBackup(formatOnly, backupDir)).rejects.toThrow(/no indexed documents/);
 
     const unsupportedIndex = join(root, 'unsupported-index.rocksdb');
     const unsupported = RocksDatabase.open(unsupportedIndex);
     await unsupported.put(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY], ROCKSDB_FORMAT_VERSION);
+    await unsupported.put(['m', 'metadata', ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY], { version: 1, status: 'ready' });
     await unsupported.put(['d', 'assets', 'row'], true);
     await unsupported.put(['i', 'old-shape', 'assets', 'row'], true);
     unsupported.close();
@@ -221,6 +227,7 @@ describe('RocksDB backup operation', () => {
     const backupDir = join(root, 'backups');
     const db = RocksDatabase.open(sourcePath);
     await db.put(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY], ROCKSDB_FORMAT_VERSION);
+    await db.put(['m', 'metadata', ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY], { version: 1, status: 'ready' });
     await db.put(['m', 'metadata', 'postgresToRocksdbMigration'], incompleteMigrationState());
     await db.put(['d', 'assets', 'sentinel'], true);
     db.close();

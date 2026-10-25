@@ -170,11 +170,11 @@ describe('ChainIndexer lifecycle', () => {
       setLifecycle: (lifecycle: 'running', startupComplete: boolean) => void;
       startWorkerStatusHeartbeat: () => void;
       workerStatusWritePromise: Promise<void> | null;
-      chainIdentityPreflightComplete: boolean;
+      repositoryStatusWritesEnabled: boolean;
       stop: () => Promise<void>;
     };
 
-    indexer.chainIdentityPreflightComplete = true;
+    indexer.repositoryStatusWritesEnabled = true;
     indexer.setLifecycle('running', true);
     indexer.startWorkerStatusHeartbeat();
     await vi.advanceTimersByTimeAsync(WORKER_STATUS_HEARTBEAT_INTERVAL_MS);
@@ -229,9 +229,9 @@ describe('ChainIndexer lifecycle', () => {
         lastSuccessfulIndexTimestamp: number | null;
       };
     };
-    const before = Math.floor(Date.now() / 1_000);
     const blockHash = `0x${'4'.repeat(64)}`;
     indexer.observedGenesisHash = SORA_MAINNET_GENESIS_HASH;
+    const before = Math.floor(Date.now() / 1_000);
 
     await indexer.indexFetchedBlock({
       requestedHash: blockHash,
@@ -636,11 +636,11 @@ describe('ChainIndexer lifecycle', () => {
     repository.upsert = vi.fn(() => new Promise<void>(() => undefined));
     const shortConfig = { ...config, chainShutdownTimeoutMs: 25 };
     const indexer = new ChainIndexer(shortConfig, repository) as unknown as {
-      chainIdentityPreflightComplete: boolean;
+      repositoryStatusWritesEnabled: boolean;
       stop: () => Promise<void>;
       getStatus: () => { lifecycle: string };
     };
-    indexer.chainIdentityPreflightComplete = true;
+    indexer.repositoryStatusWritesEnabled = true;
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
     let stopped = false;

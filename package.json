@@ -9,7 +9,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/copy-runtime.mjs",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/src/index.js",
     "start:combined": "node dist/src/combined.js",
@@ -23,6 +23,8 @@
     "storage:migrate:postgres-to-rocksdb:dist": "node dist/src/scripts/migrate-postgres-to-rocksdb.js",
     "storage:verify:rocksdb": "tsx src/scripts/verify-rocksdb.ts",
     "storage:verify:rocksdb:dist": "node dist/src/scripts/verify-rocksdb.js",
+    "storage:repair:rocksdb-legacy-checkpoint": "tsx src/scripts/repair-rocksdb-legacy-checkpoint.ts",
+    "storage:repair:rocksdb-legacy-checkpoint:dist": "node dist/src/scripts/repair-rocksdb-legacy-checkpoint.js",
     "storage:backup:rocksdb": "tsx src/scripts/backup-rocksdb.ts",
     "storage:backup:rocksdb:dist": "node dist/src/scripts/backup-rocksdb.js",
     "storage:restore:rocksdb": "tsx src/scripts/restore-rocksdb.ts",
@@ -67,7 +69,7 @@
     "@types/node": "^24.13.3",
     "@types/pg": "^8.23.1",
     "@types/ws": "^8.18.2",
-    "tsx": "^4.23.15",
+    "tsx": "4.23.15",
     "typescript": "~5.9.3",
     "vitest": "4.1.12"
   }

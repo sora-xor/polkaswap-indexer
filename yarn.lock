@@ -2160,7 +2160,7 @@ __metadata:
     graphql-ws: "npm:6.4.1"
     graphql-yoga: "npm:^5.24.6"
     pg: "npm:^8.23.1"
-    tsx: "npm:^4.23.15"
+    tsx: "npm:4.23.15"
     typescript: "npm:~5.9.3"
     vitest: "npm:4.1.12"
     ws: "npm:8.22.0"
@@ -2400,7 +2400,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"tsx@npm:^4.23.15":
+"tsx@npm:4.23.15":
   version: 4.23.15
   resolution: "tsx@npm:4.23.15"
   dependencies:

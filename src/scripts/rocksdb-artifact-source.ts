@@ -3,6 +3,8 @@ import { lstat } from 'node:fs/promises';
 import {
   ROCKSDB_FORMAT_METADATA_KEY,
   ROCKSDB_FORMAT_VERSION,
+  ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY,
+  rocksSwapAssetIndexIsReady,
 } from '../repository/rocksdb.js';
 import {
   assertServeablePostgresRocksdbMigrationState,
@@ -34,6 +36,9 @@ export const assertCurrentRocksdbArtifactSource = (db: RocksReadView, sourcePath
     throw new Error(
       `RocksDB artifact source ${sourcePath} has unsupported format ${String(formatVersion)}; expected ${ROCKSDB_FORMAT_VERSION}`
     );
+  }
+  if (!rocksSwapAssetIndexIsReady(db.getSync(['m', 'metadata', ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY]))) {
+    throw new Error(`RocksDB artifact source ${sourcePath} has an incomplete or malformed swap-asset index`);
   }
   for (const _entry of db.getRange({ start: ['i'], end: ['i', Buffer.from([0xff])], limit: 1, values: false })) {
     throw new Error(`RocksDB artifact source ${sourcePath} contains unsupported index namespace keys`);

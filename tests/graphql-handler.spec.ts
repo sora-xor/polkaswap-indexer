@@ -345,8 +345,7 @@ describe('production GraphQL handler', () => {
       '{ assets(first: 1, offset: 99999, orderBy: [ID_ASC]) { nodes { id } } }'
     );
     expect(exactOffsetBoundary.response.status).toBe(200);
-    expect(exactOffsetBoundary.body.errors?.[0]?.message).toContain('Unknown argument "offset"');
-    expect(exactOffsetBoundary.body.errors?.[0]?.extensions?.code).toBe('GRAPHQL_VALIDATION_FAILED');
+    expect(exactOffsetBoundary.body.errors).toBeUndefined();
   });
 
   it('bounds connection documents during execution before final result serialization', async () => {

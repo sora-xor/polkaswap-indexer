@@ -1,18 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { readConfig } from '../src/config.js';
 import { ChainIndexer } from '../src/worker/chain.js';
 import { MemoryRepository } from '../src/repository/memory.js';
 import { SORA_LEGACY_IDENTITY_ANCHOR } from '../src/soraIdentity.js';
 
 const config = {
-  ...readConfig(),
   host: '0.0.0.0',
   port: 4350,
   graphqlPath: '/graphql',
   databaseUrl: '',
   soraWsEndpoint: 'wss://primary.sora.invalid',
-  archiveSoraWsEndpoint: '',
+  soraArchiveWsEndpoint: null,
   chainStartBlock: 0,
   chainBatchSize: 25,
   stateRefreshIntervalBlocks: 250,

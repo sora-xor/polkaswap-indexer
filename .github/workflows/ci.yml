@@ -148,6 +148,19 @@ jobs:
           docker run --rm --entrypoint node polkaswap-indexer:ci -e \
             "const {createRequire}=await import('node:module');const require=createRequire(import.meta.url);for(const name of ['@graphql-tools/schema','@harperfast/rocksdb-js','@polkadot/api','graphql','graphql-ws','graphql-yoga','pg','ws'])require.resolve(name);for(const name of ['tsx','typescript','vitest','@sora-substrate/type-definitions']){let found=true;try{require.resolve(name)}catch{found=false}if(found)throw new Error('prohibited dependency shipped: '+name)}"
 
+      - name: Verify reviewed schemas in production container
+        run: |
+          docker run --rm -i --network none --entrypoint node polkaswap-indexer:ci --input-type=module <<'JS'
+          import { readFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          const provenance = JSON.parse(readFileSync('dist/src/runtime/provenance.json'));
+          for (const [key, file] of [['legacy', 'sora-legacy-types.json'], ['mobile', 'sora-mobile-types.json']]) {
+            const digest = createHash('sha256').update(readFileSync('dist/src/runtime/' + file)).digest('hex');
+            if (digest !== provenance[key].sha256) throw new Error('Unreviewed runtime schema: ' + file);
+          }
+          await import('./dist/src/server.js');
+          JS
+
       - name: Verify native RocksDB runtime in production container
         run: >-
           docker run --rm --entrypoint node polkaswap-indexer:ci -e
