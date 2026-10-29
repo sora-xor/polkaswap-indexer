@@ -3,6 +3,41 @@ import { describe, expect, it } from 'vitest';
 import { validatePublicConnectionQuery } from '../src/graphql/query-policy.js';
 import { createPinnedWalletHistoryFilter } from './pinned-wallet-history-fixture.js';
 
+describe('public query scalar and range boundaries', () => {
+  it('rejects a collection with no registered public policy', () => {
+    expect(() => validatePublicConnectionQuery('unknown' as any, ['ID_ASC'], {})).toThrow(/No public query policy/);
+  });
+  it.each([NaN, Infinity, Symbol('invalid'), () => 'invalid'])('rejects nonfinite or nonscalar identifier %s', value => {
+    expect(() => validatePublicConnectionQuery('assets', ['ID_ASC'], { id: { eq: value } })).toThrow(/finite scalar/);
+  });
+  it.each([null, { equalTo: null }, {}, { in: 'alice' }])('rejects an unbounded account predicate %j', value => {
+    expect(() => validatePublicConnectionQuery('accountPositions', ['TIMESTAMP_DESC'], { account: value })).toThrow();
+  });
+  it.each([10, { eq: 10 }, { equalTo: 10 }, { gte: 10, lte: 20 }, { gt: 10, lt: 20 }])('admits a bounded global snapshot range %j', timestamp => {
+    expect(() => validatePublicConnectionQuery('assetSnapshots', ['TIMESTAMP_DESC'], { timestamp })).not.toThrow();
+    expect(() => validatePublicConnectionQuery('assetSnapshots', ['TIMESTAMP_DESC'], { or: [{ timestamp }] })).not.toThrow();
+  });
+  it.each([{ gt: 10 }, { lt: 20 }, { in: [10, 20] }])('rejects a global snapshot range without both bounds %j', timestamp => {
+    expect(() => validatePublicConnectionQuery('assetSnapshots', ['TIMESTAMP_DESC'], { timestamp })).toThrow(/bounded public storage plan/);
+  });
+  it('admits a bounded range split across conjunctions', () => {
+    expect(() => validatePublicConnectionQuery('networkSnapshots', ['TIMESTAMP_DESC'], { and: [{ timestamp: { gt: 10 } }, { timestamp: { lt: 20 } }] })).not.toThrow();
+  });
+  it.each(['accountPositions', 'marketSnapshots'] as const)('requires a filter for unbounded %s timestamp order', collection => {
+    expect(() => validatePublicConnectionQuery(collection, ['TIMESTAMP_ASC'], {})).toThrow(/requires an indexed public filter/);
+    expect(() => validatePublicConnectionQuery(collection, ['TIMESTAMP_ASC'], { and: [] })).toThrow(/requires an indexed public filter/);
+  });
+  it.each([
+    ['accountTrades', { account: { in: ['alice', 'bob'] } }],
+    ['orderBookOrders', { accountId: { in: ['alice', 'bob'] } }],
+    ['orderBooks', { status: { eq: 'Trade' } }],
+    ['poolXYKs', { baseAssetReserves: { in: [1, 2] }, targetAssetReserves: { gt: 0 } }],
+  ])('rejects %s without its required indexed anchor', (collection, filter) => {
+    const order = collection === 'orderBooks' || collection === 'poolXYKs' ? 'ID_ASC' : 'TIMESTAMP_DESC';
+    expect(() => validatePublicConnectionQuery(collection as any, [order], filter as any)).toThrow(/bounded public storage plan/);
+  });
+});
+
 describe('public GraphQL repository query policy', () => {
   it('admits the shipped Polkaswap Swap History filter and singleton logical wrappers', () => {
     // PolkaswapHistoryElements from the published frontend's Swap History tab.

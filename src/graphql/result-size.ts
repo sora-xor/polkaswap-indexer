@@ -1,3 +1,4 @@
+import { isBigIntObject, isBooleanObject, isNumberObject, isStringObject } from 'node:util/types';
 import { GraphQLError } from 'graphql';
 
 import type { ExecutionResult } from 'graphql';
@@ -44,7 +45,7 @@ const escapedJsonStringBytes = (value: string, maximumBytes: number): number => 
 
 const prepareJsonValue = (input: unknown, key: string): PreparedJsonValue => {
   let value = input;
-  if ((typeof value === 'object' && value !== null) || typeof value === 'bigint') {
+  if ((typeof value === 'object' && value !== null) || typeof value === 'function' || typeof value === 'bigint') {
     const toJSON = (value as { toJSON?: unknown }).toJSON;
     if (typeof toJSON === 'function') value = toJSON.call(value, key);
   }
@@ -56,10 +57,12 @@ const prepareJsonValue = (input: unknown, key: string): PreparedJsonValue => {
   if (typeof value === 'bigint') throw new TypeError('BigInt cannot be serialized as JSON');
   if (value === undefined || typeof value === 'function' || typeof value === 'symbol') return { kind: 'omit' };
 
-  if (value instanceof String) return { kind: 'string', value: value.valueOf() };
-  if (value instanceof Number) return { kind: 'number', value: value.valueOf() };
-  if (value instanceof Boolean) return { kind: 'boolean', value: value.valueOf() };
-  if (Object.getPrototypeOf(value) === BigInt.prototype) {
+  // JSON uses internal primitive slots, not instanceof/prototype identity.
+  // Number and String boxes then apply their normal primitive-conversion hooks.
+  if (isStringObject(value)) return { kind: 'string', value: String(value) };
+  if (isNumberObject(value)) return { kind: 'number', value: +(value as unknown as number) };
+  if (isBooleanObject(value)) return { kind: 'boolean', value: Boolean.prototype.valueOf.call(value) };
+  if (isBigIntObject(value)) {
     throw new TypeError('BigInt cannot be serialized as JSON');
   }
   return { kind: 'object', value: value as object };

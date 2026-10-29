@@ -98,6 +98,13 @@ SOLSWAP burn campaign history used by the burn page stats:
 yarn seed:swap-chart
 ```
 
+Run `yarn test:coverage` with `POSTGRES_TEST_DATABASE_URL` pointing at a disposable
+test database to include the PostgreSQL integration tests. The command and CI
+enforce at least 90.01% line, statement, function, and branch coverage over all `src/**/*.ts` production files,
+including unimported worker and CLI entry points; only TypeScript declarations
+are excluded. Reports are written to `coverage/index.html`,
+`coverage/coverage-summary.json`, and `coverage/lcov.info`.
+
 The UI should point `POLKASWAP_INDEXER_ENDPOINT` at the hosted GraphQL URL:
 `https://pi.soramitsu.io/graphql`.
 

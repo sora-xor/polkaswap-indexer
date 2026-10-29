@@ -136,8 +136,8 @@ jobs:
       - name: Build
         run: yarn build
 
-      - name: Test
-        run: yarn test
+      - name: Test and enforce production coverage above 90% in all metrics
+        run: yarn test:coverage
         env:
           POSTGRES_TEST_DATABASE_URL: postgres://polkaswap:polkaswap@127.0.0.1:5432/polkaswap_indexer_test
 

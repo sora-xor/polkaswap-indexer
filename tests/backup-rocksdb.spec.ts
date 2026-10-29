@@ -77,6 +77,8 @@ describe('RocksDB backup operation', () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  // Child-process startup plus native backup/restore and checksum passes need
+  // the same I/O budget as the multi-source test below.
   it('rejects a live writer, then checksum-verifies and restores every committed row offline', async () => {
     const sourcePath = join(root, 'live.rocksdb');
     const backupDir = join(root, 'backups');
@@ -101,7 +103,7 @@ describe('RocksDB backup operation', () => {
     } finally {
       restored.close();
     }
-  });
+  }, 15_000);
 
   it('detects a forged SHA-256 receipt even when native CRC verification still passes', async () => {
     const sourcePath = join(root, 'source.rocksdb');

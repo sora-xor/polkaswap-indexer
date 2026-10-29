@@ -7,6 +7,7 @@ export type AbuseLimitResult = {
 };
 
 type Bucket = { count: number; resetAt: number };
+type ClientExpiry = { client: string; resetAt: number };
 
 export type AbuseLimiterOptions = {
   windowMs: number;
@@ -19,8 +20,10 @@ export type AbuseLimiterOptions = {
 /** In-process fixed-window limiter with bounded identity state and a global backstop. */
 export class AbuseLimiter {
   private readonly clients = new Map<string, Bucket>();
+  // One heap entry per tracked client, bounded by maxKeys. A heap also handles
+  // wall-clock adjustments without assuming creation order is expiry order.
+  private readonly expirations: ClientExpiry[] = [];
   private global: Bucket = { count: 0, resetAt: 0 };
-  private lastCleanup = 0;
 
   constructor(private readonly options: AbuseLimiterOptions) {}
 
@@ -53,6 +56,7 @@ export class AbuseLimiter {
       }
       bucket = { count: 0, resetAt: now + this.options.windowMs };
       this.clients.set(client, bucket);
+      this.trackExpiry({ client, resetAt: bucket.resetAt });
     }
     bucket.count += 1;
     return {
@@ -68,12 +72,37 @@ export class AbuseLimiter {
     return this.clients.size;
   }
 
+  private trackExpiry(expiry: ClientExpiry): void {
+    let index = this.expirations.length;
+    this.expirations.push(expiry);
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      const parentExpiry = this.expirations[parent]!;
+      if (parentExpiry.resetAt <= expiry.resetAt) break;
+      this.expirations[index] = parentExpiry;
+      index = parent;
+    }
+    this.expirations[index] = expiry;
+  }
+
   private cleanup(now: number): void {
-    const interval = Math.max(1_000, Math.min(this.options.windowMs, 10_000));
-    if (now - this.lastCleanup < interval) return;
-    this.lastCleanup = now;
-    for (const [key, bucket] of this.clients) {
-      if (bucket.resetAt <= now) this.clients.delete(key);
+    // Remove only expired clients: staggered expirations must not cause a full
+    // map scan on every request, including requests rejected by the global cap.
+    while (this.expirations.length > 0 && this.expirations[0]!.resetAt <= now) {
+      this.clients.delete(this.expirations[0]!.client);
+      const last = this.expirations.pop()!;
+      if (this.expirations.length === 0) break;
+
+      let index = 0;
+      while (index * 2 + 1 < this.expirations.length) {
+        let child = index * 2 + 1;
+        if (child + 1 < this.expirations.length &&
+            this.expirations[child + 1]!.resetAt < this.expirations[child]!.resetAt) child += 1;
+        if (last.resetAt <= this.expirations[child]!.resetAt) break;
+        this.expirations[index] = this.expirations[child]!;
+        index = child;
+      }
+      this.expirations[index] = last;
     }
   }
 }
