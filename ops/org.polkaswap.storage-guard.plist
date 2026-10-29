@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.polkaswap.storage-guard</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>/Library/PolkaswapStorage/host-storage-guard.py</string>
+		<string>run</string>
+		<string>--config</string>
+		<string>/Library/PolkaswapStorage/config.json</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Library/PolkaswapStorage/guard.log</string>
+	<key>StandardOutPath</key>
+	<string>/Library/PolkaswapStorage/guard.log</string>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>UserName</key>
+	<string>root</string>
+</dict>
+</plist>

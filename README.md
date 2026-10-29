@@ -338,15 +338,19 @@ to `25` so stats aggregates stay close to finalized block progress. Between
 refreshes, clean storage domains reuse their last RPC result while event-dirty
 domains are reloaded at the next projection; a full
 reconciliation defaults to every `250` blocks and is configurable with
-`CHAIN_STATE_FULL_RECONCILIATION_INTERVAL_BLOCKS`.
+`CHAIN_STATE_FULL_RECONCILIATION_INTERVAL_BLOCKS`. XYK swaps emit no
+`poolXYK` event, so `technical.SwapSuccess` and liquidity-proxy swap events or
+calls dirty Pool XYK reserves. A projection pinned below a later dirty block
+reloads the domain again at the next refresh.
 
 Backfill and finalized catch-up value each block from its exact parent-block
 asset metadata and Pool XYK reserves. The initial archive state is consumed in
 256-entry pages under one retained-byte ceiling; later blocks point-read only
 canonical assets and both possible pool-key orientations touched by successful
-events/calls. Ambiguous runtime mutations fail closed to a bounded full reload,
-and valuation advances only after the block documents and `chainState` commit
-atomically. Historical order-book USD stock cannot be reconstructed from pool
+events/calls. Ambiguous runtime mutations fail closed to a bounded full reload.
+That includes every block with XYK swap evidence, because swap events do not
+name a multi-hop route's pools. Valuation advances only after the block
+documents and `chainState` commit atomically. Historical order-book USD stock cannot be reconstructed from pool
 state alone, so `liquidityUSD`, `orderBookLiquidityUSD`, and
 `activeOrderBooks` are `null` until a pinned full projection has recomputed raw
 orders at the same height. The worker never substitutes a misleading zero.
@@ -875,3 +879,10 @@ The approved OVH MOF2 node (`51.161.218.175`, `wss://mof2.sora.org`) uses
 both canonical state and blocks. The durable MOF Pi worker uses this archive for
 both configured chain endpoints, including after catch-up. Recovery stays
 isolated from public routing until its data and API checks pass.
+
+### Pi host capacity safeguards
+
+The production host runs a five-minute capacity and explicit-retirement guard,
+maintenance free-space preflights, and supervised log rotation. See
+[host storage safeguards](docs/host-storage-safeguards.md) for thresholds,
+protected backups, alert delivery, validation, and release/rollback procedures.

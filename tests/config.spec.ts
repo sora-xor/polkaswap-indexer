@@ -8,6 +8,8 @@ import {
 } from '../src/config.js';
 
 const CONFIG_ENV_KEYS = [
+  'SORA_RECOVERY_POLICY_FILE',
+  'SORA_RECOVERY_POLICY_SHA256',
   'NODE_ENV',
   'CHAIN_HOURLY_REPAIR_FILE',
   'CHAIN_HOURLY_REPAIR_SHA256',
@@ -129,6 +131,7 @@ describe('runtime configuration', () => {
 
   it('uses documented development defaults when environment variables are absent', () => {
     expect(readConfig()).toEqual({
+      burnRecoveryPolicy: null,
       host: '0.0.0.0',
       port: 4350,
       graphqlPath: '/graphql',
@@ -425,6 +428,7 @@ describe('runtime configuration', () => {
     });
 
     expect(readConfig()).toEqual({
+      burnRecoveryPolicy: null,
       host: '127.0.0.1',
       port: 4444,
       graphqlPath: '/alt-graphql',

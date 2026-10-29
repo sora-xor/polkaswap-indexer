@@ -9,6 +9,7 @@ import {
   selectHourlyHistoryTargets, validateHourlyHistoryTargets,
   type AssetHourlyCloseInput, type HourlyBoundaryBlock, type HourlyHistoryTarget,
 } from '../src/worker/hourly-history.js';
+import { pinnedValuationStorage } from './pinned-valuation-storage.js';
 
 const SCALE = 10n ** 18n;
 const XOR = HOURLY_HISTORY_ASSETS[0]!.id;
@@ -406,7 +407,11 @@ function collector(snapshotRetentionMode: 'all' | 'rolling' = 'all') {
   internal.observedGenesisHash = HOURLY_HISTORY_GENESIS;
   internal.api = { genesisHash: { toString: () => HOURLY_HISTORY_GENESIS } };
   internal.previousHourlyHistoryBlock = { ...before };
-  internal.getHistoricalValuationQueryAt = vi.fn(async () => ({ denomination: { denominator: async () => ({ toString: () => input().denominator }) } }));
+  internal.getHistoricalValuationQueryAt = vi.fn(async () => ({
+    // The close reads metadata and reserves from the pinned `before` state, which matches `state` here.
+    ...pinnedValuationStorage(() => state),
+    denomination: { denominator: async () => ({ toString: () => input().denominator }) },
+  }));
   internal.prepareHistoricalValuationAdvance = vi.fn(async () => ({ blockHeight: after.height, assets: [], pools: [] }));
   const source = input();
   const state = {

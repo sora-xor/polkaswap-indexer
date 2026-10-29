@@ -128,6 +128,9 @@ export const ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY = 'historySwapAssetIndex';
 const SWAP_ASSET_INDEX_CODE = 's-a-t';
 const SWAP_ASSET_INDEX_BATCH_DOCUMENTS = 256;
 const SWAP_ASSET_INDEX_BATCH_BYTES = 8 * 1024 * 1024;
+const BURN_OWNER_INDEX_CODE = 'c-i';
+const BURN_OWNER_INDEX_BATCH_DOCUMENTS = 256;
+const BURN_OWNER_INDEX_BATCH_BYTES = 8 * 1024 * 1024;
 type SwapAssetIndexState = { version: 1; status: 'ready' } |
   { version: 1; status: 'building'; afterId: string | null };
 const NUMERIC_LENGTH_WIDTH = 4;
@@ -233,6 +236,7 @@ const COMPACT_ID_EQUALITY_INDEX_MANIFEST: Partial<
   referrerRewards: [{ code: 'r-i', field: 'referrer' }],
   stakingValidators: [{ code: 'a-i', field: 'address' }],
   vaults: [{ code: 'o-i', field: 'ownerId' }],
+  xorBurns: [{ code: BURN_OWNER_INDEX_CODE, field: 'claimOwner' }],
 };
 
 const COMPACT_EQUALITY_FIELDS = new Set(
@@ -1508,7 +1512,74 @@ export class RocksRepository implements IndexerRepository {
       });
     }
     await this.prepareHistorySwapAssetIndex();
+    await this.prepareBurnOwnerIndex();
     this.prepared = true;
+  }
+
+  /** Re-derive before every writable open: older format-2 writers do not maintain this index. */
+  private async prepareBurnOwnerIndex(): Promise<void> {
+    const prefix = compactIndexPrefix('xorBurns', BURN_OWNER_INDEX_CODE, []);
+    if (!this.readOnly) {
+      // Queries/writes remain fenced by prepared=false. Each deletion batch is
+      // bounded, and an interrupted open restarts this derived-only operation.
+      let removed: number;
+      do {
+        if (this.closing) throw new Error('RocksDB burn-owner index preparation stopped during close');
+        removed = 0;
+        await this.db.transaction(async (transaction) => {
+          removed = 0;
+          for await (const entry of transaction.getRange(rangeForPrefix(prefix, {
+            limit: BURN_OWNER_INDEX_BATCH_DOCUMENTS,
+          }))) {
+            await transaction.remove(entry.key);
+            removed += 1;
+          }
+        });
+      } while (removed !== 0);
+    }
+
+    let afterId: string | null = null;
+    let complete = false;
+    while (!complete) {
+      if (this.closing) throw new Error('RocksDB burn-owner index preparation stopped during close');
+      const options = rangeForPrefix(['d', 'xorBurns'], {
+        limit: BURN_OWNER_INDEX_BATCH_DOCUMENTS,
+        ...(afterId !== null ? { start: documentKey('xorBurns', afterId), exclusiveStart: true } : {}),
+      });
+      // Retry callbacks derive the same bounded page, without advancing the
+      // outer cursor until the transaction has committed.
+      let nextId: string | null = null;
+      const preparePage = async (view: Pick<RocksDatabase, 'getRange' | 'getSync'>,
+        put?: (key: RocksKey) => Promise<unknown>): Promise<void> => {
+        nextId = null;
+        let retainedBytes = 0;
+        for await (const entry of view.getRange(options)) {
+          if (this.closing) throw new Error('RocksDB burn-owner index preparation stopped during close');
+          const identity = documentIdentityFromKey(entry?.key);
+          if (!identity || identity.collection !== 'xorBurns') throw new Error('Malformed burn-owner document key');
+          const document = decodeStoredDocument(identity.collection, identity.id, entry?.value);
+          if (!document) throw new Error(`Missing burn-owner document ${identity.id}`);
+          const keys = compactDocumentIndexKeys(document);
+          for (const key of keys) {
+            if (put) await put(key);
+            else if (view.getSync(key) !== 1) {
+              throw new Error('RocksDB burn-owner index is incomplete; complete writable prepare() before read-only use');
+            }
+          }
+          nextId = identity.id;
+          retainedBytes += estimateRetainedValueBytes(document, BURN_OWNER_INDEX_BATCH_BYTES);
+          retainedBytes += estimateRetainedValueBytes(keys, BURN_OWNER_INDEX_BATCH_BYTES);
+          if (retainedBytes >= BURN_OWNER_INDEX_BATCH_BYTES) break;
+        }
+      };
+      if (this.readOnly) await preparePage(this.db);
+      else await this.db.transaction(async (transaction) => {
+        await preparePage(transaction, (key) => transaction.put(key, 1));
+      });
+      complete = nextId === null;
+      afterId = nextId;
+    }
+    if (!this.readOnly) await this.db.flush();
   }
 
   /** Batches derive keys and advance their resume position in the same native transaction. */

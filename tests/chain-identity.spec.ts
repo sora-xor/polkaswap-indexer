@@ -25,7 +25,7 @@ const config = {
 const hash = (byte: string): string => `0x${byte.repeat(64)}`;
 const FINALIZED_HASH = hash('a');
 const CHECKPOINT_HASH = hash('b');
-const FINALIZED_BLOCK = 30_000_000;
+const FINALIZED_BLOCK = 28_191_817;
 const FINALIZED_TIMESTAMP = 2_000_000_000;
 const STATE_BLOCK = SORA_LEGACY_IDENTITY_ANCHOR.block + 100;
 const STATE_HASH = hash('c');

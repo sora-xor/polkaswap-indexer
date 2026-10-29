@@ -1,3 +1,6 @@
+import { admitPointBlock, initializePointsRecovery, pointAccount, pointBlockDocuments, pointValuation, referralPointDocuments, POINTS_REFERRAL_PREFIX, POINTS_RECOVERY_ID } from '../points-recovery.js';
+import { decodeRecoveryBlock, RECOVERY_EVENTS_KEY, RECOVERY_TIMESTAMP_KEY } from '../recovery-metadata.js';
+import { RECOVERY_CHECKPOINT, resolveBurnOwner, validateBurnRecoveryPolicy } from '../burn-recovery.js';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
@@ -418,6 +421,8 @@ type HistoricalValuationPool = {
 type HistoricalValuationState = {
   /** Storage state at this block, used as pre-state for the next block. */
   blockHeight: number;
+  /** Actual historical query hash; recovery never admits a height-only cache. */
+  blockHash?: string;
   assets: Map<string, AssetInfo>;
   pools: Map<string, HistoricalValuationPool>;
   prices: Map<string, bigint>;
@@ -434,6 +439,7 @@ type HistoricalValuationTouches = {
 
 type HistoricalValuationAdvance = {
   blockHeight: number;
+  blockHash?: string;
   replacement?: HistoricalValuationState;
   assets: Array<{ id: string; value: AssetInfo | null }>;
   pools: Array<{ id: string; value: HistoricalValuationPool | null }>;
@@ -658,15 +664,8 @@ const soraArchiveTypesBundle = {
   },
 };
 const PSWAP = '0x0200050000000000000000000000000000000000000000000000000000000000';
-const DAI = '0x0200060000000000000000000000000000000000000000000000000000000000';
-const XSTUSD = '0x0200080000000000000000000000000000000000000000000000000000000000';
-const KUSD = '0x02000c0000000000000000000000000000000000000000000000000000000000';
-const STABLE_ASSET_IDS = new Set([DAI, XSTUSD, KUSD]);
-// Keep shallow pools from becoming global price oracles and inflating Explore TVL.
-const MIN_PRICE_DISCOVERY_LIQUIDITY_USD = 100n * SCALE;
-// Require meaningful natural depth on the asset being priced. Sub-0.5 token pools
-// are too easy to skew, even when the stable side happens to exceed $100.
-const MIN_PRICE_DISCOVERY_AMOUNT = SCALE / 2n;
+// Price discovery constants (stable anchors, liquidity gate and dust floors) live with
+// deriveAssetPrices in ./hourly-history.ts.
 const ASSET_PRICE_OUTLIER_RATIO = 20n;
 const ASSET_PRICE_OUTLIER_NEIGHBOR_WINDOW_SECONDS = 30 * 86_400;
 const ASSET_PRICE_OUTLIER_MIN_NEIGHBORS = 3;
@@ -1342,18 +1341,6 @@ const isXorBurnCall = (call: IndexedCall): boolean => {
   return firstString(args, ['assetId', 'asset_id', 'arg0']) === XOR;
 };
 
-const getBatchAllNexusRecipient = (context: BlockExtrinsicContext): string | undefined => {
-  if (context.module !== 'utility' || context.method !== 'batchAll' || context.calls.length !== 2) return undefined;
-
-  const [burnCall, remarkCall] = context.calls;
-  if (!burnCall || !remarkCall || !isXorBurnCall(burnCall) || remarkCall.module !== 'system' || remarkCall.method !== 'remark') {
-    return undefined;
-  }
-
-  const remarkArgs = getCallArgs(remarkCall);
-  return parseSoraNexusRecipient(remarkArgs.remark ?? remarkArgs.arg0);
-};
-
 /** Recognizes only an atomic XOR burn followed by the exact TS marker. */
 const getTonswapCampaign = (module: string, method: string, calls: IndexedCall[]): 'tonswap' | undefined => {
   const [burn, remark] = calls;
@@ -1361,55 +1348,6 @@ const getTonswapCampaign = (module: string, method: string, calls: IndexedCall[]
     !burn || !isXorBurnCall(burn) || remark?.module !== 'system' || remark.method !== 'remark') return undefined;
   const args = getCallArgs(remark);
   return isTonswapBurnRemark(args.remark ?? args.arg0) ? 'tonswap' : undefined;
-};
-
-/**
- * Emits compact XOR burn documents so the burn page does not need an expensive historyElements scan.
- */
-const createXorBurnDocuments = (
-  context: BlockExtrinsicContext,
-  blockHeight: number,
-  timestamp: number,
-  assets: Map<string, AssetInfo>
-): IndexerDocument[] => {
-  const createDocument = (id: string, address: string, amount: string, nexusRecipient?: string): IndexerDocument => ({
-    collection: collection('xorBurns'),
-    id,
-    blockHeight,
-    timestamp,
-    data: {
-      id,
-      address,
-      amount,
-      assetId: XOR,
-      blockHeight,
-      timestamp,
-      txHash: context.id,
-      ...(context.extrinsicIndex === undefined ? {} : { extrinsicIndex: context.extrinsicIndex }),
-      ...(getTonswapCampaign(context.module, context.method, context.calls) ? { campaign: 'tonswap' } : {}),
-      ...(nexusRecipient ? { nexusRecipient } : {}),
-    },
-  });
-
-  if (context.module === 'assets' && context.method === 'burn') {
-    const data = context.history.data as Record<string, unknown>;
-    if (String(data.assetId ?? data.asset_id ?? '') !== XOR || !data.amount) return [];
-
-    return [createDocument(context.id, context.address || context.history.from, String(data.amount))];
-  }
-
-  if (context.module !== 'utility' || (context.method !== 'batchAll' && context.method !== 'batch')) return [];
-
-  const nexusRecipient = getBatchAllNexusRecipient(context);
-  const burnCalls = context.calls.filter(isXorBurnCall);
-
-  return burnCalls.map((call, index) => {
-    const args = getCallArgs(call);
-    const amount = codecToDecimalString(args.amount ?? args.arg1 ?? '0', assets.get(XOR)?.decimals ?? DECIMALS);
-    const id = burnCalls.length === 1 ? context.id : `${context.id}-${index}`;
-
-    return createDocument(id, context.address || context.history.from, amount, nexusRecipient);
-  });
 };
 
 const getEventExtrinsicIndex = (record: EventRecord): number | null => {
@@ -1452,7 +1390,16 @@ const getExtrinsicNexusRecipient = (extrinsic: { method: { section: string; meth
   return parseSoraNexusRecipient(remarkArgs.remark ?? remarkArgs.arg0);
 };
 
-const createXorBurnDocumentsFromEvents = (
+/** A recognized marker in any unsupported wrapper must not silently become an SS burn. */
+const containsBurnAssociationMarker = (value: unknown, depth = 0): boolean => {
+  if (depth > 32) throw new Error('Burn association nesting exceeds the reviewed limit');
+  if (typeof value === 'string') return isTonswapBurnRemark(value) || parseSoraNexusRecipient(value) !== undefined;
+  if (!value || typeof value !== 'object') return false;
+  return Object.values(value).some((item) => containsBurnAssociationMarker(item, depth + 1));
+};
+
+export const createXorBurnDocumentsFromEvents = (
+  blockHash: string,
   blockHeight: number,
   timestamp: number | null,
   signedBlock: { block: { extrinsics: Array<{ hash?: { toString?: () => string }; method: { section: string; method: string; args?: unknown[] } }> } },
@@ -1460,19 +1407,30 @@ const createXorBurnDocumentsFromEvents = (
   assets: Map<string, AssetInfo>
 ): IndexerDocument[] => {
   const extrinsics = signedBlock.block.extrinsics;
-  const burnCountsByTx = new Map<string, number>();
+  if (!isNonzeroCanonicalSubstrateHash(blockHash.toLowerCase())) throw new Error('Burn receipt requires a canonical block hash');
+  const counts = new Map<number, number>();
+  for (const record of events) {
+    const burn = getXorBurnEvent(record, assets);
+    if (burn?.extrinsicIndex !== null && burn?.extrinsicIndex !== undefined) {
+      counts.set(burn.extrinsicIndex, (counts.get(burn.extrinsicIndex) ?? 0) + 1);
+    }
+  }
 
-  return events.flatMap((record) => {
+  return events.flatMap((record, eventIndex) => {
     const burn = getXorBurnEvent(record, assets);
     if (!burn) return [];
 
     const extrinsic = burn.extrinsicIndex === null ? undefined : extrinsics[burn.extrinsicIndex];
     const txHash = extrinsic?.hash?.toString?.();
-    const baseId = txHash || `${blockHeight}-${burn.extrinsicIndex ?? 'event'}`;
-    const txBurnCount = burnCountsByTx.get(baseId) ?? 0;
-    burnCountsByTx.set(baseId, txBurnCount + 1);
-    const id = txBurnCount === 0 ? baseId : `${baseId}-${txBurnCount}`;
+    const id = `${blockHash.toLowerCase()}:${eventIndex}`;
+    const campaign = extrinsic && getTonswapCampaign(extrinsic.method.section, extrinsic.method.method, getUtilityCalls(extrinsic));
     const nexusRecipient = extrinsic ? getExtrinsicNexusRecipient(extrinsic) : undefined;
+    if (extrinsic && !campaign && !nexusRecipient && containsBurnAssociationMarker(normalizeCallArgs(extrinsic.method))) {
+      throw new Error('Ambiguous burn campaign or recipient association');
+    }
+    if ((campaign || nexusRecipient) && (burn.extrinsicIndex === null || counts.get(burn.extrinsicIndex) !== 1)) {
+      throw new Error('Ambiguous burn campaign or recipient association');
+    }
 
     return [
       {
@@ -1482,6 +1440,11 @@ const createXorBurnDocumentsFromEvents = (
         timestamp,
         data: {
           id,
+          receiptId: id,
+          blockHash: blockHash.toLowerCase(),
+          eventIndex,
+          originalAddress: burn.address,
+          claimOwner: burn.address,
           address: burn.address,
           amount: burn.amount,
           assetId: XOR,
@@ -1489,8 +1452,7 @@ const createXorBurnDocumentsFromEvents = (
           ...(timestamp === null ? {} : { timestamp }),
           ...(txHash ? { txHash } : {}),
           ...(burn.extrinsicIndex === null ? {} : { extrinsicIndex: burn.extrinsicIndex }),
-          ...(extrinsic && getTonswapCampaign(extrinsic.method.section, extrinsic.method.method, getUtilityCalls(extrinsic))
-            ? { campaign: 'tonswap' } : {}),
+          ...(campaign ? { campaign } : {}),
           ...(nexusRecipient ? { nexusRecipient } : {}),
         },
       },
@@ -2649,6 +2611,8 @@ export class ChainIndexer {
   private activeDerivedStorageLoadBudget: DerivedStorageRetainedLoadBudget | null = null;
   private readonly dirtyDerivedStorageDomains = new Set<DerivedStorageDomain>(DERIVED_STORAGE_DOMAINS);
   private readonly derivedStorageDomainGenerations = new Map<DerivedStorageDomain, number>();
+  /** Highest indexed block whose events dirtied each domain. */
+  private readonly derivedStorageDomainDirtyThrough = new Map<DerivedStorageDomain, number>();
   private lastDerivedStorageReconciliationBlock: number | null = null;
   private chartSnapshotRetentionQueue: Promise<void> = Promise.resolve();
   private projectionRefreshQueue: Promise<void> = Promise.resolve();
@@ -2956,8 +2920,17 @@ export class ChainIndexer {
       }
       const finalizedBlock = await this.getFinalizedBlock(api, 'chain');
       if (this.isStopping()) return;
+      if (finalizedBlock > RECOVERY_CHECKPOINT.block && !this.config.burnRecoveryPolicy) {
+        throw new Error('Post-checkpoint indexing requires a pinned recovery fork policy');
+      }
 
-      if (supportsIdentityPreflight) await this.ensureChainIdentity(finalizedBlock);
+      if (supportsIdentityPreflight) {
+        await this.ensureChainIdentity(finalizedBlock);
+        await this.ensureRecoveryBurnIdentity(finalizedBlock);
+        if (this.config.burnRecoveryPolicy) await initializePointsRecovery(this.repository, this.config.burnRecoveryPolicy, this.config.chainStartBlock);
+      } else if (this.config.burnRecoveryPolicy) {
+        throw new Error('Recovery indexing requires full chain identity verification');
+      }
       if (this.isStopping()) return;
       this.repositoryStatusWritesEnabled = true;
       this.startWorkerStatusHeartbeat();
@@ -3195,6 +3168,14 @@ export class ChainIndexer {
     if (observed !== SORA_LEGACY_IDENTITY_ANCHOR.hash) {
       throw new Error(`${label} does not contain the reviewed SORA mainnet history anchor`);
     }
+    const policy = this.config.burnRecoveryPolicy;
+    if (policy) {
+      validateBurnRecoveryPolicy(policy);
+      for (const identity of [policy.checkpoint, policy.postForkAnchor]) {
+        const hash = (await withTimeout(api.rpc.chain.getBlockHash(identity.block), `${label}.recoveryAnchor(${identity.block})`)).toString().toLowerCase();
+        if (hash !== identity.hash) throw new Error(`${label} does not contain the pinned recovery fork anchor`);
+      }
+    }
     if (requireTimestamp) {
       const timestamp = await this.fetchBlockTimestamp(observed, api);
       if (timestamp !== SORA_LEGACY_IDENTITY_ANCHOR.timestamp) {
@@ -3274,11 +3255,11 @@ export class ChainIndexer {
   private async repositoryContainsOnlyChainIdentity(): Promise<boolean> {
     for (const name of ALL_INDEXER_COLLECTIONS) {
       const documents = this.repository.query
-        ? (await this.repository.query(name, { first: 3, includeTotalCount: false })).items
+        ? (await this.repository.query(name, { first: 5, includeTotalCount: false })).items
         : await this.repository.list(name);
       if (documents.some((document) =>
         document.collection !== 'updatesStreams' ||
-        (document.id !== CHAIN_IDENTITY_ID && document.id !== WORKER_STATUS_DOCUMENT_ID)
+        ![CHAIN_IDENTITY_ID, WORKER_STATUS_DOCUMENT_ID, 'burnRecoveryIdentity-v1', 'xorBurnEventReceipts-v2', POINTS_RECOVERY_ID].includes(document.id)
       )) return false;
     }
     return true;
@@ -3413,6 +3394,48 @@ export class ChainIndexer {
       return;
     }
     await this.verifyChainStateDocument(state, finalizedBlock);
+  }
+
+  /** Existing materialized histories cannot be relabelled onto a new fork or receipt schema. */
+  private async ensureRecoveryBurnIdentity(finalizedBlock: number): Promise<void> {
+    const schemaId = 'xorBurnEventReceipts-v2';
+    const schema = await this.repository.get('updatesStreams', schemaId);
+    if (!schema) {
+      const existing = this.repository.query
+        ? (await this.repository.query('xorBurns', { first: 1, includeTotalCount: false })).items
+        : await this.repository.list('xorBurns');
+      if (existing.length) throw new Error('Legacy burn receipts require an isolated event-derived rebuild');
+    } else if (schema.data.data !== 'blockHash:eventIndex') {
+      throw new Error('Unsupported burn receipt schema');
+    }
+    const id = 'burnRecoveryIdentity-v1';
+    const stored = await this.repository.get('updatesStreams', id);
+    const policy = this.config.burnRecoveryPolicy;
+    if (policy) {
+      if (finalizedBlock < policy.postForkAnchor.block) throw new Error('Recovery fork anchor is not finalized');
+      const encoded = JSON.stringify(policy);
+      if (stored && stored.data.data !== encoded) throw new Error('Recovery database policy mismatch');
+      if (!stored) {
+        if (!(await this.repositoryContainsOnlyChainIdentity())) throw new Error('Recovery requires an isolated empty database, not a rewound checkpoint');
+        await this.repository.upsert({ collection: 'updatesStreams', id, blockHeight: policy.postForkAnchor.block, timestamp: null,
+          data: { id, block: policy.postForkAnchor.block, data: encoded } });
+      }
+    } else if (stored) {
+      throw new Error('Recovery database cannot start without its pinned policy');
+    }
+    if (!schema) await this.repository.upsert({ collection: 'updatesStreams', id: schemaId, blockHeight: 0, timestamp: null,
+      data: { id: schemaId, block: 0, data: 'blockHash:eventIndex' } });
+  }
+
+  /** Apply only mutable claim ownership; the source address and event identity remain evidence. */
+  private recoveryBurnDocuments(documents: IndexerDocument[]): IndexerDocument[] {
+    const policy = this.config.burnRecoveryPolicy;
+    if (!policy) return documents;
+    return documents.map((document) => {
+      const owner = resolveBurnOwner(String(document.data.address), policy);
+      return { ...document, data: { ...document.data, claimOwner: owner.claimOwner, recoveryPolicyHash: policy.policyHash,
+        claimStatus: owner.extinguished ? 'extinguished' : owner.replaced && document.data.nexusRecipient ? 'recipient-confirmation-required' : 'reserved' } };
+    });
   }
 
   private async ensureChainIdentity(finalizedBlock: number): Promise<void> {
@@ -4464,9 +4487,9 @@ export class ChainIndexer {
       const blocks = Array.from({ length: batchEnd - block + 1 }, (_, index) => block + index);
       const fetched = await mapWithConcurrency(blocks, XOR_BURN_BACKFILL_RPC_CONCURRENCY,
         (height) => this.fetchBlockByNumber(height, runRpc));
-      const documents = fetched.flatMap((data, index) => createXorBurnDocumentsFromEvents(
-        blocks[index], data.timestamp, data.signedBlock, data.events, this.assetInfos
-      ));
+      const documents = this.recoveryBurnDocuments(fetched.flatMap((data, index) => createXorBurnDocumentsFromEvents(
+        data.requestedHash, blocks[index], data.timestamp, data.signedBlock, data.events, this.assetInfos
+      )));
       const last = fetched[fetched.length - 1];
       documents.push(createTonswapBurnCoverage(batchEnd, last.requestedHash.toLowerCase(), last.timestamp));
       if (this.isStopping()) return;
@@ -4512,13 +4535,14 @@ export class ChainIndexer {
       const documents = burnBlockIndexes.flatMap((index) => {
         const fetchedBlock = fetchedBlocks[index];
 
-        return createXorBurnDocumentsFromEvents(
+        return this.recoveryBurnDocuments(createXorBurnDocumentsFromEvents(
+          fetchedBlock.requestedHash,
           blocks[index],
           null,
           fetchedBlock.signedBlock,
           fetchedBlock.events,
           this.assetInfos
-        );
+        ));
       });
 
       documents.push(this.createXorBurnBackfillStateDocument(batchEnd));
@@ -5219,6 +5243,27 @@ export class ChainIndexer {
   ): Promise<FetchedBlockPayload> {
     const runRpc: RpcExecutor =
       executeRpc ?? ((createRequest, label) => this.withRpcTimeout(createRequest, label));
+    const policy = this.config.burnRecoveryPolicy;
+    if (policy) {
+      const header = await runRpc(() => blockApi.rpc.chain.getHeader(hash), `recovery.chain.getHeader(${hash})`);
+      const height = header.number.toNumber();
+      if (height >= policy.metadata[0].firstBlock) {
+        const parent = header.parentHash.toHex();
+        const [metadata, rawBlock, rawEvents, rawTimestamp] = await Promise.all([
+          runRpc(() => blockApi.rpc.state.getMetadata.raw(parent), `recovery.metadata(${parent})`),
+          runRpc(() => blockApi.rpc.chain.getBlock.raw(hash), `recovery.rawBlock(${hash})`),
+          runRpc(() => blockApi.rpc.state.getStorage.raw(RECOVERY_EVENTS_KEY, hash), `recovery.rawEvents(${hash})`),
+          runRpc(() => blockApi.rpc.state.getStorage.raw(RECOVERY_TIMESTAMP_KEY, hash), `recovery.rawTimestamp(${hash})`),
+        ]);
+        const decoded = decodeRecoveryBlock(policy, hash, height, String(metadata), rawBlock, String(rawEvents), String(rawTimestamp));
+        return {
+          fetchedBlock: { requestedHash: hash, signedBlock: decoded.signedBlock,
+            events: Array.from(decoded.events) as unknown as EventRecord[], timestamp: Math.floor(Number(decoded.timestampMilliseconds) / 1000) },
+          blockHex: decoded.signedBlock.block.toHex(), eventsHex: decoded.events.toHex(),
+          timestampMilliseconds: decoded.timestampMilliseconds,
+        };
+      }
+    }
     const canFetchApiAt = typeof (blockApi as unknown as { at?: unknown }).at === 'function';
     if (!canFetchApiAt) {
       const [signedBlock, eventsCodec, timestamp] = await Promise.all([
@@ -5516,10 +5561,13 @@ export class ChainIndexer {
 
     const eventsByExtrinsic = groupEventsByExtrinsic(events);
     const blockHeight = signedBlock.block.header.number.toNumber();
+    if (blockHeight > RECOVERY_CHECKPOINT.block && !this.config.burnRecoveryPolicy) {
+      throw new Error('Post-checkpoint indexing requires the pinned recovery policy');
+    }
     const blockHash = signedBlock.block.header.hash.toString();
     const canonicalBlockHash = blockHash.toLowerCase();
     if (
-      (this.observedGenesisHash || this.enforceFinalizedIdentity) &&
+      (this.observedGenesisHash || this.enforceFinalizedIdentity || this.config.burnRecoveryPolicy) &&
       (!isNonzeroCanonicalSubstrateHash(canonicalBlockHash) || canonicalBlockHash !== requestedHash)
     ) {
       throw new Error(`SORA block data endpoint returned a block that does not match requested hash ${requestedHash}`);
@@ -5533,6 +5581,16 @@ export class ChainIndexer {
         `Historical valuation state at block ${historicalValuationState.blockHeight} cannot value SORA block ${blockHeight}`
       );
     }
+    if (this.config.burnRecoveryPolicy && !historicalValuationState) {
+      throw new Error('Soratopia recovery requires historical valuation inputs; live-cache fallback is forbidden');
+    }
+    const recoveryValuation = this.config.burnRecoveryPolicy && historicalValuationState
+      ? pointValuation(historicalValuationState, blockHeight, signedBlock.block.header.parentHash.toString().toLowerCase())
+      : null;
+    const pointPrevious = this.config.burnRecoveryPolicy
+      ? await admitPointBlock(this.repository, this.config.burnRecoveryPolicy, blockHeight, canonicalBlockHash,
+          signedBlock.block.header.parentHash.toString().toLowerCase())
+      : null;
     const valuationAssets = historicalValuationState?.assets ?? this.assetInfos;
     const valuationPrices = historicalValuationState?.prices ?? this.prices;
     const valuationLiquidityStats =
@@ -5631,19 +5689,21 @@ export class ChainIndexer {
           historicalValuationState,
           blockHeight,
           extrinsicContexts,
-          events
+          events,
+          canonicalBlockHash
         )
       : null;
     if (this.isStopping()) return;
-    const existingAccountMeta = await this.repository.getMany(collection('accountMeta'), [...touchedAccounts]);
+    const existingAccountMeta = await this.loadPointDocuments([...touchedAccounts], blockHeight);
     const orderBookLiquidityComplete =
       historicalValuationState?.orderBookLiquidityComplete ?? true;
+
+    documents.push(...this.recoveryBurnDocuments(createXorBurnDocumentsFromEvents(canonicalBlockHash, blockHeight, timestamp, signedBlock, events, valuationAssets)));
 
     for (const context of extrinsicContexts) {
       const historyDocument = this.createHistoryElementDocument(context, blockHeight, timestamp, blockHash);
       documents.push(historyDocument);
       documents.push(...this.createAccountTransactionDocuments(context, blockHeight, timestamp, historyDocument));
-      if (!context.failed) documents.push(...createXorBurnDocuments(context, blockHeight, timestamp, valuationAssets));
       context.accounts.forEach((account) => latestHistoryByAccount.set(account, context.id));
       this.applyAccountPointUpdates(
         context.accounts,
@@ -5676,7 +5736,8 @@ export class ChainIndexer {
       ...this.createFinalAccountDocuments([...touchedAccounts], latestHistoryByAccount, blockHeight, timestamp, accountPointData)
     );
 
-    const newAccountCount = [...touchedAccounts].filter((account) => !existingAccountMeta.has(account)).length;
+    const newAccountCount = new Set([...touchedAccounts].map((account) => pointAccount(account, this.config.burnRecoveryPolicy, blockHeight))
+      .filter((key): key is string => key !== null && !existingAccountMeta.has(key))).size;
 
     const networkBlockDocument: IndexerDocument = {
       collection: collection('networkSnapshots'),
@@ -5749,6 +5810,22 @@ export class ChainIndexer {
     // its checkpoint. Keep that set in one validated backend transaction: an
     // oversized block must fail before any document is written, because
     // chunking would make a crash retry double-apply those totals.
+    if (pointPrevious && this.config.burnRecoveryPolicy) preparedDocuments.push(...await referralPointDocuments(
+      this.repository, this.config.burnRecoveryPolicy, blockHeight, timestamp,
+      events.filter(({ event }) => event.section === 'xorFee' && event.method === 'ReferrerRewarded').map(({ event }) => {
+        const data = eventData(event);
+        return { referral: firstString(data, ['referral', 'who', 'arg0']), referrer: firstString(data, ['referrer', 'arg1']),
+          amount: String(data.amount ?? data.arg2) };
+      })
+    ));
+    if (pointPrevious && this.config.burnRecoveryPolicy && recoveryValuation) preparedDocuments.push(...pointBlockDocuments(
+      this.config.burnRecoveryPolicy, pointPrevious, blockHeight, canonicalBlockHash,
+      canonicalCodecHex(signedBlock.block, 'Soratopia block'),
+      events.map((event) => canonicalCodecHex(event, 'Soratopia event')),
+      preparedDocuments.filter((row) => row.collection === 'accountMeta' || row.collection === 'accountPointSystems' ||
+        (row.collection === 'updatesStreams' && row.id.startsWith(POINTS_REFERRAL_PREFIX))),
+      recoveryValuation
+    ));
     await this.repository.upsertMany(preparedDocuments);
     if (preparedHourlyTargets) this.hourlyHistoryTargets = preparedHourlyTargets;
     this.previousHourlyHistoryBlock = { height: blockHeight, hash: blockHash, timestamp };
@@ -5770,7 +5847,7 @@ export class ChainIndexer {
       }
     }
     if (this.isStopping()) return;
-    this.markDerivedStorageDomainsDirtyFromBlock(extrinsicContexts, events);
+    this.markDerivedStorageDomainsDirtyFromBlock(extrinsicContexts, events, blockHeight);
 
     if ((options.refreshDerivedState ?? true) && shouldRefreshPolkamarktState) {
       this.requestPolkamarktStateRefresh(blockHeight, timestamp, true);
@@ -5853,20 +5930,28 @@ export class ChainIndexer {
     if (before.height !== state.blockHeight || before.hash !== parentHash) throw new Error('Hourly history pre-state identity mismatch');
     if (Math.floor(timestamp / HOUR_SECONDS) <= Math.floor(before.timestamp / HOUR_SECONDS)) return { documents: [], targets: null };
     const catalogue = await this.readHourlyHistoryTargets();
-    const pools = [...state.pools.values()];
-    const targets = selectHourlyHistoryTargets(state.assets, pools, catalogue.targets);
-    const query = await this.getHistoricalValuationQueryAt(before.height);
+    const query = this.config.burnRecoveryPolicy
+      ? await this.getHistoricalValuationQueryAt(before.height, before.hash)
+      : await this.getHistoricalValuationQueryAt(before.height);
     const denominator = await this.readPinnedSnapshotDenominator(
       query, `denomination.denominator(${before.height}) for hourly close`
     );
     if (!denominator) throw new Error('Hourly history requires the exact historical denomination');
+    // closeEvidence asserts the exact `before` state, so read its metadata and every pool
+    // from that pinned query. The incremental valuation state infers each block's
+    // mutations from events and must not be the evidence. One read per completed hour.
+    const pinned = await this.withDerivedStorageLoadBudget(() => this.readPinnedValuationStorage(query));
+    this.recordHourlyClosePoolDrift(state, pinned.pools, before.height);
+    const { assets } = pinned;
+    const pools = [...pinned.pools.values()];
+    const targets = selectHourlyHistoryTargets(assets, pools, catalogue.targets);
     const previous = await this.repository.getMany('assetSnapshots', targets.map(({ id }) => assetHourlyCloseId(id, before!.timestamp)));
     const priceRoutes = new Map<string, HourlyPoolReserves[]>();
-    const prices = deriveAssetPrices(state.assets, pools, priceRoutes);
+    const prices = deriveAssetPrices(assets, pools, priceRoutes);
     const documents = buildAssetHourlyCloseDocumentsAtBoundary({
       before,
       after: { height, hash: header.hash.toString(), timestamp },
-      genesisHash, denominator, assets: state.assets, prices,
+      genesisHash, denominator, assets, prices,
       pools, priceRoutes, previous, xorPoolsComplete: true, targets,
     });
     if (!catalogue.stored || !isDeepStrictEqual(catalogue.stored.data.targets, targets)) {
@@ -5877,6 +5962,30 @@ export class ChainIndexer {
       });
     }
     return { documents, targets };
+  }
+
+  /**
+   * Counts pools whose pinned close reserves differ from the incremental valuation
+   * state at the same block. Nonzero drift means a pool mutation was not attributed.
+   */
+  private recordHourlyClosePoolDrift(
+    state: HistoricalValuationState,
+    pinned: ReadonlyMap<string, HistoricalValuationPool>,
+    blockHeight: number
+  ): void {
+    const incremental = new Map([...state.pools.values()].map((pool) =>
+      [this.historicalPoolKey(pool.baseAssetId, pool.targetAssetId), pool] as const));
+    let drift = 0;
+    for (const [key, pool] of pinned) {
+      const current = incremental.get(key);
+      if (current?.baseAssetReserves !== pool.baseAssetReserves || current.targetAssetReserves !== pool.targetAssetReserves) {
+        drift += 1;
+      }
+    }
+    for (const key of incremental.keys()) if (!pinned.has(key)) drift += 1;
+    if (!drift) return;
+    metrics.increment('indexer_worker_hourly_close_pool_drift_total', {}, drift);
+    console.warn(`Hourly close at SORA block ${blockHeight}: ${drift} pool(s) differed from the incremental valuation state`);
   }
 
   private mergeDerivedStateRefreshRequests(
@@ -6587,10 +6696,16 @@ export class ChainIndexer {
         ? ['assetSupply']
         : [];
     }
-    // xorFee and liquidityProxy orchestrate other pallets; the underlying
-    // assets/balances/pool/order-book events below identify actual storage
-    // mutations without invalidating unrelated domains on every paid swap.
-    if (normalizedPallet === 'xorfee' || normalizedPallet === 'liquidityproxy') return [];
+    // XYK swaps emit no poolXYK event: every pool hop emits technical.SwapSuccess,
+    // and proxy swaps add Exchange, BatchSwapExecuted or XorlessTransfer. None of
+    // them names a multi-hop route's intermediate pools, so they dirty all reserves.
+    // Order-book fills emit their own orderBook events. xorFee only orchestrates;
+    // its remint swaps are XYK hops covered by technical.SwapSuccess.
+    if (normalizedPallet === 'technical') return ['poolReserves'];
+    if (normalizedPallet === 'liquidityproxy') {
+      return /(exchange|swap|xorless)/.test(normalizedMethod) ? ['poolReserves'] : [];
+    }
+    if (normalizedPallet === 'xorfee') return [];
     if (normalizedPallet === 'poolxyk') {
       if (/(exchange|swap|reserve)/.test(normalizedMethod)) return ['poolReserves'];
       if (/(deposit|withdraw|liquidity|provider)/.test(normalizedMethod)) {
@@ -6619,10 +6734,13 @@ export class ChainIndexer {
     return [];
   }
 
-  private markDerivedStorageDomainsDirty(domains: Iterable<DerivedStorageDomain>): void {
+  private markDerivedStorageDomainsDirty(domains: Iterable<DerivedStorageDomain>, blockHeight?: number): void {
     for (const domain of new Set(domains)) {
       this.derivedStorageDomainGenerations.set(domain, (this.derivedStorageDomainGenerations.get(domain) ?? 0) + 1);
       this.dirtyDerivedStorageDomains.add(domain);
+      if (blockHeight !== undefined && blockHeight > (this.derivedStorageDomainDirtyThrough.get(domain) ?? -1)) {
+        this.derivedStorageDomainDirtyThrough.set(domain, blockHeight);
+      }
       this.derivedStorageCacheMetrics.dirtyMarks += 1;
       metrics.increment('indexer_worker_derived_storage_dirty_marks_total', { domain });
     }
@@ -6632,7 +6750,8 @@ export class ChainIndexer {
 
   private markDerivedStorageDomainsDirtyFromBlock(
     contexts: BlockExtrinsicContext[],
-    events: EventRecord[]
+    events: EventRecord[],
+    blockHeight?: number
   ): void {
     const domains = new Set<DerivedStorageDomain>();
     const addPallet = (pallet: string, method: string): void => {
@@ -6648,7 +6767,7 @@ export class ChainIndexer {
     // runtime hooks can mutate indexed storage without an outer signed call.
     for (const { event } of events) addPallet(event.section, event.method);
 
-    this.markDerivedStorageDomainsDirty(domains);
+    this.markDerivedStorageDomainsDirty(domains, blockHeight);
   }
 
   private shouldFullyReconcileDerivedStorage(blockHeight: number): boolean {
@@ -6804,6 +6923,12 @@ export class ChainIndexer {
         (!currentCache || currentCache.blockHeight <= blockHeight)
       ) {
         this.cacheDerivedStorageValue(domain, blockHeight, generation, value);
+        // A refresh can start after later blocks were indexed, so its generation
+        // already includes their marks. Its pinned value is exact only for its own
+        // block; keep the domain dirty until a load reaches the latest mark.
+        if ((this.derivedStorageDomainDirtyThrough.get(domain) ?? -1) > blockHeight) {
+          this.dirtyDerivedStorageDomains.add(domain);
+        }
       } else if (this.derivedStorageCache.get(domain)?.generation !== currentGeneration) {
         // A newer block dirtied the domain while the RPC was in flight. The
         // caller may finish its older-block refresh with this value, but it
@@ -7016,7 +7141,9 @@ export class ChainIndexer {
     });
   }
 
-  private async getHistoricalValuationQueryAt(blockHeight: number, expectedHash?: string): Promise<any> {
+  private async getHistoricalValuationQueryAt(
+    blockHeight: number, expectedHash?: string, observeHash?: (hash: string) => void
+  ): Promise<any> {
     const blockApi = await this.getBlockDataApi();
     const chain = (blockApi as unknown as { rpc?: { chain?: Record<string, unknown> } }).rpc?.chain;
     const getBlockHash = chain?.getBlockHash;
@@ -7031,6 +7158,9 @@ export class ChainIndexer {
     if (!hashText || /^0x0+$/.test(hashText)) {
       throw new Error(`No SORA block hash is available for historical valuation at block ${blockHeight}`);
     }
+    if (this.config.burnRecoveryPolicy && !isNonzeroCanonicalSubstrateHash(hashText)) {
+      throw new Error('Soratopia recovery historical valuation requires a canonical block hash');
+    }
     if (expectedHash !== undefined) {
       const primaryHash = (await this.withRpcTimeout(
         () => this.api!.rpc.chain.getBlockHash(blockHeight),
@@ -7041,9 +7171,9 @@ export class ChainIndexer {
       }
     }
 
-    return (
-      await this.fetchApiAtFrom(blockApi, hashText, `historical valuation block ${blockHeight}`)
-    ).query as any;
+    const query = (await this.fetchApiAtFrom(blockApi, hashText, `historical valuation block ${blockHeight}`)).query;
+    observeHash?.(hashText);
+    return query as any;
   }
 
   private historicalPoolKey(baseAssetId: string, targetAssetId: string): string {
@@ -7138,41 +7268,50 @@ export class ChainIndexer {
     );
   }
 
+  /** Reads every asset metadata and Pool XYK reserve entry from one pinned historical query. */
+  private async readPinnedValuationStorage(query: any): Promise<Pick<HistoricalValuationState, 'assets' | 'pools'>> {
+    const assets = new Map<string, AssetInfo>();
+    await this.consumeStorageEntriesPaged(
+      query.assets?.assetInfosV2,
+      'assets.assetInfosV2',
+      [],
+      ([key, value]) => {
+        const id = canonicalSoraAssetId(key.args[0]);
+        if (!id) throw new Error('Historical asset metadata storage key is missing a canonical asset id');
+        const asset = this.parseHistoricalAssetInfo(id, value);
+        if (asset) assets.set(id, asset);
+        return { id, asset };
+      }
+    );
+    const pools = new Map<string, HistoricalValuationPool>();
+    await this.consumeStorageEntriesPaged(
+      query.poolXYK?.reserves,
+      'poolXYK.reserves',
+      [],
+      ([key, value]) => {
+        const pool = this.parseHistoricalPool(key.args[0], key.args[1], value);
+        if (pool) pools.set(this.historicalPoolKey(pool.baseAssetId, pool.targetAssetId), pool);
+        return pool;
+      }
+    );
+    return { assets, pools };
+  }
+
   private async loadHistoricalValuationBaseline(
     blockHeight: number,
     reason = 'baseline',
     expectedHash?: string,
   ): Promise<HistoricalValuationState> {
     return this.withDerivedStorageLoadBudget(async () => {
-      const query = await this.getHistoricalValuationQueryAt(blockHeight, expectedHash);
-      const assets = new Map<string, AssetInfo>();
-      await this.consumeStorageEntriesPaged(
-        query.assets?.assetInfosV2,
-        'assets.assetInfosV2',
-        [],
-        ([key, value]) => {
-          const id = canonicalSoraAssetId(key.args[0]);
-          if (!id) throw new Error('Historical asset metadata storage key is missing a canonical asset id');
-          const asset = this.parseHistoricalAssetInfo(id, value);
-          if (asset) assets.set(id, asset);
-          return { id, asset };
-        }
-      );
-      const pools = new Map<string, HistoricalValuationPool>();
-      await this.consumeStorageEntriesPaged(
-        query.poolXYK?.reserves,
-        'poolXYK.reserves',
-        [],
-        ([key, value]) => {
-          const pool = this.parseHistoricalPool(key.args[0], key.args[1], value);
-          if (pool) pools.set(this.historicalPoolKey(pool.baseAssetId, pool.targetAssetId), pool);
-          return pool;
-        }
-      );
+      let blockHash: string | undefined;
+      const query = await this.getHistoricalValuationQueryAt(blockHeight, expectedHash, (hash) => { blockHash = hash; });
+      if (this.config.burnRecoveryPolicy && (!blockHash || !isNonzeroCanonicalSubstrateHash(blockHash))) {
+        throw new Error('Soratopia recovery historical valuation query did not supply its exact block hash');
+      }
       const state: HistoricalValuationState = {
         blockHeight,
-        assets,
-        pools,
+        blockHash,
+        ...(await this.readPinnedValuationStorage(query)),
         prices: new Map(),
         networkLiquidityStats: emptyNetworkLiquidityStats(),
         orderBookLiquidityComplete: false,
@@ -7323,15 +7462,21 @@ export class ChainIndexer {
     state: HistoricalValuationState,
     blockHeight: number,
     contexts: BlockExtrinsicContext[],
-    events: EventRecord[]
+    events: EventRecord[],
+    blockHash?: string
   ): Promise<HistoricalValuationAdvance> {
+    if (this.config.burnRecoveryPolicy && (!blockHash || !isNonzeroCanonicalSubstrateHash(blockHash))) {
+      throw new Error('Soratopia recovery valuation advance requires the exact indexed block hash');
+    }
+    const expectedHash = this.config.burnRecoveryPolicy ? blockHash : undefined;
     const touches = this.collectHistoricalValuationTouches(state, contexts, events);
     const pointReadCount = touches.assets.size + touches.pools.size;
     if (touches.invalidated || pointReadCount > MAX_HISTORICAL_VALUATION_POINT_READS_PER_BLOCK) {
       const reason = touches.invalidated ? 'invalidated' : 'touched-key-limit';
       return {
         blockHeight,
-        replacement: await this.loadHistoricalValuationBaseline(blockHeight, reason),
+        blockHash,
+        replacement: await this.loadHistoricalValuationBaseline(blockHeight, reason, expectedHash),
         assets: [],
         pools: [],
         invalidateOrderBookLiquidity: touches.orderBookChanged,
@@ -7340,6 +7485,7 @@ export class ChainIndexer {
     if (pointReadCount === 0) {
       return {
         blockHeight,
+        blockHash,
         assets: [],
         pools: [],
         invalidateOrderBookLiquidity: touches.orderBookChanged,
@@ -7347,7 +7493,7 @@ export class ChainIndexer {
     }
 
     return this.withDerivedStorageLoadBudget(async () => {
-      const query = await this.getHistoricalValuationQueryAt(blockHeight);
+      const query = await this.getHistoricalValuationQueryAt(blockHeight, expectedHash);
       const assetStorage = query.assets?.assetInfosV2;
       const poolStorage = query.poolXYK?.reserves;
       if (touches.assets.size && typeof assetStorage !== 'function') {
@@ -7418,6 +7564,7 @@ export class ChainIndexer {
       if (failed && !failed.ok) throw failed.error;
       const advance: HistoricalValuationAdvance = {
         blockHeight,
+        blockHash,
         assets: [],
         pools: [],
         invalidateOrderBookLiquidity: touches.orderBookChanged,
@@ -7441,6 +7588,7 @@ export class ChainIndexer {
   ): void {
     if (advance.replacement) {
       state.blockHeight = advance.replacement.blockHeight;
+      state.blockHash = advance.replacement.blockHash;
       state.assets = advance.replacement.assets;
       state.pools = advance.replacement.pools;
       state.prices = advance.replacement.prices;
@@ -7464,6 +7612,7 @@ export class ChainIndexer {
       state.orderBookLiquidityComplete = false;
     }
     state.blockHeight = advance.blockHeight;
+    state.blockHash = advance.blockHash;
     if (advance.assets.length || advance.pools.length || advance.invalidateOrderBookLiquidity) {
       this.recalculateHistoricalValuationState(state);
     }
@@ -7576,12 +7725,7 @@ export class ChainIndexer {
     update?: AccountPointUpdate,
     existingAccountMeta?: Map<string, IndexerDocument>
   ): Promise<IndexerDocument[]> {
-    const accountMeta =
-      existingAccountMeta ??
-      (await this.repository.getMany(
-        collection('accountMeta'),
-        accounts.filter((account) => !pendingPointData.has(account))
-      ));
+    const accountMeta = existingAccountMeta ?? await this.loadPointDocuments(accounts, blockHeight);
     const latestHistoryByAccount = new Map(accounts.map((account) => [account, latestHistoryElementId]));
 
     this.applyAccountPointUpdates(accounts, blockHeight, timestamp, pendingPointData, update, accountMeta);
@@ -7811,6 +7955,18 @@ export class ChainIndexer {
     return [...obsoleteIds];
   }
 
+  /** Recovery reads each era's own baseline; metadata totals never reseed an existing era. */
+  private async loadPointDocuments(accounts: string[], blockHeight: number): Promise<Map<string, IndexerDocument>> {
+    const owners = [...new Set(accounts.map((account) => pointAccount(account, this.config.burnRecoveryPolicy, blockHeight))
+      .filter((value): value is string => value !== null))];
+    const rows = await this.repository.getMany(collection('accountMeta'), owners);
+    if (this.config.burnRecoveryPolicy) {
+      const activeEras = await this.repository.getMany(collection('accountPointSystems'), owners.map((owner) => `${owner}-1`));
+      for (const [id, row] of activeEras) rows.set(id, row);
+    }
+    return rows;
+  }
+
   private applyAccountPointUpdates(
     accounts: string[],
     blockHeight: number,
@@ -7820,14 +7976,35 @@ export class ChainIndexer {
     existingAccountMeta: Map<string, IndexerDocument>,
     prices: Map<string, bigint> = this.prices
   ): void {
-    for (const account of accounts) {
+    for (const account of new Set(accounts.map((value) => pointAccount(value, this.config.burnRecoveryPolicy, blockHeight)))) {
+      if (account === null) continue;
       const existing = pendingPointData.get(account) ?? existingAccountMeta.get(account)?.data;
       const data = this.applyAccountPointUpdate(
         existing ?? emptyPointData(account, blockHeight, timestamp),
         update,
         prices
       );
+      if (this.config.burnRecoveryPolicy) {
+        data.pointRecoveryPolicyHash = this.config.burnRecoveryPolicy.policyHash;
+        const field = blockHeight <= RECOVERY_CHECKPOINT.block ? 'pointSourceAddresses' : 'pointPostforkAddresses';
+        const prior = data[field];
+        if (prior !== undefined && (!Array.isArray(prior) || prior.some((value) => typeof value !== 'string'))) {
+          throw new Error('Invalid persisted point address provenance');
+        }
+        const observed = accounts.filter((value) => pointAccount(value, this.config.burnRecoveryPolicy, blockHeight) === account);
+        const aliases = [...new Set([...(prior as string[] | undefined ?? []), ...observed])].sort();
+        if (aliases.length > 8) throw new Error('Point history address alias bound exceeded');
+        data[field] = aliases;
+      }
       pendingPointData.set(account, data);
+      if (this.config.burnRecoveryPolicy) {
+        const eraId = `${account}-1`;
+        const existingEra = pendingPointData.get(eraId) ?? existingAccountMeta.get(eraId)?.data;
+        const era = existingEra ?? { ...emptyPointData(account, blockHeight, timestamp),
+          id: eraId, version: 1, startedAtBlock: blockHeight };
+        pendingPointData.set(eraId, { ...this.applyAccountPointUpdate(era, update, prices),
+          pointRecoveryPolicyHash: this.config.burnRecoveryPolicy.policyHash });
+      }
     }
   }
 
@@ -7839,10 +8016,11 @@ export class ChainIndexer {
     pointData: Map<string, Record<string, unknown>>
   ): IndexerDocument[] {
     const documents: IndexerDocument[] = [];
+    const emittedPointOwners = new Set<string>();
 
     for (const account of accounts) {
       const latestHistoryElementId = latestHistoryByAccount.get(account) ?? '';
-      const data = pointData.get(account) ?? emptyPointData(account, blockHeight, timestamp);
+      const pointOwner = pointAccount(account, this.config.burnRecoveryPolicy, blockHeight);
 
       documents.push({
         collection: collection('accounts'),
@@ -7856,18 +8034,22 @@ export class ChainIndexer {
         },
       });
 
-      documents.push({ collection: collection('accountMeta'), id: account, blockHeight, timestamp, data });
+      if (pointOwner === null || emittedPointOwners.has(pointOwner)) continue;
+      emittedPointOwners.add(pointOwner);
+      const data = pointData.get(pointOwner) ?? emptyPointData(pointOwner, blockHeight, timestamp);
+      documents.push({ collection: collection('accountMeta'), id: pointOwner, blockHeight, timestamp, data });
+      const activeEra = this.config.burnRecoveryPolicy ? pointData.get(`${pointOwner}-1`) : undefined;
       documents.push({
         collection: collection('accountPointSystems'),
-        id: `${account}-1`,
+        id: `${pointOwner}-1`,
         blockHeight,
         timestamp,
         data: {
-          ...data,
-          id: `${account}-1`,
-          accountId: account,
+          ...(activeEra ?? data),
+          id: `${pointOwner}-1`,
+          accountId: pointOwner,
           version: 1,
-          startedAtBlock: Number(data.createdAtBlock ?? blockHeight),
+          startedAtBlock: Number(activeEra?.startedAtBlock ?? data.createdAtBlock ?? blockHeight),
         },
       });
     }
@@ -8209,6 +8391,9 @@ export class ChainIndexer {
     prices: Map<string, bigint>,
     networkLiquidityStats: NetworkLiquidityStats
   ): boolean {
+    // This derived-state publisher does not retain an exact query hash. Recovery
+    // advances only its hash-bound historical state, never this live cache.
+    if (this.config.burnRecoveryPolicy) return false;
     if (this.liveValuationState && blockHeight < this.liveValuationState.blockHeight) return false;
     const poolsById = new Map<string, HistoricalValuationPool>();
     for (const pool of pools) {
@@ -9021,89 +9206,15 @@ export class ChainIndexer {
     );
   }
 
+  /**
+   * Live projections, the price stream and historical transaction valuation use the same
+   * discovery as finalized hourly closes, so a pricing rule cannot diverge between them.
+   */
   private derivePrices(
     assets: Map<string, Pick<AssetInfo, 'id' | 'decimals'>>,
     pools: Array<{ baseAssetId: string; targetAssetId: string; baseAssetReserves: bigint; targetAssetReserves: bigint }>
   ): Map<string, bigint> {
-    const prices = new Map<string, bigint>();
-    const confidence = new Map<string, bigint>();
-    const depth = new Map<string, bigint>();
-    const fixedAssets = new Set<string>();
-
-    for (const asset of assets.values()) {
-      if (STABLE_ASSET_IDS.has(asset.id)) {
-        prices.set(asset.id, SCALE);
-        fixedAssets.add(asset.id);
-      }
-    }
-
-    for (let round = 0; round < 12; round += 1) {
-      let changed = false;
-
-      for (const pool of pools) {
-        if (pool.baseAssetReserves === 0n || pool.targetAssetReserves === 0n) continue;
-
-        const baseInfo = assets.get(pool.baseAssetId);
-        const targetInfo = assets.get(pool.targetAssetId);
-        if (!baseInfo || !targetInfo) continue;
-
-        const baseNatural = reserveToNaturalScaled(pool.baseAssetReserves, baseInfo.decimals);
-        const targetNatural = reserveToNaturalScaled(pool.targetAssetReserves, targetInfo.decimals);
-        if (baseNatural === 0n || targetNatural === 0n) continue;
-
-        const basePrice = prices.get(pool.baseAssetId);
-        const targetPrice = prices.get(pool.targetAssetId);
-
-        const applyCandidate = (assetId: string, price: bigint, candidateConfidence: bigint, candidateDepth: bigint) => {
-          if (
-            fixedAssets.has(assetId) ||
-            price <= 0n ||
-            candidateConfidence < MIN_PRICE_DISCOVERY_LIQUIDITY_USD ||
-            candidateDepth < MIN_PRICE_DISCOVERY_AMOUNT
-          ) {
-            return;
-          }
-
-          const currentDepth = depth.get(assetId) ?? 0n;
-          const currentConfidence = confidence.get(assetId) ?? 0n;
-
-          if (candidateDepth > currentDepth || (candidateDepth === currentDepth && candidateConfidence > currentConfidence)) {
-            prices.set(assetId, price);
-            confidence.set(assetId, candidateConfidence);
-            depth.set(assetId, candidateDepth);
-            changed = true;
-          }
-        };
-
-        if (basePrice && basePrice > 0n) {
-          const baseLiquidityUSD = scaledMul(baseNatural, basePrice);
-          const baseConfidence = confidence.get(pool.baseAssetId);
-          applyCandidate(
-            pool.targetAssetId,
-            scaledDiv(baseLiquidityUSD, targetNatural),
-            baseConfidence ? baseConfidence < baseLiquidityUSD ? baseConfidence : baseLiquidityUSD : baseLiquidityUSD,
-            targetNatural
-          );
-        }
-
-        if (targetPrice && targetPrice > 0n) {
-          const targetLiquidityUSD = scaledMul(targetNatural, targetPrice);
-          const targetConfidence = confidence.get(pool.targetAssetId);
-          applyCandidate(
-            pool.baseAssetId,
-            scaledDiv(targetLiquidityUSD, baseNatural),
-            targetConfidence ? targetConfidence < targetLiquidityUSD ? targetConfidence : targetLiquidityUSD : targetLiquidityUSD,
-            baseNatural
-          );
-        }
-      }
-
-      if (!changed) {
-        break;
-      }
-    }
-
-    return prices;
+    return deriveAssetPrices(assets, pools);
   }
 
   /**

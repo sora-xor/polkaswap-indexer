@@ -1,4 +1,5 @@
 import { isIP } from 'node:net';
+import { loadBurnRecoveryPolicy, type BurnRecoveryPolicy } from './burn-recovery.js';
 
 import { findUnsafePostgresProcessEnvironmentOverride } from './postgres-session.js';
 
@@ -11,6 +12,8 @@ export type MobileCapabilities = {
 };
 
 export type AppConfig = {
+  /** Pinned public recovery policy; never inferred from genesis alone. */
+  burnRecoveryPolicy?: BurnRecoveryPolicy | null;
   host: string;
   port: number;
   graphqlPath: string;
@@ -672,6 +675,7 @@ export function readConfig(): AppConfig {
     }),
     rocksdbCompactionMinFreeGb: readNumber('ROCKSDB_COMPACTION_MIN_FREE_GB', 10, 0),
     soraWsEndpoint,
+    burnRecoveryPolicy: loadBurnRecoveryPolicy(process.env.SORA_RECOVERY_POLICY_FILE, process.env.SORA_RECOVERY_POLICY_SHA256),
     soraArchiveWsEndpoint,
     chainStartBlock: readInteger('CHAIN_START_BLOCK', 0, { minimum: 0 }),
     chainBatchSize: readInteger('CHAIN_BATCH_SIZE', 25, { minimum: 1, maximum: 1_000 }),

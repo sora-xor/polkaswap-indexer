@@ -31,10 +31,14 @@ disappear or lose liquidity. The catalogue and completed hourly rows are committ
 with the finalized block transaction; failed transactions cannot advance tracking.
 
 Each completed UTC hour uses the actual adjacent finalized blocks, the preceding immutable
-valuation state and its denomination. `assetSnapshots.closeEvidence` records
-that source and the same-state direct XOR pool reserves and precision when
-available. It corrects CLOSE while retaining existing open/high/low, volume and
-supply fields. Unavailable metadata or prices remain explicit; chain halts create
+valuation state and its denomination. The worker reads that state's complete asset
+metadata and Pool XYK reserves from storage pinned at the hour's last block; it does
+not reuse its incrementally advanced valuation state as evidence.
+`assetSnapshots.closeEvidence` records that source and the same-state direct XOR
+pool reserves and precision when available. The close corrects CLOSE while retaining
+existing open/high/low, volume and supply fields. Closes written by workers released
+before this rule can carry stale reserves and prices after XYK swaps; repair them
+with a verified archive artifact as described below. Unavailable metadata or prices remain explicit; chain halts create
 no synthetic observations. Ordinary projections cannot replace a finalized CLOSE,
 and rolling retention preserves all tracked assets' HOUR rows. The production
 `all` retention mode continues preserving every historical snapshot.

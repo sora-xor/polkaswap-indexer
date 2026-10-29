@@ -5,6 +5,7 @@ import { MemoryRepository } from '../src/repository/memory.js';
 import { SORA_MAINNET_GENESIS_HASH } from '../src/soraIdentity.js';
 import { ChainIndexer, summarizeExactPoolLiquidity } from '../src/worker/chain.js';
 import { assetHourlyCloseId, directXorPoolEvidence, HOURLY_HISTORY_ASSETS, selectHourlyHistoryTargets } from '../src/worker/hourly-history.js';
+import { pinnedValuationStorage } from './pinned-valuation-storage.js';
 
 const SCALE = 10n ** 18n;
 const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000';
@@ -135,7 +136,11 @@ const historicalState = (blockHeight = 9) => ({
 /** Models ValueQuery: missing storage decodes to zero, but its pinned size is zero. */
 const poolStorage = (stored: Map<string, string[]>) => Object.assign(
   vi.fn(async (base: string, target: string) => stored.get(`${base}\0${target}`) ?? ['0', '0']),
-  { size: vi.fn(async (base: string, target: string) => ({ toString: (): string => stored.has(`${base}\0${target}`) ? '32' : '0' })) },
+  {
+    size: vi.fn(async (base: string, target: string) => ({ toString: (): string => stored.has(`${base}\0${target}`) ? '32' : '0' })),
+    // Full pinned scans (hourly closes and unattributed swaps) see exactly the stored keys.
+    entriesPaged: vi.fn(async () => [...stored].map(([key, value]) => [{ args: key.split('\0') }, value])),
+  },
 );
 
 const prepareState = (indexer: ChainIndexer, blockHeight = 9) => {
@@ -148,6 +153,58 @@ const prepareState = (indexer: ChainIndexer, blockHeight = 9) => {
 };
 
 describe('historical valuation state', () => {
+  it('retains the exact recovery baseline query hash and rejects a different archive or primary hash', async () => {
+    const indexer = new ChainIndexer({ ...config, burnRecoveryPolicy: {} as never }, new MemoryRepository()) as any;
+    const state = historicalState();
+    const hash = `0x${'09'.repeat(32)}`, otherHash = `0x${'0a'.repeat(32)}`;
+    const archiveHash = vi.fn(async () => ({ toString: () => hash }));
+    const primaryHash = vi.fn(async () => ({ toString: () => hash }));
+    const archiveAt = vi.fn(async () => ({ query: pinnedValuationStorage(() => state) }));
+    const archive = { rpc: { chain: { getBlockHash: archiveHash } }, at: archiveAt };
+    indexer.api = { rpc: { chain: { getBlockHash: primaryHash } } };
+    indexer.getBlockDataApi = vi.fn(async () => archive);
+    const loaded = await indexer.loadHistoricalValuationBaseline(9, 'recovery-test', hash);
+    expect(loaded).toMatchObject({ blockHeight: 9, blockHash: hash });
+    expect(archiveAt).toHaveBeenCalledWith(hash);
+    archiveAt.mockClear(); archiveHash.mockImplementationOnce(async () => ({ toString: () => otherHash }));
+    await expect(indexer.loadHistoricalValuationBaseline(9, 'recovery-test', hash)).rejects.toThrow('verified parent hash');
+    expect(archiveAt).not.toHaveBeenCalled();
+    primaryHash.mockImplementationOnce(async () => ({ toString: () => otherHash }));
+    await expect(indexer.loadHistoricalValuationBaseline(9, 'recovery-test', hash)).rejects.toThrow('verified parent hash');
+    expect(archiveAt).not.toHaveBeenCalled();
+  });
+
+  it('pins recovery point reads and full reloads to the indexed hash and advances identity only after application', async () => {
+    const indexer = new ChainIndexer({ ...config, burnRecoveryPolicy: {} as never }, new MemoryRepository()) as any;
+    const state = { ...prepareState(indexer), blockHash: `0x${'09'.repeat(32)}` };
+    const hash = `0x${'0a'.repeat(32)}`;
+    const query = { poolXYK: { reserves: poolStorage(new Map([[`${XOR}\0${KUSD}`, ['100', '400']]])) } };
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => query);
+    const events = [eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD })];
+    await expect(indexer.prepareHistoricalValuationAdvance(state, 10, [], events)).rejects.toThrow('exact indexed block hash');
+    const advance = await indexer.prepareHistoricalValuationAdvance(state, 10, [], events, hash);
+    expect(indexer.getHistoricalValuationQueryAt).toHaveBeenCalledWith(10, hash);
+    expect(state).toMatchObject({ blockHeight: 9, blockHash: `0x${'09'.repeat(32)}` });
+    indexer.applyHistoricalValuationAdvance(state, advance);
+    expect(state).toMatchObject({ blockHeight: 10, blockHash: hash });
+    const reloaded = { ...state, blockHeight: 11, blockHash: `0x${'0b'.repeat(32)}` };
+    indexer.loadHistoricalValuationBaseline = vi.fn(async () => reloaded);
+    indexer.collectHistoricalValuationTouches = vi.fn(() => ({ assets: new Map(), pools: new Map(), invalidated: true, orderBookChanged: false }));
+    const replacement = await indexer.prepareHistoricalValuationAdvance(state, 11, [], [], reloaded.blockHash);
+    expect(indexer.loadHistoricalValuationBaseline).toHaveBeenCalledWith(11, 'invalidated', reloaded.blockHash);
+    expect(state.blockHeight).toBe(10);
+    indexer.applyHistoricalValuationAdvance(state, replacement);
+    expect(state).toMatchObject({ blockHeight: 11, blockHash: reloaded.blockHash });
+  });
+
+  it('does not publish an unbound live cache over the recovery historical state', () => {
+    const indexer = new ChainIndexer({ ...config, burnRecoveryPolicy: {} as never }, new MemoryRepository()) as any;
+    const state = { ...prepareState(indexer), blockHash: `0x${'09'.repeat(32)}` };
+    indexer.liveValuationState = state;
+    expect(indexer.publishLiveValuationState(9, state.assets, state.pools.values(), new Map([[XOR, 99n * SCALE]]), state.networkLiquidityStats)).toBe(false);
+    expect(indexer.liveValuationState).toBe(state);
+  });
+
   it('sums exact pool liquidity before display rounding and counts positive dust pools', () => {
     expect(summarizeExactPoolLiquidity([5_000_000_000n, 5_000_000_000n, 5_000_000_000n, 5_000_000_000n])).toEqual({
       poolLiquidityUSD: '0.00000002',
@@ -393,6 +450,7 @@ describe('historical valuation state', () => {
     indexer.previousHourlyHistoryBlock = { height: 9, hash: `0x${'9'.padStart(64, '0')}`, timestamp: 7198 };
     const reserves = poolStorage(new Map([[`${XOR}\0${KUSD}`, [(100n * SCALE).toString(), (400n * SCALE).toString()]]]));
     indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({
+      assets: pinnedValuationStorage(() => state).assets,
       poolXYK: { reserves }, denomination: { denominator: async () => ({ toString: (): string => '100000000000000000000000000000000000000' }) },
     }));
     const events = [eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD })];

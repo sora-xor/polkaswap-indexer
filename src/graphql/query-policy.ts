@@ -306,6 +306,7 @@ const PUBLIC_QUERY_POLICIES: Partial<Record<PublicConnectionName, PublicQueryPol
     filterFields: fields({
       id: 'identifier',
       address: 'identifier',
+      claimOwner: 'identifier',
       timestamp: 'numeric',
       blockHeight: 'numeric',
       amount: 'numeric',
@@ -444,6 +445,11 @@ const PUBLIC_FILTER_PLANS: Partial<Record<PublicConnectionName, readonly PublicF
   ],
   vaultEvents: [
     plan('timestamp', ['vaultId', 'type', 'timestamp'], { requiredExactAll: fieldSet('vaultId') }),
+  ],
+  xorBurns: [
+    plan('id', ['claimOwner', 'address', 'timestamp', 'blockHeight', 'amount'], {
+      requiredIndexedAll: fieldSet('claimOwner'),
+    }),
   ],
 };
 

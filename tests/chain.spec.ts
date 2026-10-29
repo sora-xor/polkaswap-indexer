@@ -570,7 +570,16 @@ describe('ChainIndexer price derivation', () => {
       'poolIssuance',
       'poolProviders',
     ]);
-    expect(indexer.derivedStorageDomainsForPallet('liquidityProxy', 'Swap')).toEqual([]);
+    // XYK swaps emit no poolXYK event; the hop and proxy evidence must dirty reserves.
+    for (const [pallet, method] of [
+      ['technical', 'SwapSuccess'], ['liquidityProxy', 'Exchange'], ['liquidityProxy', 'BatchSwapExecuted'],
+      ['liquidityProxy', 'XorlessTransfer'], ['liquidityProxy', 'swap'], ['liquidityProxy', 'swapTransfer'],
+      ['liquidityProxy', 'swapTransferBatch'], ['liquidityProxy', 'xorlessTransfer'],
+    ]) {
+      expect(indexer.derivedStorageDomainsForPallet(pallet!, method)).toEqual(['poolReserves']);
+    }
+    expect(indexer.derivedStorageDomainsForPallet('liquidityProxy', 'LiquiditySourceEnabled')).toEqual([]);
+    expect(indexer.derivedStorageDomainsForPallet('liquidityProxy', 'ADARFeeWithdrawn')).toEqual([]);
     expect(indexer.derivedStorageDomainsForPallet('xorFee', 'FeeWithdrawn')).toEqual([]);
     expect(indexer.derivedStorageDomainsForPallet('assets', 'Transfer')).toEqual([]);
     expect(indexer.derivedStorageDomainsForPallet('assets', 'Issued')).toEqual(['assetSupply']);
@@ -2376,7 +2385,7 @@ describe('ChainIndexer price derivation', () => {
       query: {
         system: {
           events: {
-            at: async () => [],
+            at: async () => [eventRecord('assets', 'Burn', { address: 'alice', assetId: XOR, amount: '10000000000000000000' })],
           },
         },
         timestamp: {
@@ -2391,7 +2400,7 @@ describe('ChainIndexer price derivation', () => {
     await indexer.indexBlockByHash(canonicalBlockHash('block'));
 
     const history = await repository.get('historyElements', '0xbatchburn');
-    const xorBurn = await repository.get('xorBurns', '0xbatchburn');
+    const xorBurn = await repository.get('xorBurns', `${canonicalBlockHash('block')}:0`);
     const chainState = await repository.get('updatesStreams', 'chainState');
     expect(xorBurn?.data.extrinsicIndex).toBe(0);
     expect(xorBurn?.data.campaign).toBe(remark === '0x7b7d' ? undefined : 'tonswap');
@@ -2417,7 +2426,7 @@ describe('ChainIndexer price derivation', () => {
       ],
     });
     expect(xorBurn?.data).toMatchObject({
-      id: '0xbatchburn',
+      id: `${canonicalBlockHash('block')}:0`,
       address: 'alice',
       amount: '10',
       assetId: XOR,
@@ -5247,12 +5256,12 @@ describe('ChainIndexer price derivation', () => {
 
     await indexer.backfillXorBurns(burnBlock + 1);
 
-    const xorBurn = await repository.get('xorBurns', '0xbackfilledburn');
+    const xorBurn = await repository.get('xorBurns', `${burnBlockHash}:0`);
     const chainState = await repository.get('updatesStreams', 'chainState');
     const backfillState = await repository.get('updatesStreams', 'xorBurnsBackfill');
 
     expect(xorBurn?.data).toMatchObject({
-      id: '0xbackfilledburn',
+      id: `${burnBlockHash}:0`,
       address: 'alice',
       amount: '10',
       assetId: XOR,
@@ -9583,26 +9592,30 @@ describe('TONSWAP finalized coverage', () => {
     const burn = { section: 'assets', method: 'burn', args: [XOR, SCALE.toString()],
       meta: { args: [{ name: 'assetId' }, { name: 'amount' }] } };
     const remark = { section: 'system', method: 'remark', args: [marker], meta: { args: [{ name: 'remark' }] } };
+    let ambiguous = true;
     subject.fetchBlockByNumber = vi.fn(async (height) => ({
       requestedHash: canonicalBlockHash(`ts-${height}`), timestamp: 1_800_000_000,
       signedBlock: { block: { extrinsics: [
         { hash: { toString: () => `0xts-${height}` }, method: {
-          section: 'utility', method: height === start ? 'batchAll' : 'batch', args: [[burn, remark]],
+          section: 'utility', method: height === start ? 'batchAll' : 'batch', args: [height === start || ambiguous ? [burn, remark] : [burn]],
           meta: { args: [{ name: 'calls' }] },
         } },
       ] } },
       events: [eventRecord('assets', 'Burn', { address: 'alice', assetId: XOR, amount: SCALE.toString() })],
     }));
+    await expect(subject.backfillTonswapBurns(start + 1)).rejects.toThrow('Ambiguous');
+    expect(await repository.get('updatesStreams', 'tonswapBurnCoverage-v1')).toBeNull();
+    ambiguous = false;
     await subject.backfillTonswapBurns(start + 1);
-    expect(subject.fetchBlockByNumber).toHaveBeenCalledTimes(2);
-    expect((await repository.get('xorBurns', `0xts-${start}`))?.data).toMatchObject({ campaign: 'tonswap', extrinsicIndex: 0 });
-    expect((await repository.get('xorBurns', `0xts-${start + 1}`))?.data.campaign).toBeUndefined();
+    expect(subject.fetchBlockByNumber).toHaveBeenCalledTimes(4);
+    expect((await repository.get('xorBurns', `${canonicalBlockHash(`ts-${start}`)}:0`))?.data).toMatchObject({ campaign: 'tonswap', extrinsicIndex: 0 });
+    expect((await repository.get('xorBurns', `${canonicalBlockHash(`ts-${start + 1}`)}:0`))?.data.campaign).toBeUndefined();
     expect((await repository.get('updatesStreams', 'tonswapBurnCoverage-v1'))?.data.block).toBe(start + 1);
     await subject.backfillTonswapBurns(start + 1);
-    expect(subject.fetchBlockByNumber).toHaveBeenCalledTimes(2);
+    expect(subject.fetchBlockByNumber).toHaveBeenCalledTimes(4);
     vi.spyOn(repository, 'upsertMany').mockRejectedValueOnce(new Error('atomic write failed'));
     await expect(subject.backfillTonswapBurns(start + 2)).rejects.toThrow('atomic write failed');
     expect((await repository.get('updatesStreams', 'tonswapBurnCoverage-v1'))?.data.block).toBe(start + 1);
-    expect(await repository.get('xorBurns', `0xts-${start + 2}`)).toBeNull();
+    expect(await repository.get('xorBurns', `${canonicalBlockHash(`ts-${start + 2}`)}:0`)).toBeNull();
   });
 });

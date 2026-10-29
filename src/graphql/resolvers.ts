@@ -1,3 +1,5 @@
+import { pointAccount, pointOwnership, pointsQueryIdentity } from '../points-recovery.js';
+import { RECOVERY_CHECKPOINT, validateBurnRecoveryPolicy } from '../burn-recovery.js';
 import { createHash } from 'node:crypto';
 
 import { makeExecutableSchema } from '@graphql-tools/schema';
@@ -2178,10 +2180,13 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
     let proof = await readProof();
     if (!proof.coherent) proof = await readProof();
     const { health, coverage } = proof;
+    const identity = await context.repository.get('updatesStreams', 'burnRecoveryIdentity-v1');
+    const recoveryPolicy = identity ? validateBurnRecoveryPolicy(JSON.parse(String(identity.data.data))) : null;
     const unavailable = () => new GraphQLError('Complete fresh finalized TONSWAP burn coverage is unavailable', {
       extensions: { code: 'TONSWAP_COVERAGE_UNAVAILABLE' },
     });
     if (!proof.coherent || !coverage) throw unavailable();
+    if (coverage.indexedThroughBlock > RECOVERY_CHECKPOINT.block && !recoveryPolicy) throw unavailable();
     const fresh = health.ok && health.workerLag !== null && health.workerLag <= 2 &&
       coverage.indexedThroughBlock === health.workerLatestIndexedBlock &&
       Math.floor(Date.now() / 1_000) - coverage.blockTimestamp <= 60;
@@ -2198,6 +2203,9 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
     }, context);
     return {
       fresh,
+      recoveryPolicyHash: recoveryPolicy?.policyHash ?? null,
+      postForkAnchorBlock: recoveryPolicy?.postForkAnchor.block ?? null,
+      postForkAnchorHash: recoveryPolicy?.postForkAnchor.hash ?? null,
       genesisHash: coverage.genesisHash,
       startBlock: TONSWAP_START_BLOCK,
       indexedThroughBlock: atBlock,
@@ -2209,6 +2217,30 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
     };
   };
   const documentResolver = createDocumentResolver(cache);
+  const recoveryPointMeta = async (parent: unknown, args: { id: string }, context: Context) => {
+    const policy = await pointsQueryIdentity(context.repository);
+    if (!policy) return documentResolver('accountMeta')(parent, args, context);
+    const id = pointAccount(args.id, policy, RECOVERY_CHECKPOINT.block + 1);
+    // Bypass legacy cache: policy/projection readiness is checked on each read.
+    return id === null ? null : (await context.repository.get('accountMeta', id))?.data ?? null;
+  };
+  const recoveryPointSystems = async (parent: unknown, args: ConnectionArgs, context: Context, info?: GraphQLResolveInfo) => {
+    const policy = await pointsQueryIdentity(context.repository);
+    if (!policy) return connectionResolver('accountPointSystems')(parent, args, context, info);
+    const normalized = normalizeConnectionArgs(args, info);
+    assertPublicConnectionQuery('accountPointSystems', normalized.orderBy, normalized.filter);
+    const filter = normalized.filter ?? {};
+    const selector = filter.accountId;
+    if (Object.keys(filter).join(',') !== 'accountId' || !isRecord(selector) ||
+        Object.keys(selector).join(',') !== 'equalTo' || typeof selector.equalTo !== 'string') {
+      throw badUserInput('Recovery point queries require one exact accountId selector');
+    }
+    const id = pointAccount(selector.equalTo, policy, RECOVERY_CHECKPOINT.block + 1);
+    if (id === null) return { nodes: [], edges: [], totalCount: 0,
+      pageInfo: { hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null } };
+    return connectionResolver('accountPointSystems')(parent, { ...args, filter: { accountId: { equalTo: id } } }, context, info);
+  };
+
   const cachedExploreStatsResolver = (
     parent: unknown,
     args: unknown,
@@ -2266,14 +2298,17 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
         vaults: connectionResolver(collection('vaults')),
         vaultEvents: connectionResolver(collection('vaultEvents')),
         updatesStream: documentResolver(collection('updatesStreams')),
-        accountMeta: documentResolver(collection('accountMeta')),
-        accountPointSystems: connectionResolver(collection('accountPointSystems')),
+        soratopiaPointOwnership: (_parent: unknown, args: { id: string }, context: Context) => pointOwnership(context.repository, args.id),
+        accountMeta: recoveryPointMeta,
+        accountPointSystems: recoveryPointSystems,
         accountPositions: accountPositionsResolver,
         accountTrades: accountTradesResolver,
         exploreStats: cachedExploreStatsResolver,
         polkamarktSignals: cachedPolkamarktSignalsResolver,
         networkAccountActivity: cachedNetworkAccountActivityResolver,
       },
+      AccountMeta: { recoveryPolicyHash: (parent: Record<string, unknown>) => parent.pointRecoveryPolicyHash ?? null },
+      AccountPointSystem: { recoveryPolicyHash: (parent: Record<string, unknown>) => parent.pointRecoveryPolicyHash ?? null },
       HistoryElement: {
         calls: (parent: Record<string, unknown>) => ({
           nodes: Array.isArray(parent.calls) ? parent.calls : [],
