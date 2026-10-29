@@ -6,7 +6,8 @@ import { createHash } from 'node:crypto';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 
 import { ApiPromise, WsProvider } from '@polkadot/api';
-import { types as soraTypes } from '@sora-substrate/type-definitions';
+import soraTypes from '../runtime/sora-legacy-types.json' with { type: 'json' };
+
 import { readSnapshotDenominator } from './denomination.js';
 import { isDiscardedTimestampState } from './historicalTimestamp.js';
 import {
@@ -767,7 +768,8 @@ const isLiquidityProxySwap = (module: string, method: string, callNames: string[
 
 
 const isBridgeOutgoing = (module: string, method: string): boolean =>
-  module === 'ethBridge' || (module === 'bridgeProxy' && method === 'burn');
+  (module === 'ethBridge' && method === 'transferToSidechain') ||
+  (module === 'bridgeProxy' && method === 'burn');
 
 const isSyntheticBridgeIncoming = (id: string, module: string, method: string): boolean =>
   module === 'bridgeProxy' && method === 'mint' && id.endsWith('-mint');
@@ -2251,7 +2253,7 @@ const normalizeStakingData = (method: string, args: Record<string, unknown>, pri
 
   if (method === 'bond') return { ...amountData, controller: firstString(args, ['controller']), payee: args.payee ?? {} };
   if (method === 'bondExtra') return amountData;
-  if (method === 'unbond') return { amount: String(amount), amountUSD: amountData.amountUSD };
+  if (method === 'unbond') return amountData;
   if (method === 'rebond') return { value: amountData.amount, amountUSD: amountData.amountUSD };
   if (method === 'nominate') return { targets: Array.isArray(args.targets) ? args.targets : [] };
   if (method === 'withdrawUnbonded') return { ...amountData, numSlashingSpans: Number(args.numSlashingSpans ?? 0) };
@@ -5652,7 +5654,11 @@ export class ChainIndexer {
           exchangeVolumeUSD: scaledToString(exchangeVolumeUSD, 8),
         };
       }
-      if (!failed && extrinsic.method.section === 'bridgeMultisig') bridgeIncomingTransactions += 1;
+      const hasIncomingBridgeMovement =
+        !failed &&
+        extrinsic.method.section === 'bridgeMultisig' &&
+        findIncomingBridgeMovement(historyEvents) !== null;
+      if (hasIncomingBridgeMovement) bridgeIncomingTransactions += 1;
       if (!failed && isBridgeOutgoing(extrinsic.method.section, extrinsic.method.method)) {
         bridgeOutgoingTransactions += 1;
       }
@@ -5675,7 +5681,7 @@ export class ChainIndexer {
 
       const incomingContext = createBridgeProxyIncomingContext(context, args, valuationPrices, valuationAssets);
       if (incomingContext) {
-        bridgeIncomingTransactions += 1;
+        if (!hasIncomingBridgeMovement) bridgeIncomingTransactions += 1;
         incomingContext.accounts.forEach((account) => touchedAccounts.add(account));
         extrinsicContexts.push(incomingContext);
       }
@@ -5697,6 +5703,7 @@ export class ChainIndexer {
     const existingAccountMeta = await this.loadPointDocuments([...touchedAccounts], blockHeight);
     const orderBookLiquidityComplete =
       historicalValuationState?.orderBookLiquidityComplete ?? true;
+    const vaultEventOccurrences = new Map<string, Map<EventRecord, number>>();
 
     documents.push(...this.recoveryBurnDocuments(createXorBurnDocumentsFromEvents(canonicalBlockHash, blockHeight, timestamp, signedBlock, events, valuationAssets)));
 
@@ -5727,7 +5734,8 @@ export class ChainIndexer {
           timestamp,
           context.address,
           valuationPrices,
-          valuationAssets
+          valuationAssets,
+          vaultEventOccurrences
         )
       );
     }
@@ -8194,11 +8202,13 @@ export class ChainIndexer {
     timestamp: number,
     signer: string,
     prices: Map<string, bigint> = this.prices,
-    assets: Map<string, AssetInfo> = this.assetInfos
+    assets: Map<string, AssetInfo> = this.assetInfos,
+    vaultEventOccurrences = new Map<string, Map<EventRecord, number>>()
   ): IndexerDocument[] {
     const documents: IndexerDocument[] = [];
 
-    for (const { event } of events) {
+    for (const record of events) {
+      const { event } = record;
       if (event.section === 'orderBook' && event.method.includes('LimitOrder')) {
         const data = eventData(event);
         documents.push(
@@ -8217,7 +8227,24 @@ export class ChainIndexer {
 
       if (event.section === 'kensetsu') {
         const data = eventData(event);
-        documents.push(...this.createVaultEventDocuments(event.method, data, blockHeight, timestamp, signer));
+        const vaultDocuments = this.createVaultEventDocuments(event.method, data, blockHeight, timestamp, signer);
+        const vaultEvent = vaultDocuments.find((document) => document.collection === 'vaultEvents');
+        if (vaultEvent) {
+          const occurrences = vaultEventOccurrences.get(vaultEvent.id) ?? new Map<EventRecord, number>();
+          let occurrence = occurrences.get(record);
+          if (occurrence === undefined) {
+            occurrence = occurrences.size;
+            occurrences.set(record, occurrence);
+            vaultEventOccurrences.set(vaultEvent.id, occurrences);
+          }
+          // Keep the original first-event ID; subsequent occurrences must not
+          // overwrite it. Reused records in synthetic contexts keep the same ID.
+          if (occurrence > 0) {
+            vaultEvent.id = `${vaultEvent.id}-${occurrence + 1}`;
+            vaultEvent.data.id = vaultEvent.id;
+          }
+        }
+        documents.push(...vaultDocuments);
         continue;
       }
 
@@ -8267,6 +8294,7 @@ export class ChainIndexer {
       const isBuy = String(data.side ?? data.arg2 ?? 'Buy') === 'Buy';
       const amount = codecToBigInt(data.amount ?? data.arg3 ?? 0);
       const price = codecToBigInt(data.price ?? data.arg4 ?? 0);
+      const baseDecimals = assets.get(orderBookId.baseAssetId)?.decimals ?? DECIMALS;
       const status = method === 'LimitOrderPlaced' || method === 'LimitOrderUpdated' ? 'Active' : method === 'LimitOrderFilled' ? 'Filled' : 'Canceled';
       const amountUSD = orderBookAmountUsd(
         orderBookId.baseAssetId,
@@ -8292,12 +8320,12 @@ export class ChainIndexer {
           createdAtBlock: blockHeight,
           timestamp,
           isBuy,
-          amount: decimalToString(amount),
+          amount: decimalToString(amount, baseDecimals),
           price: decimalToString(price),
           amountUSD,
           lifetime: Number(data.lifetime ?? 0),
           expiresAt: Number(data.expiresAt ?? 0),
-          amountFilled: decimalToString(codecToBigInt(data.amountFilled ?? 0)),
+          amountFilled: decimalToString(codecToBigInt(data.amountFilled ?? 0), baseDecimals),
           status,
           updatedAtBlock: blockHeight,
         },
@@ -10218,6 +10246,7 @@ export class ChainIndexer {
       analytics.assetWeekOpenPrice.set(asset.id, currentPrice);
     }
 
+    const assetsWithWeekOpenPrice = new Set<string>();
     for await (const snapshot of assetDaySnapshots) {
       const assetId = String(snapshot.data.assetId ?? '');
       const price = snapshot.data.priceUSD as Record<string, unknown> | undefined;
@@ -10227,8 +10256,10 @@ export class ChainIndexer {
       if (Number(snapshot.data.timestamp ?? 0) >= snapshotBucket('DAY', timestamp)) {
         analytics.assetDayOpenPrice.set(assetId, open);
       }
-      if (!analytics.assetWeekOpenPrice.has(assetId) || analytics.assetWeekOpenPrice.get(assetId) === analytics.assetDayOpenPrice.get(assetId)) {
+      // Inputs are chronological; the first observed open is the weekly baseline.
+      if (!assetsWithWeekOpenPrice.has(assetId)) {
         analytics.assetWeekOpenPrice.set(assetId, open);
+        assetsWithWeekOpenPrice.add(assetId);
       }
     }
 

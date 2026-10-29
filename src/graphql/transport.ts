@@ -319,9 +319,18 @@ export const createEmissionScopedSubscribe = (options: EmissionScopedSubscribeOp
       activeReservation = null;
       options.release(reservation);
     };
-    const closeSource = (): Promise<unknown> => {
+    const closeSource = (error?: unknown, forwardError = false): Promise<unknown> => {
       closeSourcePromise ??= Promise.resolve()
-        .then(() => sourceIterator.return?.())
+        .then(async () => {
+          if (forwardError && sourceIterator.throw) {
+            try {
+              if ((await sourceIterator.throw(error)).done) return;
+            } catch {
+              // A custom iterator may throw without closing its resources.
+            }
+          }
+          await sourceIterator.return?.();
+        })
         .catch(() => undefined);
       return closeSourcePromise;
     };
@@ -331,46 +340,47 @@ export const createEmissionScopedSubscribe = (options: EmissionScopedSubscribeOp
       releaseActive();
       if (closed) return { done: true, value: undefined };
 
-      const event = await sourceIterator.next();
-      if (closed) return { done: true, value: undefined };
-      if (event.done) {
-        closed = true;
-        return { done: true, value: undefined };
-      }
-
-      const reservation = {};
-      if (!options.acquire(reservation)) {
-        options.onRejected?.();
-        closed = true;
-        await closeSource();
-        return { done: false, value: { errors: [executionMemoryLimitError()] } };
-      }
-      activeReservation = reservation;
-
-      const execution = Promise.resolve().then(() =>
-        (options.execute ?? execute)({
-          ...args,
-          rootValue: event.value,
-          contextValue: options.contextValueForEvent
-            ? options.contextValueForEvent(args.contextValue)
-            : args.contextValue,
-        })
-      );
-      activeExecution = execution;
       try {
-        const result = await execution;
+        const event = await sourceIterator.next();
+        if (closed) return { done: true, value: undefined };
+        if (event.done) {
+          closed = true;
+          return { done: true, value: undefined };
+        }
+
+        const reservation = {};
+        if (!options.acquire(reservation)) {
+          options.onRejected?.();
+          closed = true;
+          await closeSource();
+          return { done: false, value: { errors: [executionMemoryLimitError()] } };
+        }
+        activeReservation = reservation;
+
+        activeExecution = Promise.resolve().then(() =>
+          (options.execute ?? execute)({
+            ...args,
+            rootValue: event.value,
+            contextValue: options.contextValueForEvent
+              ? options.contextValueForEvent(args.contextValue)
+              : args.contextValue,
+          })
+        );
+        const result = await activeExecution;
         if (closed) {
           releaseActive();
           return { done: true, value: undefined };
         }
         return { done: false, value: result };
       } catch (error) {
+        const cancelled = closed;
         closed = true;
         releaseActive();
         await closeSource();
+        if (cancelled) return { done: true, value: undefined };
         throw error;
       } finally {
-        if (activeExecution === execution) activeExecution = null;
+        activeExecution = null;
       }
     };
     const iterator: AsyncIterableIterator<ExecutionResult> = {
@@ -392,8 +402,7 @@ export const createEmissionScopedSubscribe = (options: EmissionScopedSubscribeOp
         closed = true;
         const execution = activeExecution;
         if (!execution) releaseActive();
-        if (sourceIterator.throw) await sourceIterator.throw(error).catch(() => undefined);
-        else await closeSource();
+        await closeSource(error, true);
         await execution?.catch(() => undefined);
         releaseActive();
         throw error;

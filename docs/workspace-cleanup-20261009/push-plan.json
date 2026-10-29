@@ -1,0 +1,10 @@
+{
+  "origin": "https://github.com/sora-xor/polkaswap-indexer.git",
+  "current_branch": "codex/pi-production-consolidated-20260801",
+  "recovery_refs": [
+    "refs/heads/recovery/20261009/polkaswap-indexer",
+    "refs/heads/recovery/20261009/polkaswap-indexer-release-candidate-20260924",
+    "refs/heads/recovery/20261009/worktrees--polkaswap-indexer-pi-production-capabilities-20260811",
+    "refs/heads/recovery/20261009/worktrees--polkaswap-indexer-qualified-96b4d20"
+  ]
+}

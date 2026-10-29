@@ -1,0 +1,81 @@
+{
+  "worktrees": [
+    {
+      "path": "polkaswap-indexer",
+      "canonical": "polkaswap-indexer",
+      "head": "2f31dd5370f76d22fe249e935227ec48c9c96a9c",
+      "branch": "refs/heads/codex/pi-production-consolidated-20260801",
+      "snapshot": "cc1fb7bd5599ec20692be6cc54c80cdb3a754d77",
+      "snapshot_ref": "refs/heads/recovery/20261009/polkaswap-indexer",
+      "tree": "58ad7e14277cb37f936dd8567c99bd3c0caceae0",
+      "staged_ref": null,
+      "status_before": [
+        "M README.md",
+        " M docs/release-checklist.md",
+        " M package.json",
+        " M src/graphql/resolvers.ts",
+        " M src/repository/postgres.ts",
+        " M src/repository/rocksdb.ts",
+        " M src/worker/chain.ts",
+        " M tests/chain.spec.ts",
+        " M tests/filter.spec.ts",
+        " M tests/postgres.spec.ts",
+        " M tests/rocksdb.spec.ts",
+        " M tests/schema.spec.ts",
+        " M vitest.config.ts",
+        " M yarn.lock"
+      ],
+      "removed": false
+    },
+    {
+      "path": ".worktrees/polkaswap-indexer-pi-production-capabilities-20260811",
+      "canonical": "polkaswap-indexer",
+      "head": "1afb5c5ad28dbdb9802b3b6a2a868cd728782b2d",
+      "branch": "refs/heads/release/pi-production-capabilities-20260811",
+      "snapshot": "1afb5c5ad28dbdb9802b3b6a2a868cd728782b2d",
+      "snapshot_ref": "refs/heads/recovery/20261009/worktrees--polkaswap-indexer-pi-production-capabilities-20260811",
+      "tree": "19fc72a5234e555c2a2d79075c42e47ab1ce93d8",
+      "staged_ref": null,
+      "status_before": [],
+      "removed": true
+    },
+    {
+      "path": ".worktrees/polkaswap-indexer-qualified-96b4d20",
+      "canonical": "polkaswap-indexer",
+      "head": "96b4d20e0393bc90d139f41d33f58254561af6be",
+      "branch": null,
+      "snapshot": "96b4d20e0393bc90d139f41d33f58254561af6be",
+      "snapshot_ref": "refs/heads/recovery/20261009/worktrees--polkaswap-indexer-qualified-96b4d20",
+      "tree": "19fc72a5234e555c2a2d79075c42e47ab1ce93d8",
+      "staged_ref": null,
+      "status_before": [],
+      "removed": true
+    },
+    {
+      "path": "polkaswap-indexer-release-candidate-20260924",
+      "canonical": "polkaswap-indexer",
+      "head": "be34760d776ed02ed9c2fbd6ec0e7c858189894f",
+      "branch": "refs/heads/codex/indexer-readiness-20260924",
+      "snapshot": "be34760d776ed02ed9c2fbd6ec0e7c858189894f",
+      "snapshot_ref": "refs/heads/recovery/20261009/polkaswap-indexer-release-candidate-20260924",
+      "tree": "6c33a7771734f6af979c4e0e147e9b9e9b9c8c19",
+      "staged_ref": null,
+      "status_before": [],
+      "removed": true
+    }
+  ],
+  "infrastructure_audits": [
+    {
+      "path": ".worktrees/infrastructure-recovery-audit",
+      "head": "d402e5e6413067b1f01242293a8003651292e68c",
+      "remote": "https://github.com/soramitsu/infrastructure.git",
+      "bundle": "polkaswap-indexer/.local/workspace-cleanup-20261009/infrastructure-audits/infrastructure-recovery-audit.bundle"
+    },
+    {
+      "path": ".worktrees/infrastructure-kubernetes-recovery-audit",
+      "head": "91c8da9b743a2565dbba05c9af543b49a4c7a485",
+      "remote": "https://github.com/soramitsu/infrastructure-kubernetes.git",
+      "bundle": "polkaswap-indexer/.local/workspace-cleanup-20261009/infrastructure-audits/infrastructure-kubernetes-recovery-audit.bundle"
+    }
+  ]
+}

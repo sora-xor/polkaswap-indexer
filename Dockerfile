@@ -1,4 +1,4 @@
-FROM node:24-bookworm-slim@sha256:cb4e8f7c443347358b7875e717c29e27bf9befc8f5a26cf18af3c3dec80e58c5 AS dependencies
+FROM node:24-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS dependencies
 
 WORKDIR /app
 
@@ -10,6 +10,7 @@ FROM dependencies AS build
 
 COPY tsconfig.json ./
 COPY src ./src
+COPY scripts/copy-runtime.mjs ./scripts/copy-runtime.mjs
 RUN yarn build
 
 
@@ -20,7 +21,7 @@ FROM dependencies AS production-dependencies
 RUN yarn workspaces focus --all --production
 
 
-FROM node:24-bookworm-slim@sha256:cb4e8f7c443347358b7875e717c29e27bf9befc8f5a26cf18af3c3dec80e58c5 AS runtime
+FROM node:24-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS runtime
 
 WORKDIR /app
 
@@ -62,7 +63,14 @@ ENV NODE_ENV=production \
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["docker-entrypoint.sh"]
 
-RUN install -d -o node -g node /data
+# Runtime commands use compiled JavaScript. Do not ship package managers and
+# their separate dependency trees or privilege-elevating mode bits.
+RUN install -d -o node -g node /data \
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+        /opt/yarn-* \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+        /usr/local/bin/yarn /usr/local/bin/yarnpkg /usr/local/bin/pnpm /usr/local/bin/pnpx \
+    && find /usr -xdev -type f -perm /6000 -exec chmod a-s '{}' +
 
 COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist

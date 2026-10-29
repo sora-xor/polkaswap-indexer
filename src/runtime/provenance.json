@@ -1,0 +1,149 @@
+{
+  "schemaVersion": 1,
+  "legacy": {
+    "license": "Apache-2.0",
+    "package": "@sora-substrate/type-definitions",
+    "version": "1.46.3",
+    "gitHead": "e7f0312f0b0eca31c6bd5d32cc4c7e535f3f805a",
+    "ormlVersion": "1.1.4",
+    "extraction": "Only static object, array and primitive literals parsed with TypeScript AST. No upstream module was imported, evaluated or executed. Merge order matches the installed schema index; RPC and executable code excluded.",
+    "typeCount": 195,
+    "sha256": "b522e7d503ad0ec6d9467f5413ee325e87155d6af83697f6dd22dc24d60129f1",
+    "sources": [
+      {
+        "file": "@open-web3/orml-type-definitions/authority.js",
+        "sha256": "f54be3feec2cd91dad7cc8c51505305c182f5dccb7e02c1564b437a3201ab09c"
+      },
+      {
+        "file": "@open-web3/orml-type-definitions/graduallyUpdates.js",
+        "sha256": "e268dbfabaac93b40e952487a13aa9f281210b15a5dae0182cb651e58eb42067"
+      },
+      {
+        "file": "@open-web3/orml-type-definitions/oracle.js",
+        "sha256": "486aeda00db87c84587d9d910cacaebc5f178ff5b215c3a036d6f089225fe260"
+      },
+      {
+        "file": "@open-web3/orml-type-definitions/tokens.js",
+        "sha256": "5bc5308bfe5113297c27aa849448848854492415c4837afe342ab62abe74b619"
+      },
+      {
+        "file": "@open-web3/orml-type-definitions/traits.js",
+        "sha256": "183be0bde97f2b707c5a67d9e845a4116925e787bc791c8a37084fd5ab7802ed"
+      },
+      {
+        "file": "@open-web3/orml-type-definitions/vesting.js",
+        "sha256": "7e36a18fb8a836ba2f977f17cce30fc587860643ff71af5603df94436112f7ab"
+      },
+      {
+        "file": "@open-web3/orml-type-definitions/rewards.js",
+        "sha256": "560bfd45da84a7c161c3340d0e4c09c0985023fc2ffdb2a0829cc1364c420e23"
+      },
+      {
+        "file": "@open-web3/orml-type-definitions/runtime.js",
+        "sha256": "fd24395038a89bcd9259db57d758ee6f134395d9dde8e31f0a8ae9d8d28b342c"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/assets.ts",
+        "sha256": "5b06e64707da11818b3198c2d2998d535046dfc55ca514e5e7b06f76c8caab4c"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/ceresGovernancePlatform.ts",
+        "sha256": "17c8aa9b4c6cc2b7dd18c75e978e7bd6434ee0877c23b6aa8d9854c90bfd5b10"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/ceresLiquidityLocker.ts",
+        "sha256": "b2965f06136b973ffb49a22a02b13dbe9d322406e3bb11fe747dfab2ee94e492"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/ceresStaking.ts",
+        "sha256": "ad69b4c97e943e573717a840f935120f8834366729dc1d5b46170ac032eb21e7"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/ceresTokenLocker.ts",
+        "sha256": "e4e5196def10e56df110aeeae889297ba652c9dd5dc551f0313e2fff55a5dd6e"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/ceresLaunchpad.ts",
+        "sha256": "2ed4a85f61bcb63974cbb1d57ac44bae55205e4d2876c685ed7c68e6a98890ca"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/demeterFarmingPlatform.ts",
+        "sha256": "02f0120a557f70ec33b16486ee499cb05402a8076bde12ec44853f9f3a33da8e"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/dexApi.ts",
+        "sha256": "b7a8eff3bdaeafa0dca5c28be08434a42a35cf23e6924df7a415fa1b246506e4"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/dexManager.ts",
+        "sha256": "8229ce508290adf1179e32b82fb3cf7960b5f6ff732d0186fa9184fd4cca5272"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/ethBridge.ts",
+        "sha256": "44becfb5ced455a721d28e9f8f617e772e9084f649dcd9f32a65084949a0f420"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/bridgeProxy.ts",
+        "sha256": "d95da2cccd195739a7cf470e110723de809541cef87ed70353b25bede95ec59c"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/farming.ts",
+        "sha256": "799891b32fe3e9ec44315da9d32f714786ebcf9f1e41b02acabe04ea209a9225"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/hermesGovernancePlatform.ts",
+        "sha256": "c11eb2991975e4caa5b82887293eda3cce50f2bece6f4534a114064bc6462cc7"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/irohaMigration.ts",
+        "sha256": "a44f03bd039c391941a6e09aa928af09fcab822da72d72319256b5ef2c6e4f11"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/liquidityProxy.ts",
+        "sha256": "692bdc2687149df513f4b8911864b6bb400b5857bab45cc0ca2cc0c580b6c0c8"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/pswapDistribution.ts",
+        "sha256": "fc229954a14a5eb6e148dfe82747d02cdef5d6655870223de1e34c648a80f4e7"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/rewards.ts",
+        "sha256": "b1922f3948751f7dc4f7d4bb13217ea83e5eabf0dc4b74c2adeeb53f3e8abc44"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/runtime.ts",
+        "sha256": "396eb9c597265f6dd2cfb24fbe1f6a85c6bf0ee4ba5cfbff0be72e77085deb96"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/template.ts",
+        "sha256": "f62156a5e204e3ff1bcefc5d9cbd970349ffeab8c33240ec6fbc2231503009fb"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/tradingPair.ts",
+        "sha256": "e4dcebbd514bb0c4a211de11f7b70b009a5ed376deb405b0c6376a0fec2e89bf"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/vestedRewards.ts",
+        "sha256": "6b16d67fd4fc61353bd133d52369288cfeec91d468c2d413dbebed2546fb4ab4"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/leafProvider.ts",
+        "sha256": "9e904db8d4cc978f82dad2774c34c9b5e4b60d5268485fd479ae99c8bb38c3ef"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/basicChannel.ts",
+        "sha256": "94595d401028cd20051a14de71abb596f4d7ad98092f5f1aaae86542ac0ddfad"
+      },
+      {
+        "file": "@sora-substrate/type-definitions/src/intentivizedChannel.ts",
+        "sha256": "d37535cb215afd5d0cf95c77781d974e40aa3dd334dc587fa7143cb1261dedd0"
+      }
+    ]
+  },
+  "mobile": {
+    "source": "sora-android/common/src/production/assets/types_scalecodec_mobile.json",
+    "reviewedForSourceRevision": "411dcdb70c5c00b21482a44d02334840d5f338c6",
+    "specVersion": 130,
+    "sha256": "e87760d7a566d1b1b3d21a1e76ad70990fd54e14e6af3ba27dd4440461063601"
+  }
+}

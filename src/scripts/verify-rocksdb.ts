@@ -84,11 +84,13 @@ export const runRocksdbVerification = async (): Promise<void> => {
     connectionString: config.databaseUrl,
     options: POSTGRES_TRUSTED_SESSION_OPTIONS,
   });
-  const client = await pool.connect();
-  const repository = new RocksRepository({ ...config, storageEngine: 'rocksdb' });
+  let client: pg.PoolClient | undefined;
+  let repository: RocksRepository | undefined;
   let committed = false;
 
   try {
+    client = await pool.connect();
+    repository = new RocksRepository({ ...config, storageEngine: 'rocksdb' });
     await client.query('begin isolation level repeatable read');
     await client.query('lock table indexer_documents in share mode');
     await repository.prepare();
@@ -102,9 +104,11 @@ export const runRocksdbVerification = async (): Promise<void> => {
       `RocksDB verification passed: compact indexes valid; ${fullVerification ? 'exhaustively verified' : 'sampled'} ${compared} document(s)`
     );
   } finally {
-    if (!committed) await client.query('rollback').catch(() => undefined);
-    client.release();
-    await repository.close().catch(() => undefined);
+    if (client) {
+      if (!committed) await client.query('rollback').catch(() => undefined);
+      client.release();
+    }
+    await repository?.close().catch(() => undefined);
     await pool.end();
   }
 };

@@ -14,7 +14,7 @@ template intentionally contains TODO placeholders and must fail the release-read
 audit until an operator attests the real deployment and its successful live
 production smoke result, exact SORA mainnet genesis and indexed checkpoint,
 independent verifying RPC controls, plus the delegated TLS-edge client-IP
-HTTP/WebSocket controls.
+HTTP/WebSocket controls and the exact public mobileConfig readback.
 USAGE
 }
 
@@ -112,6 +112,7 @@ const requiredEvidenceFields = [
   'deployedAt',
   'smokePassedAt',
   'healthInfo',
+  'mobileConfig',
   'soraRpcControls',
   'tlsEdgeControls',
   'operator'
@@ -278,6 +279,13 @@ const template = {
       deployedAt: 'TODO_UTC_DEPLOYED_AT_SECONDS',
       smokePassedAt: 'TODO_UTC_SMOKE_TIMESTAMP_SECONDS',
       healthInfo: contract.healthInfo,
+      mobileConfig: {
+        nexusAvailable: 'TODO_BOOLEAN_NEXUS_AVAILABLE',
+        nexusSendsAvailable: 'TODO_BOOLEAN_NEXUS_SENDS_AVAILABLE',
+        polkamarktVisible: 'TODO_BOOLEAN_POLKAMARKT_VISIBLE',
+        polkamarktMutationsAvailable: 'TODO_BOOLEAN_POLKAMARKT_MUTATIONS_AVAILABLE',
+        tairaDefaultVisible: 'TODO_BOOLEAN_TAIRA_DEFAULT_VISIBLE'
+      },
       soraRpcControls: contract.soraRpcControls,
       tlsEdgeControls: contract.tlsEdgeControls,
       operator: 'TODO_RELEASE_OPERATOR'

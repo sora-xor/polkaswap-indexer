@@ -621,7 +621,7 @@ describe('Polkaswap indexer schema', () => {
     expect(mobileConfigField?.resolve?.({}, {}, { repository: new MemoryRepository() }, {} as never)).toEqual({
       blockExplorerUrl: 'https://sorametrics.org/sorav2?tab=extrinsics&q={transaction}',
       substrateTypesUrl:
-        'https://raw.githubusercontent.com/sora-xor/sora2-substrate-js-library/metadata14ios/packages/types/src/metadata/prod/types_scalecodec_mobile.json',
+        'https://pi.soramitsu.io/runtime/sora-mobile-types.json',
       soracard: false,
       nodes: [{ name: 'Sora', address: 'wss://mof2.sora.org' }],
       nexusAvailable: true,
@@ -1746,6 +1746,64 @@ describe('Polkaswap indexer schema', () => {
 
     expect(positions.totalCount).toBe(1);
     expect(positions.edges.map((edge) => edge.node.id)).toEqual(['7-alice']);
+  });
+
+  it('preserves complete account predicates when querying account trades', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'accountTransactions',
+        id: 'alice-trade',
+        timestamp: 20,
+        data: { id: 'alice-trade', accountId: 'alice', timestamp: 20, module: 'polkamarkt', marketId: 7 },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'bob-trade',
+        timestamp: 10,
+        data: { id: 'bob-trade', accountId: 'bob', timestamp: 10, module: 'polkamarkt', marketId: 7 },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'alice-transfer',
+        timestamp: 30,
+        data: { id: 'alice-transfer', accountId: 'alice', timestamp: 30, module: 'assets' },
+      },
+    ]);
+    const tradesField = createSchema().getQueryType()?.getFields().accountTrades;
+
+    const alternatives = (await tradesField?.resolve?.(
+      {},
+      {
+        first: 10,
+        orderBy: ['TIMESTAMP_DESC'],
+        filter: {
+          or: [
+            { account: { equalTo: 'alice' } },
+            { account: { equalTo: 'bob' } },
+          ],
+        },
+      },
+      { repository },
+      {} as never
+    )) as { edges: Array<{ node: Record<string, unknown> }>; totalCount: number };
+    const conflicting = (await tradesField?.resolve?.(
+      {},
+      {
+        first: 10,
+        where: { account_eq: 'alice' },
+        filter: { account: { equalTo: 'bob' } },
+      },
+      { repository },
+      {} as never
+    )) as { edges: Array<{ node: Record<string, unknown> }>; totalCount: number };
+
+    expect(alternatives.totalCount).toBe(2);
+    expect(alternatives.edges.map(({ node }) => [node.id, node.account])).toEqual([
+      ['alice-trade', 'alice'],
+      ['bob-trade', 'bob'],
+    ]);
+    expect(conflicting).toMatchObject({ totalCount: 0, edges: [] });
   });
 
   it('serves SubQuery-compatible asset connections', async () => {

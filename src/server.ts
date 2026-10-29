@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import mobileTypes from './runtime/sora-mobile-types.json' with { type: 'json' };
 
 import { getOperationAST, GraphQLError, parse, specifiedRules, validate } from 'graphql';
 import { GRAPHQL_TRANSPORT_WS_PROTOCOL } from 'graphql-ws';
@@ -47,6 +48,9 @@ export type ServerHandle = {
   stop: () => Promise<void>;
 };
 
+const MOBILE_TYPES_PATH = '/runtime/sora-mobile-types.json';
+const MOBILE_TYPES_BODY = JSON.stringify(mobileTypes);
+
 const secondsSince = (startedAt: number): number => (Date.now() - startedAt) / 1000;
 
 export const normalizeRequestPath = (url: string | undefined, graphqlPath: string): string => {
@@ -61,6 +65,7 @@ export const normalizeRequestPath = (url: string | undefined, graphqlPath: strin
 
   if (path === graphqlPath) return graphqlPath;
   if (path === '/metrics') return '/metrics';
+  if (path === MOBILE_TYPES_PATH) return MOBILE_TYPES_PATH;
 
   return 'other';
 };
@@ -432,6 +437,22 @@ export async function startServer(
         'content-length': '0',
       });
       response.end();
+      return;
+    }
+
+    if (path === MOBILE_TYPES_PATH) {
+      request.resume();
+      if (method !== 'GET' && method !== 'HEAD') {
+        writeJsonError(response, 405, 'Method not allowed.', { allow: 'GET, HEAD' });
+        return;
+      }
+      response.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'content-length': String(Buffer.byteLength(MOBILE_TYPES_BODY)),
+        'cache-control': 'public, max-age=3600',
+        'access-control-allow-origin': '*',
+      });
+      response.end(method === 'HEAD' ? undefined : MOBILE_TYPES_BODY);
       return;
     }
 

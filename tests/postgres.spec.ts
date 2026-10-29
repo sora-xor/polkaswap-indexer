@@ -664,6 +664,26 @@ describe('PostgresRepository', () => {
     });
   });
 
+  it('treats substring-search metacharacters as literal text', async () => {
+    mocks.pool.query.mockResolvedValueOnce({ rows: [] });
+    const repository = new PostgresRepository(DATABASE_URL);
+
+    await repository.query('historyElements', {
+      first: 10,
+      filter: {
+        address: { equalTo: 'alice' },
+        module: { includesInsensitive: '%_\\' },
+      },
+      orderBy: ['TIMESTAMP_DESC'],
+      includeTotalCount: false,
+    });
+
+    const [sql, values] = mocks.pool.query.mock.calls[0] ?? [];
+    expect(String(sql)).toContain("strpos(lower(data->>'module'), $3) > 0");
+    expect(String(sql)).not.toContain(' like ');
+    expect(values).toEqual(['historyElements', 'alice', '%_\\', 11, 0]);
+  });
+
   it('orders USD acronym fields against the stored JSON key', async () => {
     const row = {
       collection: 'poolXYKs',

@@ -1739,6 +1739,58 @@ describe('ChainIndexer price derivation', () => {
     });
   });
 
+  it('normalizes staking unbond amounts to decimal XOR units', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      prices: Map<string, bigint>;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+    indexer.prices = new Map([[XOR, 2n * SCALE]]);
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 43 },
+                hash: { toString: () => canonicalBlockHash('staking-unbond-block') },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'alice' },
+                  hash: { toString: () => '0xstaking-unbond' },
+                  method: {
+                    section: 'staking',
+                    method: 'unbond',
+                    args: [(3n * SCALE).toString()],
+                    meta: { args: [{ name: 'value' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: { events: { at: async () => [] } },
+        timestamp: { now: { at: async () => ({ toString: () => '1700000000000' }) } },
+      },
+    };
+
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('staking-unbond-block'));
+
+    await expect(repository.get('historyElements', '0xstaking-unbond')).resolves.toMatchObject({
+      data: {
+        module: 'staking',
+        method: 'unbond',
+        data: { amount: '3', amountUSD: '6' },
+      },
+    });
+  });
+
   it('aggregates Polkamarkt batch claims without inventing payouts for skipped markets', async () => {
     const repository = new MemoryRepository();
     const indexer = new ChainIndexer(config, repository) as unknown as {
@@ -2788,6 +2840,7 @@ describe('ChainIndexer price derivation', () => {
     await indexer.indexBlockByHash(canonicalBlockHash('ethincomingblock'));
 
     const history = await repository.get('historyElements', '0xethincoming');
+    const snapshot = await repository.get('networkSnapshots', 'block-43');
     const accountMeta = await repository.get('accountMeta', 'alice');
     const aliceActivity = await repository.get('accountTransactions', '0xethincoming-alice');
     const bridgeSignerActivity = await repository.get('accountTransactions', '0xethincoming-bridge-peer');
@@ -2807,9 +2860,70 @@ describe('ChainIndexer price derivation', () => {
         to: 'alice',
       },
     });
+    expect(snapshot?.data.bridgeIncomingTransactions).toBe(1);
     expect(accountMeta?.data.deposit).toEqual({ incomingUSD: '8', outgoingUSD: '0' });
     expect(aliceActivity?.data).toMatchObject({ accountId: 'alice', historyElementId: '0xethincoming' });
     expect(bridgeSignerActivity).toBeNull();
+  });
+
+  it('does not count bridge approvals without an asset transfer', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      api: unknown;
+      indexBlockByHash: (hash: string) => Promise<void>;
+    };
+    indexer.api = {
+      rpc: {
+        chain: {
+          getBlock: async () => ({
+            block: {
+              header: {
+                number: { toNumber: () => 44 },
+                hash: { toString: () => canonicalBlockHash('bridge-approvals-block') },
+              },
+              extrinsics: [
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'bridge-peer' },
+                  hash: { toString: () => '0xmultisig-approval' },
+                  method: {
+                    section: 'bridgeMultisig',
+                    method: 'approveAsMulti',
+                    args: ['0xrequest'],
+                    meta: { args: [{ name: 'requestHash' }] },
+                  },
+                },
+                {
+                  isSigned: true,
+                  signer: { toString: () => 'bridge-peer' },
+                  hash: { toString: () => '0xeth-approval' },
+                  method: {
+                    section: 'ethBridge',
+                    method: 'approveRequest',
+                    args: ['0xrequest'],
+                    meta: { args: [{ name: 'requestHash' }] },
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      },
+      query: {
+        system: { events: { at: async () => [] } },
+        timestamp: { now: { at: async () => ({ toString: () => '1700000000000' }) } },
+      },
+    };
+
+    markIndexerMainnet(indexer);
+    await indexer.indexBlockByHash(canonicalBlockHash('bridge-approvals-block'));
+
+    await expect(repository.get('networkSnapshots', 'block-44')).resolves.toMatchObject({
+      data: {
+        bridgeIncomingTransactions: 0,
+        bridgeOutgoingTransactions: 0,
+      },
+    });
   });
 
   it('indexes bridgeProxy request events as mint history for EVM incoming restores', async () => {
@@ -6503,6 +6617,78 @@ describe('ChainIndexer price derivation', () => {
         }),
       ])
     );
+  });
+
+  it.each(['CollateralDeposit', 'DebtPayment'])(
+    'retains repeated %s vault events within and across extrinsics on replay',
+    async (method) => {
+      const repository = new MemoryRepository();
+      const indexer = new ChainIndexer(config, repository) as unknown as {
+        indexFetchedBlock: (block: unknown, options: { refreshDerivedState: boolean }) => Promise<void>;
+      };
+      markIndexerMainnet(indexer);
+      const requestedHash = canonicalBlockHash(`repeated-vault-${method}`);
+      const fetchedBlock = () => ({
+        requestedHash,
+        signedBlock: {
+          block: {
+            header: {
+              number: { toNumber: () => 99 },
+              hash: { toString: () => requestedHash },
+            },
+            extrinsics: [0, 1].map((index) => ({
+              isSigned: true,
+              signer: { toString: () => 'alice' },
+              hash: { toString: () => `0xvault-${index}` },
+              method: { section: 'utility', method: 'batch', args: [], meta: { args: [] } },
+            })),
+          },
+        },
+        events: [
+          eventRecord('kensetsu', method, { cdpId: 'vault-1', amount: SCALE.toString() }, 0),
+          eventRecord('kensetsu', method, { cdpId: 'vault-1', amount: (2n * SCALE).toString() }, 0),
+          eventRecord('kensetsu', method, { cdpId: 'vault-1', amount: (3n * SCALE).toString() }, 1),
+          eventRecord('kensetsu', method, { cdpId: 'vault-2', amount: (4n * SCALE).toString() }, 1),
+        ],
+        timestamp: 1_700_000_000,
+      });
+
+      await indexer.indexFetchedBlock(fetchedBlock(), { refreshDerivedState: false });
+      const first = await repository.list('vaultEvents');
+      expect(first.map(({ data }) => [data.vaultId, data.amount])).toEqual([
+        ['vault-1', '1'], ['vault-1', '2'], ['vault-1', '3'], ['vault-2', '4'],
+      ]);
+      expect(new Set(first.map(({ id }) => id)).size).toBe(4);
+      expect(first[0]?.id).toBe(`vault-1-99-${method}`);
+      expect(first[3]?.id).toBe(`vault-2-99-${method}`);
+      for (const document of first) expect(document.data.id).toBe(document.id);
+
+      await indexer.indexFetchedBlock(fetchedBlock(), { refreshDerivedState: false });
+      expect(await repository.list('vaultEvents')).toEqual(first);
+    }
+  );
+
+  it('keeps repeated vault event records idempotent across synthetic contexts', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as unknown as {
+      createEventDocuments: (
+        events: unknown[], blockHeight: number, timestamp: number, signer: string,
+        prices: undefined, assets: undefined, occurrences: Map<string, Map<unknown, number>>
+      ) => IndexerDocument[];
+    };
+    const occurrences = new Map<string, Map<unknown, number>>();
+    const events = [1n, 2n].map((amount) => eventRecord('kensetsu', 'CollateralDeposit', {
+      cdpId: 'vault-1', amount: (amount * SCALE).toString(),
+    }));
+    const documents = (records: unknown[]) => indexer.createEventDocuments(
+      records, 99, 1_700_000_000, 'alice', undefined, undefined, occurrences
+    );
+    await repository.upsertMany(documents(events));
+    const first = await repository.list('vaultEvents');
+    expect(first.map(({ data }) => data.amount)).toEqual(['1', '2']);
+
+    await repository.upsertMany(documents([...events].reverse()));
+    expect(await repository.list('vaultEvents')).toEqual(first);
   });
 
   it('creates storage-derived staking and referral documents', () => {

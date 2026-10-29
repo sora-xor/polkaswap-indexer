@@ -590,7 +590,7 @@ const DEFAULT_MOBILE_CAPABILITIES: MobileCapabilities = Object.freeze({
 const mobileConfigResolver = (capabilities: MobileCapabilities) => ({
   blockExplorerUrl: 'https://sorametrics.org/sorav2?tab=extrinsics&q={transaction}',
   substrateTypesUrl:
-    'https://raw.githubusercontent.com/sora-xor/sora2-substrate-js-library/metadata14ios/packages/types/src/metadata/prod/types_scalecodec_mobile.json',
+    'https://pi.soramitsu.io/runtime/sora-mobile-types.json',
   soracard: false,
   nodes: [{ name: 'Sora', address: 'wss://mof2.sora.org' }],
   ...capabilities,
@@ -1465,42 +1465,6 @@ const readString = (value: unknown): string | null => {
   return text.length ? text : null;
 };
 
-const readEqualFilterValue = (value: unknown): string | null => {
-  const direct = readString(value);
-  if (direct) return direct;
-
-  if (!isRecord(value)) return null;
-
-  return readString(value.equalTo) ?? readString(value.eq) ?? readString(value._eq) ?? null;
-};
-
-const readAccountFromFilter = (filter: unknown): string | null => {
-  if (!isRecord(filter)) return null;
-
-  for (const [key, value] of Object.entries(filter)) {
-    if ((key === 'and' || key === 'or') && Array.isArray(value)) {
-      const nested = value.map(readAccountFromFilter).find((account): account is string => Boolean(account));
-      if (nested) return nested;
-      continue;
-    }
-
-    if (key === 'account_eq' || key === 'accountId_eq' || key === 'account_id_eq') {
-      const account = readString(value);
-      if (account) return account;
-    }
-
-    if (key === 'account' || key === 'accountId' || key === 'account_id') {
-      const account = readEqualFilterValue(value);
-      if (account) return account;
-    }
-  }
-
-  return null;
-};
-
-const readAccountFromArgs = (args: AccountActivityConnectionArgs): string | null =>
-  readAccountFromFilter(args.where) ?? readAccountFromFilter(args.filter);
-
 const addFilterField = (filter: Record<string, unknown>, field: string, condition: unknown): void => {
   const existing = filter[field];
   if (existing === undefined) {
@@ -1514,24 +1478,27 @@ const addFilterField = (filter: Record<string, unknown>, field: string, conditio
   filter.and = [...andFilters, { [field]: existing }, { [field]: condition }];
 };
 
-const normalizeAccountPositionFilter = (filter: unknown): Record<string, unknown> | null => {
+const normalizeAccountActivityFilter = (
+  filter: unknown,
+  accountField: 'account' | 'accountId'
+): Record<string, unknown> | null => {
   if (!isRecord(filter)) return null;
 
   const normalized: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(filter)) {
     if ((key === 'and' || key === 'or') && Array.isArray(value)) {
-      normalized[key] = value.map((entry) => normalizeAccountPositionFilter(entry) ?? entry);
+      normalized[key] = value.map((entry) => normalizeAccountActivityFilter(entry, accountField) ?? entry);
       continue;
     }
 
     if (key === 'account_eq' || key === 'accountId_eq' || key === 'account_id_eq') {
-      addFilterField(normalized, 'account', { equalTo: value });
+      addFilterField(normalized, accountField, { equalTo: value });
       continue;
     }
 
-    if (key === 'accountId' || key === 'account_id') {
-      addFilterField(normalized, 'account', value);
+    if (key === 'account' || key === 'accountId' || key === 'account_id') {
+      addFilterField(normalized, accountField, value);
       continue;
     }
 
@@ -1541,15 +1508,25 @@ const normalizeAccountPositionFilter = (filter: unknown): Record<string, unknown
   return normalized;
 };
 
-const accountPositionFilterFromArgs = (args: AccountActivityConnectionArgs): Record<string, unknown> => {
-  const filters = [normalizeAccountPositionFilter(args.where), normalizeAccountPositionFilter(args.filter)].filter(
-    (filter): filter is Record<string, unknown> => Boolean(filter && Object.keys(filter).length)
-  );
+const accountActivityFilterFromArgs = (
+  args: AccountActivityConnectionArgs,
+  accountField: 'account' | 'accountId'
+): Record<string, unknown> => {
+  const filters = [
+    normalizeAccountActivityFilter(args.where, accountField),
+    normalizeAccountActivityFilter(args.filter, accountField),
+  ].filter((filter): filter is Record<string, unknown> => Boolean(filter && Object.keys(filter).length));
 
   if (filters.length === 0) return {};
   if (filters.length === 1) return filters[0]!;
   return { and: filters };
 };
+
+const accountPositionFilterFromArgs = (args: AccountActivityConnectionArgs): Record<string, unknown> =>
+  accountActivityFilterFromArgs(args, 'account');
+
+const accountTransactionFilterFromArgs = (args: AccountActivityConnectionArgs): Record<string, unknown> =>
+  accountActivityFilterFromArgs(args, 'accountId');
 
 const normalizeAccountPositionOrder = (orderBy: unknown): unknown => {
   const normalizeToken = (token: unknown): unknown => {
@@ -1587,18 +1564,28 @@ const queryDocuments = async (
 
   const documents = await repository.list(collectionName);
   const filtered = sortDocuments(
-    documents.filter((document) => matchesFilter(document.data, filter)),
+    documents.map((document) => ({
+      ...document.data,
+      id: document.id,
+      timestamp: document.timestamp ?? document.data.timestamp,
+      blockHeight: document.blockHeight ?? document.data.blockHeight,
+      document,
+    })).filter((document) => matchesFilter(document, filter)),
     orderBy
   );
   const totalCount = filtered.length;
-  const { end, pageStart } = paginationWindow(normalizedArgs, totalCount);
+  const keyset = queryArgs.keyset;
+  const remaining = keyset ? filtered.filter((document) => isAfterOrderPosition(document, keyset)) : filtered;
+  const { end, pageStart } = paginationWindow(normalizedArgs, remaining.length);
+  const items = remaining.slice(pageStart, end).map(({ document }) => document);
 
   return {
-    items: filtered.slice(pageStart, end),
+    items,
+    itemCursors: items.map((document) => cursorForDocument(collectionName, document, orderBy, filter)),
     totalCount,
     pageStart,
-    hasNextPage: end < totalCount,
-    hasPreviousPage: pageStart > 0,
+    hasNextPage: end < remaining.length,
+    hasPreviousPage: Boolean(keyset) || pageStart > 0,
   };
 };
 
@@ -1699,7 +1686,7 @@ const indexedRuntimeUInt32ListOrNull = (value: unknown): number[] | null => {
 
 const toAccountTradeNode = (
   historyDocument: IndexerDocument | null | undefined,
-  account: string,
+  account: string | null,
   accountTransaction?: IndexerDocument
 ): Record<string, unknown> => {
   const source = historyDocument?.data ?? accountTransaction?.data ?? {};
@@ -1730,7 +1717,7 @@ const toAccountTradeNode = (
     readString(source.id) ??
     readString(accountTransaction?.id) ??
     readString(historyDocument?.id) ??
-    `${account}-${String(timestamp ?? 'activity')}`;
+    `${account ?? 'unknown'}-${String(timestamp ?? 'activity')}`;
 
   return {
     id,
@@ -1797,17 +1784,11 @@ const accountTradesResolver = async (
 ) => {
   const normalizedArgs = normalizeConnectionArgs(args);
   const orderBy = args.orderBy ?? ['TIMESTAMP_DESC'];
-  assertPublicConnectionQuery('accountTrades', orderBy, accountPositionFilterFromArgs(args));
-  const account = readAccountFromArgs(args);
-  if (!account) return buildConnection(collection('accountTrades'), [], normalizedArgs);
-
-  // Account transaction rows also drive network activity. Restrict this
-  // connection to the worker's canonical Polkamarkt projection so unrelated
-  // transfers cannot surface as trades with a null market identifier.
+  const activityFilter = accountTransactionFilterFromArgs(args);
+  assertPublicConnectionQuery('accountTrades', orderBy, activityFilter);
+  // Preserve every caller filter while limiting results to canonical trades.
   const transactionFilter = {
-    accountId: { equalTo: account },
-    module: { equalTo: 'polkamarkt' },
-    marketId: { greaterThanOrEqualTo: 0 },
+    and: [activityFilter, { module: { equalTo: 'polkamarkt' }, marketId: { greaterThanOrEqualTo: 0 } }],
   };
   const accountTransactionResult = await queryDocuments(
     context.repository,
@@ -1819,7 +1800,7 @@ const accountTradesResolver = async (
   );
 
   const nodes = accountTransactionResult.items.map((document) =>
-    toAccountTradeNode(null, account, document)
+    toAccountTradeNode(null, readString(document.data.accountId), document)
   );
   return connectionFromNodes(
     collection('accountTransactions'),
@@ -1911,6 +1892,7 @@ async function* pollSubscription(
   const ids = getSubscriptionIds(args.id);
   const mutations = getSubscriptionMutations(args.mutation);
   const snapshots = new Map<string, string>();
+  let firstPoll = true;
 
   while (!signal.aborted) {
     const seen = new Set<string>();
@@ -1927,11 +1909,13 @@ async function* pollSubscription(
       const fingerprint = subscriptionDocumentFingerprint(document.data);
       if (snapshots.get(document.id) === fingerprint) continue;
 
+      // Preserve the initial snapshot emission; only later appearances are inserts.
+      const mutationType = firstPoll || snapshots.has(document.id) ? 'UPDATE' : 'INSERT';
       snapshots.set(document.id, fingerprint);
       emissions.push({
         collection: collectionName,
         id: document.id,
-        mutationType: 'UPDATE',
+        mutationType,
       });
     }
     for (const id of [...snapshots.keys()]) {
@@ -1939,6 +1923,7 @@ async function* pollSubscription(
       snapshots.delete(id);
       emissions.push({ collection: collectionName, id, mutationType: 'DELETE' });
     }
+    firstPoll = false;
     for (const event of emissions) {
       if (mutations.has(event.mutationType)) yield event;
     }

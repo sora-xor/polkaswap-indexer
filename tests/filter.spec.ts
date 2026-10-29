@@ -1,6 +1,30 @@
 import { describe, expect, it } from 'vitest';
 
-import { matchesFilter, sortDocuments } from '../src/graphql/filter.js';
+import { compareOrderValues, isAfterOrderPosition, matchesFilter, sortDocuments } from '../src/graphql/filter.js';
+
+describe('trusted repository filter compatibility boundaries', () => {
+  it('compares bigint identifiers without rounding them through Number', () => {
+    expect(matchesFilter({ id: 9007199254740993n }, { id: { eq: '9007199254740993' } })).toBe(true);
+    expect(matchesFilter({ id: 9007199254740993n }, { id: { in: [9007199254740993n] } })).toBe(true);
+  });
+  it.each(['in', 'notIn', 'not_in'])('rejects a nonarray %s set instead of broadening it', operator => {
+    expect(matchesFilter({ id: 'alice' }, { id: { [operator]: 'alice' } })).toBe(false);
+  });
+  it('normalizes missing text fields for case-insensitive comparisons', () => {
+    expect(matchesFilter({}, { name: { equalToInsensitive: '' } })).toBe(true);
+    expect(matchesFilter({}, { name: { includesInsensitive: 'a' } })).toBe(false);
+  });
+  it('orders plain numeric fields numerically in both directions', () => {
+    expect(compareOrderValues(9, 10, 'custom', 'asc')).toBe(-1); expect(compareOrderValues(10, 9, 'custom', 'desc')).toBe(-1);
+  });
+  it('does not follow inherited or unsafe paths in a continuation position', () => {
+    expect(isAfterOrderPosition({ id: 'b' }, { field: '__proto__.secret', value: null, id: 'a', direction: 'asc' })).toBe(true);
+    expect(isAfterOrderPosition({}, { field: 'name', value: null, id: 'a', direction: 'desc' })).toBe(true);
+  });
+  it('sorts tied records with absent IDs without inventing a tie breaker', () => {
+    expect(sortDocuments([{ symbol: 'A' }, { symbol: 'A' }], ['SYMBOL_ASC'])).toEqual([{ symbol: 'A' }, { symbol: 'A' }]);
+  });
+});
 
 describe('GraphQL filter compatibility', () => {
   it('matches SubQuery-style boolean filters', () => {
@@ -148,6 +172,11 @@ describe('GraphQL filter compatibility', () => {
         }
       )
     ).toBe(true);
+  });
+
+  it('treats substring metacharacters as ordinary characters', () => {
+    expect(matchesFilter({ module: 'assets' }, { module: { includesInsensitive: '%' } })).toBe(false);
+    expect(matchesFilter({ module: 'assets_%_bridge' }, { module: { includesInsensitive: '_%_' } })).toBe(true);
   });
 
   it('fails numeric comparisons closed for invalid decimal values', () => {
