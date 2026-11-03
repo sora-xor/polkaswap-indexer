@@ -202,7 +202,7 @@ describe('RocksDB backup operation', () => {
 
     const wrongVersion = join(root, 'wrong-version.rocksdb');
     const wrong = RocksDatabase.open(wrongVersion);
-    await wrong.put(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY], ROCKSDB_FORMAT_VERSION + 1);
+    await wrong.put(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY], 99);
     await wrong.put(['d', 'assets', 'row'], true);
     wrong.close();
     await expect(createRocksdbBackup(wrongVersion, backupDir)).rejects.toThrow(/unsupported format/);

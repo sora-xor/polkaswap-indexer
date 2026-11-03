@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { canonicalAccount, RECOVERY_CHECKPOINT, validateBurnAllocationPolicy, validateBurnRecoveryPolicy, type BurnAllocationPolicy, type BurnRecoveryPolicy } from './burn-recovery.js';
 import type { IndexerDocument, IndexerRepository } from './repository/types.js';
 import { serializeIndexerDocument } from './repository/validation.js';
+import { assertNotStatsRecovery } from './stats-recovery.js';
 
 export const POINTS_RECOVERY_ID = 'soratopiaRecoveryContinuity-v1';
 export const POINTS_CHECKPOINT_ID = 'soratopiaRecoveryCheckpoint-v1';
@@ -143,6 +144,7 @@ const continuity = async (repository: IndexerRepository, policy: BurnRecoveryPol
 
 /** Only a fresh isolated recovery replay may establish point provenance. No legacy retrofit. */
 export async function initializePointsRecovery(repository: IndexerRepository, policy: BurnRecoveryPolicy, startBlock: number): Promise<void> {
+  await assertNotStatsRecovery(repository);
   validateBurnRecoveryPolicy(policy);
   targets(policy);
   need(integer(startBlock) && startBlock <= 1, 'complete point replay must start at block 1');
@@ -424,6 +426,7 @@ export async function projectCheckpointPoints(repository: IndexerRepository, pol
 
 /** Queries never expose a partial projection or treat a retired key as a claimant. */
 export async function pointsQueryIdentity(repository: IndexerRepository): Promise<BurnRecoveryPolicy | null> {
+  await assertNotStatsRecovery(repository);
   const identity = await repository.get('updatesStreams', 'burnRecoveryIdentity-v1');
   if (!identity) {
     need(!(await repository.get('updatesStreams', POINTS_RECOVERY_ID)), 'policy is missing');

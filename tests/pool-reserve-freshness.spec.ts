@@ -169,7 +169,7 @@ describe('XYK swap reserve freshness', () => {
       }, extrinsics: [] } },
     }, { historicalValuationState: state, refreshDerivedState: false });
 
-    expect(indexer.getHistoricalValuationQueryAt).toHaveBeenCalledWith(9);
+    expect(indexer.getHistoricalValuationQueryAt).toHaveBeenCalledWith(9, expect.any(String), undefined, expect.any(Function));
     expect((await repository.get('assetSnapshots', assetHourlyCloseId(KUSD, 7198)))?.data.closeEvidence).toMatchObject({
       blockHeight: 9,
       xorPool: { baseAssetReserves: (100n * SCALE).toString(), targetAssetReserves: (400n * SCALE).toString() },

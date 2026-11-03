@@ -140,7 +140,7 @@ export const repairRocksdbLegacyCheckpoint = async (
   const repository = new RocksRepository(config);
   try {
     if (repository.getMetadata(ROCKSDB_FORMAT_METADATA_KEY) !== ROCKSDB_FORMAT_VERSION) {
-      throw new Error('Checkpoint repair requires the current RocksDB format');
+      throw new Error('Checkpoint repair requires legacy RocksDB format 2');
     }
     const migration = parsePostgresRocksdbMigrationState(repository.getMetadata(POSTGRES_ROCKSDB_MIGRATION_STATE_KEY));
     if (!migration || migration.status !== 'validated_complete') {

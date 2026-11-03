@@ -36,6 +36,25 @@ For the one-shot trading-volume repair, follow
 `docs/network-volume-repair.md` and complete the offline
 repair before starting a calendar-enabled worker.
 
+As of 1 November 2026, Pi serves the exhaustively audited canonical prefix
+through block 28,191,816 in native read-only recovery hold. That canonical
+service is the rollback target; the older abandoned-fork database remains
+retained for incident evidence and must never resume its writer or have its
+checkpoint rewound. MOF2 retains a 657 GiB old archive, separate from its public
+recovery database. Preserve that archive and bound its historical use to the
+shared prefix through block 28,191,817. See
+`docs/post-fork-recovery-20261031.md` for exact service paths, evidence and
+canonical rebuild prerequisites. The hold is not a successful live-indexing
+recovery. A separate statistics/history candidate is private and cannot certify
+entitlements; no candidate preparation receipt authorizes public promotion.
+
+The restored canonical historical endpoint is `wss://mof2.sora.org/archive`
+(`https://mof2.sora.org/archive` for HTTP). It combines the retained shared prefix
+with recovery-chain heads and post-fork reads, rejects abandoned-fork hashes,
+and preserves the runtime-metadata boundary. See `docs/archive-gateway.md` for
+service isolation, branch pins, verification and rollback. Do not point the
+indexer directly at the retained old node's unbounded head.
+
 ## Stack
 
 - Node.js 24+

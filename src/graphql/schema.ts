@@ -47,6 +47,21 @@ export const typeDefs = /* GraphQL */ `
     DELETE
   }
 
+  type IndexerCapabilities {
+    schemaVersion: Int!
+    genesisHash: String!
+    policyHash: String
+    mode: String!
+    statsReady: Boolean!
+    historyReady: Boolean!
+    currentViewsReady: Boolean!
+  coreViewsReady: Boolean!
+    entitlementsReady: Boolean!
+    indexedBlock: Int
+    indexedBlockHash: String
+    reason: String
+  }
+
   type Health {
     ok: Boolean!
     repositoryReady: Boolean!
@@ -970,6 +985,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type Query {
+    indexerCapabilities: IndexerCapabilities!
     _health: Health!
     mobileConfig: MobileConfig!
     account(id: String!): JSON

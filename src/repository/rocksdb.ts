@@ -123,6 +123,11 @@ const WATCH_IDLE_WAKE_INTERVAL_MS = 30_000;
 const FALLBACK_CURSOR_VALUE_PREFIX = '\u0000rkv1.';
 export const ROCKSDB_FORMAT_METADATA_KEY = 'rocksdbFormatVersion';
 export const ROCKSDB_FORMAT_VERSION = 2;
+export const ROCKSDB_COMPRESSED_FORMAT_VERSION = 3;
+export const ROCKSDB_SUPPORTED_FORMAT_VERSIONS = [ROCKSDB_FORMAT_VERSION, ROCKSDB_COMPRESSED_FORMAT_VERSION] as const;
+/** Reader capability; the default writer remains format 2. */
+export const rocksFormatIsSupported = (version: unknown): version is 2 | 3 =>
+  version === ROCKSDB_FORMAT_VERSION || version === ROCKSDB_COMPRESSED_FORMAT_VERSION;
 /** Completion/progress for the derived swap-asset timestamp index. */
 export const ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY = 'historySwapAssetIndex';
 const SWAP_ASSET_INDEX_CODE = 's-a-t';
@@ -1035,12 +1040,6 @@ const documentIdentityFromKey = (key: unknown): { collection: IndexerCollection;
   return { collection: key[1] as IndexerCollection, id: key[2] };
 };
 
-const decodeStoredDocument = (
-  collection: IndexerCollection,
-  id: string,
-  stored: unknown
-): IndexerDocument | undefined => decodeRocksDocument(collection, id, stored) ?? undefined;
-
 const selectCompactDefinition = (
   collection: IndexerCollection,
   field: CompactIndexOrderField,
@@ -1435,6 +1434,8 @@ export class RocksRepository implements IndexerRepository {
   private readonly db: RocksDatabase;
   private readonly config: AppConfig;
   private readonly readOnly: boolean;
+  private readonly documentCompression: 'none' | 'brotli';
+  private documentFormatVersion = ROCKSDB_FORMAT_VERSION;
   private readonly allowIncompleteMigration: boolean;
   private readonly events = new EventEmitter();
   private readonly watchQueueMax: number;
@@ -1455,6 +1456,10 @@ export class RocksRepository implements IndexerRepository {
 
   constructor(config: AppConfig, options: RocksRepositoryOptions = {}) {
     this.config = config;
+    this.documentCompression = config.rocksdbDocumentCompression ?? 'none';
+    if (this.documentCompression !== 'none' && this.documentCompression !== 'brotli') {
+      throw new Error('Unsupported RocksDB document compression');
+    }
     this.readOnly = options.readOnly === true;
     this.allowIncompleteMigration = options.allowIncompleteMigration === true;
     this.watchQueueMax = config.rocksdbWatchQueueMax;
@@ -1507,6 +1512,13 @@ export class RocksRepository implements IndexerRepository {
 
   private async prepareCurrentFormat(): Promise<void> {
     const storedVersion = this.getMetadata<unknown>(ROCKSDB_FORMAT_METADATA_KEY);
+    const requestedVersion = this.documentCompression === 'brotli' ? ROCKSDB_COMPRESSED_FORMAT_VERSION : ROCKSDB_FORMAT_VERSION;
+    // Fence mode changes before index preparation or any metadata mutation.
+    if (!this.readOnly && storedVersion !== undefined &&
+        ((requestedVersion === ROCKSDB_COMPRESSED_FORMAT_VERSION && storedVersion !== requestedVersion) ||
+         (storedVersion === ROCKSDB_COMPRESSED_FORMAT_VERSION && requestedVersion !== storedVersion))) {
+      throw new Error('Unsupported RocksDB compression mode for existing database; brotli requires a fresh format-3 database or an explicitly opted-in format-3 resume');
+    }
     if (storedVersion === undefined) {
       if (this.readOnly) {
         throw new Error('RocksDB is empty or unversioned; a read-only repository cannot initialize it');
@@ -1517,18 +1529,23 @@ export class RocksRepository implements IndexerRepository {
         );
       }
       await this.db.transaction(async (transaction) => {
-        await transaction.put(metadataKey(ROCKSDB_FORMAT_METADATA_KEY), ROCKSDB_FORMAT_VERSION);
+        await transaction.put(metadataKey(ROCKSDB_FORMAT_METADATA_KEY), requestedVersion);
         await transaction.put(metadataKey(ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY), {
           version: 1, status: 'building', afterId: null,
         } satisfies SwapAssetIndexState);
       });
     } else if (storedVersion === 1 && this.readOnly) {
       throw new Error('Unsupported RocksDB format 1 for read-only use; complete writable prepare() to upgrade the swap-asset index to format 2 first');
-    } else if (storedVersion !== ROCKSDB_FORMAT_VERSION && (storedVersion !== 1 || this.readOnly)) {
+    } else if (!rocksFormatIsSupported(storedVersion) && (storedVersion !== 1 || this.readOnly)) {
       throw new Error(
-        `Unsupported RocksDB format ${String(storedVersion)} at ${this.config.rocksdbPath}; expected ${ROCKSDB_FORMAT_VERSION}`
+        `Unsupported RocksDB format ${String(storedVersion)} at ${this.config.rocksdbPath}; expected ${ROCKSDB_SUPPORTED_FORMAT_VERSIONS.join(', ')}`
       );
     }
+
+    // Readers select capability from the stored marker, independent of writer options.
+    this.documentFormatVersion = storedVersion === ROCKSDB_COMPRESSED_FORMAT_VERSION ||
+      (storedVersion === undefined && requestedVersion === ROCKSDB_COMPRESSED_FORMAT_VERSION)
+      ? ROCKSDB_COMPRESSED_FORMAT_VERSION : ROCKSDB_FORMAT_VERSION;
 
     if (this.hasStoredKeyWithPrefix(['i'])) {
       throw new Error(
@@ -1609,7 +1626,7 @@ export class RocksRepository implements IndexerRepository {
           if (this.closing) throw new Error('RocksDB burn-owner index preparation stopped during close');
           const identity = documentIdentityFromKey(entry?.key);
           if (!identity || identity.collection !== 'xorBurns') throw new Error('Malformed burn-owner document key');
-          const document = decodeStoredDocument(identity.collection, identity.id, entry?.value);
+          const document = this.decodeStoredDocument(identity.collection, identity.id, entry?.value);
           if (!document) throw new Error(`Missing burn-owner document ${identity.id}`);
           const keys = compactDocumentIndexKeys(document);
           for (const key of keys) {
@@ -1687,7 +1704,7 @@ export class RocksRepository implements IndexerRepository {
           if (!identity || identity.collection !== 'historyElements') {
             throw new Error('RocksDB swap-asset index preparation found a malformed history document key');
           }
-          const document = decodeStoredDocument(identity.collection, identity.id, entry?.value);
+          const document = this.decodeStoredDocument(identity.collection, identity.id, entry?.value);
           if (!document) throw new Error(`RocksDB swap-asset index preparation found a missing document ${identity.id}`);
           const keys = swapAssetDocumentIndexKeys(document);
           for (const key of keys) await transaction.put(key, 1);
@@ -1728,7 +1745,7 @@ export class RocksRepository implements IndexerRepository {
       for (const entry of this.db.getRange(rangeForPrefix(['d', collection]))) {
         const id = keyId(entry?.key);
         if (!id) continue;
-        const document = decodeStoredDocument(collection, id, entry?.value);
+        const document = this.decodeStoredDocument(collection, id, entry?.value);
         if (document) documents.push(document);
       }
 
@@ -1845,7 +1862,7 @@ export class RocksRepository implements IndexerRepository {
           for (const candidate of batch) {
             const document = candidate;
             const key = documentKey(document.collection, document.id);
-            const previous = decodeStoredDocument(document.collection, document.id, transaction.getSync(key));
+            const previous = this.decodeStoredDocument(document.collection, document.id, transaction.getSync(key));
             if (previous && !canReplaceDocumentAtBlock(previous, document)) continue;
             if (documentsEqual(previous, document)) continue;
 
@@ -1871,7 +1888,7 @@ export class RocksRepository implements IndexerRepository {
               if (!previousCountKeys.has(identity)) await updateIndexCount(countKeyValue, 1);
             }
 
-            await transaction.put(key, encodeRocksDocument(document));
+            await transaction.put(key, encodeRocksDocument(document, this.documentCompression));
             for (const indexKey of compactDocumentIndexKeys(document)) {
               await transaction.put(indexKey, 1);
             }
@@ -2122,7 +2139,7 @@ export class RocksRepository implements IndexerRepository {
         if (!identity) {
           throw new Error(`Compact RocksDB index validation failed: malformed document key ${JSON.stringify(entry?.key)}`);
         }
-        const document = decodeStoredDocument(identity.collection, identity.id, entry?.value);
+        const document = this.decodeStoredDocument(identity.collection, identity.id, entry?.value);
         if (!document) throw new Error(`Compact RocksDB index validation failed: missing value for ${identity.collection}/${identity.id}`);
         documentCounts.set(identity.collection, (documentCounts.get(identity.collection) ?? 0) + 1);
         expectedCount += new Set(compactDocumentIndexKeys(document).map((key) => JSON.stringify(key))).size;
@@ -2169,7 +2186,7 @@ export class RocksRepository implements IndexerRepository {
 
         const collection = key[1] as IndexerCollection;
         const id = key[key.length - 1] as string;
-        const document = decodeStoredDocument(collection, id, transaction.getSync(documentKey(collection, id)));
+        const document = this.decodeStoredDocument(collection, id, transaction.getSync(documentKey(collection, id)));
         if (!document) {
           throw new Error(`Compact RocksDB index validation failed: dangling key ${JSON.stringify(key)}`);
         }
@@ -2244,6 +2261,10 @@ export class RocksRepository implements IndexerRepository {
 
   private assertPrepared(operation: string): void {
     if (!this.prepared) throw new Error(`Cannot ${operation}: call RocksDB repository prepare() first`);
+  }
+
+  private decodeStoredDocument(collection: IndexerCollection, id: string, stored: unknown): IndexerDocument | undefined {
+    return decodeRocksDocument(collection, id, stored, this.documentFormatVersion) ?? undefined;
   }
 
   private documentCacheKey(collection: IndexerCollection, id: string): string {
@@ -2324,7 +2345,7 @@ export class RocksRepository implements IndexerRepository {
       metrics.increment('indexer_rocksdb_document_cache_misses_total', { collection });
     }
 
-    const document = decodeStoredDocument(collection, id, this.db.getSync(documentKey(collection, id)));
+    const document = this.decodeStoredDocument(collection, id, this.db.getSync(documentKey(collection, id)));
     if (document) this.cacheDocument(document);
     return document;
   }
@@ -2829,14 +2850,14 @@ export class RocksRepository implements IndexerRepository {
       if (range.keyKind === 'document') {
           const identity = documentIdentityFromKey(entry?.key);
           if (!identity) continue;
-          const document = decodeStoredDocument(identity.collection, identity.id, entry?.value);
+          const document = this.decodeStoredDocument(identity.collection, identity.id, entry?.value);
           if (document) yield document;
         continue;
       }
 
       const id = keyId(entry?.key);
       if (!id) continue;
-        const document = decodeStoredDocument(collection, id, this.db.getSync(documentKey(collection, id)));
+        const document = this.decodeStoredDocument(collection, id, this.db.getSync(documentKey(collection, id)));
         if (document) yield document;
     }
   }

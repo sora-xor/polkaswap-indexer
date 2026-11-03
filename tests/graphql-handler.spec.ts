@@ -373,7 +373,7 @@ describe('production GraphQL handler', () => {
     expect(body.data?.historyElements?.pageInfo?.hasNextPage).toBe(true);
     expect(querySpy).toHaveBeenCalledWith(
       'historyElements',
-      expect.objectContaining({ first: 3, maxBytes: 1_000_000 })
+      expect.objectContaining({ first: 3, maxBytes: 1_000_000 - 4 * estimateRetainedValueBytes(null, Number.MAX_SAFE_INTEGER) })
     );
   });
 
@@ -449,7 +449,9 @@ describe('production GraphQL handler', () => {
       }),
     ]);
     expect(maximumActiveQueries).toBe(1);
-    expect(passedBudgets).toEqual([operationBudget, sampleBytes]);
+    // The four bounded classification reads per alias share the same budget.
+    const authorizationBytes = 3 * 4 * estimateRetainedValueBytes(null, Number.MAX_SAFE_INTEGER);
+    expect(passedBudgets).toEqual([operationBudget - authorizationBytes, sampleBytes - authorizationBytes]);
     expect(fetchedBytes).toBeLessThanOrEqual(operationBudget);
   });
 });

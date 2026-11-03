@@ -1,0 +1,48 @@
+{
+  "schema": "sora-nexus-normalized-prefix-v1",
+  "phase": "before",
+  "sourceDocuments": 27428271,
+  "sourceCollections": {
+    "accountLiquiditySnapshots": 6745788,
+    "accountMeta": 441,
+    "accountPointSystems": 441,
+    "accountPositions": 31,
+    "accountTransactions": 41344,
+    "accounts": 441,
+    "assetSnapshots": 10981388,
+    "assets": 957,
+    "historyElements": 2176311,
+    "marketSnapshots": 162240,
+    "markets": 50,
+    "networkSnapshots": 2163891,
+    "orderBookSnapshots": 206064,
+    "orderBooks": 18,
+    "poolSnapshots": 4945536,
+    "poolXYKs": 432,
+    "referrerRewards": 505,
+    "stakingStakers": 2181,
+    "stakingValidators": 15,
+    "updatesStreams": 18,
+    "vaultEvents": 8,
+    "vaults": 12,
+    "xorBurns": 159
+  },
+  "normalizedDocumentsSha256": "1497ab33d6e532a458d4c825ecf5401ea703a75f363606f8d9905cfbd3286c7e",
+  "volumeRepairMarker": {
+    "collection": "updatesStreams",
+    "id": "networkVolumeRepair-v2",
+    "blockHeight": 27159179,
+    "timestamp": 1785761832,
+    "data": {
+      "block": 27159179,
+      "data": "{\"status\":\"complete\",\"completedAt\":1791525988,\"repairVersion\":2,\"semantics\":\"verified-block-exchange-volume-calendar-v2\",\"throughBlock\":27159179,\"earliestHistoryTimestamp\":1616951754,\"latestSnapshotTimestamp\":1785761832,\"historyRowsScanned\":1122922,\"valuedSwapRows\":14687,\"blockSnapshotsScanned\":1100704,\"aggregateSnapshotsScanned\":4590,\"changedBlockSnapshots\":955,\"changedAggregateSnapshots\":4590,\"reconciledAggregateCountMismatches\":1647,\"preservedUnverifiedAggregates\":81,\"seededCalendarSnapshots\":4555,\"estimatedWriteBytes\":4322851}",
+      "id": "networkVolumeRepair-v2"
+    }
+  },
+  "volumeRepairMarkerSha256": "28ddafd9e177edb13f9b588e293ba7913f6509ab787a4a1d5ddcc4a145e8e169",
+  "seedRows": {},
+  "database": "/data/pi-indexer-stats-history-trial-20261101/candidate.rocksdb",
+  "readOnly": true,
+  "exhaustiveNativeExecutedOnClone": false,
+  "normalizedScanExecutedOnClone": true
+}

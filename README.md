@@ -6,6 +6,12 @@ The API intentionally exposes SubQuery-compatible GraphQL field names so the
 static Polkaswap UI can use a single external endpoint without depending on
 SubQuery or Subsquid from the browser.
 
+Production recovery status (31 October 2026): the Pi API is in native read-only
+hold while a canonical replacement is prepared. MOF2's retained old archive
+passed historical availability checks; live indexing is not yet restored.
+See [post-fork recovery](docs/post-fork-recovery-20261031.md) for the archive,
+service paths, validation and cutover prerequisites.
+
 ## Runtime
 
 - Node.js 24+
@@ -162,6 +168,18 @@ index progress marker before adding keys. Earlier indexer binaries reject format
 2, preventing an older writer from invalidating the derived index. Rolling back
 to an earlier binary requires restoration of a verified complete pre-upgrade
 database backup; manually downgrading the format marker is unsafe.
+
+For a **fresh** recovery database only, `ROCKSDB_DOCUMENT_COMPRESSION=brotli`
+selects storage format 3. The default `none` keeps format 2 unchanged, including
+its existing format-1 upgrade. Enabling compression against any existing
+format-1/2 or nonempty unversioned database fails before preparation writes;
+there is no in-place conversion. Every writable format-3 resume must retain the
+`brotli` option. New read-only readers support formats 2 and 3 without a writer
+option; older binaries reject the format-3 marker. Never downgrade that marker.
+Compression changes physical document storage, not normalized amounts, query
+indexes, receipt hashes, journal data or recovery admission. See
+[`docs/rocksdb-compression.md`](docs/rocksdb-compression.md) for the format,
+bounded decoding rules, compatible tooling and validation requirements.
 
 Collection connections accept `first`, `last`, `offset`, and `after`. Both page
 sizes are limited to 100, and explicit offsets and numeric continuation positions
@@ -356,7 +374,12 @@ reloads the domain again at the next refresh.
 
 Backfill and finalized catch-up value each block from its exact parent-block
 asset metadata and Pool XYK reserves. The initial archive state is consumed in
-256-entry pages under one retained-byte ceiling; later blocks point-read only
+pages under one retained-byte ceiling. `CHAIN_DERIVED_STORAGE_ENTRIES_PAGE_SIZE`
+selects 1–1,000 entries per pinned storage page (default 256); 1,000 reduces
+archive round trips during recovery without changing the exact block/hash,
+full-reload rules, pagination checks or `CHAIN_DERIVED_STORAGE_LOAD_MAX_BYTES`
+ceiling. A larger page must still fit that existing byte budget and can be
+reverted to 256 if it does not. Later blocks point-read only
 canonical assets and both possible pool-key orientations touched by successful
 events/calls. Ambiguous runtime mutations fail closed to a bounded full reload.
 That includes every block with XYK swap evidence, because swap events do not
@@ -573,8 +596,9 @@ migrator and both verification modes read `data::text` and validate every
 numeric token before `JSON.parse`; an unsafe source can never pass by comparing
 two identically rounded values.
 
-The first release has one mandatory RocksDB format (version 1) and writes
-compact documents/indexes from the first row. There is no pre-v1 upgrade mode:
+The PostgreSQL migrator writes ordinary format-2 compact documents/indexes
+from the first row and requires `ROCKSDB_DOCUMENT_COMPRESSION=none`. It does not
+create compressed recovery databases. There is no pre-v1 upgrade mode:
 the migrator refuses a non-empty destination without its exact versioned
 destination/run/source state. Rebuild an unversioned or incompatible artifact
 from an empty path.
@@ -916,3 +940,9 @@ The production host runs a five-minute capacity and explicit-retirement guard,
 maintenance free-space preflights, and supervised log rotation. See
 [host storage safeguards](docs/host-storage-safeguards.md) for thresholds,
 protected backups, alert delivery, validation, and release/rollback procedures.
+
+An inactive, separately admitted canonical statistics/history recovery candidate
+is documented in [docs/canonical-stats-history.md](docs/canonical-stats-history.md).
+It preserves full-recovery admission requirements, exposes explicit partial
+capabilities, and never certifies point/burn entitlements. Its private clone must
+be independently qualified before the explicit initializer or worker is run.

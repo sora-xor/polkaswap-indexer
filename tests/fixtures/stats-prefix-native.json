@@ -1,0 +1,49 @@
+{
+  "mode": "replay",
+  "checkpoint": {
+    "lastIndexedBlock": 28191816,
+    "genesisHash": "0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5",
+    "blockHash": "0x60b63e40ce4de9b9c1408bf7455a6f5ced796825f2437a0ee8496476d80c56d6",
+    "blockTimestamp": 1792939554
+  },
+  "identity": {
+    "block": 26872383,
+    "data": "{\"schemaVersion\":1,\"genesisHash\":\"0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5\",\"verificationBlock\":26872383,\"verificationBlockHash\":\"0x28dd415867e637e5c70056a564cfa4e81f0f3df3a18d1132ccc61fe5025c762c\",\"verificationBlockTimestamp\":1783716432,\"migration\":\"legacy-production-anchor-v1\"}",
+    "id": "chainIdentity"
+  },
+  "readOnly": true,
+  "indexValidationPassed": true,
+  "documents": 27428271,
+  "collections": {
+    "accountLiquiditySnapshots": 6745788,
+    "accountMeta": 441,
+    "accountPointSystems": 441,
+    "accountPositions": 31,
+    "accountTransactions": 41344,
+    "accounts": 441,
+    "assetSnapshots": 10981388,
+    "assets": 957,
+    "historyElements": 2176311,
+    "marketSnapshots": 162240,
+    "markets": 50,
+    "networkSnapshots": 2163891,
+    "orderBookSnapshots": 206064,
+    "orderBooks": 18,
+    "poolSnapshots": 4945536,
+    "poolXYKs": 432,
+    "referrerRewards": 505,
+    "stakingStakers": 2181,
+    "stakingValidators": 15,
+    "updatesStreams": 18,
+    "vaultEvents": 8,
+    "vaults": 12,
+    "xorBurns": 159
+  },
+  "maxBlock": 28191816,
+  "blocks": 2133341,
+  "minBlockSnapshot": 1,
+  "maxBlockSnapshot": 28191816,
+  "replayBlocks": 165073,
+  "replayTransactions": "2225",
+  "replayVolumeUsdScale8": "2721075196855"
+}

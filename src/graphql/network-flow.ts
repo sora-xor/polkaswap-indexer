@@ -139,8 +139,9 @@ export async function networkFlowRepositoryFilter(
   return replace(filter) as typeof filter;
 }
 
-function readTotals(data: Record<string, unknown>): Totals {
+function readTotals(data: Record<string, unknown>, unavailableAccounts = false): Totals {
   return Object.fromEntries(NETWORK_FLOW_FIELDS.map((field) => {
+    if (field === 'accounts' && unavailableAccounts) return [field, 0n];
     const raw = String(data[field] ?? '0');
     if (field === 'volumeUSD') {
       if (!/^\d{1,100}(?:\.\d{1,8})?$/.test(raw)) throw unavailable('invalid indexed USD flow');
@@ -175,8 +176,10 @@ function blockPosition(document: IndexerDocument): { height: number; timestamp: 
 export async function projectNetworkSnapshotFlows(
   repository: IndexerRepository,
   documents: IndexerDocument[],
-  filter?: Record<string, unknown> | null
+  filter?: Record<string, unknown> | null,
+  unavailableAccounts = false,
 ): Promise<IndexerDocument[]> {
+  if (unavailableAccounts) documents = documents.map((row) => ({ ...row, data: { ...row.data, accounts: null, accountCountAvailable: false } }));
   if (!documents.some((document) => WINDOWS[String(document.data.type)])) return documents.map((document) => ({
     ...document, data: { ...document.data, flowAggregation: document.data.type === 'BLOCK' ? 'BLOCK' : null },
   }));
@@ -222,7 +225,7 @@ export async function projectNetworkSnapshotFlows(
         previousTimestamp = position.timestamp;
         rowsRead += 1;
         if (accept(position.timestamp)) {
-          const delta = readTotals(document.data);
+          const delta = readTotals(document.data, unavailableAccounts);
           for (const field of NETWORK_FLOW_FIELDS) totals[field] += sign * delta[field];
         }
       }
@@ -260,7 +263,7 @@ export async function projectNetworkSnapshotFlows(
       continue;
     }
     const key = JSON.stringify([document.id, height, timestamp, start, end,
-      end === latest.timestamp + 1 ? latest.height : null, NETWORK_FLOW_FIELDS.map((field) => document.data[field]), durable]);
+      end === latest.timestamp + 1 ? latest.height : null, NETWORK_FLOW_FIELDS.map((field) => document.data[field]), durable, unavailableAccounts]);
     let hit = memo.get(key);
     if (!hit || hit.until <= Date.now()) {
       const value = (async () => {
@@ -270,7 +273,7 @@ export async function projectNetworkSnapshotFlows(
           const through = durable ? Number(durable.throughBlock) : height;
           const sourceTimestamp = durable ? Number(durable.throughTimestamp) : timestamp;
           const baseStart = durable ? bucketStart : timestamp - window;
-          const totals = readTotals(durable ?? document.data);
+          const totals = readTotals(durable ?? document.data, unavailableAccounts);
           if (!durable?.complete) {
             if (through < oldest.height) throw new RetiredCoverage();
             const source = await repository.get('networkSnapshots', `block-${through}`);
@@ -302,6 +305,7 @@ export async function projectNetworkSnapshotFlows(
     }
     const projected = await hit.value;
     output.push({ ...document, data: { ...document.data, ...projected,
+      ...(unavailableAccounts ? { accounts: null, accountCountAvailable: false } : {}),
       ...(projected.flowAggregation === 'CALENDAR' ? { timestamp: Math.min(Math.max(timestamp, bounds.lower + 1), bounds.upper) } : {}),
     } });
   }

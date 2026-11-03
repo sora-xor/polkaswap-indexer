@@ -425,7 +425,7 @@ describe('RocksRepository', () => {
   it.each([
     { name: 'unversioned document', version: undefined, legacyIndex: false },
     { name: 'zero version', version: 0, legacyIndex: false },
-    { name: 'future version', version: 3, legacyIndex: false },
+    { name: 'future version', version: 99, legacyIndex: false },
     { name: 'string version', version: '1', legacyIndex: false },
     { name: 'fractional version', version: 1.5, legacyIndex: false },
     { name: 'legacy index residue', version: 1, legacyIndex: true },

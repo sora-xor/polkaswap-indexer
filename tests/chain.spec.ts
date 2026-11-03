@@ -5828,9 +5828,9 @@ describe('ChainIndexer price derivation', () => {
   });
 
 
-  it('publishes current-state maintenance before subscribing to finalized heads', async () => {
+  it.each([false, true])('publishes maintenance before readiness with primary RPC legacy decoding %s', async (legacySoraBlockTypes) => {
     const repository = new MemoryRepository();
-    const indexer = new ChainIndexer(config, repository) as unknown as {
+    const indexer = new ChainIndexer({ ...config, legacySoraBlockTypes }, repository) as unknown as {
       start: () => Promise<void>;
       stop: () => Promise<void>;
       backfill: () => Promise<boolean>;
@@ -5883,6 +5883,14 @@ describe('ChainIndexer price derivation', () => {
         'subscribe',
       ]);
       expect(indexer.getStatus().startupComplete).toBe(true);
+      const primaryOptions = apiCreate.mock.calls[0]?.[0];
+      if (legacySoraBlockTypes) {
+        expect(primaryOptions?.typesBundle?.spec?.sora?.types?.[0].types).toMatchObject({
+          AssetSymbol: 'Text', AssetName: 'Text', BalancePrecision: 'u8',
+        });
+      } else {
+        expect(primaryOptions?.typesBundle).toBeUndefined();
+      }
     } finally {
       await indexer.stop();
       apiCreate.mockRestore();

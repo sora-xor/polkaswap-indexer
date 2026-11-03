@@ -1,5 +1,6 @@
 import { isIP } from 'node:net';
 import { loadBurnRecoveryPolicy, type BurnRecoveryPolicy } from './burn-recovery.js';
+import { loadStatsRecoveryAdmission, type StatsRecoveryAdmission } from './stats-recovery.js';
 
 import { findUnsafePostgresProcessEnvironmentOverride } from './postgres-session.js';
 
@@ -14,6 +15,8 @@ export type MobileCapabilities = {
 export type AppConfig = {
   /** Pinned public recovery policy; never inferred from genesis alone. */
   burnRecoveryPolicy?: BurnRecoveryPolicy | null;
+  /** Separate, pre-admitted prefix derivative; never enables full recovery or entitlements. */
+  statsRecoveryAdmission?: StatsRecoveryAdmission | null;
   host: string;
   port: number;
   graphqlPath: string;
@@ -67,6 +70,8 @@ export type AppConfig = {
   postgresWatchReconnectMinDelayMs: number;
   postgresWatchReconnectMaxDelayMs: number;
   rocksdbPath: string;
+  /** Fresh format-3 databases only; existing format-2 databases are never converted. */
+  rocksdbDocumentCompression?: 'none' | 'brotli';
   rocksdbBlockCacheMb: number;
   rocksdbWriteBufferManagerMb: number;
   rocksdbParallelism: number;
@@ -89,6 +94,8 @@ export type AppConfig = {
   chainShutdownTimeoutMs: number;
   chainRpcTimeoutMs: number;
   chainRpcMaxInFlight: number;
+  /** Entries per pinned storage page; readConfig supplies 256, with the archive RPC limit of 1,000. */
+  derivedStorageEntriesPageSize?: number;
   /** Hard ceiling for one pinned projection's retained RPC storage entries. */
   derivedStorageLoadMaxBytes: number;
   derivedStorageCacheMaxBytes: number;
@@ -650,6 +657,7 @@ export function readConfig(): AppConfig {
     postgresWatchReconnectMinDelayMs,
     postgresWatchReconnectMaxDelayMs,
     rocksdbPath: readString('ROCKSDB_PATH', './data/polkaswap-indexer.rocksdb'),
+    rocksdbDocumentCompression: readEnum<'none' | 'brotli'>('ROCKSDB_DOCUMENT_COMPRESSION', 'none', ['none', 'brotli']),
     rocksdbBlockCacheMb: readInteger('ROCKSDB_BLOCK_CACHE_MB', 512, { minimum: 0, maximum: 65_536 }),
     rocksdbWriteBufferManagerMb: readInteger('ROCKSDB_WRITE_BUFFER_MANAGER_MB', 256, {
       minimum: 0,
@@ -676,6 +684,7 @@ export function readConfig(): AppConfig {
     rocksdbCompactionMinFreeGb: readNumber('ROCKSDB_COMPACTION_MIN_FREE_GB', 10, 0),
     soraWsEndpoint,
     burnRecoveryPolicy: loadBurnRecoveryPolicy(process.env.SORA_RECOVERY_POLICY_FILE, process.env.SORA_RECOVERY_POLICY_SHA256),
+    statsRecoveryAdmission: loadStatsRecoveryAdmission(process.env.SORA_STATS_RECOVERY_ADMISSION_FILE, process.env.SORA_STATS_RECOVERY_ADMISSION_SHA256),
     soraArchiveWsEndpoint,
     chainStartBlock: readInteger('CHAIN_START_BLOCK', 0, { minimum: 0 }),
     chainBatchSize: readInteger('CHAIN_BATCH_SIZE', 25, { minimum: 1, maximum: 1_000 }),
@@ -691,6 +700,10 @@ export function readConfig(): AppConfig {
       maximum: 3_600_000,
     }),
     chainRpcMaxInFlight,
+    derivedStorageEntriesPageSize: readInteger('CHAIN_DERIVED_STORAGE_ENTRIES_PAGE_SIZE', 256, {
+      minimum: 1,
+      maximum: 1_000,
+    }),
     derivedStorageLoadMaxBytes: readInteger('CHAIN_DERIVED_STORAGE_LOAD_MAX_BYTES', 268_435_456, {
       minimum: 1_048_576,
       maximum: 4_294_967_296,

@@ -31,7 +31,7 @@ export const createRocksdbBackup = async (
   const db = RocksDatabase.open(sourcePath);
 
   try {
-    assertCurrentRocksdbArtifactSource(db, sourcePath);
+    const formatVersion = assertCurrentRocksdbArtifactSource(db, sourcePath);
     mkdirSync(backupDir, { recursive: true });
     let backupId: number | null = null;
     try {
@@ -42,6 +42,7 @@ export const createRocksdbBackup = async (
           createdAt: new Date().toISOString(),
           rocksdbPath: sourcePath,
           integrity: 'sha256',
+          formatVersion,
         }),
         sync: true,
       });

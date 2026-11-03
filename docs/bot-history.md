@@ -6,6 +6,27 @@ snapshot's `priceUSD.close`. The worker reads it from the same immutable query
 context used for that snapshot; it never substitutes the latest chain state for
 a historical query. Failed, pruned, absent, or malformed storage produces `null`.
 
+Hourly replay has one explicit historical exception: original SORA Nexus units
+before the denomination pallet existed. Commit
+`93cf5ca2f2e147924b5e3475e155eb01a68f7d8d` introduced the pallet at runtime 113
+with `Denominator` defaulting to `One::one()`. The first denomination occurred
+at block 21,063,093; its parent 21,063,092 is
+`0xf47edd8d25943b4c11d0b07f722c85aecb33525f6a70139c41195e2672a0b62f`
+(see the chain repository's `misc/incident_recovery/capture_offence_preimages.mjs`).
+Only within that earlier canonical mainnet interval, for `sora-substrate`
+runtimes 1–113, may an hourly close record `1`: its own pinned metadata must
+explicitly lack the Denomination pallet, and a raw read of the exact historical
+Denominator key must return absence. Both checked RPC roles must agree on the
+close's exact block hash. A missing query context, a declared but unreadable
+pallet, a present raw key, or any later runtime remains unknown and stops the
+hourly replay. The generic snapshot reader still never substitutes `1`.
+
+The original metadata at block 90 (hash
+`0xa07c08f83b432f84a3e98746bd7d0844bd5ea9eb328f989a7cb814951cdd2a1f`)
+is version 12, runtime 1, and contains no Denomination pallet. Its raw metadata
+SHA-256 is `e0b721141bc2ef0ab0eee2167d1800d8d14ec0cbe27f61752b10d9543a8d0eda`.
+This is the first hourly boundary encountered by a genesis replay (block 91).
+
 The field applies to the CLOSE price only. It does not attest that an OHLC bucket
 is free of denomination transitions, and it does not normalize historical prices.
 Snapshots retain their current identifiers and actual last-update timestamps.
@@ -91,3 +112,14 @@ Deploy the API and worker together, retaining the usual health, source custody a
 rollback controls. The additions require no collection or index migration. Repair
 is an explicit operation; restoring the API does not upgrade historical evidence.
 After repair, query the same bounded coverage window and preserve its gap statuses.
+
+
+Historical asset metadata uses the map declared by the pinned runtime. Before
+`AssetInfosV2`, the indexer accepts the original four-field `AssetInfos` tuple
+and its later six-field form with optional text content source and description;
+all other tuple shapes remain invalid. The exact SCALE fixture from block
+5,000,000 (runtime 30) is
+`tests/fixtures/historical-assets/asset-infos-six-field.json`. The six-field
+source layout is recorded in chain commit `3ea532728` (ContentSource/Description
+migration, 11 February 2022), and retained alongside V2 by `a6ad32345`.
+The extra text fields do not change precision, supply or price arithmetic.

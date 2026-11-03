@@ -421,7 +421,7 @@ describe('RocksDB restore operation', () => {
     const wrong = RocksDatabase.open(wrongPath);
     let backupId: number;
     try {
-      await wrong.put(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY], ROCKSDB_FORMAT_VERSION + 1);
+      await wrong.put(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY], 99);
       backupId = await wrong.backup(backupDir, { flushBeforeBackup: true, sync: true });
     } finally {
       wrong.close();

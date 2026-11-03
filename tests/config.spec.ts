@@ -69,6 +69,7 @@ const CONFIG_ENV_KEYS = [
   'POSTGRES_WATCH_RECONNECT_MIN_DELAY_MS',
   'POSTGRES_WATCH_RECONNECT_MAX_DELAY_MS',
   'ROCKSDB_PATH',
+  'ROCKSDB_DOCUMENT_COMPRESSION',
   'ROCKSDB_BLOCK_CACHE_MB',
   'ROCKSDB_WRITE_BUFFER_MANAGER_MB',
   'ROCKSDB_PARALLELISM',
@@ -89,6 +90,7 @@ const CONFIG_ENV_KEYS = [
   'CHAIN_SHUTDOWN_TIMEOUT_MS',
   'CHAIN_RPC_TIMEOUT_MS',
   'CHAIN_RPC_MAX_IN_FLIGHT',
+  'CHAIN_DERIVED_STORAGE_ENTRIES_PAGE_SIZE',
   'CHAIN_DERIVED_STORAGE_LOAD_MAX_BYTES',
   'CHAIN_DERIVED_STORAGE_CACHE_MAX_BYTES',
   'CHAIN_ANALYTICS_INPUT_CACHE_MAX_BYTES',
@@ -132,6 +134,7 @@ describe('runtime configuration', () => {
   it('uses documented development defaults when environment variables are absent', () => {
     expect(readConfig()).toEqual({
       burnRecoveryPolicy: null,
+      statsRecoveryAdmission: null,
       host: '0.0.0.0',
       port: 4350,
       graphqlPath: '/graphql',
@@ -183,6 +186,7 @@ describe('runtime configuration', () => {
       postgresWatchReconnectMinDelayMs: 100,
       postgresWatchReconnectMaxDelayMs: 10_000,
       rocksdbPath: './data/polkaswap-indexer.rocksdb',
+      rocksdbDocumentCompression: 'none',
       rocksdbBlockCacheMb: 512,
       rocksdbWriteBufferManagerMb: 256,
       rocksdbParallelism: 4,
@@ -203,6 +207,7 @@ describe('runtime configuration', () => {
       chainShutdownTimeoutMs: 30_000,
       chainRpcTimeoutMs: 15_000,
       chainRpcMaxInFlight: 256,
+      derivedStorageEntriesPageSize: 256,
       derivedStorageLoadMaxBytes: 268_435_456,
       derivedStorageCacheMaxBytes: 67_108_864,
       analyticsInputCacheMaxBytes: 134_217_728,
@@ -389,6 +394,7 @@ describe('runtime configuration', () => {
       POSTGRES_WATCH_RECONNECT_MIN_DELAY_MS: '250',
       POSTGRES_WATCH_RECONNECT_MAX_DELAY_MS: '5000',
       ROCKSDB_PATH: '/tmp/polkaswap.rocksdb',
+      ROCKSDB_DOCUMENT_COMPRESSION: 'BROTLI',
       ROCKSDB_BLOCK_CACHE_MB: '1024',
       ROCKSDB_WRITE_BUFFER_MANAGER_MB: '512',
       ROCKSDB_PARALLELISM: '8',
@@ -407,6 +413,7 @@ describe('runtime configuration', () => {
       CHAIN_SHUTDOWN_TIMEOUT_MS: '45000',
       CHAIN_RPC_TIMEOUT_MS: '12000',
       CHAIN_RPC_MAX_IN_FLIGHT: '128',
+      CHAIN_DERIVED_STORAGE_ENTRIES_PAGE_SIZE: '1000',
       CHAIN_DERIVED_STORAGE_LOAD_MAX_BYTES: '201326592',
       CHAIN_DERIVED_STORAGE_CACHE_MAX_BYTES: '33554432',
       CHAIN_ANALYTICS_INPUT_CACHE_MAX_BYTES: '67108864',
@@ -429,6 +436,7 @@ describe('runtime configuration', () => {
 
     expect(readConfig()).toEqual({
       burnRecoveryPolicy: null,
+      statsRecoveryAdmission: null,
       host: '127.0.0.1',
       port: 4444,
       graphqlPath: '/alt-graphql',
@@ -480,6 +488,7 @@ describe('runtime configuration', () => {
       postgresWatchReconnectMinDelayMs: 250,
       postgresWatchReconnectMaxDelayMs: 5_000,
       rocksdbPath: '/tmp/polkaswap.rocksdb',
+      rocksdbDocumentCompression: 'brotli',
       rocksdbBlockCacheMb: 1024,
       rocksdbWriteBufferManagerMb: 512,
       rocksdbParallelism: 8,
@@ -500,6 +509,7 @@ describe('runtime configuration', () => {
       chainShutdownTimeoutMs: 45_000,
       chainRpcTimeoutMs: 12_000,
       chainRpcMaxInFlight: 128,
+      derivedStorageEntriesPageSize: 1000,
       derivedStorageLoadMaxBytes: 201_326_592,
       derivedStorageCacheMaxBytes: 33_554_432,
       analyticsInputCacheMaxBytes: 67_108_864,
@@ -921,5 +931,19 @@ describe('checked hourly repair startup configuration', () => {
     expect(() => readConfig()).toThrow('lowercase SHA-256');
     process.env.CHAIN_HOURLY_REPAIR_SHA256 = 'a'.repeat(64);
     expect(readConfig()).toMatchObject({ hourlyRepairFile: '/tmp/checked-history.jsonl', hourlyRepairSha256: 'a'.repeat(64) });
+  });
+});
+
+
+describe('fresh RocksDB document compression configuration', () => {
+  beforeEach(() => { for (const key of CONFIG_ENV_KEYS) delete process.env[key]; });
+  afterEach(restoreEnv);
+  it.each(['none', 'brotli'] as const)('accepts only the explicit %s mode', (mode) => {
+    process.env.ROCKSDB_DOCUMENT_COMPRESSION = mode;
+    expect(readConfig().rocksdbDocumentCompression).toBe(mode);
+  });
+  it.each(['gzip', 'br', 'true', '3'])('rejects unsupported mode %s', (mode) => {
+    process.env.ROCKSDB_DOCUMENT_COMPRESSION = mode;
+    expect(() => readConfig()).toThrow(/ROCKSDB_DOCUMENT_COMPRESSION/);
   });
 });

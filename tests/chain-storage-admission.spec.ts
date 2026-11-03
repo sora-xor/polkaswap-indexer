@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { readConfig } from '../src/config.js';
+import { readConfig, type AppConfig } from '../src/config.js';
 import { MemoryRepository } from '../src/repository/memory.js';
 import { ChainIndexer } from '../src/worker/chain.js';
-const make = (): any => new ChainIndexer(readConfig(), new MemoryRepository());
+const make = (overrides: Partial<AppConfig> = {}): any => new ChainIndexer({ ...readConfig(), ...overrides }, new MemoryRepository());
 const entry = (id: number): any => [{ args: [id], toHex: () => `0x${id.toString(16).padStart(4, '0')}` }, { amount: id }];
 const page = () => Array.from({ length: 256 }, (_, i) => entry(i));
 const invoke = (indexer: any, kind: string, storage: any, consume = (entry: any) => entry[1]) => kind === 'retain'
@@ -24,6 +24,39 @@ describe.each(['retain', 'stream'])('%s historical storage page admission', kind
     const consume = vi.fn((entry: any) => entry[1]); const result = await invoke(make(), kind, storage, consume);
     expect(storage.entriesPaged.mock.calls).toEqual([[{ args: ['account'], pageSize: 256 }], [{ args: ['account'], pageSize: 256, startKey: '0x00ff' }]]);
     if (kind === 'retain') expect(result).toEqual([...first, ...second]); else expect(consume).toHaveBeenCalledTimes(257);
+  });
+  it('uses the configured page size with exclusive continuation and complete results', async () => {
+    const indexer = make({ derivedStorageEntriesPageSize: 1000 });
+    const first = Array.from({ length: 1000 }, (_, i) => entry(i));
+    const second = [entry(1000)];
+    const storage = { entriesPaged: vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(second) };
+    const consume = vi.fn((row: unknown[]) => row[1]);
+    const result = await invoke(indexer, kind, storage, consume);
+    expect(storage.entriesPaged.mock.calls).toEqual([
+      [{ args: ['account'], pageSize: 1000 }],
+      [{ args: ['account'], pageSize: 1000, startKey: '0x03e7' }],
+    ]);
+    if (kind === 'retain') expect(result).toEqual([...first, ...second]);
+    else expect(consume).toHaveBeenCalledTimes(1001);
+  });
+  it('keeps the original default for programmatic configurations without the new field', async () => {
+    const storage = { entriesPaged: vi.fn(async () => []) };
+    await invoke(make({ derivedStorageEntriesPageSize: undefined }), kind, storage);
+    expect(storage.entriesPaged).toHaveBeenCalledWith({ args: ['account'], pageSize: 256 });
+  });
+  it('enforces the configured response size and retained-byte limits', async () => {
+    const oversized = Array.from({ length: 1001 }, (_, i) => entry(i));
+    await expect(invoke(make({ derivedStorageEntriesPageSize: 1000 }), kind,
+      { entriesPaged: async () => oversized })).rejects.toThrow(/1001 entries for page size 1000/);
+    const indexer = make({ derivedStorageEntriesPageSize: 1000, derivedStorageLoadMaxBytes: 1024 });
+    await expect(invoke(indexer, kind, { entriesPaged: async () => oversized.slice(0, 1000) }))
+      .rejects.toThrow(/retained-load limit/);
+  });
+  it('rejects an inclusive continuation with the larger page size', async () => {
+    const first = Array.from({ length: 1000 }, (_, i) => entry(i));
+    const storage = { entriesPaged: vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce([first.at(-1)]) };
+    await expect(invoke(make({ derivedStorageEntriesPageSize: 1000 }), kind, storage))
+      .rejects.toThrow(/repeated its startKey/);
   });
   it('stops on an empty first page', async () => {
     const storage = { entriesPaged: vi.fn(async () => []) }; const consume = vi.fn();
@@ -49,6 +82,12 @@ describe.each(['retain', 'stream'])('%s historical storage page admission', kind
     await expect(invoke(indexer, kind, { entriesPaged: async () => [entry(1)] })).rejects.toThrow(/retained-load limit/);
     expect(indexer.activeDerivedStorageLoadBudget.activeLoads).toBe(0); expect(first).toHaveBeenCalledOnce(); expect(second).toHaveBeenCalledOnce();
     expect(indexer.activeDerivedStorageLoadBudget.idleWaiters).toEqual([]);
+  });
+});
+
+describe('programmatic storage page configuration', () => {
+  it.each([0, -1, 1.5, 1001, Number.NaN, Number.POSITIVE_INFINITY])('rejects invalid page size %s', value => {
+    expect(() => make({ derivedStorageEntriesPageSize: value })).toThrow(/integer from 1 to 1000/);
   });
 });
 

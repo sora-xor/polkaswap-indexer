@@ -145,6 +145,7 @@ describe('Polkaswap indexer schema', () => {
 
     await expect(healthField?.resolve?.({}, {}, { repository: new MemoryRepository() }, {} as never)).resolves.toEqual({
       ok: false,
+      statsPipelineReady: false,
       checkpointCoherent: false,
       repositoryReady: true,
       service: 'polkaswap-indexer',
@@ -183,6 +184,7 @@ describe('Polkaswap indexer schema', () => {
 
     await expect(healthField?.resolve?.({}, {}, { repository }, {} as never)).resolves.toEqual({
       ok: false,
+      statsPipelineReady: false,
       checkpointCoherent: false,
       repositoryReady: false,
       service: 'polkaswap-indexer',
@@ -2089,11 +2091,10 @@ describe('Polkaswap indexer schema', () => {
   });
 
   it('caches repeated non-checkpoint singleton resolver queries within the TTL window', async () => {
-    const get = vi.fn<IndexerRepository['get']>().mockResolvedValue({
-      collection: 'updatesStreams',
-      id: 'otherState',
-      data: { id: 'otherState', block: 123, data: '{"lastIndexedBlock":123}' },
-    });
+    const get = vi.fn<IndexerRepository['get']>().mockImplementation(async (collection, id) =>
+      collection === 'updatesStreams' && id === 'otherState' ? {
+        collection, id, data: { id, block: 123, data: '{"lastIndexedBlock":123}' },
+      } : null);
     const repository: IndexerRepository = {
       list: async () => [],
       query: async () => ({ items: [], totalCount: 0 }),
@@ -2115,7 +2116,7 @@ describe('Polkaswap indexer schema', () => {
       block: 123,
     });
 
-    expect(get).toHaveBeenCalledTimes(1);
+    expect(get.mock.calls.filter(([collection, id]) => collection === 'updatesStreams' && id === 'otherState')).toHaveLength(1);
   });
 
   it('falls back to list-based filtering, sorting, and forward keyset pagination when query is unavailable', async () => {
@@ -3015,7 +3016,7 @@ describe('Polkaswap indexer schema', () => {
       mutation_type: 'DELETE',
       _entity: { id: 'price' },
     });
-    expect(get).not.toHaveBeenCalled();
+    expect(get.mock.calls.filter(([collection, id]) => collection === 'updatesStreams' && id === 'price')).toEqual([]);
     await iterator.return(undefined);
   });
 });

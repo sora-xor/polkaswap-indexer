@@ -434,7 +434,7 @@ describe('finalized-block hourly collection', () => {
     expect(snapshots).toHaveLength(7);
     expect(snapshots.every((row) => row.timestamp === before.timestamp)).toBe(true);
     expect(snapshots.find((row) => row.data.assetId === KUSD)?.data.closeEvidence).toHaveProperty('xorPool', null);
-    expect(test.internal.getHistoricalValuationQueryAt).toHaveBeenCalledWith(before.height);
+    expect(test.internal.getHistoricalValuationQueryAt).toHaveBeenCalledWith(before.height, before.hash, undefined, expect.any(Function));
     expect((await test.repository.get('updatesStreams', 'chainState'))?.blockHeight).toBe(after.height);
     expect(test.internal.previousHourlyHistoryBlock).toEqual(after);
   });
