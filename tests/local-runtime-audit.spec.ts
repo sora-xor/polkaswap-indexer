@@ -30,7 +30,7 @@ describe('runtime dependency audit', () => {
     ]));
   });
 
-  it('passes for this repository source, manifest and lockfile', () => {
+  it('passes for this repository: source, manifest, lockfile and no installed @sora-substrate package', () => {
     // A source import of the removed package fails the build and leaves the
     // worker unable to load, so the repository itself must stay clean.
     expect(auditLocalRuntime(fileURLToPath(new URL('..', import.meta.url)))).toEqual([]);
