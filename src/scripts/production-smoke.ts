@@ -121,9 +121,22 @@ const FULL_SERVICE_MODE = 'full';
 const STATS_HISTORY_MODE = 'canonical-stats-history';
 const EXPECTED_MODES: readonly ProductionSmokeExpectedMode[] = [FULL_SERVICE_MODE, STATS_HISTORY_MODE];
 const FULL_SERVICE_CAPABILITY_MODES = ['legacy', 'full-recovery'];
-/** One operation resolves its roots independently, so the capability read may be a block or two newer. */
-const MAX_CAPABILITY_ADVANCE_BLOCKS = 2;
+/**
+ * Recovery policy commitment shipped in the recovery chain spec (BLAKE2-256 of
+ * `recovery.policyScale`) and reported by the live runtime; recorded in
+ * docs/post-fork-recovery-20261031.md. The partial mode is admitted only under it.
+ */
+const SORA_RECOVERY_POLICY_COMMITMENT = '0x1f4e11427a9c0a61a4868af40c9e0bdf263bb44a9ee59886a537c52164f3cdbb';
 const CANONICAL_HASH = /^0x[0-9a-f]{64}$/;
+const ZERO_HASH = `0x${'0'.repeat(64)}`;
+/**
+ * `indexerCapabilities` reads chainState after the shared checkpoint view, so a
+ * block landing mid-request moves it ahead of `chainState`; the server also asks
+ * callers to retry the complete query when a checkpoint or core view moves. Such
+ * movement is retried with a fresh request, at most this many requests in total.
+ */
+const MAX_SMOKE_REQUESTS = 3;
+const RETRYABLE_GRAPHQL_MESSAGES = ['retry the complete query', 'core view changed during the read'];
 const INDEXER_CAPABILITY_FIELDS = [
   'schemaVersion',
   'genesisHash',
@@ -254,7 +267,7 @@ function redactSecrets(value: string): string {
   return value
     .replace(/("(?:access[_-]?token|refresh[_-]?token|token|password|passwd|api[-_]?key|secret|authorization|cookie|set-cookie)"\s*:\s*)(?:"(?:\\.|[^"\\])*"|[^,}\]\s]+)/gi, '$1"<redacted>"')
     .replace(/(\b(?:bearer|basic)\s+)[A-Za-z0-9+/=_~.-]+/gi, '$1<redacted>')
-    .replace(/(https?:\/\/)[^/\s@]+@/gi, '$1<redacted>@')
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi, '$1<redacted>@')
     .replace(/([?&](?:access[_-]?token|refresh[_-]?token|token|password|passwd|api[-_]?key|secret|authorization|key)=)[^&#\s]*/gi, '$1<redacted>')
     .replace(/(\b(?:access[_-]?token|refresh[_-]?token|token|password|passwd|api[-_]?key|secret|authorization)\b\s*[:=]\s*)(?:["'][^"'\r\n]*["']|[^\s,;&]+)/gi, '$1<redacted>');
 }
@@ -561,22 +574,23 @@ async function fetchGraphQl(
 
 /** Explains an unready service from what it reports itself; every value is bounded and redacted. */
 function notReadyDiagnosis(health: HealthInfo, capabilities: IndexerCapabilityInfo | undefined): string {
+  // workerLastError is free-form text that can carry endpoint credentials; only its presence is reported.
+  const lastError = health.workerLastError === null ? 'none'
+    : health.workerLastError === undefined ? '<missing>' : 'present (not printed)';
   const worker =
     `workerReady=${formatValue(health.workerReady)}, workerReadinessReason=${formatValue(health.workerReadinessReason)}, ` +
     `workerLifecycle=${formatValue(health.workerLifecycle)}, workerLag=${formatValue(health.workerLag)}, ` +
-    `workerLatestIndexedBlock=${formatValue(health.workerLatestIndexedBlock)}`;
+    `workerLatestIndexedBlock=${formatValue(health.workerLatestIndexedBlock)}, workerLastError=${lastError}`;
   if (capabilities?.mode === STATS_HISTORY_MODE) {
     return (
-      `The service reports the ${STATS_HISTORY_MODE} partial mode, in which _health.ok stays false by design: ` +
-      `statistics and history are served, recovery entitlements and current account views are not ` +
-      `(reason: ${formatValue(capabilities.reason)}). Reported state: ${worker}. ` +
+      `The service reports the ${STATS_HISTORY_MODE} partial mode, in which _health.ok stays false by design and ` +
+      `recovery entitlements and current account views are never served (statsReady=${formatValue(capabilities.statsReady)}, ` +
+      `historyReady=${formatValue(capabilities.historyReady)}, coreViewsReady=${formatValue(capabilities.coreViewsReady)}; ` +
+      `reason: ${formatValue(capabilities.reason)}). Reported state: ${worker}. ` +
       `This is not a full-service recovery. To verify the partial-mode contract instead, set ${EXPECTED_MODE_VARIABLE}=${STATS_HISTORY_MODE}.`
     );
   }
-  return (
-    `Reported state: repositoryReady=${formatValue(health.repositoryReady)}, ${worker}, ` +
-    `workerLastError=${formatValue(health.workerLastError)}. ${PI_HEALTH_DEPLOYMENT_HINT}`
-  );
+  return `Reported state: repositoryReady=${formatValue(health.repositoryReady)}, ${worker}. ${PI_HEALTH_DEPLOYMENT_HINT}`;
 }
 
 function assertHealthContract(
@@ -707,27 +721,38 @@ function assertIndexerCapabilityContract(
     fail('reason must be null or a bounded string');
   }
   if (capabilities.policyHash !== null &&
-      (typeof capabilities.policyHash !== 'string' || !CANONICAL_HASH.test(capabilities.policyHash))) {
-    fail('policyHash must be null or a canonical hash');
+      (typeof capabilities.policyHash !== 'string' || !CANONICAL_HASH.test(capabilities.policyHash) ||
+       capabilities.policyHash === ZERO_HASH)) {
+    fail('policyHash must be null or a canonical nonzero hash');
+  }
+  // Schema v1 has no certification path: every implemented mode reports false.
+  if (capabilities.entitlementsReady !== false) {
+    fail(`entitlementsReady must be false in schema v1; received ${formatValue(capabilities.entitlementsReady)}`);
   }
 
   if (expectedMode === STATS_HISTORY_MODE) {
     if (capabilities.mode !== STATS_HISTORY_MODE) {
       fail(`mode must be ${STATS_HISTORY_MODE} when ${EXPECTED_MODE_VARIABLE} selects it; received ${formatValue(capabilities.mode)}`);
     }
-    if (capabilities.policyHash === null) fail(`policyHash must pin the recovery policy in the ${STATS_HISTORY_MODE} mode`);
+    if (capabilities.policyHash !== SORA_RECOVERY_POLICY_COMMITMENT) {
+      fail(`policyHash must be the shipped recovery policy commitment ${SORA_RECOVERY_POLICY_COMMITMENT} in the ${STATS_HISTORY_MODE} mode; received ${formatValue(capabilities.policyHash)}`);
+    }
     // Statistics and history are the whole purpose of the partial mode.
     for (const field of ['statsReady', 'historyReady'] as const) {
       if (capabilities[field] !== true) fail(`${field} must be true in the ${STATS_HISTORY_MODE} mode`);
     }
-    // These two can only be true after a full recovery; true here means the
+    // Current account views never exist in this mode; true here means the
     // deployment is not the admitted partial mode.
-    for (const field of ['currentViewsReady', 'entitlementsReady'] as const) {
-      if (capabilities[field] !== false) fail(`${field} must be false in the ${STATS_HISTORY_MODE} mode`);
-    }
+    if (capabilities.currentViewsReady !== false) fail(`currentViewsReady must be false in the ${STATS_HISTORY_MODE} mode`);
   } else {
     if (typeof capabilities.mode !== 'string' || !FULL_SERVICE_CAPABILITY_MODES.includes(capabilities.mode)) {
       fail(`mode must be one of ${FULL_SERVICE_CAPABILITY_MODES.join(', ')} for a fully healthy service; received ${formatValue(capabilities.mode)}`);
+    }
+    if (capabilities.mode === 'legacy' && capabilities.policyHash !== null) {
+      fail(`policyHash must be null in the legacy mode; received ${formatValue(capabilities.policyHash)}`);
+    }
+    if (capabilities.mode === 'full-recovery' && capabilities.policyHash === null) {
+      fail('policyHash must pin the admitted recovery policy in the full-recovery mode');
     }
     for (const field of ['statsReady', 'historyReady', 'currentViewsReady', 'coreViewsReady'] as const) {
       if (capabilities[field] !== true) fail(`${field} must be true for a fully healthy service`);
@@ -739,11 +764,25 @@ function assertIndexerCapabilityContract(
       typeof capabilities.indexedBlockHash !== 'string' || !CANONICAL_HASH.test(capabilities.indexedBlockHash)) {
     fail('indexedBlock and indexedBlockHash must identify an indexed block');
   }
-  const advance = indexedBlock - state.lastIndexedBlock;
-  if (advance < 0 || advance > MAX_CAPABILITY_ADVANCE_BLOCKS ||
-      (advance === 0 && capabilities.indexedBlockHash !== state.blockHash)) {
-    fail(`indexedBlock ${formatValue(indexedBlock)} must identify the chainState checkpoint ${formatValue(state.lastIndexedBlock)} or one of the next ${MAX_CAPABILITY_ADVANCE_BLOCKS} blocks`);
+  if (indexedBlock !== state.lastIndexedBlock || capabilities.indexedBlockHash !== state.blockHash) {
+    fail(`indexedBlock ${formatValue(indexedBlock)} and its hash must identify the chainState checkpoint ${formatValue(state.lastIndexedBlock)} (still different after ${MAX_SMOKE_REQUESTS} requests if it kept moving)`);
   }
+}
+
+/** True only for observed checkpoint movement during one request, which a fresh request may resolve. */
+function checkpointMovedDuringRequest(payload: GraphQlResponse): boolean {
+  if (Array.isArray(payload.errors) && payload.errors.length > 0) {
+    return payload.errors.every((error) => {
+      if (!error || typeof error !== 'object') return false;
+      const { message, extensions } = error as { message?: unknown; extensions?: { code?: unknown } };
+      return extensions?.code === 'CHECKPOINT_VIEW_UNAVAILABLE' ||
+        (typeof message === 'string' && RETRYABLE_GRAPHQL_MESSAGES.some((text) => message.includes(text)));
+    });
+  }
+  const capabilityBlock = payload.data?.indexerCapabilities?.indexedBlock;
+  const stateBlock = payload.data?.chainState?.block;
+  return Number.isSafeInteger(capabilityBlock) && Number.isSafeInteger(stateBlock) &&
+    Number(capabilityBlock) > Number(stateBlock);
 }
 
 function parseProbeJson(probe: UpdateStreamProbe, label: string): unknown {
@@ -784,7 +823,10 @@ export async function runProductionSmoke(
     MAX_INDEXER_AGE_SEC,
   );
   const expectedMode = resolveExpectedMode(options.expectedMode ?? process.env[EXPECTED_MODE_VARIABLE]);
-  const payload = await fetchGraphQl(fetchImpl, graphqlUrl, requestOptions);
+  let payload = await fetchGraphQl(fetchImpl, graphqlUrl, requestOptions);
+  for (let request = 2; request <= MAX_SMOKE_REQUESTS && checkpointMovedDuringRequest(payload); request += 1) {
+    payload = await fetchGraphQl(fetchImpl, graphqlUrl, requestOptions);
+  }
 
   if (payload.errors !== undefined) {
     const missingIdentityFields = missingHealthIdentityFields(payload.errors);
@@ -882,6 +924,14 @@ export async function runProductionSmoke(
   if (checkpointAgeSec < -FUTURE_TIMESTAMP_TOLERANCE_SEC || checkpointAgeSec > maxIndexerAgeSec) {
     throw new Error(
       `PI production worker checkpoint must be within ${maxIndexerAgeSec} seconds of the smoke clock; received timestamp ${formatValue(state.blockTimestamp)}. ${PI_HEALTH_DEPLOYMENT_HINT}`,
+    );
+  }
+  // The worker's own commit heartbeat must be fresh too, not only positive.
+  const heartbeat = Number(payload.data._health.workerLastSuccessfulIndexTimestamp);
+  const heartbeatAgeSec = now - heartbeat;
+  if (heartbeatAgeSec < -FUTURE_TIMESTAMP_TOLERANCE_SEC || heartbeatAgeSec > maxIndexerAgeSec) {
+    throw new Error(
+      `PI production workerLastSuccessfulIndexTimestamp must be within ${maxIndexerAgeSec} seconds of the smoke clock; received ${formatValue(heartbeat)}. ${PI_HEALTH_DEPLOYMENT_HINT}`,
     );
   }
   if (!capabilities) {

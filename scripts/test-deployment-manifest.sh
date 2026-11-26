@@ -137,6 +137,11 @@ cp "$ROOT_DIR/Dockerfile" "$unbounded_health"
 perl -0pi -e "s/POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS:'4000'/POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS:'5000'/" "$unbounded_health"
 expect_failure "unbounded-health" "$unbounded_health" "$ROOT_DIR/.dockerignore" "runtime healthcheck must use a deadline shorter than its container timeout"
 
+inherited_partial_health="$TMP_DIR/Dockerfile.inherited-partial-health"
+cp "$ROOT_DIR/Dockerfile" "$inherited_partial_health"
+perl -0pi -e "s/,POLKASWAP_INDEXER_SMOKE_EXPECTED_MODE:'full'//" "$inherited_partial_health"
+expect_failure "inherited-partial-health" "$inherited_partial_health" "$ROOT_DIR/.dockerignore" "runtime healthcheck must keep the full-service smoke contract regardless of the container environment"
+
 remote_health="$TMP_DIR/Dockerfile.remote-health"
 cp "$ROOT_DIR/Dockerfile" "$remote_health"
 perl -0pi -e 's#http://127\.0\.0\.1:#https://attacker.invalid:#' "$remote_health"
