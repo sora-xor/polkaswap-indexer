@@ -1,13 +1,20 @@
 import { spawnSync } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createYoga } from 'graphql-yoga';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { ATTACKER_ACCOUNT, RECOVERY_CHECKPOINT } from '../src/burn-recovery.js';
 import { createSchema } from '../src/graphql/resolvers.js';
+import { PRE_FORK_HISTORY_HOLD_CHECKPOINT } from '../src/recovery-hold.js';
 import { MemoryRepository } from '../src/repository/memory.js';
+import type { IndexerDocument } from '../src/repository/types.js';
 import { normalizeGraphqlUrl, runProductionSmoke } from '../src/scripts/production-smoke.js';
 import { SORA_LEGACY_IDENTITY_ANCHOR, SORA_MAINNET_GENESIS_HASH } from '../src/soraIdentity.js';
+import {
+  STATS_ADMISSION_ID, STATS_CURSOR_ID, statsEvidenceDigest, type StatsRecoveryAdmission,
+} from '../src/stats-recovery.js';
 import { createPersistedWorkerStatusDocument } from '../src/worker/status.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -56,6 +63,21 @@ const validMobileCapabilities = {
   tairaDefaultVisible: true,
 };
 
+const validIndexerCapabilities = (block = VALID_BLOCK, blockHash = VALID_BLOCK_HASH) => ({
+  schemaVersion: 1,
+  genesisHash: SORA_MAINNET_GENESIS_HASH,
+  policyHash: null as string | null,
+  mode: 'legacy',
+  statsReady: true,
+  historyReady: true,
+  currentViewsReady: true,
+  coreViewsReady: true,
+  entitlementsReady: false,
+  indexedBlock: block,
+  indexedBlockHash: blockHash,
+  reason: 'Recovery entitlements require independent complete-history certification.',
+});
+
 const jsonResponse = (body: unknown, init: ResponseInit = {}): Response =>
   new Response(JSON.stringify(body), {
     status: 200,
@@ -69,6 +91,7 @@ const validWorkerState = (
   blockHash = VALID_BLOCK_HASH,
 ) => ({
   mobileConfig: validMobileCapabilities,
+  indexerCapabilities: validIndexerCapabilities(block, blockHash),
   chainIdentity: {
     id: 'chainIdentity',
     block: IDENTITY_BLOCK,
@@ -247,6 +270,10 @@ describe('Polkaswap production smoke', () => {
     expect(String(init?.body)).toContain('_health');
     expect(String(init?.body)).toContain('mobileConfig');
     for (const field of Object.keys(validMobileCapabilities)) {
+      expect(String(init?.body)).toContain(field);
+    }
+    expect(String(init?.body)).toContain('indexerCapabilities');
+    for (const field of Object.keys(validIndexerCapabilities())) {
       expect(String(init?.body)).toContain(field);
     }
     expect(String(init?.body)).toContain('chainIdentity: updatesStream(id: \\"chainIdentity\\")');
@@ -983,5 +1010,275 @@ describe('Polkaswap production smoke', () => {
     await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
       'chainIdentity must exactly prove the reviewed SORA mainnet checkpoint',
     );
+  });
+});
+
+describe('production smoke service modes', () => {
+  const endpoint = 'https://pi.soramitsu.io/graphql';
+  const partialMode = 'canonical-stats-history';
+  const partialReason = 'Canonical statistics/history only; account creation counts and recovery entitlements are unavailable.';
+  const partialHealth = { ...validHealth, ok: false };
+  const partialCapabilities = {
+    ...validIndexerCapabilities(),
+    policyHash: `0x${'1f'.repeat(32)}`,
+    mode: partialMode,
+    currentViewsReady: false,
+    reason: partialReason,
+  };
+  const fetchMode = (health: Record<string, unknown>, capabilities: unknown, state = validWorkerState()) =>
+    vi.fn(async () => jsonResponse({ data: { _health: health, ...state, indexerCapabilities: capabilities } }));
+  const captureStdout = () => {
+    const lines: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: unknown) => { lines.push(String(chunk)); return true; }) as never);
+    return lines;
+  };
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it('explains a partial-mode service instead of asking for a redeploy, and still fails by default', async () => {
+    const error = await runProductionSmoke(endpoint, fetchMode(partialHealth, partialCapabilities)).catch(e => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain('expected ok=true');
+    expect(error.message).toContain(`${partialMode} partial mode`);
+    expect(error.message).toContain('_health.ok stays false by design');
+    expect(error.message).toContain(partialReason);
+    expect(error.message).toContain('workerLifecycle=running');
+    expect(error.message).toContain('workerLag=5');
+    expect(error.message).toContain(`workerLatestIndexedBlock=${VALID_BLOCK}`);
+    expect(error.message).toContain(`POLKASWAP_INDEXER_SMOKE_EXPECTED_MODE=${partialMode}`);
+    expect(error.message).not.toContain('Deploy the current polkaswap-indexer worker');
+  });
+
+  it('reports what an unready full service says about itself', async () => {
+    const health = {
+      ...validHealth, ok: false, workerReady: false, workerReadinessReason: 'lag-exceeded',
+      workerLag: 900, workerLatestFinalizedBlock: VALID_BLOCK + 900,
+      workerLastError: 'RPC failed with Authorization: Bearer abcdef0123456789', workerLastErrorTimestamp: VALID_TIMESTAMP,
+    };
+    const error = await runProductionSmoke(endpoint, fetchMode(health, validIndexerCapabilities())).catch(e => e);
+    expect(error.message).toContain('expected ok=true');
+    expect(error.message).toContain('workerReadinessReason=lag-exceeded');
+    expect(error.message).toContain('workerLag=900');
+    expect(error.message).toContain('workerLastError=RPC failed');
+    expect(error.message).not.toContain('abcdef0123456789');
+    expect(error.message).toContain('Deploy the current polkaswap-indexer worker');
+    expect(error.message).not.toContain('partial mode');
+  });
+
+  it.each([undefined, null, 'legacy', 7])('keeps the full-service failure when capabilities are %j', async (capabilities) => {
+    const fetchImpl = fetchMode(partialHealth, capabilities);
+    const error = await runProductionSmoke(endpoint, fetchImpl).catch(e => e);
+    expect(error.message).toContain('expected ok=true');
+    expect(error.message).toContain('Deploy the current polkaswap-indexer worker');
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it('passes a healthy partial-mode service only when the operator selects that mode', async () => {
+    const lines = captureStdout();
+    const fetchImpl = fetchMode(partialHealth, partialCapabilities);
+    await expect(runProductionSmoke(endpoint, fetchImpl, { expectedMode: partialMode })).resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(lines.join('')).toBe(
+      `polkaswap production smoke ok in the ${partialMode} partial mode (statistics and history only; _health.ok stays false; coreViewsReady=true): ${endpoint}\n`
+    );
+  });
+
+  it('reads the expected mode from the environment', async () => {
+    captureStdout();
+    vi.stubEnv('POLKASWAP_INDEXER_SMOKE_EXPECTED_MODE', partialMode);
+    await expect(runProductionSmoke(endpoint, fetchMode(partialHealth, partialCapabilities))).resolves.toBeUndefined();
+    vi.stubEnv('POLKASWAP_INDEXER_SMOKE_EXPECTED_MODE', 'full');
+    await expect(runProductionSmoke(endpoint, fetchMode(partialHealth, partialCapabilities))).rejects.toThrow('expected ok=true');
+    await expect(runProductionSmoke(endpoint, fetchWithHealth(validHealth))).resolves.toBeUndefined();
+  });
+
+  it.each(['', 'FULL', 'partial', 'legacy', 'full-recovery', ' canonical-stats-history'])(
+    'rejects the unknown expected mode %j before transport', async (expectedMode) => {
+      const fetchImpl = vi.fn();
+      await expect(runProductionSmoke(endpoint, fetchImpl, { expectedMode })).rejects.toThrow(
+        'POLKASWAP_INDEXER_SMOKE_EXPECTED_MODE must be one of full, canonical-stats-history'
+      );
+      vi.stubEnv('POLKASWAP_INDEXER_SMOKE_EXPECTED_MODE', expectedMode);
+      await expect(runProductionSmoke(endpoint, fetchImpl)).rejects.toThrow('must be one of full, canonical-stats-history');
+      expect(fetchImpl).not.toHaveBeenCalled();
+    }
+  );
+
+  it('does not accept full-service health under the partial-mode override', async () => {
+    await expect(
+      runProductionSmoke(endpoint, fetchMode(validHealth, partialCapabilities), { expectedMode: partialMode })
+    ).rejects.toThrow('reports full-service health (ok=true)');
+    await expect(
+      runProductionSmoke(endpoint, fetchMode({ ...validHealth, ok: null }, partialCapabilities), { expectedMode: partialMode })
+    ).rejects.toThrow(`health ok must be false in the ${partialMode} partial mode`);
+  });
+
+  it.each([
+    [{ workerReady: false, workerReadinessReason: 'lag-exceeded' }, 'available worker must be ready'],
+    [{ workerLifecycle: 'stopped' }, 'ready worker lifecycle must be running'],
+    [{ workerStartupComplete: false }, 'ready worker startup must be complete'],
+    [{ repositoryReady: false }, 'health repositoryReady must be true'],
+    [{ workerAvailable: false }, 'must expose a shared worker status'],
+    [{ workerLag: 4 }, 'health workerLag must match finalized minus indexed blocks'],
+    [{ genesisHash: `0x${'00'.repeat(32)}` }, 'health genesisHash must be the reviewed SORA mainnet genesis'],
+  ])('keeps every worker and identity check in the partial mode: %j', async (change, message) => {
+    await expect(
+      runProductionSmoke(endpoint, fetchMode({ ...partialHealth, ...change }, partialCapabilities), { expectedMode: partialMode })
+    ).rejects.toThrow(message);
+  });
+
+  it('keeps the checkpoint freshness limit in the partial mode', async () => {
+    const stale = VALID_TIMESTAMP - 301;
+    const fetchImpl = fetchMode(
+      { ...partialHealth, latestIndexedAt: stale }, partialCapabilities, validWorkerState(stale)
+    );
+    await expect(runProductionSmoke(endpoint, fetchImpl, { expectedMode: partialMode })).rejects.toThrow(
+      'must be within 300 seconds of the smoke clock'
+    );
+  });
+
+  it.each([
+    [{ mode: 'legacy' }, `mode must be ${partialMode}`],
+    [{ mode: 'full-recovery' }, `mode must be ${partialMode}`],
+    [{ mode: null }, `mode must be ${partialMode}`],
+    [{ statsReady: false }, 'statsReady must be true'],
+    [{ historyReady: false }, 'historyReady must be true'],
+    [{ currentViewsReady: true }, 'currentViewsReady must be false'],
+    [{ entitlementsReady: true }, 'entitlementsReady must be false'],
+    [{ coreViewsReady: 'yes' }, 'coreViewsReady must be boolean'],
+    [{ statsReady: 1 }, 'statsReady must be boolean'],
+    [{ policyHash: null }, 'policyHash must pin the recovery policy'],
+    [{ policyHash: '0x1f' }, 'policyHash must be null or a canonical hash'],
+    [{ genesisHash: `0x${'11'.repeat(32)}` }, 'genesisHash must be the reviewed SORA mainnet genesis'],
+    [{ schemaVersion: 2 }, 'schemaVersion must be 1'],
+    [{ reason: 5 }, 'reason must be null or a bounded string'],
+    [{ reason: 'x'.repeat(1_001) }, 'reason must be null or a bounded string'],
+    [{ indexedBlock: VALID_BLOCK - 1 }, 'must identify the chainState checkpoint'],
+    [{ indexedBlock: VALID_BLOCK + 3 }, 'must identify the chainState checkpoint'],
+    [{ indexedBlockHash: `0x${'cd'.repeat(32)}` }, 'must identify the chainState checkpoint'],
+    [{ indexedBlock: null }, 'must identify an indexed block'],
+    [{ indexedBlock: 1.5 }, 'must identify an indexed block'],
+    [{ indexedBlockHash: 'not-a-hash' }, 'must identify an indexed block'],
+  ])('rejects the partial-mode capability change %j', async (change, message) => {
+    const error = await runProductionSmoke(
+      endpoint, fetchMode(partialHealth, { ...partialCapabilities, ...change }), { expectedMode: partialMode }
+    ).catch(e => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain(message);
+    expect(error.message).toContain('Deploy the current polkaswap-indexer API so indexerCapabilities');
+  });
+
+  it('accepts a core refresh in progress and a capability read that is slightly newer than chainState', async () => {
+    const lines = captureStdout();
+    const newer = { ...partialCapabilities, coreViewsReady: false, indexedBlock: VALID_BLOCK + 2, indexedBlockHash: `0x${'cd'.repeat(32)}`, reason: null };
+    await expect(
+      runProductionSmoke(endpoint, fetchMode(partialHealth, newer), { expectedMode: partialMode })
+    ).resolves.toBeUndefined();
+    expect(lines.join('')).toContain('coreViewsReady=false');
+  });
+
+  it.each([
+    [undefined, 'did not return data.indexerCapabilities'],
+    [null, 'did not return data.indexerCapabilities'],
+    ['legacy', 'did not return data.indexerCapabilities'],
+    [{ ...validIndexerCapabilities(), mode: partialMode }, 'mode must be one of legacy, full-recovery'],
+    [{ ...validIndexerCapabilities(), mode: 'future-mode' }, 'mode must be one of legacy, full-recovery'],
+    [{ ...validIndexerCapabilities(), currentViewsReady: false }, 'currentViewsReady must be true for a fully healthy service'],
+    [{ ...validIndexerCapabilities(), coreViewsReady: false }, 'coreViewsReady must be true for a fully healthy service'],
+    [{ ...validIndexerCapabilities(), statsReady: false }, 'statsReady must be true for a fully healthy service'],
+    [{ ...validIndexerCapabilities(), indexedBlock: VALID_BLOCK - 5 }, 'must identify the chainState checkpoint'],
+    [{ ...validIndexerCapabilities(), genesisHash: null }, 'genesisHash must be the reviewed SORA mainnet genesis'],
+  ])('rejects a fully healthy response whose capabilities are %j', async (capabilities, message) => {
+    await expect(runProductionSmoke(endpoint, fetchMode(validHealth, capabilities))).rejects.toThrow(message);
+  });
+
+  it('accepts a fully healthy full-recovery service whose policy is pinned', async () => {
+    const capabilities = { ...validIndexerCapabilities(), mode: 'full-recovery', policyHash: `0x${'2e'.repeat(32)}`, entitlementsReady: true };
+    await expect(runProductionSmoke(endpoint, fetchMode(validHealth, capabilities))).resolves.toBeUndefined();
+  });
+
+  it.each([200, 400])('diagnoses a deployed schema without indexerCapabilities over HTTP %i', async (status) => {
+    for (const message of [
+      'Cannot query field "indexerCapabilities" on type "Query".',
+      'Cannot query field "coreViewsReady" on type "IndexerCapabilities".',
+    ]) {
+      const fetchImpl = vi.fn(async () => jsonResponse({ errors: [{ message }] }, { status }));
+      const error = await runProductionSmoke(endpoint, fetchImpl).catch(e => e);
+      expect(error.message).toContain('PI production GraphQL schema is missing indexer capability fields');
+      expect(error.message).toContain(message.includes('coreViewsReady') ? '(coreViewsReady)' : '(indexerCapabilities)');
+      expect(error.message).toContain('Deploy the current polkaswap-indexer API so indexerCapabilities');
+    }
+  });
+
+  it('runs both modes against the real resolvers of a statistics-only database', async () => {
+    const prefix = PRE_FORK_HISTORY_HOLD_CHECKPOINT;
+    const hash = (n: number) => `0x${n.toString(16).padStart(64, '0')}`;
+    const repair = JSON.parse(
+      await readFile(new URL('./fixtures/stats-prefix-volume-repair.json', import.meta.url), 'utf8')
+    ) as IndexerDocument;
+    const admission: StatsRecoveryAdmission = {
+      schema: 'sora-nexus-canonical-stats-history-v1', approvedForStatsHistory: true, entitlementsReady: false,
+      sourceDatabasePath: '/qualified/original-prefix', databasePath: '/isolated/stats-copy',
+      prefix: { ...prefix, genesisHash: SORA_MAINNET_GENESIS_HASH },
+      qualification: {
+        databaseFilesSha256: 'a'.repeat(64), nativeAuditSha256: 'b'.repeat(64), executorReceiptSha256: 'c'.repeat(64),
+        volumeRepairMarkerSha256: statsEvidenceDigest(repair),
+      },
+      policy: {
+        version: 1, policyHash: hash(1), releaseManifestHash: hash(2), genesisHash: SORA_MAINNET_GENESIS_HASH,
+        checkpoint: RECOVERY_CHECKPOINT, postForkAnchor: { block: RECOVERY_CHECKPOINT.block + 2, hash: hash(5) },
+        substitutions: [{ old: hash(3), new: hash(4) }], attackerAccounts: [ATTACKER_ACCOUNT],
+        metadata: [{
+          firstBlock: RECOVERY_CHECKPOINT.block, lastBlock: RECOVERY_CHECKPOINT.block + 100,
+          executionCodeHash: hash(6), metadataHash: hash(7),
+        }],
+      },
+    };
+    const state = {
+      lastIndexedBlock: prefix.block, blockHash: prefix.hash, blockTimestamp: prefix.timestamp,
+      genesisHash: SORA_MAINNET_GENESIS_HASH,
+    };
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      repair,
+      { collection: 'updatesStreams', id: STATS_ADMISSION_ID, blockHeight: prefix.block, timestamp: null,
+        data: { id: STATS_ADMISSION_ID, admission, admissionDigest: statsEvidenceDigest(admission) } },
+      { collection: 'updatesStreams', id: STATS_CURSOR_ID, blockHeight: prefix.block, timestamp: null,
+        data: { id: STATS_CURSOR_ID, admissionDigest: statsEvidenceDigest(admission), block: prefix.block,
+          hash: prefix.hash, blockTimestamp: prefix.timestamp, entitlementsReady: false } },
+      { collection: 'updatesStreams', id: 'chainIdentity', blockHeight: IDENTITY_BLOCK, timestamp: IDENTITY_TIMESTAMP,
+        data: { id: 'chainIdentity', block: IDENTITY_BLOCK, data: JSON.stringify({
+          schemaVersion: 1, genesisHash: SORA_MAINNET_GENESIS_HASH, verificationBlock: IDENTITY_BLOCK,
+          verificationBlockHash: IDENTITY_BLOCK_HASH, verificationBlockTimestamp: IDENTITY_TIMESTAMP, migration: 'fresh-database',
+        }) } },
+      { collection: 'updatesStreams', id: 'chainState', blockHeight: prefix.block, timestamp: prefix.timestamp,
+        data: { id: 'chainState', block: prefix.block, data: JSON.stringify(state) } },
+      { collection: 'networkSnapshots', id: `block-${prefix.block}`, blockHeight: prefix.block, timestamp: prefix.timestamp,
+        data: { id: `block-${prefix.block}`, type: 'BLOCK', timestamp: prefix.timestamp } },
+      createPersistedWorkerStatusDocument({
+        lifecycle: 'running', startupComplete: true, latestFinalizedBlock: prefix.block, latestIndexedBlock: prefix.block,
+        lag: 0, lastSuccessfulIndexTimestamp: prefix.timestamp, lastError: null, lastErrorTimestamp: null,
+      }, prefix.timestamp),
+    ]);
+    vi.spyOn(Date, 'now').mockReturnValue(prefix.timestamp * 1000);
+    const lines = captureStdout();
+    const yoga = createYoga({ schema: createSchema(), context: { repository }, graphqlEndpoint: '/graphql', logging: false });
+    const fetchImpl = vi.fn(async (url: URL, init?: RequestInit) => yoga.fetch(url, init ?? {}));
+
+    // The worker is running at the head with no lag, yet complete health is
+    // withheld: this is the deliberate state of the statistics-only mode.
+    const defaultMode = await runProductionSmoke(endpoint, fetchImpl).catch(e => e);
+    expect(defaultMode).toBeInstanceOf(Error);
+    expect(defaultMode.message).toContain('expected ok=true');
+    expect(defaultMode.message).toContain(`${partialMode} partial mode`);
+    expect(defaultMode.message).toContain('workerReady=true');
+    expect(defaultMode.message).toContain('workerLag=0');
+
+    await expect(runProductionSmoke(endpoint, fetchImpl, { expectedMode: partialMode })).resolves.toBeUndefined();
+    expect(lines.join('')).toContain(`polkaswap production smoke ok in the ${partialMode} partial mode`);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 });

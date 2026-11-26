@@ -845,6 +845,22 @@ redirects, uses a 10-second total deadline, accepts exact JSON media types
 `POLKASWAP_INDEXER_SMOKE_MAX_RESPONSE_BYTES`, and
 `POLKASWAP_INDEXER_SMOKE_MAX_INDEXER_AGE_SEC`.
 
+The same request reads `indexerCapabilities`. A fully healthy service must also
+report `mode` `legacy` or `full-recovery` with statistics, history, current and
+core views ready at the `chainState` checkpoint (or one of the next two blocks,
+because that root reads the checkpoint separately). The
+`canonical-stats-history` partial mode keeps `_health.ok=false` by design, so
+the default smoke fails there and its message names the partial mode, its
+reason and the worker state instead of asking for a redeploy. To verify that
+partial mode deliberately, set
+`POLKASWAP_INDEXER_SMOKE_EXPECTED_MODE=canonical-stats-history`: the smoke then
+requires `ok=false`, a pinned `policyHash`, `statsReady` and `historyReady`
+true, `currentViewsReady` and `entitlementsReady` false, and every other worker,
+identity and freshness check above, and prints a distinct
+`smoke ok in the canonical-stats-history partial mode` line. It rejects a
+service that reports `ok=true` under that override. The only accepted values
+are `full` (the default) and `canonical-stats-history`.
+
 Current checkpoint fields share one bounded read per GraphQL execution context.
 `_health`, explicit `chainState`/`chainIdentity` reads, and the stock-only latest
 `BLOCK` connection (`first: 1`, `TIMESTAMP_DESC`, exact `type.equalTo: BLOCK`)
