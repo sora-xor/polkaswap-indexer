@@ -2,7 +2,7 @@ import { Metadata, TypeRegistry } from '@polkadot/types';
 import { hexToU8a } from '@polkadot/util';
 import type { SignedBlock } from '@polkadot/types/interfaces';
 import { blake2AsHex, xxhashAsHex } from '@polkadot/util-crypto';
-import { types as soraTypes } from '@sora-substrate/type-definitions';
+import soraTypes from './runtime/sora-legacy-types.json' with { type: 'json' };
 import type { BurnRecoveryPolicy } from './burn-recovery.js';
 import { isNonzeroCanonicalSubstrateHash } from './soraIdentity.js';
 

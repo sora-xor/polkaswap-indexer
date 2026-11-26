@@ -7,7 +7,7 @@ import {gunzipSync} from 'node:zlib';
 import {Metadata, TypeRegistry} from '@polkadot/types';
 import type {SignedBlock, EventRecord} from '@polkadot/types/interfaces';
 import {blake2AsHex} from '@polkadot/util-crypto';
-import {types as soraTypes} from '@sora-substrate/type-definitions';
+import soraTypes from './runtime/sora-legacy-types.json' with {type: 'json'};
 import {createXorBurnDocumentsFromEvents} from './worker/chain.js';
 import {RECOVERY_CHECKPOINT, SOLSWAP_START_BLOCK, type CanonicalBurnReceipt} from './burn-recovery.js';
 
