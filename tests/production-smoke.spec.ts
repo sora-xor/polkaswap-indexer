@@ -1199,10 +1199,18 @@ describe('production smoke service modes', () => {
 
   it('retries a request whose capability read moved past chainState, then requires the exact checkpoint', async () => {
     captureStdout();
-    const moved = { ...partialCapabilities, indexedBlock: VALID_BLOCK + 1, indexedBlockHash: `0x${'cd'.repeat(32)}` };
+    const nextHash = `0x${'cd'.repeat(32)}`;
+    const moved = { ...partialCapabilities, indexedBlock: VALID_BLOCK + 1, indexedBlockHash: nextHash };
+    // The settled request sees the moved checkpoint everywhere.
+    const healthAtNext = {
+      ...partialHealth, latestIndexedBlock: VALID_BLOCK + 1, latestIndexedBlockHash: nextHash,
+      workerLatestIndexedBlock: VALID_BLOCK + 1, workerLatestFinalizedBlock: VALID_BLOCK + 6,
+    };
     const settles = vi.fn()
       .mockResolvedValueOnce(jsonResponse({ data: { _health: partialHealth, ...validWorkerState(), indexerCapabilities: moved } }))
-      .mockResolvedValueOnce(jsonResponse({ data: { _health: partialHealth, ...validWorkerState(), indexerCapabilities: partialCapabilities } }));
+      .mockResolvedValueOnce(jsonResponse({ data: {
+        _health: healthAtNext, ...validWorkerState(VALID_TIMESTAMP, VALID_BLOCK + 1, nextHash), indexerCapabilities: moved,
+      } }));
     await expect(runProductionSmoke(endpoint, settles, { expectedMode: partialMode })).resolves.toBeUndefined();
     expect(settles).toHaveBeenCalledTimes(2);
 
@@ -1218,6 +1226,48 @@ describe('production smoke service modes', () => {
       'must identify the chainState checkpoint'
     );
     expect(older).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a retry whose checkpoint is lower than one already observed', async () => {
+    const moved = { ...partialCapabilities, indexedBlock: VALID_BLOCK + 1, indexedBlockHash: `0x${'cd'.repeat(32)}` };
+    const regresses = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ data: { _health: partialHealth, ...validWorkerState(), indexerCapabilities: moved } }))
+      .mockResolvedValueOnce(jsonResponse({ data: { _health: partialHealth, ...validWorkerState(), indexerCapabilities: partialCapabilities } }));
+    await expect(runProductionSmoke(endpoint, regresses, { expectedMode: partialMode })).rejects.toThrow(
+      `chainState checkpoint ${VALID_BLOCK} is lower than block ${VALID_BLOCK + 1} observed earlier`
+    );
+    expect(regresses).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    [{ entitlementsReady: true }, {}, 'entitlementsReady must be false in schema v1'],
+    [{ policyHash: `0x${'1f'.repeat(32)}` }, {}, 'policyHash must be the shipped recovery policy commitment'],
+    [{}, { ok: true }, 'reports full-service health (ok=true)'],
+    [{}, { workerReady: false }, 'available worker must be ready'],
+  ])('fails on the first request when a moved response also breaks the contract: %j %j', async (capChange, healthChange, message) => {
+    const moved = { ...partialCapabilities, ...capChange, indexedBlock: VALID_BLOCK + 1, indexedBlockHash: `0x${'cd'.repeat(32)}` };
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ data: { _health: { ...partialHealth, ...healthChange }, ...validWorkerState(), indexerCapabilities: moved } }))
+      .mockResolvedValue(jsonResponse({ data: { _health: partialHealth, ...validWorkerState(), indexerCapabilities: partialCapabilities } }));
+    await expect(runProductionSmoke(endpoint, fetchImpl, { expectedMode: partialMode })).rejects.toThrow(message);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it('does not retry past the one total request deadline', async () => {
+    const start = VALID_TIMESTAMP * 1_000;
+    let calls = 0;
+    // The first reading sets the deadline; every later reading is past it.
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => (calls++ === 0 ? start : start + 10_001));
+    try {
+      const moved = { ...partialCapabilities, indexedBlock: VALID_BLOCK + 1, indexedBlockHash: `0x${'cd'.repeat(32)}` };
+      const fetchImpl = fetchMode(partialHealth, moved);
+      await expect(runProductionSmoke(endpoint, fetchImpl, { expectedMode: partialMode })).rejects.toThrow(
+        'must identify the chainState checkpoint'
+      );
+      expect(fetchImpl).toHaveBeenCalledOnce();
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it.each([
@@ -1269,11 +1319,11 @@ describe('production smoke service modes', () => {
   });
 
   it('redacts credentials of any URL scheme in GraphQL error diagnostics', async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse({ errors: [{ message: 'upstream wss://ws-user:ws-pass@archive.invalid/ws failed' }] }));
+    const fetchImpl = vi.fn(async () => jsonResponse({ errors: [{ message:
+      'upstream wss://ws-user:ws-pass@archive.invalid/ws failed; fallback wss://archive.invalid?token=query-secret@SUFFIX' }] }));
     const error = await runProductionSmoke(endpoint, fetchImpl).catch(e => e);
     expect(error.message).toContain('wss://<redacted>@archive.invalid');
-    expect(error.message).not.toContain('ws-pass');
-    expect(error.message).not.toContain('ws-user');
+    for (const secret of ['ws-pass', 'ws-user', 'query-secret']) expect(error.message).not.toContain(secret);
   });
 
   it.each([

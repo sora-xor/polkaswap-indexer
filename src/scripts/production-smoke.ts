@@ -267,7 +267,7 @@ function redactSecrets(value: string): string {
   return value
     .replace(/("(?:access[_-]?token|refresh[_-]?token|token|password|passwd|api[-_]?key|secret|authorization|cookie|set-cookie)"\s*:\s*)(?:"(?:\\.|[^"\\])*"|[^,}\]\s]+)/gi, '$1"<redacted>"')
     .replace(/(\b(?:bearer|basic)\s+)[A-Za-z0-9+/=_~.-]+/gi, '$1<redacted>')
-    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi, '$1<redacted>@')
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^/\s@?#]+@/gi, '$1<redacted>@')
     .replace(/([?&](?:access[_-]?token|refresh[_-]?token|token|password|passwd|api[-_]?key|secret|authorization|key)=)[^&#\s]*/gi, '$1<redacted>')
     .replace(/(\b(?:access[_-]?token|refresh[_-]?token|token|password|passwd|api[-_]?key|secret|authorization)\b\s*[:=]\s*)(?:["'][^"'\r\n]*["']|[^\s,;&]+)/gi, '$1<redacted>');
 }
@@ -702,14 +702,16 @@ function assertMobileCapabilityContract(capabilities: MobileCapabilityInfo): voi
   }
 }
 
-function assertIndexerCapabilityContract(
+function failCapability(message: string): never {
+  throw new Error(`PI production indexer capability ${message}. ${PI_INDEXER_CAPABILITY_DEPLOYMENT_HINT}`);
+}
+
+/** Every capability field except the checkpoint identity; also applied to a response that is retried. */
+function assertIndexerCapabilityFields(
   capabilities: IndexerCapabilityInfo,
   expectedMode: ProductionSmokeExpectedMode,
-  state: { lastIndexedBlock: number; blockHash: string },
 ): void {
-  function fail(message: string): never {
-    throw new Error(`PI production indexer capability ${message}. ${PI_INDEXER_CAPABILITY_DEPLOYMENT_HINT}`);
-  }
+  const fail: (message: string) => never = failCapability;
   if (capabilities.schemaVersion !== 1) fail(`schemaVersion must be 1; received ${formatValue(capabilities.schemaVersion)}`);
   if (capabilities.genesisHash !== SORA_MAINNET_GENESIS_HASH) {
     fail(`genesisHash must be the reviewed SORA mainnet genesis; received ${formatValue(capabilities.genesisHash)}`);
@@ -759,13 +761,26 @@ function assertIndexerCapabilityContract(
     }
   }
 
-  const indexedBlock = capabilities.indexedBlock;
-  if (typeof indexedBlock !== 'number' || !Number.isSafeInteger(indexedBlock) ||
+  if (typeof capabilities.indexedBlock !== 'number' || !Number.isSafeInteger(capabilities.indexedBlock) ||
       typeof capabilities.indexedBlockHash !== 'string' || !CANONICAL_HASH.test(capabilities.indexedBlockHash)) {
     fail('indexedBlock and indexedBlockHash must identify an indexed block');
   }
-  if (indexedBlock !== state.lastIndexedBlock || capabilities.indexedBlockHash !== state.blockHash) {
-    fail(`indexedBlock ${formatValue(indexedBlock)} and its hash must identify the chainState checkpoint ${formatValue(state.lastIndexedBlock)} (still different after ${MAX_SMOKE_REQUESTS} requests if it kept moving)`);
+}
+
+function assertIndexerCapabilityContract(
+  capabilities: IndexerCapabilityInfo,
+  expectedMode: ProductionSmokeExpectedMode,
+  state: { lastIndexedBlock: number; blockHash: string },
+  highestObservedBlock: number,
+): void {
+  assertIndexerCapabilityFields(capabilities, expectedMode);
+  if (capabilities.indexedBlock !== state.lastIndexedBlock || capabilities.indexedBlockHash !== state.blockHash) {
+    failCapability(`indexedBlock ${formatValue(capabilities.indexedBlock)} and its hash must identify the chainState checkpoint ${formatValue(state.lastIndexedBlock)} (still different after ${MAX_SMOKE_REQUESTS} requests or the smoke deadline if it kept moving)`);
+  }
+  // Finalized history only moves forward: an earlier request of this run that
+  // already saw a higher checkpoint makes a lower final one a regression.
+  if (state.lastIndexedBlock < highestObservedBlock) {
+    failCapability(`chainState checkpoint ${formatValue(state.lastIndexedBlock)} is lower than block ${formatValue(highestObservedBlock)} observed earlier in this smoke run`);
   }
 }
 
@@ -823,9 +838,23 @@ export async function runProductionSmoke(
     MAX_INDEXER_AGE_SEC,
   );
   const expectedMode = resolveExpectedMode(options.expectedMode ?? process.env[EXPECTED_MODE_VARIABLE]);
+  // One total deadline covers every request of this run, retries included.
+  const deadline = Date.now() + requestOptions.timeoutMs;
   let payload = await fetchGraphQl(fetchImpl, graphqlUrl, requestOptions);
+  let highestObservedBlock = 0;
   for (let request = 2; request <= MAX_SMOKE_REQUESTS && checkpointMovedDuringRequest(payload); request += 1) {
-    payload = await fetchGraphQl(fetchImpl, graphqlUrl, requestOptions);
+    const moved = payload.data;
+    if (moved?._health && typeof moved._health === 'object' && moved.indexerCapabilities &&
+        typeof moved.indexerCapabilities === 'object') {
+      // A moved response is still a complete answer: its other contract fields
+      // must hold before it is discarded, so a retry never hides a failure.
+      assertHealthContract(moved._health, expectedMode, moved.indexerCapabilities);
+      assertIndexerCapabilityFields(moved.indexerCapabilities, expectedMode);
+      highestObservedBlock = Math.max(highestObservedBlock, Number(moved.indexerCapabilities.indexedBlock));
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    payload = await fetchGraphQl(fetchImpl, graphqlUrl, { ...requestOptions, timeoutMs: remainingMs });
   }
 
   if (payload.errors !== undefined) {
@@ -939,7 +968,7 @@ export async function runProductionSmoke(
       `Polkaswap GraphQL endpoint did not return data.indexerCapabilities. ${PI_INDEXER_CAPABILITY_DEPLOYMENT_HINT}`
     );
   }
-  assertIndexerCapabilityContract(capabilities, expectedMode, state);
+  assertIndexerCapabilityContract(capabilities, expectedMode, state, highestObservedBlock);
   if (expectedMode === STATS_HISTORY_MODE) {
     process.stdout.write(
       `polkaswap production smoke ok in the ${STATS_HISTORY_MODE} partial mode ` +

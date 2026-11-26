@@ -855,7 +855,9 @@ and `indexedBlockHash` must equal the `chainState` checkpoint exactly. That root
 reads the checkpoint after the shared view, so a block landing mid-request can
 move it ahead; such movement, and server errors that ask for the complete query
 to be retried (`CHECKPOINT_VIEW_UNAVAILABLE`, a changed core view), are retried
-with a fresh request, at most three requests in total. `entitlementsReady` must
+with a fresh request, at most three requests within the one total deadline. A
+moved response must still satisfy every other check before it is discarded, and
+a later checkpoint lower than one already observed fails. `entitlementsReady` must
 be false: no schema v1 mode certifies entitlements. A fully healthy service must
 report `mode` `legacy` (with a null `policyHash`) or `full-recovery` (with a
 pinned nonzero `policyHash`) and statistics, history, current and core views
