@@ -341,26 +341,39 @@ function tinyFixture(options: { spec?: number; parentSpec?: number } = {}) {
   return { manager, rpc, state };
 }
 
-/** Hold isolated API construction open and expose the real pinned provider facade it was handed. */
-async function heldProvider(options: { spec?: number; parentSpec?: number } = {}) {
-  const fixture = tinyFixture(options), { state } = fixture;
-  let handed!: (provider: any) => void;
-  const facade = new Promise<any>((resolve) => { handed = resolve; });
-  vi.spyOn(ApiPromise, 'create').mockImplementationOnce(((init: { provider: unknown }) => {
-    handed(init.provider); return new Promise(() => undefined);
-  }) as never);
-  const pending = fixture.manager.at(state.hash);
-  pending.catch(() => undefined);
-  // Fail fast with the capture's own error if verification ends without requesting an isolated API.
-  const provider = await Promise.race([facade, pending.then(() => { throw new Error('capture finished without an isolated API request'); })]);
-  // The exact evidence the fixture served, rebuilt by the test: the facade accepts it only because it matches its own registry.
-  const registry = new TypeRegistry();
-  const proof = { hash: state.hash, height: state.height, parentHash: state.parentHash, header: state.header,
-    version: registry.createType('RuntimeVersion', version(options.spec ?? 134)),
-    parentVersion: registry.createType('RuntimeVersion', version(options.parentSpec ?? 134)),
-    metadata: tiny.raw, metadataHash: tinyPolicy.metadata[0].metadataHash, executionCodeHash: tinyPolicy.metadata[0].executionCodeHash };
-  return { ...fixture, provider, proof, pending };
+type Outcome<T> = { ok: true; value: T } | { ok: false; error: unknown };
+/** Observe a promise's outcome as soon as it is created, so an early failure can never surface unobserved. */
+const observe = <T>(promise: Promise<T>): Promise<Outcome<T>> =>
+  promise.then((value) => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
+
+/** A real isolated client over the tiny metadata, plus the pinned provider facade the manager handed to it. */
+async function liveClient(options: { spec?: number; parentSpec?: number } = {}) {
+  const fixture = tinyFixture(options);
+  const real = ApiPromise.create.bind(ApiPromise);
+  let provider: any;
+  const create = vi.spyOn(ApiPromise, 'create').mockImplementationOnce(async (init) => { provider = init!.provider; return real(init); });
+  const context = await fixture.manager.at(fixture.state.hash);
+  expect(create).toHaveBeenCalledOnce();
+  return { ...fixture, context, provider };
 }
+
+const probeKey = `0x${'ab'.repeat(32)}`;
+/** Park public query storage reads at the owner until released; meanwhile each holds the manager's own exact-state lease. */
+function parkQueryReads(rpc: ReturnType<typeof tinyFixture>['rpc']) {
+  const normal = rpc.getMockImplementation()!;
+  const parked: Array<() => void> = [];
+  let arrival: (() => void) | undefined;
+  rpc.mockImplementation(async (method, params) => {
+    if (method === 'state_getStorage' && params[0] !== probeKey) await new Promise<void>((resolve) => { parked.push(resolve); arrival?.(); });
+    return normal(method, params);
+  });
+  return {
+    async arrived(count: number) { while (parked.length < count) await new Promise<void>((resolve) => { arrival = resolve; }); },
+    release() { parked.shift()?.(); },
+    releaseAll() { parked.splice(0).forEach((resolve) => resolve()); },
+  };
+}
+const runtime134 = new TypeRegistry().createType('RuntimeVersion', version(134));
 
 describe('recovery query adapter fail-closed guards', () => {
   it('validates every decorated storage declaration and refuses a mismatched, incomplete or storage-less registry', () => {
@@ -387,8 +400,8 @@ describe('recovery query adapter fail-closed guards', () => {
       { registry: empty.registry, runtimeVersion: empty.runtime, query: {} } as never, empty.raw)).toThrow('no storage declarations');
   });
 
-  it('serves only immutable initialization facts until an exact-state lease exists and never forwards refused RPCs', async () => {
-    const { provider, proof, rpc, state } = await heldProvider();
+  it('serves only immutable initialization facts until the manager\'s own exact-state lease exists and never forwards refused RPCs', async () => {
+    const { provider, context, rpc, state } = await liveClient();
     expect(provider.isConnected).toBe(true);
     await expect(provider.connect()).resolves.toBeUndefined();
     const calls = rpc.mock.calls.length;
@@ -398,96 +411,112 @@ describe('recovery query adapter fail-closed guards', () => {
     await expect(provider.send('chain_getHeader', [state.hash])).rejects.toThrow('not allowed: chain_getHeader');
     await expect(provider.send('state_getRuntimeVersion', [state.parentHash])).rejects.toThrow('not allowed: state_getRuntimeVersion');
     await expect(provider.send('author_submitExtrinsic', ['0x00'])).rejects.toThrow('not allowed: author_submitExtrinsic');
-    await expect(provider.send('state_getStorage', ['0x00', state.hash])).rejects.toThrow('lacks an active exact-state proof');
-    await provider.withProof(proof, async () => {
-      expect(await provider.send('chain_getHeader', [state.hash])).toEqual(state.header);
-      expect(await provider.send('state_getRuntimeVersion', [state.parentHash])).toEqual(proof.parentVersion.toJSON());
-    });
+    await expect(provider.send('state_getStorage', [probeKey, state.hash])).rejects.toThrow('lacks an active exact-state proof');
     expect(rpc).toHaveBeenCalledTimes(calls);
+    const parked = parkQueryReads(rpc);
+    const read = observe(context.query.system.number().then(String));
+    try {
+      await parked.arrived(1);
+      // Header and executing-parent version now come from the proof the manager itself captured for this lease.
+      expect(await provider.send('chain_getHeader', [state.hash])).toEqual(state.header);
+      expect(await provider.send('state_getRuntimeVersion', [state.parentHash])).toEqual(runtime134.toJSON());
+    } finally { parked.releaseAll(); }
+    expect(await read).toEqual({ ok: true, value: '7' });
+    await expect(provider.send('chain_getHeader', [state.hash])).rejects.toThrow('not allowed: chain_getHeader');
   }, 30_000);
 
   it('never invents the executing parent version of a runtime-transition state', async () => {
-    const { provider, proof, state } = await heldProvider({ spec: 138, parentSpec: 134 });
-    // The facade's registry is the transition state's own version, not its parent's.
-    await expect(provider.withProof({ ...proof, version: proof.parentVersion }, async () => 'used')).rejects.toThrow('does not match isolated registry');
-    await provider.withProof(proof, async () => {
+    const { provider, context, rpc, state } = await liveClient({ spec: 138, parentSpec: 134 });
+    expect(context.evidence).toMatchObject({ specVersion: 138, fixedTransitionContext: true });
+    const parked = parkQueryReads(rpc);
+    const read = observe(context.query.system.number().then(String));
+    try {
+      await parked.arrived(1);
       expect(await provider.send('chain_getHeader', [state.hash])).toEqual(state.header);
       await expect(provider.send('state_getRuntimeVersion', [state.parentHash])).rejects.toThrow('not allowed: state_getRuntimeVersion');
-    });
+    } finally { parked.releaseAll(); }
+    expect(await read).toEqual({ ok: true, value: '7' });
   }, 30_000);
 
   it('bounds leased storage request shapes and validates returned key pages, change sets and storage hashes', async () => {
-    const { provider, proof, rpc } = await heldProvider();
-    const start = `0x${'ab'.repeat(32)}`, normal = rpc.getMockImplementation()!;
+    const { provider, context, rpc, state } = await liveClient();
+    const start = probeKey, normal = rpc.getMockImplementation()!;
     let page: unknown = [`${start}01`, `${start}02`], digest: unknown = hex(99);
     rpc.mockImplementation(async (method, params) => method === 'state_getKeysPaged' ? page : method === 'state_getStorageHash' ? digest
       : method === 'state_queryStorageAt' ? [{ block: params[1], changes: (params[0] as string[]).map((key) => [key, null]) }] : normal(method, params));
-    await provider.withProof(proof, async () => {
+    const parked = parkQueryReads(rpc);
+    const read = observe(context.query.system.number().then(String));
+    try {
+      await parked.arrived(1);
       const calls = rpc.mock.calls.length;
-      for (const params of [[['0xzz'], proof.hash], ['0x00', proof.hash], [Array(1001).fill(start), proof.hash], [[start], 'extra', proof.hash]]) {
+      for (const params of [[['0xzz'], state.hash], ['0x00', state.hash], [Array(1001).fill(start), state.hash], [[start], 'extra', state.hash]]) {
         await expect(provider.send('state_queryStorageAt', params)).rejects.toThrow('multi-read exceeds bound');
       }
-      for (const params of [['0xzz', proof.hash], [start, 'extra', proof.hash]]) {
+      for (const params of [['0xzz', state.hash], [start, 'extra', state.hash]]) {
         await expect(provider.send('state_getStorage', params)).rejects.toThrow('Invalid recovery storage read');
       }
       expect(rpc).toHaveBeenCalledTimes(calls);
-      expect(await provider.send('state_queryStorageAt', [[start], proof.hash])).toEqual([{ block: proof.hash, changes: [[start, null]] }]);
-      expect(await provider.send('state_getKeysPaged', [start, 2, null, proof.hash])).toEqual(page);
+      expect(await provider.send('state_queryStorageAt', [[start], state.hash])).toEqual([{ block: state.hash, changes: [[start, null]] }]);
+      expect(await provider.send('state_getKeysPaged', [start, 2, null, state.hash])).toEqual(page);
       for (const bad of [null, [`${start}02`, `${start}01`], [start], [`0x${'cd'.repeat(33)}`], [`${start}01`, `${start}02`, `${start}03`]]) {
         page = bad;
-        await expect(provider.send('state_getKeysPaged', [start, 2, null, proof.hash])).rejects.toThrow('Invalid recovery storage keys page');
+        await expect(provider.send('state_getKeysPaged', [start, 2, null, state.hash])).rejects.toThrow('Invalid recovery storage keys page');
       }
-      expect(await provider.send('state_getStorageHash', [start, proof.hash])).toBe(hex(99));
+      expect(await provider.send('state_getStorageHash', [start, state.hash])).toBe(hex(99));
       digest = null;
-      expect(await provider.send('state_getStorageHash', [start, proof.hash])).toBeNull();
+      expect(await provider.send('state_getStorageHash', [start, state.hash])).toBeNull();
       for (const bad of ['0x1234', 42, hex(99).toUpperCase()]) {
         digest = bad;
-        await expect(provider.send('state_getStorageHash', [start, proof.hash])).rejects.toThrow('Invalid recovery storage hash');
+        await expect(provider.send('state_getStorageHash', [start, state.hash])).rejects.toThrow('Invalid recovery storage hash');
       }
-    });
+    } finally { parked.releaseAll(); }
+    expect(await read).toEqual({ ok: true, value: '7' });
   }, 30_000);
 
-  it('scopes exact-state leases to the isolated registry, reference-counts overlap and bounds active states', async () => {
-    const { provider, proof } = await heldProvider();
-    const key = `0x${'ab'.repeat(32)}`;
-    for (const foreign of [{ ...proof, metadataHash: hex(9) }, { ...proof, version: new TypeRegistry().createType('RuntimeVersion', version(135)) }]) {
+  it('scopes exact-state leases to the isolated registry, reference-counts overlapping queries and bounds active states', async () => {
+    const { provider, context, rpc, state } = await liveClient();
+    // Registry admission and the active-state bound depend only on these fields; the rest of a proof is irrelevant here.
+    const proofAt = (hash: string) => ({ hash, metadataHash: tinyPolicy.metadata[0].metadataHash, version: runtime134 });
+    for (const foreign of [{ ...proofAt(state.hash), metadataHash: hex(9) }, { ...proofAt(state.hash), version: new TypeRegistry().createType('RuntimeVersion', version(135)) }]) {
       await expect(provider.withProof(foreign, async () => 'used')).rejects.toThrow('does not match isolated registry');
     }
-    let releaseFirst: ((value: string) => void) | undefined, releaseSecond: ((value: string) => void) | undefined;
+    const parked = parkQueryReads(rpc);
+    // Distinct keys: the API coalesces identical in-flight storage requests into one owner read.
+    const reads = [1, 2].map((block) => observe(context.query.system.blockHash(block).then(String)));
     let open!: () => void;
     const gate = new Promise<void>((resolve) => { open = resolve; });
-    const leases: Promise<unknown>[] = [];
+    let heldSettled: Promise<unknown> = Promise.resolve();
     try {
-      const first = provider.withProof(proof, () => new Promise<string>((resolve) => { releaseFirst = resolve; }));
-      const second = provider.withProof(proof, () => new Promise<string>((resolve) => { releaseSecond = resolve; }));
-      leases.push(first, second);
-      releaseFirst!('first');
-      await expect(first).resolves.toBe('first');
-      expect(await provider.send('state_getStorage', [key, proof.hash])).toBe(storageValue);
-      releaseSecond!('second');
-      await expect(second).resolves.toBe('second');
-      await expect(provider.send('state_getStorage', [key, proof.hash])).rejects.toThrow('lacks an active exact-state proof');
-      leases.push(...Array.from({ length: 128 }, (_, index) => provider.withProof({ ...proof, hash: hex(5000 + index) }, () => gate)));
-      await expect(provider.withProof({ ...proof, hash: hex(6000) }, async () => 'late')).rejects.toThrow('active-state bound exceeded');
-      await expect(provider.withProof({ ...proof, hash: hex(5000) }, async () => 'reentered')).resolves.toBe('reentered');
+      await parked.arrived(2);
+      parked.release();
+      expect(await Promise.race(reads)).toEqual({ ok: true, value: '7' });
+      // The other in-flight query still holds the same state's lease.
+      expect(await provider.send('state_getStorage', [probeKey, state.hash])).toBe(storageValue);
+      parked.releaseAll();
+      expect(await Promise.all(reads)).toEqual([{ ok: true, value: '7' }, { ok: true, value: '7' }]);
+      await expect(provider.send('state_getStorage', [probeKey, state.hash])).rejects.toThrow('lacks an active exact-state proof');
+      const held = Array.from({ length: 128 }, (_, index) => provider.withProof(proofAt(hex(5000 + index)), () => gate));
+      heldSettled = Promise.allSettled(held);
+      await expect(provider.withProof(proofAt(hex(6000)), async () => 'late')).rejects.toThrow('active-state bound exceeded');
+      await expect(provider.withProof(proofAt(hex(5000)), async () => 'reentered')).resolves.toBe('reentered');
       open();
-      await Promise.all(leases);
-      await expect(provider.withProof({ ...proof, hash: hex(6000) }, async () => 'admitted')).resolves.toBe('admitted');
+      expect((await heldSettled as PromiseSettledResult<unknown>[]).every((lease) => lease.status === 'fulfilled')).toBe(true);
+      await expect(provider.withProof(proofAt(hex(6000)), async () => 'admitted')).resolves.toBe('admitted');
     } finally {
-      // Settle every lease even after a failed assertion, so none outlives the test or rejects unobserved at close.
-      releaseFirst?.('first'); releaseSecond?.('second'); open();
-      await Promise.allSettled(leases);
+      // Settle every lease even after a failed assertion, so none outlives the test.
+      parked.releaseAll(); open();
+      await Promise.all([heldSettled, ...reads]);
     }
   }, 30_000);
 
   it('refuses reconnection and every later read once the facade is disconnected', async () => {
-    const { provider, proof, rpc } = await heldProvider();
+    const { provider, context, rpc } = await liveClient();
     await provider.disconnect();
     expect(provider.isConnected).toBe(false);
     const calls = rpc.mock.calls.length;
     await expect(provider.connect()).rejects.toThrow('Recovery query provider is closed');
     await expect(provider.send('system_chain', [])).rejects.toThrow('Recovery query provider is closed');
-    await expect(provider.withProof(proof, async () => 'used')).rejects.toThrow('Recovery query provider is closed');
+    await expect(context.query.system.number()).rejects.toThrow('Recovery query provider is closed');
     expect(rpc).toHaveBeenCalledTimes(calls);
   }, 30_000);
 
@@ -567,24 +596,29 @@ describe('recovery query adapter fail-closed guards', () => {
     const creationRequested = new Promise<void>((resolve) => { requested = resolve; });
     const lateClosed = new Promise<void>((resolve) => { closedLate = resolve; });
     const late = { disconnect: vi.fn(async () => { closedLate(); }) };
-    vi.spyOn(ApiPromise, 'create').mockImplementationOnce((() => {
+    const create = vi.spyOn(ApiPromise, 'create').mockImplementationOnce((() => {
       requested(); return new Promise((resolve) => { finish = resolve; });
     }) as never);
-    const pending = manager.at(state.hash), rejected = expect(pending).rejects.toThrow('Recovery queries cancelled');
-    await Promise.race([creationRequested, pending]);
+    const capture = observe(manager.at(state.hash));
+    await Promise.race([creationRequested, capture]);
+    expect(create).toHaveBeenCalledOnce();
     await manager.close();
-    await rejected;
+    const outcome = await capture;
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok ? null : (outcome.error as Error).message).toBe('Recovery queries cancelled');
     finish(late);
     await lateClosed;
-    expect(late.disconnect).toHaveBeenCalledTimes(1);
+    expect(late.disconnect).toHaveBeenCalledOnce();
     await expect(manager.at(state.hash)).rejects.toThrow('Recovery queries cancelled');
+    expect(create).toHaveBeenCalledOnce();
   }, 30_000);
 
   it('refuses a client initialized with a different genesis and a cached client that resolves the wrong registry', async () => {
     const { manager, state } = tinyFixture();
     const real = ApiPromise.create.bind(ApiPromise);
-    let closedRejected!: () => void;
-    const rejectedClosed = new Promise<void>((resolve) => { closedRejected = resolve; });
+    let signalClosed!: () => void;
+    const rejectedClosed = new Promise<void>((resolve) => { signalClosed = resolve; });
+    const closedRejected = vi.fn(() => signalClosed());
     const accepted: ApiPromise[] = [];
     vi.spyOn(ApiPromise, 'create').mockImplementationOnce(async (options) => {
       const api = await real(options);
@@ -599,6 +633,7 @@ describe('recovery query adapter fail-closed guards', () => {
     });
     await expect(manager.at(state.hash)).rejects.toThrow('initialized with different chain/runtime properties');
     await rejectedClosed;
+    expect(closedRejected).toHaveBeenCalledOnce();
     const context = await manager.at(state.hash);
     expect(context.evidence).toMatchObject({ block: state.height, storageEntries: 2, fixedTransitionContext: false });
     expect(accepted).toHaveLength(1);
@@ -607,5 +642,6 @@ describe('recovery query adapter fail-closed guards', () => {
     await expect(manager.at(state.hash)).rejects.toThrow('Recovery query reused the wrong registry');
     expect((await manager.at(state.hash)).registry).toBe(context.registry);
     expect(accepted).toHaveLength(1);
+    expect(closedRejected).toHaveBeenCalledOnce();
   }, 30_000);
 });

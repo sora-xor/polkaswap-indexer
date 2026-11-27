@@ -200,6 +200,14 @@ afterEach(async () => {
 /** Waits poll for up to 10 s; tests that use them, or loop heavily, get a 30 s budget instead of the 5 s default. */
 const WAIT = { timeout: 10_000 };
 const SLOW = 30_000;
+/** Resolve with `promise`, or fail with `message` if it has not settled within `ms`. */
+async function within<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })]);
+  } finally { clearTimeout(timer); }
+}
+
 
 it('sends one subscription notification over WebSocket and nothing after it', async () => {
   const { adapter } = fixture();
@@ -363,11 +371,17 @@ describe('replay upstream JSON-RPC client', () => {
     const server = createTcpServer((socket) => {
       sockets.add(socket);
       socket.on('error', () => undefined);
-      socket.once('data', (data: Buffer) => {
-        received.push(data);
+      // TCP has no message boundaries: gather at least the 5-byte record header and handshake type.
+      let first = Buffer.alloc(0);
+      const onData = (data: Buffer) => {
+        first = Buffer.concat([first, data]);
+        if (first.length < 6) return;
+        socket.off('data', onData);
+        received.push(first);
         const body = JSON.stringify({ jsonrpc: '2.0', id: 1, result: 'plaintext' });
         socket.end(`HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${body.length}\r\n\r\n${body}`);
-      });
+      };
+      socket.on('data', onData);
     });
     server.listen(0, '127.0.0.1'); await once(server, 'listening');
     closers.push(() => new Promise<void>((resolve) => { for (const socket of sockets) socket.destroy(); server.close(() => resolve()); }));
@@ -387,17 +401,14 @@ describe('replay upstream JSON-RPC client', () => {
     let upstreamClosed!: Promise<void>;
     const host = await scripted((_method, res) => {
       upstreamClosed = new Promise<void>((resolve) => res.socket!.once('close', () => resolve()));
+      // Write past the limit and never end the response: only an active client abort closes the socket.
       let sent = 0;
-      const pump = () => {
-        while (sent < 65) { sent++; if (!res.write(chunk)) { res.once('drain', pump); return; } }
-        res.end();
-      };
+      const pump = () => { while (sent < 65) { sent++; if (!res.write(chunk)) { res.once('drain', pump); return; } } };
       pump();
     });
     await expect(jsonRpcClient(`http://${host}/`)('state_getMetadata', [])).rejects
       .toMatchObject({ code: -32003, message: 'Upstream response too large' });
-    // A keep-alive socket would stay open until teardown had the transfer been read to the end.
-    await upstreamClosed;
+    await within(upstreamClosed, 5_000, 'Upstream socket still open 5 s after the caller rejected');
   }, SLOW);
 });
 
@@ -409,7 +420,10 @@ async function serve(adapter: LegacyReplayAdapter) {
   replay.server.listen(0, '127.0.0.1'); await once(replay.server, 'listening');
   closers.push(replay.close);
   const host = `127.0.0.1:${(replay.server.address() as AddressInfo).port}`;
-  const post = async (body: unknown) => fetch(`http://${host}`, { method: 'POST', body: typeof body === 'string' ? body : JSON.stringify(body) });
+  // Every request is bounded so that a mistakenly held reply fails the test instead of hanging it.
+  const post = async (body: unknown) => fetch(`http://${host}`, {
+    method: 'POST', body: typeof body === 'string' ? body : JSON.stringify(body), signal: AbortSignal.timeout(10_000),
+  });
   return { ws: `ws://${host}`, post };
 }
 async function open(url: string) {
@@ -479,18 +493,22 @@ describe('bounded pre-fork replay HTTP server', () => {
     await adapter.verify();
     const s = await serve(adapter);
     const release = hold(archive);
-    const batches = Array.from({ length: 16 }, (_, b) =>
-      s.post(Array.from({ length: 16 }, (_, i) => request(b * 16 + i))).then((response) => response.json() as Promise<Reply[]>));
+    // Settlement is observed from creation, so an early transport failure is never unhandled.
+    const settled = Promise.allSettled(Array.from({ length: 16 }, (_, b) =>
+      s.post(Array.from({ length: 16 }, (_, i) => request(b * 16 + i))).then((response) => response.json() as Promise<Reply[]>)));
+    let outcomes: Array<PromiseSettledResult<Reply[]>> = [];
     try {
       await vi.waitFor(() => expect(archive).toHaveBeenCalledTimes(256), WAIT);
       expect(await (await s.post(request(256))).json())
         .toEqual({ jsonrpc: '2.0', id: 256, error: { code: -32004, message: 'Replay concurrency limit' } });
     } finally {
       release();
-      await Promise.allSettled(batches);
+      outcomes = await settled;
     }
+    expect(outcomes.map((outcome) => outcome.status)).toEqual(Array(16).fill('fulfilled'));
     // Every submitted request is answered with its own id and result, in submission order.
-    expect((await Promise.all(batches)).flat()).toEqual(Array.from({ length: 256 }, (_, id) => ({ jsonrpc: '2.0', id, result: id })));
+    expect(outcomes.flatMap((outcome) => outcome.status === 'fulfilled' ? outcome.value : []))
+      .toEqual(Array.from({ length: 256 }, (_, id) => ({ jsonrpc: '2.0', id, result: id })));
     expect(await (await s.post(request(257))).json()).toEqual({ jsonrpc: '2.0', id: 257, result: 257 });
   }, SLOW);
 });
@@ -540,21 +558,28 @@ describe('bounded pre-fork replay WebSocket server', () => {
     expect(archive).not.toHaveBeenCalled();
   });
 
-  it('closes with 1008 beyond 128 pending requests and drops replies for the closed client', async () => {
+  it('closes with 1008 beyond 128 pending requests and attempts no send to the closed client', async () => {
     const { adapter, archive } = fixture();
     await adapter.verify();
     const { ws, replies } = await open((await serve(adapter)).ws);
     const release = hold(archive);
     const done = closed(ws);
+    // Every WebSocket in this process shares this prototype, so the server-side client's sends are seen here too.
+    const sends = vi.spyOn(WebSocket.prototype, 'send');
+    let outcomes: Array<PromiseSettledResult<unknown>> = [];
     try {
       for (let id = 0; id < 129; id++) ws.send(JSON.stringify(request(id)));
       expect(await done).toEqual([1008, 'Invalid payload or concurrency limit']);
       expect(archive).toHaveBeenCalledTimes(128);
     } finally {
       release();
-      await Promise.allSettled(archive.mock.results.map((result) => result.value));
+      outcomes = await Promise.allSettled(archive.mock.results.map((result) => result.value));
     }
-    await new Promise((resolve) => setImmediate(resolve));
+    expect(outcomes).toEqual(Array.from({ length: 128 }, (_, id) => ({ status: 'fulfilled', value: id })));
+    for (let turn = 0; turn < 3; turn++) await new Promise((resolve) => setImmediate(resolve));
+    // The 129 sends are the test client's own; the server attempted none of the 128 late replies.
+    expect(sends.mock.contexts.filter((socket) => socket === ws)).toHaveLength(129);
+    expect(sends.mock.contexts.filter((socket) => socket !== ws)).toEqual([]);
     expect(replies).toEqual([]);
   });
 

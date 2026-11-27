@@ -17,6 +17,14 @@ afterEach(async () => {
 /** Waits poll for up to 10 s; tests that use them get a 30 s budget instead of the 5 s default. */
 const WAIT = { timeout: 10_000 };
 const SLOW = 30_000;
+/** Resolve with `promise`, or fail with `message` if it has not settled within `ms`. */
+async function within<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })]);
+  } finally { clearTimeout(timer); }
+}
+
 /** Start a disposable loopback service; no external connections are used. */
 async function listen(server: Server) {
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
@@ -124,16 +132,13 @@ describe('bounded upstream transport', () => {
     let upstreamClosed!: Promise<void>;
     const rpc = httpRpc(await scripted((_method, res) => {
       upstreamClosed = new Promise<void>((resolve) => res.socket!.once('close', () => resolve()));
+      // Write past the limit and never end the response: only an active client abort closes the socket.
       let sent = 0;
-      const pump = () => {
-        while (sent < 33) { sent++; if (!res.write(chunk)) { res.once('drain', pump); return; } }
-        res.end();
-      };
+      const pump = () => { while (sent < 33) { sent++; if (!res.write(chunk)) { res.once('drain', pump); return; } } };
       pump();
     }));
     await expect(rpc('state_getMetadata', [])).rejects.toMatchObject({ code: -32003, message: 'Upstream response too large' });
-    // A keep-alive socket would stay open until teardown had the transfer been read to the end.
-    await upstreamClosed;
+    await within(upstreamClosed, 5_000, 'Upstream socket still open 5 s after the caller rejected');
   }, SLOW);
 });
 
@@ -151,7 +156,10 @@ async function stubGateway(call: (method: string, params: unknown[]) => Promise<
   const router = { call: vi.fn(call) };
   const gateway = createArchiveGateway(router as unknown as ArchiveRouter, liveUrl.replace('http:', 'ws:'));
   const url = await listen(gateway.server); cleanup.push(gateway.close);
-  const post = async (body: unknown) => fetch(url, { method: 'POST', body: typeof body === 'string' ? body : JSON.stringify(body) });
+  // Every request is bounded so that a mistakenly held reply fails the test instead of hanging it.
+  const post = async (body: unknown) => fetch(url, {
+    method: 'POST', body: typeof body === 'string' ? body : JSON.stringify(body), signal: AbortSignal.timeout(10_000),
+  });
   return { ws: url.replace('http:', 'ws:'), router, live, post };
 }
 async function open(url: string) {
@@ -207,18 +215,22 @@ describe('archive gateway HTTP surface', () => {
   it('refuses requests beyond 64 in flight with -32004 and recovers once they finish', async () => {
     const hold = gate();
     const g = await stubGateway(async (_method, params) => { await hold.promise; return params[0]; });
-    const batches = Array.from({ length: 4 }, (_, b) =>
-      g.post(Array.from({ length: 16 }, (_, i) => read(b * 16 + i))).then((response) => response.json() as Promise<unknown[]>));
+    // Settlement is observed from creation, so an early transport failure is never unhandled.
+    const settled = Promise.allSettled(Array.from({ length: 4 }, (_, b) =>
+      g.post(Array.from({ length: 16 }, (_, i) => read(b * 16 + i))).then((response) => response.json() as Promise<unknown[]>)));
+    let outcomes: Array<PromiseSettledResult<unknown[]>> = [];
     try {
       await vi.waitFor(() => expect(g.router.call).toHaveBeenCalledTimes(64), WAIT);
       expect(await (await g.post(read(64))).json())
         .toEqual({ jsonrpc: '2.0', id: 64, error: { code: -32004, message: 'Archive concurrency limit' } });
     } finally {
       hold.release();
-      await Promise.allSettled(batches);
+      outcomes = await settled;
     }
+    expect(outcomes.map((outcome) => outcome.status)).toEqual(Array(4).fill('fulfilled'));
     // Every submitted request is answered with its own id and result, in submission order.
-    expect((await Promise.all(batches)).flat()).toEqual(Array.from({ length: 64 }, (_, id) => ({ jsonrpc: '2.0', id, result: id })));
+    expect(outcomes.flatMap((outcome) => outcome.status === 'fulfilled' ? outcome.value : []))
+      .toEqual(Array.from({ length: 64 }, (_, id) => ({ jsonrpc: '2.0', id, result: id })));
     expect(await (await g.post(read(65))).json()).toEqual({ jsonrpc: '2.0', id: 65, result: 65 });
   }, SLOW);
 });
@@ -246,22 +258,29 @@ describe('archive gateway WebSocket surface', () => {
     expect(await done).toEqual([1008, 'Invalid payload or concurrency limit']);
     expect(g.router.call).not.toHaveBeenCalled();
   });
-  it('closes with 1008 beyond 16 pending requests and drops replies for the closed client', async () => {
+  it('closes with 1008 beyond 16 pending requests and attempts no send to the closed client', async () => {
     const hold = gate();
     const g = await stubGateway(async (_method, params) => { await hold.promise; return params[0]; });
     const ws = await open(g.ws);
     const replies: unknown[] = [];
     ws.on('message', (data) => replies.push(data.toString()));
     const done = closed(ws);
+    // Every WebSocket in this process shares this prototype, so the server-side client's sends are seen here too.
+    const sends = vi.spyOn(WebSocket.prototype, 'send');
+    let outcomes: Array<PromiseSettledResult<unknown>> = [];
     try {
       for (let id = 0; id < 17; id++) ws.send(JSON.stringify(read(id)));
       expect(await done).toEqual([1008, 'Invalid payload or concurrency limit']);
       expect(g.router.call).toHaveBeenCalledTimes(16);
     } finally {
       hold.release();
-      await Promise.allSettled(g.router.call.mock.results.map((result) => result.value));
+      outcomes = await Promise.allSettled(g.router.call.mock.results.map((result) => result.value));
     }
-    await new Promise((resolve) => setImmediate(resolve));
+    expect(outcomes).toEqual(Array.from({ length: 16 }, (_, id) => ({ status: 'fulfilled', value: id })));
+    for (let turn = 0; turn < 3; turn++) await new Promise((resolve) => setImmediate(resolve));
+    // The 17 sends are the test client's own; the server attempted none of the 16 late replies.
+    expect(sends.mock.contexts.filter((socket) => socket === ws)).toHaveLength(17);
+    expect(sends.mock.contexts.filter((socket) => socket !== ws)).toEqual([]);
     expect(replies).toEqual([]);
   });
   it('closes with 1009 on an oversized frame and drops that client\'s live connection', async () => {

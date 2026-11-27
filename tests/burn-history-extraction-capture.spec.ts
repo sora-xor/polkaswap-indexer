@@ -86,7 +86,7 @@ describe('complete Burn history capture over a shortened checkpoint range', () =
     await writeFile(join(verified, file), bytes); return {file, sha256: sha(bytes)};
   };
   /** Stages the linked stream as two pages (one record, then two) with one metadata witness per execution code. */
-  async function prepare(linked: ReturnType<typeof linkedStream>, checkpointHash: string) {
+  async function prepare(linked: ReturnType<typeof linkedStream>, checkpointHash: string, tail = [linked.second, linked.third]) {
     range.checkpoint.block = S + 2; range.checkpoint.hash = checkpointHash;
     const verifier = join(directory, 'verifier'); await writeFile(verifier, VERIFIER); await chmod(verifier, 0o755);
     const manifest = join(directory, 'manifest.json'), manifestBytes = '{"syntheticHistory":true}';
@@ -96,7 +96,7 @@ describe('complete Burn history capture over a shortened checkpoint range', () =
       extrinsicsRootsVerified: true, storageProofsVerified: true, metadataExecutedFromAuthenticatedParentCode: true, nativeExecution: false,
       pages: [
         await put('page-0.json.gz', gzipSync(JSON.stringify({schema: 'sora-nexus-verified-burn-page-v1', first: S, records: [linked.first]}))),
-        await put('page-1.json.gz', gzipSync(JSON.stringify({schema: 'sora-nexus-verified-burn-page-v1', first: S + 1, records: [linked.second, linked.third]}))),
+        await put('page-1.json.gz', gzipSync(JSON.stringify({schema: 'sora-nexus-verified-burn-page-v1', first: S + 1, records: tail}))),
       ],
       metadata: [
         {codeHash: SORA_CODE, specVersion: 134, metadata: await put('runtime-134.scale', soraMetadata)},
@@ -124,6 +124,14 @@ describe('complete Burn history capture over a shortened checkpoint range', () =
 
   it('rejects a fully linked stream whose terminal block is not the pinned checkpoint hash', async () => {
     const {options} = await prepare(stream(), h(0xdead));
+    await expect(extractBurnHistory(options)).rejects.toThrow('Burn extraction did not reach the checkpoint');
+    expect(await access(options.output).then(() => true, () => false)).toBe(false);
+  }, 30_000);
+
+  it('rejects a valid linked nonempty stream that stops one block before the pinned checkpoint', async () => {
+    const linked = stream();
+    // Both remaining records decode and link; the report still pins the dropped third block as the checkpoint.
+    const {options} = await prepare(linked, linked.third.hash, [linked.second]);
     await expect(extractBurnHistory(options)).rejects.toThrow('Burn extraction did not reach the checkpoint');
     expect(await access(options.output).then(() => true, () => false)).toBe(false);
   }, 30_000);
