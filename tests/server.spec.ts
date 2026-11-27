@@ -251,6 +251,34 @@ const rejectedWebSocketStatus = (url: string, protocol: string): Promise<number>
   });
 
 describe('startServer', () => {
+
+  it('serves local mobile runtime JSON with GET/HEAD and rejects writes', async () => {
+    const reservation = await listenOnEphemeralPort();
+    const port = reservation.port;
+    await reservation.close();
+    const server = await startServer(baseConfig(port), new MemoryRepository());
+    const endpoint = `http://127.0.0.1:${port}/runtime/sora-mobile-types.json`;
+    try {
+      const get = await fetch(endpoint);
+      expect(get.status).toBe(200);
+      expect(get.headers.get('content-type')).toBe('application/json; charset=utf-8');
+      expect(get.headers.get('access-control-allow-origin')).toBe('*');
+      const body = await get.json() as { runtime_id: number; versioning: Array<{ types: Record<string, string> }> };
+      expect(body.runtime_id).toBe(42);
+      expect(body.versioning[0].types['framenode_runtime::RuntimeCall']).toBe('GenericCall');
+      const head = await fetch(endpoint, { method: 'HEAD' });
+      expect(head.status).toBe(200);
+      expect(await head.text()).toBe('');
+      expect(head.headers.get('content-length')).toBe(get.headers.get('content-length'));
+      const post = await fetch(endpoint, { method: 'POST', body: '{}' });
+      expect(post.status).toBe(405);
+      expect(post.headers.get('allow')).toBe('GET, HEAD');
+      expect((await fetch(`${endpoint}/extra`)).status).toBe(404);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('caps oversized HTTP, modern WS, and legacy WS results before serialization', async ({ skip }) => {
     let reservation: Awaited<ReturnType<typeof listenOnEphemeralPort>>;
     try {

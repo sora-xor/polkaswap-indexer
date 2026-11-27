@@ -66,6 +66,7 @@ RUN install -d -o node -g node /data
 
 COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
+COPY --from=build --chown=node:node /app/src/runtime/LICENSE /app/src/runtime/README.md /app/src/runtime/provenance.json ./dist/src/runtime/
 COPY --chown=node:node package.json ./package.json
 COPY --chown=node:node LICENSE ./LICENSE
 

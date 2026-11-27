@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 
 import { ApiPromise, WsProvider } from '@polkadot/api';
-import { types as soraTypes } from '@sora-substrate/type-definitions';
+import soraTypes from '../runtime/sora-legacy-types.json' with { type: 'json' };
 import { readSnapshotDenominator } from './denomination.js';
 import { isDiscardedTimestampState } from './historicalTimestamp.js';
 import {

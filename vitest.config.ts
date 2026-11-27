@@ -18,6 +18,14 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['tests/**/*.spec.ts'],
+    maxWorkers: 2,
+    coverage: {
+      provider: 'v8',
+      include: ['src/**/*.ts'],
+      exclude: ['src/**/*.d.ts'],
+      reporter: ['text-summary', 'json', 'json-summary', 'lcov'],
+      thresholds: { lines: 80 },
+    },
     // PostgreSQL integration files share one migrated database and several
     // intentionally global tables/advisory locks. Running those files in
     // parallel makes a neighboring truncate race otherwise-correct fencing
