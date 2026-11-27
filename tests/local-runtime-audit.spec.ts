@@ -1,6 +1,7 @@
 import { mkdtempSync, mkdirSync, copyFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 const { auditLocalRuntime } = await import(new URL('../scripts/audit-local-runtime.mjs', import.meta.url).href) as { auditLocalRuntime: (root: string) => string[] };
 
@@ -27,6 +28,12 @@ describe('runtime dependency audit', () => {
       'yarn.lock: prohibited dependency',
       'src/remote.ts: prohibited import or remote runtime dependency',
     ]));
+  });
+
+  it('passes for this repository: source, manifest, lockfile and no installed @sora-substrate package', () => {
+    // A source import of the removed package fails the build and leaves the
+    // worker unable to load, so the repository itself must stay clean.
+    expect(auditLocalRuntime(fileURLToPath(new URL('..', import.meta.url)))).toEqual([]);
   });
 
   it('rejects changed schema data and a stale installed package', () => {
