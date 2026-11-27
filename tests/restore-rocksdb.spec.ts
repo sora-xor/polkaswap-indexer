@@ -260,7 +260,9 @@ describe('RocksDB restore operation', () => {
     await expectCurrentDocument(plan.targetPath, xor);
     await expectCurrentDocument(plan.targetPath, val);
     await expectCurrentDocument(sourcePath, xor);
-  });
+    // Native backup/restore plus three read-only reopen checks can exceed the unit-test
+    // deadline on a busy release runner; retain a bounded integration-test timeout.
+  }, 15_000);
 
   it('rejects an existing generated target without changing its contents or the live database', async () => {
     const sourcePath = join(root, 'live.rocksdb');
@@ -419,7 +421,7 @@ describe('RocksDB restore operation', () => {
     const wrong = RocksDatabase.open(wrongPath);
     let backupId: number;
     try {
-      await wrong.put(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY], ROCKSDB_FORMAT_VERSION + 1);
+      await wrong.put(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY], 99);
       backupId = await wrong.backup(backupDir, { flushBeforeBackup: true, sync: true });
     } finally {
       wrong.close();

@@ -1,6 +1,5 @@
 import {
   assertExplicitProductionWorkerChainInputs,
-  assertIndependentSoraRpcEndpoints,
   readConfig,
   readSoraArchiveWsEndpoint,
 } from './config.js';
@@ -15,11 +14,10 @@ import { acquirePostgresWorkerLease, stopOnWorkerLeaseLoss } from './worker/leas
 const config = readConfig();
 assertExplicitProductionWorkerChainInputs();
 const archiveSoraWsEndpoint = readSoraArchiveWsEndpoint(process.env.NODE_ENV === 'production');
-if (archiveSoraWsEndpoint) {
-  assertIndependentSoraRpcEndpoints(config.soraWsEndpoint, archiveSoraWsEndpoint);
-}
 await Promise.all([
-  preflightSoraMainnetIdentity(config.soraWsEndpoint, { requireAnchorTimestamp: true }),
+  preflightSoraMainnetIdentity(config.soraWsEndpoint, {
+    requireAnchorTimestamp: true, historicalEndpoint: archiveSoraWsEndpoint || undefined,
+  }),
   ...(archiveSoraWsEndpoint ? [preflightSoraMainnetIdentity(archiveSoraWsEndpoint)] : []),
 ]);
 console.info(

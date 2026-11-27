@@ -3,6 +3,20 @@ import { describe, expect, it } from 'vitest';
 import { decodePostgresDocument, decodePostgresDocumentText } from '../src/repository/postgres-document.js';
 
 describe('Postgres document decoding', () => {
+  it('preserves matching JSONB position strings while normalizing pg int8 columns', () => {
+    const data = { id: 'reward', amount: '1000000000000000000', updated: 1,
+      referral: 'alice', referrer: 'bob', timestamp: 1_779_860_520, blockHeight: '26309250' };
+    const document = decodePostgresDocumentText({ collection: 'referrerRewards', id: data.id,
+      blockHeight: '26309250', timestamp: '1779860520', dataText: JSON.stringify(data) });
+    expect(document).toEqual({ collection: 'referrerRewards', id: 'reward',
+      blockHeight: 26_309_250, timestamp: 1_779_860_520, data });
+    expect(typeof document.data.blockHeight).toBe('string');
+    expect(() => decodePostgresDocumentText({ collection: 'referrerRewards', id: data.id,
+      blockHeight: null, timestamp: '1779860520', dataText: JSON.stringify(data) })).toThrow(/safe integer/);
+    expect(() => decodePostgresDocumentText({ collection: 'referrerRewards', id: data.id,
+      blockHeight: '26309251', timestamp: '1779860520', dataText: JSON.stringify(data) })).toThrow(/conflicts/);
+  });
+
   it('normalizes pg bigint strings to repository-safe integers', () => {
     expect(
       decodePostgresDocument({

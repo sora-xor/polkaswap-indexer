@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { MigrationPreflightError } from '../src/db/migrate.js';
 
 import {
   productionMigrationCliErrorMessage,
@@ -1055,6 +1056,15 @@ describe('production PostgreSQL migration credential preflight', () => {
     expect(productionMigrationCliErrorMessage(driverError)).not.toContain('secret');
     expect(productionMigrationCliErrorMessage('postgresql://owner:password@host/database')).toBe(
       'Production database migration failed'
+    );
+  });
+
+  it('reports only an approved migration preflight code at the CLI boundary', () => {
+    const preflight = new MigrationPreflightError('chain-state-block-snapshot-missing-or-malformed');
+    preflight.message = 'connect to secret-db.internal with ultra-secret';
+
+    expect(productionMigrationCliErrorMessage(preflight)).toBe(
+      'PostgreSQL migration preflight failed: chain-state-block-snapshot-missing-or-malformed'
     );
   });
 });

@@ -1,0 +1,916 @@
+{
+  "CallOf": "Call",
+  "DispatchTime": {
+    "_enum": {
+      "At": "BlockNumber",
+      "After": "BlockNumber"
+    }
+  },
+  "ScheduleTaskIndex": "u32",
+  "DelayedOrigin": {
+    "delay": "BlockNumber",
+    "origin": "PalletsOrigin"
+  },
+  "AuthorityOrigin": "DelayedOrigin",
+  "StorageValue": "Vec<u8>",
+  "GraduallyUpdate": {
+    "key": "StorageKey",
+    "targetValue": "StorageValue",
+    "perBlock": "StorageValue"
+  },
+  "StorageKeyBytes": "Vec<u8>",
+  "StorageValueBytes": "Vec<u8>",
+  "RpcDataProviderId": "Text",
+  "DataProviderId": "u8",
+  "TimestampedValue": {
+    "value": "OracleValue",
+    "timestamp": "Moment"
+  },
+  "TimestampedValueOf": "TimestampedValue",
+  "OrderedSet": "Vec<AccountId>",
+  "OrmlAccountData": {
+    "free": "Balance",
+    "reserved": "Balance",
+    "frozen": "Balance"
+  },
+  "OrmlBalanceLock": {
+    "amount": "Balance",
+    "id": "LockIdentifier"
+  },
+  "AuctionInfo": {
+    "bid": "Option<(AccountId, Balance)>",
+    "start": "BlockNumber",
+    "end": "Option<BlockNumber>"
+  },
+  "DelayedDispatchTime": {
+    "_enum": {
+      "At": "BlockNumber",
+      "After": "BlockNumber"
+    }
+  },
+  "DispatchId": "u32",
+  "Price": "FixedU128",
+  "OrmlVestingSchedule": {
+    "start": "BlockNumber",
+    "period": "BlockNumber",
+    "periodCount": "u32",
+    "perPeriod": "Compact<Balance>"
+  },
+  "VestingScheduleOf": "OrmlVestingSchedule",
+  "OrmlCurrencyId": "u8",
+  "PoolInfo": {
+    "totalShares": "Share",
+    "rewards": "BTreeMap<OrmlCurrencyId, (Balance, Balance)>"
+  },
+  "CompactBalance": "Compact<Balance>",
+  "PoolInfoV0": {
+    "totalShares": "Compact<Share>",
+    "totalRewards": "CompactBalance",
+    "totalWithdrawnRewards": "CompactBalance"
+  },
+  "Share": "u128",
+  "OracleValue": "FixedU128",
+  "BalanceInfo": {
+    "balance": "Balance"
+  },
+  "AssetInfo": {
+    "assetId": "AssetId",
+    "symbol": "AssetSymbolStr",
+    "name": "AssetNameStr",
+    "precision": "u8",
+    "isMintable": "bool"
+  },
+  "AssetSymbolStr": "String",
+  "AssetNameStr": "String",
+  "AssetRecord": "Null",
+  "VotingInfo": {
+    "votingOption": "u32",
+    "numberOfVotes": "Balance",
+    "ceresWithdrawn": "bool"
+  },
+  "PollInfo": {
+    "numberOfOptions": "u32",
+    "pollStartTimestamp": "Moment",
+    "pollEndTimestamp": "Moment"
+  },
+  "LockInfo": {
+    "poolTokens": "Balance",
+    "unlockingTimestamp": "Moment",
+    "assetA": "AssetId",
+    "assetB": "AssetId"
+  },
+  "StakingInfo": {
+    "deposited": "Balance",
+    "rewards": "Balance"
+  },
+  "TokenLockInfo": {
+    "tokens": "Balance",
+    "unlockingTimestamp": "Moment",
+    "assetId": "AssetId"
+  },
+  "ContributorsVesting": {
+    "firstReleasePercent": "Balance",
+    "vestingPeriod": "Moment",
+    "vestingPercent": "Balance"
+  },
+  "TeamVesting": {
+    "teamVestingTotalTokens": "Balance",
+    "teamVestingFirstReleasePercent": "Balance",
+    "teamVestingPeriod": "Moment",
+    "teamVestingPercent": "Balance"
+  },
+  "ContributionInfo": {
+    "fundsContributed": "Balance",
+    "tokensBought": "Balance",
+    "tokensClaimed": "Balance",
+    "claimingFinished": "bool",
+    "numberOfClaims": "u32"
+  },
+  "ILOInfo": {
+    "iloOrganizer": "AccountId",
+    "tokensForIlo": "Balance",
+    "tokensForLiquidity": "Balance",
+    "iloPrice": "Balance",
+    "softCap": "Balance",
+    "hardCap": "Balance",
+    "minContribution": "Balance",
+    "maxContribution": "Balance",
+    "refundType": "bool",
+    "liquidityPercent": "Balance",
+    "listingPrice": "Balance",
+    "lockupDays": "u32",
+    "startTimestamp": "Moment",
+    "endTimestamp": "Moment",
+    "contributorsVesting": "ContributorsVesting",
+    "teamVesting": "TeamVesting",
+    "soldTokens": "Balance",
+    "fundsRaised": "Balance",
+    "succeeded": "bool",
+    "failed": "bool",
+    "lpTokens": "Balance",
+    "claimedLpTokens": "bool",
+    "finishTimestamp": "Moment",
+    "baseAsset": "AssetId"
+  },
+  "PoolData": {
+    "multiplier": "u32",
+    "depositFee": "Balance",
+    "isCore": "bool",
+    "isFarm": "bool",
+    "totalTokensInPool": "Balance",
+    "rewards": "Balance",
+    "rewardsToBeDistributed": "Balance",
+    "isRemoved": "bool",
+    "baseAsset": "AssetId"
+  },
+  "TokenInfo": {
+    "farmsTotalMultiplier": "u32",
+    "stakingTotalMultiplier": "u32",
+    "tokenPerBlock": "Balance",
+    "farmsAllocation": "Balance",
+    "stakingAllocation": "Balance",
+    "teamAllocation": "Balance",
+    "teamAccount": "AccountId"
+  },
+  "UserInfo": {
+    "poolAsset": "AssetId",
+    "rewardAsset": "AssetId",
+    "isFarm": "bool",
+    "pooledTokens": "Balance",
+    "rewards": "Balance",
+    "baseAsset": "AssetId"
+  },
+  "MultiChainHeight": {
+    "_enum": {
+      "Thischain": "BlockNumber",
+      "Sidechain": "u64"
+    }
+  },
+  "BridgeTimepoint": {
+    "height": "MultiChainHeight",
+    "index": "u32"
+  },
+  "EthPeersSync": {
+    "isBridgeReady": "bool",
+    "isXorReady": "bool",
+    "isValReady": "bool"
+  },
+  "BridgeStatus": {
+    "_enum": [
+      "Initialized",
+      "Migrating"
+    ]
+  },
+  "BridgeNetworkId": "u32",
+  "AssetKind": {
+    "_enum": [
+      "Thischain",
+      "Sidechain",
+      "SidechainOwned"
+    ]
+  },
+  "RequestStatus": {
+    "_enum": [
+      "Pending",
+      "Frozen",
+      "ApprovalsReady",
+      "Failed",
+      "Done"
+    ]
+  },
+  "SignatureParams": {
+    "r": "[u8; 32]",
+    "s": "[u8; 32]",
+    "v": "u8"
+  },
+  "IncomingTransactionRequestKind": {
+    "_enum": [
+      "Transfer",
+      "AddAsset",
+      "AddPeer",
+      "RemovePeer",
+      "PrepareForMigration",
+      "Migrate",
+      "AddPeerCompat",
+      "RemovePeerCompat",
+      "TransferXOR"
+    ]
+  },
+  "IncomingMetaRequestKind": {
+    "_enum": [
+      "CancelOutgoingRequest",
+      "MarkAsDone"
+    ]
+  },
+  "IncomingRequestKind": {
+    "_enum": {
+      "Transaction": "IncomingTransactionRequestKind",
+      "Meta": "IncomingMetaRequestKind"
+    }
+  },
+  "ChangePeersContract": {
+    "_enum": [
+      "XOR",
+      "VAL"
+    ]
+  },
+  "CurrencyIdEncoded": {
+    "_enum": {
+      "AssetId": "H256",
+      "TokenAddress": "H160"
+    }
+  },
+  "FixedBytes": "Vec<u8>",
+  "OutgoingTransfer": {
+    "from": "AccountId",
+    "to": "EthAddress",
+    "assetId": "AssetId",
+    "amount": "Balance",
+    "nonce": "Index",
+    "networkId": "BridgeNetworkId",
+    "timepoint": "BridgeTimepoint"
+  },
+  "OutgoingTransferEncoded": {
+    "currencyId": "CurrencyIdEncoded",
+    "amount": "U256",
+    "to": "EthAddress",
+    "from": "EthAddress",
+    "txHash": "H256",
+    "networkId": "H256",
+    "raw": "Vec<u8>"
+  },
+  "OutgoingAddAsset": {
+    "author": "AccountId",
+    "assetId": "AssetId",
+    "supply": "Balance",
+    "nonce": "Index",
+    "networkId": "BridgeNetworkId",
+    "timepoint": "BridgeTimepoint"
+  },
+  "OutgoingAddAssetEncoded": {
+    "name": "String",
+    "symbol": "String",
+    "decimal": "u8",
+    "supply": "U256",
+    "sidechainAssetId": "FixedBytes",
+    "hash": "H256",
+    "networkId": "H256",
+    "raw": "Vec<u8>"
+  },
+  "OutgoingAddToken": {
+    "author": "AccountId",
+    "tokenAddress": "EthAddress",
+    "ticker": "String",
+    "name": "String",
+    "decimals": "u8",
+    "nonce": "Index",
+    "networkId": "BridgeNetworkId",
+    "timepoint": "BridgeTimepoint"
+  },
+  "OutgoingAddTokenEncoded": {
+    "tokenAddress": "EthAddress",
+    "ticker": "String",
+    "name": "String",
+    "decimals": "u8",
+    "hash": "H256",
+    "networkId": "H256",
+    "raw": "Vec<u8>"
+  },
+  "OutgoingAddPeer": {
+    "author": "AccountId",
+    "peerAddress": "EthAddress",
+    "peerAccountId": "AccountId",
+    "nonce": "Index",
+    "networkId": "BridgeNetworkId",
+    "timepoint": "BridgeTimepoint"
+  },
+  "OutgoingAddPeerCompat": {
+    "author": "AccountId",
+    "peerAddress": "EthAddress",
+    "peerAccountId": "AccountId",
+    "nonce": "Index",
+    "networkId": "BridgeNetworkId",
+    "timepoint": "BridgeTimepoint"
+  },
+  "OutgoingAddPeerEncoded": {
+    "peerAddress": "EthAddress",
+    "txHash": "H256",
+    "networkId": "H256",
+    "raw": "Vec<u8>"
+  },
+  "OutgoingRemovePeer": {
+    "author": "AccountId",
+    "peerAccountId": "AccountId",
+    "peerAddress": "EthAddress",
+    "nonce": "Index",
+    "networkId": "BridgeNetworkId",
+    "timepoint": "BridgeTimepoint"
+  },
+  "OutgoingRemovePeerCompat": {
+    "author": "AccountId",
+    "peerAccountId": "AccountId",
+    "peerAddress": "EthAddress",
+    "nonce": "Index",
+    "networkId": "BridgeNetworkId",
+    "timepoint": "BridgeTimepoint"
+  },
+  "OutgoingRemovePeerEncoded": {
+    "peerAddress": "EthAddress",
+    "txHash": "H256",
+    "networkId": "H256",
+    "raw": "Vec<u8>"
+  },
+  "OutgoingPrepareForMigration": {
+    "author": "AccountId",
+    "nonce": "Index",
+    "networkId": "BridgeNetworkId",
+    "timepoint": "BridgeTimepoint"
+  },
+  "OutgoingPrepareForMigrationEncoded": {
+    "thisContractAddress": "EthAddress",
+    "txHash": "H256",
+    "networkId": "H256",
+    "raw": "Vec<u8>"
+  },
+  "OutgoingMigrate": {
+    "author": "AccountId",
+    "newContractAddress": "EthAddress",
+    "erc20NativeTokens": "Vec<EthAddress>",
+    "nonce": "Index",
+    "networkId": "BridgeNetworkId",
+    "timepoint": "BridgeTimepoint"
+  },
+  "OutgoingMigrateEncoded": {
+    "thisContractAddress": "EthAddress",
+    "txHash": "H256",
+    "newContractAddress": "EthAddress",
+    "erc20NativeTokens": "Vec<EthAddress>",
+    "networkId": "H256",
+    "raw": "Vec<u8>"
+  },
+  "OutgoingRequest": {
+    "_enum": {
+      "Transfer": "OutgoingTransfer",
+      "AddAsset": "OutgoingAddAsset",
+      "AddToken": "OutgoingAddToken",
+      "AddPeer": "OutgoingAddPeer",
+      "RemovePeer": "OutgoingRemovePeer",
+      "PrepareForMigration": "OutgoingPrepareForMigration",
+      "Migrate": "OutgoingMigrate"
+    }
+  },
+  "OutgoingRequestEncoded": {
+    "_enum": {
+      "Transfer": "OutgoingTransferEncoded",
+      "AddAsset": "OutgoingAddAssetEncoded",
+      "AddToken": "OutgoingAddTokenEncoded",
+      "AddPeer": "OutgoingAddPeerEncoded",
+      "RemovePeer": "OutgoingRemovePeerEncoded",
+      "PrepareForMigration": "OutgoingPrepareForMigrationEncoded",
+      "Migrate": "OutgoingMigrateEncoded"
+    }
+  },
+  "IncomingTransfer": {
+    "from": "EthAddress",
+    "to": "AccountId",
+    "assetId": "AssetId",
+    "assetKind": "AssetKind",
+    "amount": "Balance",
+    "author": "AccountId",
+    "txHash": "H256",
+    "atHeight": "u64",
+    "timepoint": "BridgeTimepoint",
+    "networkId": "BridgeNetworkId"
+  },
+  "IncomingAddToken": {
+    "tokenAddress": "EthAddress",
+    "assetId": "AssetId",
+    "precision": "BalancePrecision",
+    "symbol": "AssetSymbol",
+    "name": "AssetName",
+    "author": "AccountId",
+    "txHash": "H256",
+    "atHeight": "u64",
+    "timepoint": "BridgeTimepoint",
+    "networkId": "BridgeNetworkId"
+  },
+  "IncomingChangePeers": {
+    "peerAccountId": "AccountId",
+    "peerAddress": "EthAddress",
+    "added": "bool",
+    "author": "AccountId",
+    "txHash": "H256",
+    "atHeight": "u64",
+    "timepoint": "BridgeTimepoint",
+    "networkId": "BridgeNetworkId"
+  },
+  "IncomingChangePeersCompat": {
+    "peerAccountId": "AccountId",
+    "peerAddress": "EthAddress",
+    "added": "bool",
+    "contract": "ChangePeersContract",
+    "author": "AccountId",
+    "txHash": "H256",
+    "atHeight": "u64",
+    "timepoint": "BridgeTimepoint",
+    "networkId": "BridgeNetworkId"
+  },
+  "IncomingCancelOutgoingRequest": {
+    "outgoingRequest": "OutgoingRequest",
+    "outgoingRequestHash": "H256",
+    "initialRequestHash": "H256",
+    "txInput": "Vec<u8>",
+    "author": "AccountId",
+    "txHash": "H256",
+    "atHeight": "u64",
+    "timepoint": "BridgeTimepoint",
+    "networkId": "BridgeNetworkId"
+  },
+  "IncomingMarkAsDoneRequest": {
+    "outgoingRequestHash": "H256",
+    "initialRequestHash": "H256",
+    "author": "AccountId",
+    "atHeight": "u64",
+    "timepoint": "BridgeTimepoint",
+    "networkId": "BridgeNetworkId"
+  },
+  "IncomingPrepareForMigration": {
+    "author": "AccountId",
+    "txHash": "H256",
+    "atHeight": "u64",
+    "timepoint": "BridgeTimepoint",
+    "networkId": "BridgeNetworkId"
+  },
+  "IncomingMigrate": {
+    "newContractAddress": "EthAddress",
+    "author": "AccountId",
+    "txHash": "H256",
+    "atHeight": "u64",
+    "timepoint": "BridgeTimepoint",
+    "networkId": "BridgeNetworkId"
+  },
+  "IncomingRequest": {
+    "_enum": {
+      "Transfer": "IncomingTransfer",
+      "AddToken": "IncomingAddToken",
+      "ChangePeers": "IncomingChangePeers",
+      "CancelOutgoingRequest": "IncomingCancelOutgoingRequest",
+      "MarkAsDone": "IncomingMarkAsDoneRequest",
+      "PrepareForMigration": "IncomingPrepareForMigration",
+      "Migrate": "IncomingMigrate"
+    }
+  },
+  "LoadIncomingTransactionRequest": {
+    "author": "AccountId",
+    "hash": "H256",
+    "timepoint": "BridgeTimepoint",
+    "kind": "IncomingTransactionRequestKind",
+    "networkId": "BridgeNetworkId"
+  },
+  "LoadIncomingMetaRequest": {
+    "author": "AccountId",
+    "hash": "H256",
+    "timepoint": "BridgeTimepoint",
+    "kind": "IncomingMetaRequestKind",
+    "networkId": "BridgeNetworkId"
+  },
+  "LoadIncomingRequest": {
+    "_enum": {
+      "Transaction": "LoadIncomingTransactionRequest",
+      "Meta": "(LoadIncomingMetaRequest, H256)"
+    }
+  },
+  "OffchainRequest": {
+    "_enum": {
+      "Outgoing": "(OutgoingRequest, H256)",
+      "LoadIncoming": "LoadIncomingRequest",
+      "Incoming": "(IncomingRequest, H256)"
+    }
+  },
+  "EthBridgeStorageVersion": {
+    "_enum": [
+      "V1",
+      "V2RemovePendingTransfers"
+    ]
+  },
+  "EthAddress": "H160",
+  "BridgeSignatureVersion": {
+    "_enum": [
+      "V1",
+      "V2",
+      "V3"
+    ]
+  },
+  "BridgeAppInfo": {
+    "_enum": {
+      "EVM": "(GenericNetworkId, EVMAppInfo)",
+      "Sub": "(GenericNetworkId)"
+    }
+  },
+  "BridgeAssetInfo": {
+    "_enum": {
+      "EVMLegacy": "EVMLegacyAssetInfo",
+      "EVM": "EVMAssetInfo",
+      "Sub": "SubAssetInfo"
+    }
+  },
+  "EVMAppInfo": {
+    "evmAddress": "H160",
+    "appKind": "EVMAppKind"
+  },
+  "EVMAssetInfo": {
+    "assetId": "MainnetAssetId",
+    "evmAddress": "H160",
+    "appKind": "EVMAppKind",
+    "precision": "u8"
+  },
+  "EVMLegacyAssetInfo": {
+    "assetId": "MainnetAssetId",
+    "evmAddress": "H160",
+    "appKind": "EVMAppKind",
+    "precision": "Option<u8>"
+  },
+  "EVMAppKind": {
+    "_enum": [
+      "EthApp",
+      "FaApp",
+      "HashiBridge",
+      "XorMaster",
+      "ValMaster"
+    ]
+  },
+  "SubAssetInfo": {
+    "assetId": "MainnetAssetId",
+    "assetKind": "SubAssetKind",
+    "precision": "u8"
+  },
+  "SubAssetKind": {
+    "_enum": [
+      "Thischain",
+      "Sidechain"
+    ]
+  },
+  "GenericNetworkId": {
+    "_enum": {
+      "EVMLegacy": "u32",
+      "EVM": "EVMChainId",
+      "Sub": "SubNetworkId"
+    }
+  },
+  "MainnetAssetId": "H256",
+  "EVMChainId": "H256",
+  "SubNetworkId": {
+    "_enum": {
+      "Mainnet": null,
+      "Kusama": null,
+      "Polkadot": null,
+      "Rococo": null,
+      "Liberland": null,
+      "Alphanet": null,
+      "Custom": "u32"
+    }
+  },
+  "PoolFarmer": {
+    "account": "AccountId",
+    "block": "BlockNumber",
+    "weight": "Balance"
+  },
+  "VotingOption": {
+    "_enum": [
+      "Yes",
+      "No"
+    ]
+  },
+  "HermesVotingInfo": {
+    "votingOption": "VotingOption",
+    "numberOfHermes": "Balance",
+    "hermesWithdrawn": "bool"
+  },
+  "HermesPollInfo": {
+    "creator": "AccountId",
+    "hermesLocked": "Balance",
+    "pollStartTimestamp": "Moment",
+    "pollEndTimestamp": "Moment",
+    "title": "String",
+    "description": "String",
+    "creatorHermesWithdrawn": "bool"
+  },
+  "PendingMultisigAccount": {
+    "approvingAccounts": "Vec<AccountId>",
+    "migrateAt": "Option<BlockNumber>"
+  },
+  "OutcomeFee": "BTreeMap<AssetId, Balance>",
+  "LPSwapOutcomeInfo": {
+    "amount": "Balance",
+    "amountWithoutImpact": "Balance",
+    "fee": "OutcomeFee",
+    "rewards": "Vec<LPRewardsInfo>",
+    "route": "Vec<AssetId>"
+  },
+  "LPRewardsInfo": {
+    "amount": "Balance",
+    "currency": "AssetId",
+    "reason": "RewardReason"
+  },
+  "LiquiditySourceIdOf": {
+    "dexId": "DEXId",
+    "liquiditySourceIndex": "LiquiditySourceType"
+  },
+  "AssetIdOf": "AssetId",
+  "Amount": "i128",
+  "AmountOf": "Amount",
+  "CurrencyId": "AssetId",
+  "CurrencyIdOf": "AssetId",
+  "BasisPoints": "u16",
+  "Fixed": "FixedU128",
+  "FarmId": "u64",
+  "DEXId": "u32",
+  "DEXIdOf": "DEXId",
+  "DEXInfo": {
+    "baseAssetId": "AssetId",
+    "defaultFee": "BasisPoints",
+    "defaultProtocolFee": "BasisPoints"
+  },
+  "BalancePrecision": "u8",
+  "AssetSymbol": "Text",
+  "AssetName": "Text",
+  "AssetId32": "[u8; 32]",
+  "SwapWithDesiredInput": {
+    "desiredAmountIn": "Balance",
+    "minAmountOut": "Balance"
+  },
+  "SwapWithDesiredOutput": {
+    "desiredAmountOut": "Balance",
+    "maxAmountIn": "Balance"
+  },
+  "SwapAmount": {
+    "_enum": {
+      "WithDesiredInput": "SwapWithDesiredInput",
+      "WithDesiredOutput": "SwapWithDesiredOutput"
+    }
+  },
+  "QuoteWithDesiredInput": {
+    "desiredAmountIn": "Balance"
+  },
+  "QuoteWithDesiredOutput": {
+    "desiredAmountOut": "Balance"
+  },
+  "QuoteAmount": {
+    "_enum": {
+      "WithDesiredInput": "QuoteWithDesiredInput",
+      "WithDesiredOutput": "QuoteWithDesiredOutput"
+    }
+  },
+  "SwapVariant": {
+    "_enum": [
+      "WithDesiredInput",
+      "WithDesiredOutput"
+    ]
+  },
+  "TechAmount": "Amount",
+  "TechBalance": "Balance",
+  "SwapOutcome": {
+    "amount": "Balance",
+    "fee": "Balance"
+  },
+  "LiquiditySourceType": {
+    "_enum": [
+      "XYKPool",
+      "BondingCurvePool",
+      "MulticollateralBondingCurvePool",
+      "MockPool",
+      "MockPool2",
+      "MockPool3",
+      "MockPool4",
+      "XSTPool",
+      "OrderBook"
+    ]
+  },
+  "FilterMode": {
+    "_enum": [
+      "Disabled",
+      "ForbidSelected",
+      "AllowSelected"
+    ]
+  },
+  "SwapOutcomeInfo": {
+    "amount": "Balance",
+    "fee": "Balance"
+  },
+  "TradingPair": {
+    "baseAssetId": "AssetId",
+    "targetAssetId": "AssetId"
+  },
+  "PermissionId": "u32",
+  "HolderId": "AccountId",
+  "OwnerId": "AccountId",
+  "Mode": {
+    "_enum": [
+      "Permit",
+      "Forbid"
+    ]
+  },
+  "Scope": {
+    "_enum": {
+      "Limited": "H512",
+      "Unlimited": "Null"
+    }
+  },
+  "OracleKey": "AssetId",
+  "ChargeFeeInfo": {
+    "tip": "Compact<Balance>",
+    "target_asset_id": "AssetId"
+  },
+  "SwapAction": "Null",
+  "ValidationFunction": "Null",
+  "Permission": "Null",
+  "DistributionAccounts": "Null",
+  "MultisigAccount": {
+    "signatories": "Vec<AccountId>",
+    "threshold": "u8"
+  },
+  "Farmer": "Null",
+  "Farm": "Null",
+  "SmoothPriceState": "Null",
+  "MultiCurrencyBalanceOf": "MultiCurrencyBalance",
+  "Duration": "Null",
+  "PostDispatchInfo": {
+    "actualWeight": "Option<Weight>",
+    "paysFee": "Pays"
+  },
+  "DispatchErrorWithPostInfoTPostDispatchInfo": {
+    "postInfo": "PostDispatchInfo",
+    "error": "DispatchError"
+  },
+  "DispatchResultWithPostInfo": "Result<PostDispatchInfo, DispatchErrorWithPostInfoTPostDispatchInfo>",
+  "Public": "[u8; 33]",
+  "RewardReason": {
+    "_enum": [
+      "Unspecified",
+      "BuyOnBondingCurve",
+      "LiquidityProvisionFarming",
+      "MarketMakerVolume"
+    ]
+  },
+  "StorageVersion": "Null",
+  "MarketMakerInfo": {
+    "count": "u32",
+    "volume": "Balance"
+  },
+  "CrowdloanReward": {
+    "id": "Vec<u8>",
+    "address": "Vec<u8>",
+    "contribution": "Fixed",
+    "xorReward": "Fixed",
+    "valReward": "Fixed",
+    "pswapReward": "Fixed",
+    "xstusdReward": "Fixed",
+    "percent": "Fixed"
+  },
+  "PredefinedAssetId": {
+    "_enum": [
+      "XOR",
+      "DOT",
+      "KSM",
+      "USDT",
+      "VAL",
+      "PSWAP",
+      "DAI",
+      "ETH",
+      "XSTUSD",
+      "XST",
+      "TBCD",
+      "KEN",
+      "KUSD",
+      "KGOLD",
+      "KXOR",
+      "KARMA"
+    ]
+  },
+  "RewardInfo": {
+    "limit": "Balance",
+    "totalAvailable": "Balance",
+    "rewards": "BTreeMap<RewardReason, Balance>"
+  },
+  "TechTradingPair": {
+    "baseAssetId": "TechAssetId",
+    "targetAssetId": "TechAssetId"
+  },
+  "TechAssetId": {
+    "_enum": {
+      "Wrapped": "PredefinedAssetId",
+      "Escaped": "AssetId"
+    }
+  },
+  "TechPurpose": {
+    "_enum": {
+      "FeeCollector": "Null",
+      "FeeCollectorForPair": "TechTradingPair",
+      "LiquidityKeeper": "TechTradingPair",
+      "Identifier": "Vec<u8>"
+    }
+  },
+  "TechAccountId": {
+    "_enum": {
+      "Pure": "(DEXId, TechPurpose)",
+      "Generic": "(Vec<u8>, Vec<u8>)",
+      "Wrapped": "AccountId",
+      "WrappedRepr": "AccountId"
+    }
+  },
+  "PriceInfo": {
+    "priceFailures": "u32",
+    "spotPrices": "Vec<Balance>",
+    "averagePrice": "Balance",
+    "needsUpdate": "bool",
+    "lastSpotPrice": "Balance"
+  },
+  "ContentSource": "Text",
+  "Description": "Text",
+  "CustomInfo": {
+    "amount": "Balance"
+  },
+  "TP": "TradingPair",
+  "CrowdloanLease": {
+    "startBlock": "String",
+    "totalDays": "String",
+    "blocksPerDay": "String"
+  },
+  "AuxiliaryDigest": {
+    "logs": "Vec<AuxiliaryDigestItem>"
+  },
+  "AuxiliaryDigestItem": {
+    "_enum": {
+      "Commitment": "(EthNetworkId, ChannelId, H256)"
+    }
+  },
+  "EthNetworkId": "U256",
+  "ChannelId": {
+    "_enum": {
+      "Basic": null,
+      "Incentivized": null
+    }
+  },
+  "BasicChannelMessage": {
+    "networkId": "EthNetworkId",
+    "target": "H160",
+    "nonce": "u64",
+    "payload": "Vec<u8>"
+  },
+  "IntentivizedChannelMessage": {
+    "networkId": "EthNetworkId",
+    "target": "H160",
+    "nonce": "u64",
+    "fee": "U256",
+    "payload": "Vec<u8>"
+  },
+  "Address": "AccountId",
+  "LookupSource": "AccountId",
+  "AssetId": "AssetId32",
+  "Keys": "SessionKeys3",
+  "RefCount": "u32",
+  "Balance": "u128",
+  "TAssetBalance": "Balance",
+  "MultiCurrencyBalance": "Balance",
+  "AccountInfo": "AccountInfoWithDualRefCount"
+}

@@ -1,0 +1,66 @@
+{
+  "date": "2026-10-25",
+  "purpose": "Consolidate current master, indexer reliability fixes, and mobile runtime dependency work for release review.",
+  "inputs": {
+    "master": "3426757",
+    "localReliability": "c2cb5fd",
+    "dependencyAndRuntimeSnapshot": "03d8a48",
+    "retainedReadinessSafeguards": [
+      "a594bca71ce37f9af6aa25269eed5aaa5848aa4f",
+      "029aa98d74f72e01b4605b788eaeffbe953882a3",
+      "5d49ffac9aa7b8384a44af46317a5197a2582217",
+      "56c4d14761ae7029b1f525d3bf6ff42caf4cd0cc"
+    ]
+  },
+  "compatibility": [
+    "Preserves current master history, hourly analytics, query/storage, chain-identity, and deployment changes.",
+    "Keeps complete account trade predicates while excluding non-Polkamarkt transfers.",
+    "Preserves local pagination, repeated vault event, bridge counter, order precision, and weekly baseline fixes.",
+    "Serves repository-owned runtime schemas and preserves their exact reviewed bytes in build artifacts.",
+    "Checks existing PostgreSQL key collation, primary key and checkpoint/BLOCK snapshot coherence in a bounded read-only transaction before migration DDL.",
+    "Requires all five operator-selected production mobile capabilities and their exact public readback in deployment evidence.",
+    "Orders deployment, public smoke and ready-evidence audit explicitly; does not mark an undeployed candidate ready."
+  ],
+  "validation": {
+    "node": "24.19.0",
+    "yarn": "4.10.3",
+    "testFilesPassed": 89,
+    "testsPassed": 2121,
+    "testsSkipped": 0,
+    "postgres": "16, isolated disposable database",
+    "build": "passed",
+    "packagingRegressionTestsPassed": 18,
+    "immutableInstall": "passed",
+    "localRuntimeAudit": "passed",
+    "dependencyAudits": "all and production: no audit suggestions",
+    "branchPublicArtifactAndTodoAudits": "passed",
+    "deploymentManifestAssertions": "passed",
+    "container": {
+      "platform": "linux/arm64",
+      "manifestDigest": "sha256:8042fb6167b3bdca02e7672ada1c2dba8487cd0fe502837a9b8e5ab9d71f8e60",
+      "nativeRocksDB": "passed",
+      "schemaDigestsAndCompiledServer": "passed",
+      "nonRootAndDependencyBoundaries": "passed",
+      "tlsDatabaseHandoff": "passed",
+      "manifestListDigest": "sha256:18edada7e79d3ef5f6559536f279acc5546d227cf9a9964957800d4ac70592a5",
+      "scope": "Final source including read-only preflight and explicit capability evidence; rebuilt and all container checks rerun."
+    },
+    "deploymentEvidenceAndTemplateTests": "passed after retained readiness safeguards were reconciled"
+  },
+  "releaseBoundary": {
+    "deployed": false,
+    "releasePublished": false,
+    "independentReview": "pending",
+    "deploymentNotes": [
+      "Forward /runtime/sora-mobile-types.json through the API reverse proxy before deploying its mobileConfig URL.",
+      "Supply all five reviewed POLKASWAP_MOBILE_CONFIG_* values explicitly; missing or empty values now fail Compose validation.",
+      "Preserve the production RocksDB path and use the existing backup, restore and repair runbooks; no production database was changed.",
+      "Historical audit documents retain their original date and limitations, including vendor-unfixed container OS findings."
+    ]
+  },
+  "historicalPullRequests": {
+    "10": "Repair functionality and newer runbooks retained from current master.",
+    "11 and 12": "Missing preflight, capability evidence, CI inputs and deployment ordering selectively incorporated; obsolete dependency/runtime revisions retained only in history.",
+    "13": "Independent read-only ChatGPT plugin feature remains outside the wallet release."
+  }
+}

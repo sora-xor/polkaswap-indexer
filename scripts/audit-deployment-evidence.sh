@@ -14,7 +14,8 @@ blocked state. --require-ready requires an operator-attested deployment record
 for the current release commit, image digest, deployment identity, successful
 live smoke timestamp, exact PI health identity with a recent SORA mainnet
 checkpoint, independently verified SORA RPC controls, and delegated TLS-edge
-client-IP HTTP/WebSocket controls.
+client-IP HTTP/WebSocket controls. It also requires the five-boolean public
+mobileConfig readback selected by the release operator.
 
 Set DEPLOYMENT_EVIDENCE_EXPECTED_COMMIT to validate evidence for a specific
 release commit instead of the local repository HEAD.
@@ -115,6 +116,7 @@ const requiredEvidenceFields = [
   'deployedAt',
   'smokePassedAt',
   'healthInfo',
+  'mobileConfig',
   'soraRpcControls',
   'tlsEdgeControls',
   'operator'
@@ -163,6 +165,13 @@ const exactHealthInfoFields = [
   'publicBaseUrl',
   'readOnly',
   'genesisHash'
+];
+const mobileConfigFields = [
+  'nexusAvailable',
+  'nexusSendsAvailable',
+  'polkamarktVisible',
+  'polkamarktMutationsAvailable',
+  'tairaDefaultVisible'
 ];
 const soraRpcControlFields = [
   'primaryEndpoint',
@@ -432,6 +441,26 @@ function validateHealthInfo(value, currentPath, smokePassedAtMillis) {
   }
 }
 
+function validateMobileConfig(value, currentPath) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    fail(`${currentPath} must be an object`);
+    return;
+  }
+
+  rejectUnsupportedKeys(value, mobileConfigFields, currentPath);
+  for (const field of mobileConfigFields) {
+    if (typeof value[field] !== 'boolean') {
+      fail(`${currentPath}.${field} must be boolean`);
+    }
+  }
+  if (value.nexusSendsAvailable === true && value.nexusAvailable !== true) {
+    fail(`${currentPath}.nexusSendsAvailable requires nexusAvailable=true`);
+  }
+  if (value.polkamarktMutationsAvailable === true && value.polkamarktVisible !== true) {
+    fail(`${currentPath}.polkamarktMutationsAvailable requires polkamarktVisible=true`);
+  }
+}
+
 function isPlaceholderRpcHostname(hostname) {
   const normalized = String(hostname || '')
     .toLowerCase()
@@ -665,6 +694,7 @@ function validateDeploymentRecord(record, index, expectedCommitResult, seenDeplo
   }
 
   validateHealthInfo(record.healthInfo, `${currentPath}.healthInfo`, smokePassedAt);
+  validateMobileConfig(record.mobileConfig, `${currentPath}.mobileConfig`);
   validateSoraRpcControls(record.soraRpcControls, `${currentPath}.soraRpcControls`);
   validateTlsEdgeControls(record.tlsEdgeControls, `${currentPath}.tlsEdgeControls`);
 

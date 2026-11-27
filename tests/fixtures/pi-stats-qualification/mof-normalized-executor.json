@@ -1,0 +1,41 @@
+{
+  "schema": "sora-nexus-stats-history-clone-qualification-v1",
+  "sourceDatabasePath": "/data/polkaswap-indexer-recovery-20261101/legacy-db",
+  "databasePath": "/data/pi-indexer-stats-history-trial-20261101/candidate.rocksdb",
+  "prefix": {
+    "block": 28191816,
+    "hash": "0x60b63e40ce4de9b9c1408bf7455a6f5ced796825f2437a0ee8496476d80c56d6",
+    "timestamp": 1792939554,
+    "genesisHash": "0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5"
+  },
+  "databaseFilesSha256": "987715ca7ca04e77f4dd78d87aacf70a5c762d745e293f953deb5cbadb9ac8c6",
+  "nativeAuditSha256": "786455fba448810322010a84badc80e4f1a122da3b683cbcee397ec09db96c1f",
+  "sourceQualification": {
+    "databaseFilesSha256": "987715ca7ca04e77f4dd78d87aacf70a5c762d745e293f953deb5cbadb9ac8c6",
+    "nativeAuditSha256": "786455fba448810322010a84badc80e4f1a122da3b683cbcee397ec09db96c1f",
+    "completionReceiptSha256": "6d0618532b04d9cfa4f3e2a0687d3798b7955ace84e553125200e561f43315a4"
+  },
+  "sourceStopped": true,
+  "sourceLockHeldDuringCopy": true,
+  "sourceFilesUnchanged": true,
+  "targetFilesMatchSource": true,
+  "targetIndependentInodes": true,
+  "nativeReadOnly": true,
+  "nativeExitCode": 0,
+  "nativeBeforeAfterFilesUnchanged": true,
+  "nativeOutputMatchesSource": true,
+  "nativeValidationMode": "inherited-exact-source-bytes",
+  "nativeOutputOrigin": "retained-qualified-source-inspection",
+  "exhaustiveNativeExecutedOnClone": false,
+  "normalizedScanExecutedOnClone": true,
+  "volumeRepairMarkerSha256": "28ddafd9e177edb13f9b588e293ba7913f6509ab787a4a1d5ddcc4a145e8e169",
+  "entitlementsReady": false,
+  "productionChanged": false,
+  "files": 499,
+  "logicalBytes": 18786660488,
+  "normalizedBeforeSha256": "388270a3ab2f31ec0113116264761eb86b52ff1965a02fa078010bd82e314ada",
+  "nativePid": 1201385,
+  "nativeChildReaped": true,
+  "admissionSha256": "ec9212cc3e70da4cafe2a57b6a3af1663e21e0e98db10e5ea44a453b24a360ba",
+  "availableBytes": 64161689600
+}

@@ -1,0 +1,11 @@
+{
+  "collection": "updatesStreams",
+  "id": "networkVolumeRepair-v2",
+  "blockHeight": 27159179,
+  "timestamp": 1785761832,
+  "data": {
+    "block": 27159179,
+    "data": "{\"status\":\"complete\",\"completedAt\":1791525988,\"repairVersion\":2,\"semantics\":\"verified-block-exchange-volume-calendar-v2\",\"throughBlock\":27159179,\"earliestHistoryTimestamp\":1616951754,\"latestSnapshotTimestamp\":1785761832,\"historyRowsScanned\":1122922,\"valuedSwapRows\":14687,\"blockSnapshotsScanned\":1100704,\"aggregateSnapshotsScanned\":4590,\"changedBlockSnapshots\":955,\"changedAggregateSnapshots\":4590,\"reconciledAggregateCountMismatches\":1647,\"preservedUnverifiedAggregates\":81,\"seededCalendarSnapshots\":4555,\"estimatedWriteBytes\":4322851}",
+    "id": "networkVolumeRepair-v2"
+  }
+}

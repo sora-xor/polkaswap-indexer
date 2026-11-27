@@ -25,11 +25,11 @@ await assertCanonicalDisjointPaths(
   'the live ROCKSDB_PATH',
   config.rocksdbPath
 );
+const iterations = readPositiveSafeInteger(process.env, 'ROCKSDB_BENCHMARK_ITERATIONS', 10);
 const repository = RocksRepository.openReadOnly({
   ...config,
   rocksdbPath: benchmarkPath,
 });
-const iterations = readPositiveSafeInteger(process.env, 'ROCKSDB_BENCHMARK_ITERATIONS', 10);
 
 const first = async (collection: IndexerCollection, args: RepositoryQueryArgs): Promise<IndexerDocument | null> =>
   (await repository.query(collection, { ...args, first: 1, includeTotalCount: false })).items[0] ?? null;

@@ -1,11 +1,13 @@
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
 import { RocksDatabase } from '@harperfast/rocksdb-js';
 
-import { matchesFilter } from '../graphql/filter.js';
+import { compareOrderValues, matchesFilter } from '../graphql/filter.js';
+import { finiteNumberToPlainDecimal } from '../decimal-number.js';
 import { getOrderField, NUMERIC_ORDER_FIELDS } from '../graphql/order.js';
 import { metrics } from '../metrics.js';
 import { estimateRetainedValueBytes } from '../cache-weight.js';
@@ -26,6 +28,7 @@ import {
   assertValidIndexedDecimal,
   assertValidIndexerCollection,
   assertValidRepositoryQueryPositions,
+  MAX_DOCUMENT_DATA_STRING_LENGTH,
   iterateIndexerDocumentJsonPayloads,
   normalizeIndexerDocumentWriteCall,
 } from './validation.js';
@@ -119,7 +122,22 @@ const HIGH_KEY = Buffer.from([0xff]);
 const WATCH_IDLE_WAKE_INTERVAL_MS = 30_000;
 const FALLBACK_CURSOR_VALUE_PREFIX = '\u0000rkv1.';
 export const ROCKSDB_FORMAT_METADATA_KEY = 'rocksdbFormatVersion';
-export const ROCKSDB_FORMAT_VERSION = 1;
+export const ROCKSDB_FORMAT_VERSION = 2;
+export const ROCKSDB_COMPRESSED_FORMAT_VERSION = 3;
+export const ROCKSDB_SUPPORTED_FORMAT_VERSIONS = [ROCKSDB_FORMAT_VERSION, ROCKSDB_COMPRESSED_FORMAT_VERSION] as const;
+/** Reader capability; the default writer remains format 2. */
+export const rocksFormatIsSupported = (version: unknown): version is 2 | 3 =>
+  version === ROCKSDB_FORMAT_VERSION || version === ROCKSDB_COMPRESSED_FORMAT_VERSION;
+/** Completion/progress for the derived swap-asset timestamp index. */
+export const ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY = 'historySwapAssetIndex';
+const SWAP_ASSET_INDEX_CODE = 's-a-t';
+const SWAP_ASSET_INDEX_BATCH_DOCUMENTS = 256;
+const SWAP_ASSET_INDEX_BATCH_BYTES = 8 * 1024 * 1024;
+const BURN_OWNER_INDEX_CODE = 'c-i';
+const BURN_OWNER_INDEX_BATCH_DOCUMENTS = 256;
+const BURN_OWNER_INDEX_BATCH_BYTES = 8 * 1024 * 1024;
+type SwapAssetIndexState = { version: 1; status: 'ready' } |
+  { version: 1; status: 'building'; afterId: string | null };
 const NUMERIC_LENGTH_WIDTH = 4;
 const MAX_NUMERIC_INTEGER_LENGTH = 10 ** NUMERIC_LENGTH_WIDTH - 1;
 const NUMERIC_EQUALITY_FIELDS = new Set(['marketId']);
@@ -223,6 +241,7 @@ const COMPACT_ID_EQUALITY_INDEX_MANIFEST: Partial<
   referrerRewards: [{ code: 'r-i', field: 'referrer' }],
   stakingValidators: [{ code: 'a-i', field: 'address' }],
   vaults: [{ code: 'o-i', field: 'ownerId' }],
+  xorBurns: [{ code: BURN_OWNER_INDEX_CODE, field: 'claimOwner' }],
 };
 
 const COMPACT_EQUALITY_FIELDS = new Set(
@@ -297,8 +316,9 @@ const indexValue = (value: unknown): string | number | boolean | null => {
 };
 
 const normalizeDecimal = (value: unknown): { sign: -1 | 0 | 1; integer: string; fraction: string } => {
-  assertValidIndexedDecimal(value);
-  const text = String(value ?? '0').trim();
+  const decimalValue = typeof value === 'number' ? finiteNumberToPlainDecimal(value) ?? value : value;
+  assertValidIndexedDecimal(decimalValue);
+  const text = String(decimalValue ?? '0').trim();
 
   const negative = text.startsWith('-');
   const [integerRaw = '0', fractionRaw = ''] = (negative ? text.slice(1) : text).split('.');
@@ -445,25 +465,7 @@ const compareDocumentOrderValues = (
   field: string,
   direction: 'asc' | 'desc'
 ): number => {
-  const factor = direction === 'desc' ? -1 : 1;
-  const leftNullish = left === undefined || left === null;
-  const rightNullish = right === undefined || right === null;
-
-  if (left === right || (leftNullish && rightNullish)) return 0;
-  if (leftNullish) return factor;
-  if (rightNullish) return -factor;
-
-  if (NUMERIC_ORDER_FIELDS.has(field)) {
-    const leftKey = numericSortKey(left);
-    const rightKey = numericSortKey(right);
-    return leftKey === rightKey ? 0 : (leftKey < rightKey ? -1 : 1) * factor;
-  }
-
-  if (typeof left === 'number' && typeof right === 'number') return left > right ? factor : -factor;
-
-  const leftText = String(left);
-  const rightText = String(right);
-  return (leftText === rightText ? 0 : leftText < rightText ? -1 : 1) * factor;
+  return compareOrderValues(left, right, field, direction);
 };
 
 const indexedNumericFieldsForCollection = (collection: IndexerCollection): string[] =>
@@ -481,8 +483,51 @@ const compactIndexPrefix = (collection: IndexerCollection, code: string, equalit
   ...equalityValues,
 ];
 
+// Fixed-size prefixes avoid multiplying asset strings or exceeding native key
+// limits. The existing native value codec can replace unpaired surrogates with
+// one or several U+FFFDs, depending on its encoding/decoding path. A conservative
+// common bucket keeps both raw cached values and their persisted aliases in the
+// candidate set; exact residual filters and scan budgets remain authoritative.
+// The leading ! is outside the ordinary base64url digest domain.
+const swapAssetReplacementBucket = '!native-unicode-replacement-alias';
+const swapAssetIndexValue = (asset: string): string => {
+  for (let offset = 0; offset < asset.length; offset += 1) {
+    const codeUnit = asset.charCodeAt(offset);
+    if (codeUnit === 0xfffd) return swapAssetReplacementBucket;
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = asset.charCodeAt(offset + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) offset += 1;
+      else return swapAssetReplacementBucket;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) return swapAssetReplacementBucket;
+  }
+  const hash = createHash('sha256');
+  // Hash at most 64K code units per update: the temporary encoding is <=128 KiB.
+  for (let offset = 0; offset < asset.length; offset += 65_536) {
+    hash.update(asset.slice(offset, offset + 65_536), 'utf16le');
+  }
+  // Compound Buffer parts are raw ordered-binary encodings, not opaque values.
+  // Base64url is a fixed 43-character string that round-trips through that codec.
+  return hash.digest('base64url');
+};
+
+/** Index only actual swaps, deduplicating repeated asset IDs without copying payloads. */
+const swapAssetDocumentIndexKeys = (document: IndexerDocument): RocksKey[] => {
+  if (document.collection !== 'historyElements' || document.data.module !== 'liquidityProxy' ||
+      document.data.method !== 'swap') return [];
+  const assets = document.data.dataAssets;
+  // Scalar strings also match the repository's existing JSON contains semantics.
+  const values = typeof assets === 'string' ? [assets] : Array.isArray(assets)
+    ? assets.filter((asset): asset is string => typeof asset === 'string') : [];
+  const timestamp = numericSortKey(readCompactOrderValue(document, 'timestamp'));
+  const prefixes = new Set<string>();
+  for (const asset of new Set(values)) prefixes.add(swapAssetIndexValue(asset));
+  return [...prefixes].map((prefix) => [
+    ...compactIndexPrefix('historyElements', SWAP_ASSET_INDEX_CODE, [prefix]), timestamp, document.id,
+  ]);
+};
+
 const compactDocumentIndexKeys = (document: IndexerDocument): RocksKey[] => {
-  const keys: RocksKey[] = [];
+  const keys: RocksKey[] = swapAssetDocumentIndexKeys(document);
 
   for (const definition of COMPACT_INDEX_MANIFEST[document.collection] ?? []) {
     if (!compactDefinitionMatchesDocument(definition, document)) continue;
@@ -578,6 +623,11 @@ const sortIndexerDocuments = (documents: IndexerDocument[], orderBy: RepositoryQ
 const isFilterRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 
+/** Shared release/backup readiness check; a building or malformed marker is never ready. */
+export const rocksSwapAssetIndexIsReady = (value: unknown): boolean =>
+  isFilterRecord(value) && value.version === 1 && value.status === 'ready' &&
+  Object.keys(value).sort().join(',') === 'status,version';
+
 const isEmptyFilter = (filter: RepositoryQueryArgs['filter']): boolean => {
   if (!filter) return true;
   if (!isFilterRecord(filter)) return false;
@@ -601,7 +651,9 @@ const collectEqualities = (filter: RepositoryQueryArgs['filter']): Array<{ field
   const equalities: Array<{ field: string; value: string | number | boolean }> = [];
 
   for (const [field, condition] of Object.entries(filter)) {
-    if (field === 'and' && Array.isArray(condition)) {
+    // A one-branch OR has the same mandatory predicates as its child.
+    // Never extract a common equality from a multi-branch OR.
+    if (Array.isArray(condition) && (field === 'and' || (field === 'or' && condition.length === 1))) {
       for (const item of condition) equalities.push(...collectEqualities(item as RepositoryQueryArgs['filter']));
       continue;
     }
@@ -628,7 +680,13 @@ const collectEqualities = (filter: RepositoryQueryArgs['filter']): Array<{ field
 
 const findOrItems = (filter: RepositoryQueryArgs['filter']): unknown[] | null => {
   if (!filter || !isFilterRecord(filter)) return null;
-  if (Array.isArray(filter.or) && filter.or.length) return filter.or;
+  if (Array.isArray(filter.or)) {
+    if (filter.or.length > 1) return filter.or;
+    if (filter.or.length === 1) {
+      const nested = findOrItems(filter.or[0] as RepositoryQueryArgs['filter']);
+      if (nested) return nested;
+    }
+  }
 
   if (Array.isArray(filter.and)) {
     for (const item of filter.and) {
@@ -722,7 +780,7 @@ const collectNumericRangeBounds = (
   if (!filter || !isFilterRecord(filter)) return bounds;
 
   for (const [filterField, condition] of Object.entries(filter)) {
-    if (filterField === 'and' && Array.isArray(condition)) {
+    if (Array.isArray(condition) && (filterField === 'and' || (filterField === 'or' && condition.length === 1))) {
       for (const item of condition) collectNumericRangeBounds(item as RepositoryQueryArgs['filter'], field, bounds);
       continue;
     }
@@ -773,7 +831,7 @@ const collectExactNumericRangeBounds = (
   if (!filter || !isFilterRecord(filter)) return bounds;
 
   for (const [filterField, condition] of Object.entries(filter)) {
-    if (filterField === 'and' && Array.isArray(condition)) {
+    if (Array.isArray(condition) && (filterField === 'and' || (filterField === 'or' && condition.length === 1))) {
       for (const item of condition) {
         collectExactNumericRangeBounds(item as RepositoryQueryArgs['filter'], field, bounds);
       }
@@ -832,7 +890,7 @@ const compactFilterCoveredByIndex = (
     if (!isFilterRecord(value)) return false;
 
     for (const [field, condition] of Object.entries(value)) {
-      if (field === 'and') {
+      if (field === 'and' || (field === 'or' && Array.isArray(condition) && condition.length === 1)) {
         if (!Array.isArray(condition) || !condition.every((entry) => visit(entry as RepositoryQueryArgs['filter']))) {
           return false;
         }
@@ -935,7 +993,9 @@ const rangeForOrderedPrefix = (
   return {
     start,
     end,
-    inclusiveEnd: true,
+    // The binding swaps reverse traversal bounds before applying these flags:
+    // the descending cursor is the native upper bound, excluded by inclusiveEnd.
+    inclusiveEnd: !(position && direction === 'desc'),
     reverse: direction === 'desc',
     values: false,
     ...(exclusiveStart ? { exclusiveStart: true } : {}),
@@ -951,7 +1011,8 @@ const rangeForDocumentOrder = (
   const options = rangeForPrefix(prefix, { reverse: direction === 'desc' });
   if (position) {
     options.start = documentKey(collection, String(position.value));
-    options.exclusiveStart = true;
+    if (direction === 'desc') options.inclusiveEnd = false;
+    else options.exclusiveStart = true;
   }
 
   return options;
@@ -978,12 +1039,6 @@ const documentIdentityFromKey = (key: unknown): { collection: IndexerCollection;
 
   return { collection: key[1] as IndexerCollection, id: key[2] };
 };
-
-const decodeStoredDocument = (
-  collection: IndexerCollection,
-  id: string,
-  stored: unknown
-): IndexerDocument | undefined => decodeRocksDocument(collection, id, stored) ?? undefined;
 
 const selectCompactDefinition = (
   collection: IndexerCollection,
@@ -1038,6 +1093,9 @@ const compactFilterValues = (
       const values = compactFilterValues(nested as RepositoryQueryArgs['filter'], field);
       if (values) return values;
     }
+  }
+  if (Array.isArray(filter.or) && filter.or.length === 1) {
+    return compactFilterValues(filter.or[0] as RepositoryQueryArgs['filter'], field);
   }
   return null;
 };
@@ -1109,24 +1167,88 @@ const sourceForDirectIdSet = (
   };
 };
 
-const exactNumericFilterOccurrences = (
+const dedupeIndexRanges = (ranges: IndexRange[]): IndexRange[] => {
+  const deduped: IndexRange[] = [];
+  for (const range of ranges) {
+    if (!deduped.some((candidate) => isDeepStrictEqual(candidate, range))) deduped.push(range);
+  }
+  return deduped;
+};
+
+/**
+ * Returns a bounded union that is guaranteed to cover every document matching
+ * the filter. Filter object fields and `and` members are conjunctive, so any
+ * one bounded child is a sufficient source. Every `or` branch must have its
+ * own bounded source or the projection is unsafe and the caller must fall
+ * back to another plan.
+ */
+const boundedIdProjectionRanges = (
+  collection: IndexerCollection,
   filter: RepositoryQueryArgs['filter'],
-  field: string
-): ExactNumericRangeBounds[] => {
-  if (!filter || !isFilterRecord(filter)) return [];
-  const results: ExactNumericRangeBounds[] = [];
-  if (field in filter) {
-    const bounds = collectExactNumericRangeBounds({ [field]: filter[field] }, field);
-    if (bounds.lower || bounds.upper) results.push(bounds);
-  }
-  for (const logical of ['and', 'or'] as const) {
-    const nested = filter[logical];
-    if (!Array.isArray(nested)) continue;
-    for (const item of nested) {
-      results.push(...exactNumericFilterOccurrences(item as RepositoryQueryArgs['filter'], field));
+  numericFields: ReadonlySet<string>
+): IndexRange[] | null => {
+  if (!filter || !isFilterRecord(filter)) return null;
+  const conjunctiveSources: IndexRange[][] = [];
+
+  for (const [field, condition] of Object.entries(filter)) {
+    if (field === 'and') {
+      if (!Array.isArray(condition)) continue;
+      for (const item of condition) {
+        const ranges = boundedIdProjectionRanges(
+          collection,
+          item as RepositoryQueryArgs['filter'],
+          numericFields
+        );
+        if (ranges) conjunctiveSources.push(ranges);
+      }
+      continue;
     }
+
+    if (field === 'or') {
+      if (!Array.isArray(condition) || !condition.length) continue;
+      const branches = condition.map((item) =>
+        boundedIdProjectionRanges(collection, item as RepositoryQueryArgs['filter'], numericFields)
+      );
+      if (branches.every((ranges): ranges is IndexRange[] => ranges !== null)) {
+        conjunctiveSources.push(dedupeIndexRanges(branches.flat()));
+      }
+      continue;
+    }
+
+    if (field === 'id') {
+      const values = compactFilterValues({ id: condition }, 'id');
+      if (values?.length) {
+        conjunctiveSources.push(
+          [...new Set(values.map(String))].map((id) => ({
+            keyKind: 'document' as const,
+            options: { key: documentKey(collection, id) },
+          }))
+        );
+      }
+      continue;
+    }
+
+    if (!numericFields.has(field)) continue;
+    const bounds = collectExactNumericRangeBounds({ [field]: condition }, field);
+    if (!bounds.lower && !bounds.upper) continue;
+    conjunctiveSources.push([
+      {
+        keyKind: 'index',
+        options: rangeForOrderedPrefix(
+          compactIndexPrefix(collection, `n:${field}`),
+          'asc',
+          bounds,
+          null,
+          numericSortKey,
+          '3'
+        ),
+      },
+    ]);
   }
-  return results;
+
+  if (!conjunctiveSources.length) return null;
+  conjunctiveSources.sort((left, right) => left.length - right.length);
+  return dedupeIndexRanges(conjunctiveSources[0]!);
 };
 
 const sourceForNumericIdProjection = (
@@ -1135,20 +1257,8 @@ const sourceForNumericIdProjection = (
   fields: readonly string[],
   reason: string
 ): QuerySource | null => {
-  const ranges = fields.flatMap((field) =>
-    exactNumericFilterOccurrences(filter, field).map((bounds) => ({
-      keyKind: 'index' as const,
-      options: rangeForOrderedPrefix(
-        compactIndexPrefix(collection, `n:${field}`),
-        'asc',
-        bounds,
-        null,
-        numericSortKey,
-        '3'
-      ),
-    }))
-  );
-  if (!ranges.length) return null;
+  const ranges = boundedIdProjectionRanges(collection, filter, new Set(fields));
+  if (!ranges?.length) return null;
   return { ranges, preservesOrder: false, boundedSort: true, reason };
 };
 
@@ -1185,6 +1295,53 @@ const sourceForHistoryIdSignatureBlockRange = (
     preservesOrder: false,
     boundedSort: true,
     reason: 'x:history-signature-block-id',
+  };
+};
+
+/** Finds a membership predicate required by every result, never by one OR branch. */
+const conjunctiveHistoryAsset = (filter: RepositoryQueryArgs['filter']): string | null => {
+  if (!isFilterRecord(filter)) return null;
+  const condition = filter.dataAssets;
+  if (isFilterRecord(condition)) {
+    const value = condition.contains;
+    // A scalar "null" is ignored by matchesComparison, so it cannot anchor an index.
+    if (typeof value === 'string' && value !== 'null') return value;
+    if (Array.isArray(value) && value.length > 0 && value.every((item) => typeof item === 'string')) {
+      return value[0] as string;
+    }
+  }
+  if (Array.isArray(filter.and)) {
+    for (const child of filter.and) {
+      const asset = conjunctiveHistoryAsset(child as RepositoryQueryArgs['filter']);
+      if (asset !== null) return asset;
+    }
+  }
+  if (Array.isArray(filter.or) && filter.or.length === 1) {
+    return conjunctiveHistoryAsset(filter.or[0] as RepositoryQueryArgs['filter']);
+  }
+  return null;
+};
+
+const sourceForHistorySwapAssetTimestamp = (
+  equalities: Array<{ field: string; value: string | number | boolean }>,
+  direction: 'asc' | 'desc',
+  args: RepositoryQueryArgs
+): QuerySource | null => {
+  if (!equalities.some(({ field, value }) => field === 'module' && value === 'liquidityProxy') ||
+      !equalities.some(({ field, value }) => field === 'method' && value === 'swap')) return null;
+  const asset = conjunctiveHistoryAsset(args.filter);
+  if (asset === null || asset.length > MAX_DOCUMENT_DATA_STRING_LENGTH) return null;
+  const bounds = collectNumericRangeBounds(args.filter, 'timestamp');
+  return {
+    ranges: [{
+      keyKind: 'index',
+      options: rangeForOrderedPrefix(
+        compactIndexPrefix('historyElements', SWAP_ASSET_INDEX_CODE, [swapAssetIndexValue(asset)]), direction, bounds,
+        orderedPositionForArgs(args, 'timestamp', direction, numericSortKey), numericSortKey, '3'
+      ),
+    }],
+    preservesOrder: true,
+    reason: `x:${SWAP_ASSET_INDEX_CODE}`,
   };
 };
 
@@ -1277,6 +1434,8 @@ export class RocksRepository implements IndexerRepository {
   private readonly db: RocksDatabase;
   private readonly config: AppConfig;
   private readonly readOnly: boolean;
+  private readonly documentCompression: 'none' | 'brotli';
+  private documentFormatVersion = ROCKSDB_FORMAT_VERSION;
   private readonly allowIncompleteMigration: boolean;
   private readonly events = new EventEmitter();
   private readonly watchQueueMax: number;
@@ -1297,6 +1456,10 @@ export class RocksRepository implements IndexerRepository {
 
   constructor(config: AppConfig, options: RocksRepositoryOptions = {}) {
     this.config = config;
+    this.documentCompression = config.rocksdbDocumentCompression ?? 'none';
+    if (this.documentCompression !== 'none' && this.documentCompression !== 'brotli') {
+      throw new Error('Unsupported RocksDB document compression');
+    }
     this.readOnly = options.readOnly === true;
     this.allowIncompleteMigration = options.allowIncompleteMigration === true;
     this.watchQueueMax = config.rocksdbWatchQueueMax;
@@ -1349,6 +1512,13 @@ export class RocksRepository implements IndexerRepository {
 
   private async prepareCurrentFormat(): Promise<void> {
     const storedVersion = this.getMetadata<unknown>(ROCKSDB_FORMAT_METADATA_KEY);
+    const requestedVersion = this.documentCompression === 'brotli' ? ROCKSDB_COMPRESSED_FORMAT_VERSION : ROCKSDB_FORMAT_VERSION;
+    // Fence mode changes before index preparation or any metadata mutation.
+    if (!this.readOnly && storedVersion !== undefined &&
+        ((requestedVersion === ROCKSDB_COMPRESSED_FORMAT_VERSION && storedVersion !== requestedVersion) ||
+         (storedVersion === ROCKSDB_COMPRESSED_FORMAT_VERSION && requestedVersion !== storedVersion))) {
+      throw new Error('Unsupported RocksDB compression mode for existing database; brotli requires a fresh format-3 database or an explicitly opted-in format-3 resume');
+    }
     if (storedVersion === undefined) {
       if (this.readOnly) {
         throw new Error('RocksDB is empty or unversioned; a read-only repository cannot initialize it');
@@ -1358,12 +1528,24 @@ export class RocksRepository implements IndexerRepository {
           `Unsupported unversioned RocksDB at ${this.config.rocksdbPath}; first-release storage must be rebuilt from an empty destination`
         );
       }
-      await this.db.put(metadataKey(ROCKSDB_FORMAT_METADATA_KEY), ROCKSDB_FORMAT_VERSION);
-    } else if (storedVersion !== ROCKSDB_FORMAT_VERSION) {
+      await this.db.transaction(async (transaction) => {
+        await transaction.put(metadataKey(ROCKSDB_FORMAT_METADATA_KEY), requestedVersion);
+        await transaction.put(metadataKey(ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY), {
+          version: 1, status: 'building', afterId: null,
+        } satisfies SwapAssetIndexState);
+      });
+    } else if (storedVersion === 1 && this.readOnly) {
+      throw new Error('Unsupported RocksDB format 1 for read-only use; complete writable prepare() to upgrade the swap-asset index to format 2 first');
+    } else if (!rocksFormatIsSupported(storedVersion) && (storedVersion !== 1 || this.readOnly)) {
       throw new Error(
-        `Unsupported RocksDB format ${String(storedVersion)} at ${this.config.rocksdbPath}; expected ${ROCKSDB_FORMAT_VERSION}`
+        `Unsupported RocksDB format ${String(storedVersion)} at ${this.config.rocksdbPath}; expected ${ROCKSDB_SUPPORTED_FORMAT_VERSIONS.join(', ')}`
       );
     }
+
+    // Readers select capability from the stored marker, independent of writer options.
+    this.documentFormatVersion = storedVersion === ROCKSDB_COMPRESSED_FORMAT_VERSION ||
+      (storedVersion === undefined && requestedVersion === ROCKSDB_COMPRESSED_FORMAT_VERSION)
+      ? ROCKSDB_COMPRESSED_FORMAT_VERSION : ROCKSDB_FORMAT_VERSION;
 
     if (this.hasStoredKeyWithPrefix(['i'])) {
       throw new Error(
@@ -1384,7 +1566,164 @@ export class RocksRepository implements IndexerRepository {
         );
       }
     }
+    if (storedVersion === 1) {
+      // Old writers cannot maintain this derived index. Fence them before the
+      // first batch so interruption or rollback can never silently stale it.
+      if (this.getMetadata(ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY) !== undefined ||
+          this.hasStoredKeyWithPrefix(['x', 'historyElements', SWAP_ASSET_INDEX_CODE])) {
+        throw new Error('RocksDB format 1 has unexpected swap-asset index metadata or keys');
+      }
+      await this.db.transaction(async (transaction) => {
+        await transaction.put(metadataKey(ROCKSDB_FORMAT_METADATA_KEY), ROCKSDB_FORMAT_VERSION);
+        await transaction.put(metadataKey(ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY), {
+          version: 1, status: 'building', afterId: null,
+        } satisfies SwapAssetIndexState);
+      });
+    }
+    await this.prepareHistorySwapAssetIndex();
+    await this.prepareBurnOwnerIndex();
     this.prepared = true;
+  }
+
+  /** Re-derive before every writable open: older format-2 writers do not maintain this index. */
+  private async prepareBurnOwnerIndex(): Promise<void> {
+    const prefix = compactIndexPrefix('xorBurns', BURN_OWNER_INDEX_CODE, []);
+    if (!this.readOnly) {
+      // Queries/writes remain fenced by prepared=false. Each deletion batch is
+      // bounded, and an interrupted open restarts this derived-only operation.
+      let removed: number;
+      do {
+        if (this.closing) throw new Error('RocksDB burn-owner index preparation stopped during close');
+        removed = 0;
+        await this.db.transaction(async (transaction) => {
+          removed = 0;
+          for await (const entry of transaction.getRange(rangeForPrefix(prefix, {
+            limit: BURN_OWNER_INDEX_BATCH_DOCUMENTS,
+          }))) {
+            await transaction.remove(entry.key);
+            removed += 1;
+          }
+        });
+      } while (removed !== 0);
+    }
+
+    let afterId: string | null = null;
+    let complete = false;
+    while (!complete) {
+      if (this.closing) throw new Error('RocksDB burn-owner index preparation stopped during close');
+      const options = rangeForPrefix(['d', 'xorBurns'], {
+        limit: BURN_OWNER_INDEX_BATCH_DOCUMENTS,
+        ...(afterId !== null ? { start: documentKey('xorBurns', afterId), exclusiveStart: true } : {}),
+      });
+      // Retry callbacks derive the same bounded page, without advancing the
+      // outer cursor until the transaction has committed.
+      let nextId: string | null = null;
+      const preparePage = async (view: Pick<RocksDatabase, 'getRange' | 'getSync'>,
+        put?: (key: RocksKey) => Promise<unknown>): Promise<void> => {
+        nextId = null;
+        let retainedBytes = 0;
+        for await (const entry of view.getRange(options)) {
+          if (this.closing) throw new Error('RocksDB burn-owner index preparation stopped during close');
+          const identity = documentIdentityFromKey(entry?.key);
+          if (!identity || identity.collection !== 'xorBurns') throw new Error('Malformed burn-owner document key');
+          const document = this.decodeStoredDocument(identity.collection, identity.id, entry?.value);
+          if (!document) throw new Error(`Missing burn-owner document ${identity.id}`);
+          const keys = compactDocumentIndexKeys(document);
+          for (const key of keys) {
+            if (put) await put(key);
+            else if (view.getSync(key) !== 1) {
+              throw new Error('RocksDB burn-owner index is incomplete; complete writable prepare() before read-only use');
+            }
+          }
+          nextId = identity.id;
+          retainedBytes += estimateRetainedValueBytes(document, BURN_OWNER_INDEX_BATCH_BYTES);
+          retainedBytes += estimateRetainedValueBytes(keys, BURN_OWNER_INDEX_BATCH_BYTES);
+          if (retainedBytes >= BURN_OWNER_INDEX_BATCH_BYTES) break;
+        }
+      };
+      if (this.readOnly) await preparePage(this.db);
+      else await this.db.transaction(async (transaction) => {
+        await preparePage(transaction, (key) => transaction.put(key, 1));
+      });
+      complete = nextId === null;
+      afterId = nextId;
+    }
+    if (!this.readOnly) await this.db.flush();
+  }
+
+  /** Batches derive keys and advance their resume position in the same native transaction. */
+  private async prepareHistorySwapAssetIndex(): Promise<void> {
+    const state = this.getMetadata<unknown>(ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY);
+    const validateState = (value: unknown): SwapAssetIndexState | undefined => {
+      if (value === undefined) return undefined;
+      if (isFilterRecord(value) && value.version === 1) {
+        const fields = Object.keys(value).sort().join(',');
+        if (rocksSwapAssetIndexIsReady(value)) return { version: 1, status: 'ready' };
+        if (value.status === 'building' && fields === 'afterId,status,version' &&
+            (value.afterId === null || typeof value.afterId === 'string')) {
+          if (value.afterId !== null) {
+            try { assertValidDocumentId(value.afterId); } catch {
+              throw new Error('Malformed RocksDB swap-asset index progress marker');
+            }
+          }
+          return { version: 1, status: 'building', afterId: value.afterId };
+        }
+      }
+      throw new Error('Malformed RocksDB swap-asset index progress marker');
+    };
+    let progress = validateState(state);
+    if (progress === undefined) throw new Error('RocksDB format 2 is missing its swap-asset index progress marker');
+    if (progress?.status === 'ready') return;
+    if (this.readOnly) {
+      throw new Error('RocksDB swap-asset index is incomplete; open a writable repository to complete prepare() before read-only use');
+    }
+    if (progress?.status === 'building' && progress.afterId !== null &&
+        this.db.getSync(documentKey('historyElements', progress.afterId)) === undefined) {
+      throw new Error('RocksDB swap-asset index resume document is missing');
+    }
+    while (progress?.status !== 'ready') {
+      if (this.closing) throw new Error('RocksDB swap-asset index preparation stopped during close');
+      const afterId = progress?.afterId ?? null;
+      const startedAt = Date.now();
+      let scanned = 0;
+      let written = 0;
+      let nextState: SwapAssetIndexState = { version: 1, status: 'ready' };
+      await this.db.transaction(async (transaction) => {
+        // Native retries rerun this entire callback; counters must describe that attempt.
+        scanned = 0;
+        written = 0;
+        let retainedBytes = 0;
+        const options = rangeForPrefix(['d', 'historyElements'], {
+          limit: SWAP_ASSET_INDEX_BATCH_DOCUMENTS,
+          ...(afterId !== null ? { start: documentKey('historyElements', afterId), exclusiveStart: true } : {}),
+        });
+        nextState = { version: 1, status: 'ready' };
+        for await (const entry of transaction.getRange(options)) {
+          if (this.closing) throw new Error('RocksDB swap-asset index preparation stopped during close');
+          const identity = documentIdentityFromKey(entry?.key);
+          if (!identity || identity.collection !== 'historyElements') {
+            throw new Error('RocksDB swap-asset index preparation found a malformed history document key');
+          }
+          const document = this.decodeStoredDocument(identity.collection, identity.id, entry?.value);
+          if (!document) throw new Error(`RocksDB swap-asset index preparation found a missing document ${identity.id}`);
+          const keys = swapAssetDocumentIndexKeys(document);
+          for (const key of keys) await transaction.put(key, 1);
+          scanned += 1;
+          written += keys.length;
+          nextState = { version: 1, status: 'building', afterId: identity.id };
+          retainedBytes += estimateRetainedValueBytes(document, SWAP_ASSET_INDEX_BATCH_BYTES);
+          retainedBytes += estimateRetainedValueBytes(keys, SWAP_ASSET_INDEX_BATCH_BYTES);
+          if (retainedBytes >= SWAP_ASSET_INDEX_BATCH_BYTES) break;
+        }
+        await transaction.put(metadataKey(ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY), nextState);
+      });
+      progress = validateState(this.getMetadata<unknown>(ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY));
+      if (!isDeepStrictEqual(progress, nextState)) throw new Error('RocksDB swap-asset index progress did not commit');
+      metrics.increment('indexer_rocksdb_swap_asset_index_prepared_documents_total', {}, scanned);
+      metrics.increment('indexer_rocksdb_swap_asset_index_prepared_keys_total', {}, written);
+      metrics.observe('indexer_rocksdb_swap_asset_index_prepare_batch_seconds', {}, secondsSince(startedAt));
+    }
+    await this.db.flush();
   }
 
   private hasAnyStoredKey(): boolean {
@@ -1406,7 +1745,7 @@ export class RocksRepository implements IndexerRepository {
       for (const entry of this.db.getRange(rangeForPrefix(['d', collection]))) {
         const id = keyId(entry?.key);
         if (!id) continue;
-        const document = decodeStoredDocument(collection, id, entry?.value);
+        const document = this.decodeStoredDocument(collection, id, entry?.value);
         if (document) documents.push(document);
       }
 
@@ -1523,7 +1862,7 @@ export class RocksRepository implements IndexerRepository {
           for (const candidate of batch) {
             const document = candidate;
             const key = documentKey(document.collection, document.id);
-            const previous = decodeStoredDocument(document.collection, document.id, transaction.getSync(key));
+            const previous = this.decodeStoredDocument(document.collection, document.id, transaction.getSync(key));
             if (previous && !canReplaceDocumentAtBlock(previous, document)) continue;
             if (documentsEqual(previous, document)) continue;
 
@@ -1549,7 +1888,7 @@ export class RocksRepository implements IndexerRepository {
               if (!previousCountKeys.has(identity)) await updateIndexCount(countKeyValue, 1);
             }
 
-            await transaction.put(key, encodeRocksDocument(document));
+            await transaction.put(key, encodeRocksDocument(document, this.documentCompression));
             for (const indexKey of compactDocumentIndexKeys(document)) {
               await transaction.put(indexKey, 1);
             }
@@ -1722,6 +2061,7 @@ export class RocksRepository implements IndexerRepository {
       rocksdb_estimated_keys: this.db.getEstimatedKeyCount(),
       rocksdb_open: this.db.isOpen() ? 1 : 0,
       rocksdb_format_version: this.formatVersion() ?? 0,
+      rocksdb_swap_asset_index_ready: rocksSwapAssetIndexIsReady(this.getMetadata(ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY)) ? 1 : 0,
       rocksdb_document_cache_entries: this.documentCache.size,
       rocksdb_document_cache_max: this.documentCacheMax,
       rocksdb_document_cache_bytes: this.documentCacheBytes,
@@ -1769,6 +2109,13 @@ export class RocksRepository implements IndexerRepository {
     });
   }
 
+  /** Flushes completed offline writes before publishing an external durable receipt. */
+  async flushWrites(): Promise<void> {
+    this.assertWritable('flush writes');
+    this.assertPrepared('flush writes');
+    await this.runWrite(() => this.db.flush());
+  }
+
   /** Performs a complete snapshot validation without creating persistent verification keys. */
   async validateCompactIndexes(): Promise<void> {
     if (this.closing) throw new Error('Cannot validate compact indexes: RocksDB repository is closing');
@@ -1792,7 +2139,7 @@ export class RocksRepository implements IndexerRepository {
         if (!identity) {
           throw new Error(`Compact RocksDB index validation failed: malformed document key ${JSON.stringify(entry?.key)}`);
         }
-        const document = decodeStoredDocument(identity.collection, identity.id, entry?.value);
+        const document = this.decodeStoredDocument(identity.collection, identity.id, entry?.value);
         if (!document) throw new Error(`Compact RocksDB index validation failed: missing value for ${identity.collection}/${identity.id}`);
         documentCounts.set(identity.collection, (documentCounts.get(identity.collection) ?? 0) + 1);
         expectedCount += new Set(compactDocumentIndexKeys(document).map((key) => JSON.stringify(key))).size;
@@ -1839,7 +2186,7 @@ export class RocksRepository implements IndexerRepository {
 
         const collection = key[1] as IndexerCollection;
         const id = key[key.length - 1] as string;
-        const document = decodeStoredDocument(collection, id, transaction.getSync(documentKey(collection, id)));
+        const document = this.decodeStoredDocument(collection, id, transaction.getSync(documentKey(collection, id)));
         if (!document) {
           throw new Error(`Compact RocksDB index validation failed: dangling key ${JSON.stringify(key)}`);
         }
@@ -1914,6 +2261,10 @@ export class RocksRepository implements IndexerRepository {
 
   private assertPrepared(operation: string): void {
     if (!this.prepared) throw new Error(`Cannot ${operation}: call RocksDB repository prepare() first`);
+  }
+
+  private decodeStoredDocument(collection: IndexerCollection, id: string, stored: unknown): IndexerDocument | undefined {
+    return decodeRocksDocument(collection, id, stored, this.documentFormatVersion) ?? undefined;
   }
 
   private documentCacheKey(collection: IndexerCollection, id: string): string {
@@ -1994,7 +2345,7 @@ export class RocksRepository implements IndexerRepository {
       metrics.increment('indexer_rocksdb_document_cache_misses_total', { collection });
     }
 
-    const document = decodeStoredDocument(collection, id, this.db.getSync(documentKey(collection, id)));
+    const document = this.decodeStoredDocument(collection, id, this.db.getSync(documentKey(collection, id)));
     if (document) this.cacheDocument(document);
     return document;
   }
@@ -2119,6 +2470,12 @@ export class RocksRepository implements IndexerRepository {
       }
 
       const selected = selectCompactDefinition(collection, field, equalities);
+      // Retain the existing address and address-OR plans. Asset selection
+      // replaces only the otherwise unanchored whole-history timestamp scan.
+      if (collection === 'historyElements' && field === 'timestamp' && selected?.definition.code === 't') {
+        const swapAssets = sourceForHistorySwapAssetTimestamp(equalities, direction, args);
+        if (swapAssets) return swapAssets;
+      }
       if (selected) return sourceForCompactOrderedRange(collection, selected, direction, args);
 
       return {
@@ -2160,6 +2517,7 @@ export class RocksRepository implements IndexerRepository {
     source: QuerySource,
     args: RepositoryQueryArgs
   ): Promise<RepositoryQueryResult> {
+    if (args.last !== null && args.last !== undefined) return this.queryOrderedTail(collection, source, args);
     const keyset = args.offset === null || args.offset === undefined ? args.keyset ?? null : null;
     const offset = args.seek || keyset ? 0 : Math.max(Number(args.offset ?? afterToOffset(args.after)), 0);
     const logicalOffset = offset;
@@ -2181,12 +2539,23 @@ export class RocksRepository implements IndexerRepository {
         : null;
     const exactTotalCount =
       collectionCount ?? compactRangeCount;
-    const shouldOverfetch = exactTotalCount === null && (args.includeTotalCount === false || keyset !== null) && limit !== null;
+    const hasPosition = Boolean(args.seek || keyset);
+    // An exact prefix count still covers rows before a cursor/seek position.
+    // Positioned windows need their own extra row to prove there is a next page.
+    const knownWindowCount = hasPosition ? null : exactTotalCount;
+    const shouldOverfetch = knownWindowCount === null && (args.includeTotalCount === false || hasPosition) && limit !== null;
     const queryLimit = shouldOverfetch ? limit + 1 : limit;
     const rows: IndexerDocument[] = [];
     const requestedLimit = queryLimit ?? Number.POSITIVE_INFINITY;
     const { field: orderField } = getOrderField(args.orderBy);
-    const keysetAppliedByDocumentRange = keyset !== null && source.reason === 'document' && orderField === 'id';
+    // rocksdb-js currently treats a reverse range's exact start as inclusive
+    // even when exclusiveStart is set. Recheck descending document cursors in
+    // userland so the cursor row cannot be emitted twice.
+    const keysetAppliedByDocumentRange =
+      keyset !== null &&
+      keyset.direction === 'asc' &&
+      source.reason === 'document' &&
+      orderField === 'id';
     const maxBytes = args.maxBytes ?? null;
     let retainedBytes = 0;
     let byteLimitReached = false;
@@ -2195,13 +2564,13 @@ export class RocksRepository implements IndexerRepository {
       metrics.increment('indexer_rocksdb_query_fast_count_total', { collection, source: source.reason });
     }
 
-    if (exactTotalCount !== null && args.includeTotalCount !== false && limit === 0) {
+    if (knownWindowCount !== null && args.includeTotalCount !== false && limit === 0) {
       return {
         items: [],
         itemCursors: [],
-        totalCount: exactTotalCount,
+        totalCount: knownWindowCount,
         pageStart: logicalOffset,
-        hasNextPage: logicalOffset < exactTotalCount,
+        hasNextPage: logicalOffset < knownWindowCount,
         hasPreviousPage: logicalOffset > 0,
       };
     }
@@ -2250,6 +2619,7 @@ export class RocksRepository implements IndexerRepository {
     const items = last === null || last === undefined ? windowRows : windowRows.slice(pageStartOffset);
     const pageStart = logicalOffset + pageStartOffset;
     const itemCursors = items.map((document) => cursorForIndexerDocument(collection, document, args));
+    const pageTotalCount = hasPosition ? null : exactTotalCount ?? totalCount;
 
     return {
       items,
@@ -2258,8 +2628,117 @@ export class RocksRepository implements IndexerRepository {
       pageStart,
       hasNextPage:
         byteLimitReached ||
-        (totalCount === null ? hasOverfetched : logicalOffset + windowRows.length < totalCount),
-      hasPreviousPage: keyset !== null || pageStart > 0,
+        (pageTotalCount === null ? hasOverfetched : logicalOffset + windowRows.length < pageTotalCount),
+      hasPreviousPage: hasPosition || pageStart > 0,
+    };
+  }
+
+  /** Materialize only selected IDs; skipped offsets and discarded first-window rows do not consume page bytes. */
+  private materializeQueryIds(collection: IndexerCollection, ids: string[], args: RepositoryQueryArgs) {
+    const items: IndexerDocument[] = [];
+    const maxBytes = args.maxBytes ?? null;
+    let retainedBytes = 0;
+    let byteLimitReached = false;
+    for (const id of ids) {
+      const document = this.readDocument(collection, id, true);
+      if (!document) continue;
+      if (maxBytes !== null) {
+        const remainingBytes = Math.max(maxBytes - retainedBytes, 0);
+        const bytes = estimateRetainedValueBytes(document, remainingBytes);
+        if (items.length > 0 && bytes > remainingBytes) {
+          byteLimitReached = true;
+          break;
+        }
+        retainedBytes = Math.min(maxBytes + 1, retainedBytes + bytes);
+      }
+      items.push(document);
+    }
+    return { items, byteLimitReached };
+  }
+
+  private async queryOrderedTail(
+    collection: IndexerCollection,
+    source: QuerySource,
+    args: RepositoryQueryArgs
+  ): Promise<RepositoryQueryResult> {
+    const keyset = args.offset == null ? args.keyset ?? null : null;
+    const hasPosition = Boolean(args.seek || keyset);
+    const offset = hasPosition ? 0 : Math.max(Number(args.offset ?? afterToOffset(args.after)), 0);
+    const first = args.first ?? null;
+    const last = Math.max(args.last ?? 0, 0);
+    const tailOnly = first === null;
+    // Reuse the existing direction-aware index planner. Cursor validation and
+    // output cursors retain the caller's original order and scope.
+    const effectiveOrder = Array.isArray(args.orderBy)
+      ? args.orderBy.length > 0 ? args.orderBy : ['ID_ASC']
+      : [args.orderBy ?? 'ID_ASC'];
+    const reversedOrder = effectiveOrder.map((token) =>
+      String(token).replace(/_(ASC|DESC)$/i, (_match, direction: string) => direction.toUpperCase() === 'ASC' ? '_DESC' : '_ASC')
+    );
+    const scanSource = tailOnly
+      ? this.selectQuerySource(collection, { ...args, orderBy: reversedOrder, keyset: null, seek: undefined })
+      : source;
+    const exactCount = !hasPosition
+      ? source.reason === 'document' && isEmptyFilter(args.filter)
+        ? this.count(collection)
+        : source.exactCountKeys
+          ? source.exactCountKeys.reduce((sum, key) => {
+              const count = this.db.getSync(key);
+              if (count === undefined) return sum;
+              if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) {
+                throw new Error(`Missing or corrupt RocksDB compact prefix count ${JSON.stringify(key)}`);
+              }
+              return sum + count;
+            }, 0)
+          : null
+      : null;
+    const ids: string[] = [];
+    const seen = scanSource.ranges.length > 1 ? new Set<string>() : null;
+    let scanned = 0;
+    let matched = 0;
+    let exhausted = true;
+    for (const document of this.iterateSourceDocuments(collection, scanSource)) {
+      scanned += 1;
+      this.assertQueryScanBudget(collection, scanSource.reason, scanned);
+      if (seen?.has(document.id)) continue;
+      seen?.add(document.id);
+      if (hasPosition && !isAfterQueryPosition(document, args)) {
+        if (tailOnly) break;
+        continue;
+      }
+      if (!matchesDocumentFilter(document, args.filter)) continue;
+      if (tailOnly) {
+        if (ids.length < last) ids.push(document.id);
+      } else if (matched >= offset && matched < offset + first && last > 0) {
+        ids.push(document.id);
+        if (ids.length > last) ids.shift();
+      }
+      matched += 1;
+      const proofLimit = tailOnly ? offset + last + 1 : offset + first + 1;
+      if ((args.includeTotalCount === false || exactCount !== null) && matched >= proofLimit) {
+        exhausted = false;
+        break;
+      }
+      if (tailOnly && exactCount !== null && matched >= Math.min(last, Math.max(exactCount - offset, 0))) {
+        exhausted = matched >= exactCount;
+        break;
+      }
+    }
+    metrics.increment('indexer_rocksdb_query_scanned_rows_total', { collection, source: scanSource.reason }, scanned);
+    const availableCount = exactCount ?? matched;
+    const end = tailOnly ? availableCount : Math.min(offset + first, availableCount);
+    const pageStart = Math.max(end - last, offset);
+    const selectedIds = tailOnly ? ids.slice(0, Math.max(end - pageStart, 0)).reverse() : ids;
+    const { items, byteLimitReached } = this.materializeQueryIds(collection, selectedIds, args);
+    return {
+      items,
+      itemCursors: items.map((document) => cursorForIndexerDocument(collection, document, args)),
+      totalCount: args.includeTotalCount === false ? null : availableCount,
+      // A reverse page without a count proves the flags but not its absolute
+      // position; do not publish a synthetic absolute offset.
+      pageStart: tailOnly && exactCount === null && !exhausted ? undefined : pageStart,
+      hasNextPage: byteLimitReached || (!tailOnly && (exactCount !== null ? end < exactCount : !exhausted || end < matched)),
+      hasPreviousPage: hasPosition || pageStart > 0,
     };
   }
 
@@ -2268,51 +2747,23 @@ export class RocksRepository implements IndexerRepository {
     source: QuerySource,
     args: RepositoryQueryArgs
   ): Promise<RepositoryQueryResult> {
-    const keyset = args.offset === null || args.offset === undefined ? args.keyset ?? null : null;
+    const keyset = args.offset == null ? args.keyset ?? null : null;
     const offset = args.seek || keyset ? 0 : Math.max(Number(args.offset ?? afterToOffset(args.after)), 0);
     const first = args.first ?? null;
     const last = args.last ?? null;
-    const limit = first === null || first === undefined ? null : Math.max(first, 0);
-    const retainedLimit = limit === null ? Number.POSITIVE_INFINITY : offset + limit;
+    const tailOnly = first === null && last !== null;
+    const retainedLimit = tailOnly ? Math.max(last, 0) : first === null ? Number.POSITIVE_INFINITY : offset + Math.max(first, 0);
+    const { field } = getOrderField(args.orderBy);
+    // Retain order positions, not document payloads, while finding a bounded
+    // prefix or tail. Offset rows never bypass the document byte budget.
+    let candidates: IndexerDocument[] = [];
     const seen = new Set<string>();
-    const matching: IndexerDocument[] = [];
-    const maxBytes = args.maxBytes ?? null;
-    const documentBytes = new Map<string, number>();
     let scanned = 0;
     let matched = 0;
-
-    const trimCandidates = (): void => {
-      const sorted = sortIndexerDocuments(matching, args.orderBy);
-      const countLimited = Number.isFinite(retainedLimit) ? sorted.slice(0, retainedLimit) : sorted;
-      if (maxBytes === null) {
-        matching.splice(0, matching.length, ...countLimited);
-        return;
-      }
-
-      const retained: IndexerDocument[] = [];
-      let retainedBytes = 0;
-      for (let index = 0; index < countLimited.length; index += 1) {
-        const document = countLimited[index]!;
-        // Offset rows are needed only to establish the requested window. The
-        // public GraphQL surface is keyset-only, so this compatibility path
-        // cannot be attacker-amplified there.
-        if (index < offset) {
-          retained.push(document);
-          continue;
-        }
-        const identity = `${document.collection}\0${document.id}`;
-        let bytes = documentBytes.get(identity);
-        if (bytes === undefined) {
-          bytes = estimateRetainedValueBytes(document, maxBytes);
-          documentBytes.set(identity, bytes);
-        }
-        if (retained.length > offset && bytes > Math.max(maxBytes - retainedBytes, 0)) break;
-        retained.push(document);
-        retainedBytes = Math.min(maxBytes + 1, retainedBytes + bytes);
-      }
-      matching.splice(0, matching.length, ...retained);
+    const trim = () => {
+      const sorted = sortIndexerDocuments(candidates, args.orderBy);
+      candidates = tailOnly ? sorted.slice(Math.max(sorted.length - retainedLimit, 0)) : sorted.slice(0, retainedLimit);
     };
-
     for (const document of this.iterateSourceDocuments(collection, source)) {
       scanned += 1;
       this.assertQueryScanBudget(collection, source.reason, scanned);
@@ -2321,35 +2772,25 @@ export class RocksRepository implements IndexerRepository {
       if ((args.seek || keyset) && !isAfterQueryPosition(document, args)) continue;
       if (!matchesDocumentFilter(document, args.filter)) continue;
       matched += 1;
-      if (retainedLimit > 0) matching.push(document);
-      if (
-        maxBytes !== null ||
-        (Number.isFinite(retainedLimit) && matching.length >= Math.max(retainedLimit * 2, 1_000))
-      ) {
-        trimCandidates();
+      if (retainedLimit > 0) {
+        const value = documentOrderValue(document, field);
+        candidates.push({ collection, id: document.id, data: { [field]: value !== null && typeof value === 'object' ? String(value) : value } });
       }
+      if (Number.isFinite(retainedLimit) && candidates.length >= Math.max(retainedLimit * 2, 1_000)) trim();
     }
-
     metrics.increment('indexer_rocksdb_query_scanned_rows_total', { collection, source: source.reason }, scanned);
-
-    trimCandidates();
-    const sorted = sortIndexerDocuments(matching, args.orderBy);
-    const remainingCount = matched;
-    const totalCount = matched;
-    const end = limit === null || limit === undefined ? remainingCount : Math.min(offset + limit, remainingCount);
-    const countWindowSize = Math.max(end - offset, 0);
-    const byteLimitReached = maxBytes !== null && Math.max(sorted.length - offset, 0) < countWindowSize;
-    const relativePageStart = last === null || last === undefined ? offset : Math.max(end - Math.max(last, 0), offset);
-    const items = sorted.slice(relativePageStart, end);
-    const pageStart = relativePageStart;
-    const itemCursors = items.map((document) => cursorForIndexerDocument(collection, document, args));
-
+    trim();
+    const sorted = sortIndexerDocuments(candidates, args.orderBy);
+    const end = first === null ? matched : Math.min(offset + Math.max(first, 0), matched);
+    const pageStart = last === null ? offset : Math.max(end - Math.max(last, 0), offset);
+    const selected = tailOnly ? sorted.slice(Math.max(sorted.length - Math.max(end - pageStart, 0), 0)) : sorted.slice(pageStart, end);
+    const { items, byteLimitReached } = this.materializeQueryIds(collection, selected.map(({ id }) => id), args);
     return {
       items,
-      itemCursors,
-      totalCount: args.includeTotalCount === false ? null : totalCount,
+      itemCursors: items.map((document) => cursorForIndexerDocument(collection, document, args)),
+      totalCount: args.includeTotalCount === false ? null : matched,
       pageStart,
-      hasNextPage: byteLimitReached || end < remainingCount,
+      hasNextPage: byteLimitReached || end < matched,
       hasPreviousPage: keyset !== null || pageStart > 0,
     };
   }
@@ -2409,14 +2850,14 @@ export class RocksRepository implements IndexerRepository {
       if (range.keyKind === 'document') {
           const identity = documentIdentityFromKey(entry?.key);
           if (!identity) continue;
-          const document = decodeStoredDocument(identity.collection, identity.id, entry?.value);
+          const document = this.decodeStoredDocument(identity.collection, identity.id, entry?.value);
           if (document) yield document;
         continue;
       }
 
       const id = keyId(entry?.key);
       if (!id) continue;
-        const document = decodeStoredDocument(collection, id, this.db.getSync(documentKey(collection, id)));
+        const document = this.decodeStoredDocument(collection, id, this.db.getSync(documentKey(collection, id)));
         if (document) yield document;
     }
   }

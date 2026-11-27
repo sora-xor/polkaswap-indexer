@@ -4,8 +4,12 @@ import { readConfig } from '../config.js';
 import {
   ROCKSDB_FORMAT_METADATA_KEY,
   ROCKSDB_FORMAT_VERSION,
+  ROCKSDB_SUPPORTED_FORMAT_VERSIONS,
+  rocksFormatIsSupported,
+  ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY,
   RocksRepository,
   rocksCompactIndexKeysForDocument,
+  rocksSwapAssetIndexIsReady,
 } from '../repository/rocksdb.js';
 import { decodeRocksDocument } from '../repository/rocksdb-document.js';
 import { INDEXER_COLLECTIONS } from '../repository/types.js';
@@ -107,11 +111,12 @@ const parseChainState = (
   db: RocksReadView,
   finalizedBlock: number | null,
   chainReadError: string | null,
-  nowMs: number
+  nowMs: number,
+  formatVersion: number
 ) => {
   const collection: IndexerCollection = 'updatesStreams';
   const id = 'chainState';
-  const document = decodeRocksDocument(collection, id, db.getSync(['d', collection, id]));
+  const document = decodeRocksDocument(collection, id, db.getSync(['d', collection, id]), formatVersion);
   let payload: Record<string, unknown> = {};
 
   if (typeof document?.data.data === 'string') {
@@ -162,7 +167,9 @@ export const buildRocksAuditReport = (db: RocksReadView, options: RocksAuditOpti
   const sampleSize = Math.max(Math.trunc(options.sampleSize ?? 1_000), 1);
   const formatVersionValue = readMetadata(db, ROCKSDB_FORMAT_METADATA_KEY);
   const formatVersion = Number.isSafeInteger(formatVersionValue) ? (formatVersionValue as number) : null;
-  const formatReady = formatVersion === ROCKSDB_FORMAT_VERSION;
+  const swapAssetIndexReady = rocksSwapAssetIndexIsReady(readMetadata(db, ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY));
+  const formatReady = rocksFormatIsSupported(formatVersion) && swapAssetIndexReady;
+  const documentFormatVersion = rocksFormatIsSupported(formatVersion) ? formatVersion : ROCKSDB_FORMAT_VERSION;
   const verifyMissingIndexes = formatReady;
   const perCollectionSampleSize = Math.max(Math.ceil(sampleSize / INDEXER_COLLECTIONS.length), 1);
   const documentSamplesByCollection = Object.fromEntries(
@@ -181,7 +188,7 @@ export const buildRocksAuditReport = (db: RocksReadView, options: RocksAuditOpti
     for (const entry of stratifiedRangeEntries(db, ['d', collection], perCollectionSampleSize)) {
       const identity = documentIdentity(entry?.key);
       if (!identity) continue;
-      const document = decodeRocksDocument(identity.collection, identity.id, entry?.value);
+      const document = decodeRocksDocument(identity.collection, identity.id, entry?.value, documentFormatVersion);
       if (!document) continue;
       sampledDocuments += 1;
       documentSamplesByCollection[collection] += 1;
@@ -210,7 +217,7 @@ export const buildRocksAuditReport = (db: RocksReadView, options: RocksAuditOpti
       }
 
       const stored = db.getSync(['d', identity.collection, identity.id]);
-      const document = decodeRocksDocument(identity.collection, identity.id, stored);
+      const document = decodeRocksDocument(identity.collection, identity.id, stored, documentFormatVersion);
       if (!document) {
         danglingCompactIndexes += 1;
         if (danglingExamples.length < MAX_EXAMPLES) danglingExamples.push({ key: identity.key, reason: 'missing_document' });
@@ -256,7 +263,8 @@ export const buildRocksAuditReport = (db: RocksReadView, options: RocksAuditOpti
     db,
     options.finalizedBlock ?? null,
     options.chainReadError ?? null,
-    options.nowMs ?? Date.now()
+    options.nowMs ?? Date.now(),
+    documentFormatVersion
   );
   const requireChain = options.requireChain ?? false;
   const maxLagBlocks = Math.max(Math.trunc(options.maxLagBlocks ?? 100), 0);
@@ -294,7 +302,9 @@ export const buildRocksAuditReport = (db: RocksReadView, options: RocksAuditOpti
     format: {
       version: formatVersion,
       expectedVersion: ROCKSDB_FORMAT_VERSION,
+      supportedVersions: ROCKSDB_SUPPORTED_FORMAT_VERSIONS,
       ready: formatReady,
+      swapAssetIndexReady,
       unexpectedIndexNamespaceKeys: unsupportedIndexKeys,
     },
     chainState,

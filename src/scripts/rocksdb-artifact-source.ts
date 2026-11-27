@@ -2,7 +2,10 @@ import { lstat } from 'node:fs/promises';
 
 import {
   ROCKSDB_FORMAT_METADATA_KEY,
-  ROCKSDB_FORMAT_VERSION,
+  ROCKSDB_SUPPORTED_FORMAT_VERSIONS,
+  rocksFormatIsSupported,
+  ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY,
+  rocksSwapAssetIndexIsReady,
 } from '../repository/rocksdb.js';
 import {
   assertServeablePostgresRocksdbMigrationState,
@@ -27,13 +30,16 @@ export const assertExistingRocksdbDirectory = async (sourcePath: string): Promis
   }
 };
 
-/** Validates the first-release marker and refuses a useless document-empty artifact. */
-export const assertCurrentRocksdbArtifactSource = (db: RocksReadView, sourcePath: string): void => {
+/** Validates an explicitly supported reader format marker and refuses a useless document-empty artifact. */
+export const assertCurrentRocksdbArtifactSource = (db: RocksReadView, sourcePath: string): 2 | 3 => {
   const formatVersion = db.getSync(['m', 'metadata', ROCKSDB_FORMAT_METADATA_KEY]);
-  if (formatVersion !== ROCKSDB_FORMAT_VERSION) {
+  if (!rocksFormatIsSupported(formatVersion)) {
     throw new Error(
-      `RocksDB artifact source ${sourcePath} has unsupported format ${String(formatVersion)}; expected ${ROCKSDB_FORMAT_VERSION}`
+      `RocksDB artifact source ${sourcePath} has unsupported format ${String(formatVersion)}; expected ${ROCKSDB_SUPPORTED_FORMAT_VERSIONS.join(', ')}`
     );
+  }
+  if (!rocksSwapAssetIndexIsReady(db.getSync(['m', 'metadata', ROCKSDB_SWAP_ASSET_INDEX_METADATA_KEY]))) {
+    throw new Error(`RocksDB artifact source ${sourcePath} has an incomplete or malformed swap-asset index`);
   }
   for (const _entry of db.getRange({ start: ['i'], end: ['i', Buffer.from([0xff])], limit: 1, values: false })) {
     throw new Error(`RocksDB artifact source ${sourcePath} contains unsupported index namespace keys`);
@@ -54,4 +60,5 @@ export const assertCurrentRocksdbArtifactSource = (db: RocksReadView, sourcePath
   if (!hasDocument) {
     throw new Error(`RocksDB artifact source ${sourcePath} contains no indexed documents`);
   }
+  return formatVersion;
 };

@@ -153,8 +153,8 @@ describe('RocksDB audit report', () => {
       });
 
       expect(report.format).toMatchObject({
-        version: 1,
-        expectedVersion: 1,
+        version: 2,
+        expectedVersion: 2,
         ready: true,
         unexpectedIndexNamespaceKeys: 1,
       });

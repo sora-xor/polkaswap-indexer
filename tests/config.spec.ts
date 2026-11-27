@@ -2,13 +2,17 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   assertExplicitProductionWorkerChainInputs,
-  assertIndependentSoraRpcEndpoints,
   readConfig,
+  readRuntimeSecurityConfig,
   readSoraArchiveWsEndpoint,
 } from '../src/config.js';
 
 const CONFIG_ENV_KEYS = [
+  'SORA_RECOVERY_POLICY_FILE',
+  'SORA_RECOVERY_POLICY_SHA256',
   'NODE_ENV',
+  'CHAIN_HOURLY_REPAIR_FILE',
+  'CHAIN_HOURLY_REPAIR_SHA256',
   'NODE_OPTIONS',
   'NODE_TLS_REJECT_UNAUTHORIZED',
   'PGOPTIONS',
@@ -65,6 +69,7 @@ const CONFIG_ENV_KEYS = [
   'POSTGRES_WATCH_RECONNECT_MIN_DELAY_MS',
   'POSTGRES_WATCH_RECONNECT_MAX_DELAY_MS',
   'ROCKSDB_PATH',
+  'ROCKSDB_DOCUMENT_COMPRESSION',
   'ROCKSDB_BLOCK_CACHE_MB',
   'ROCKSDB_WRITE_BUFFER_MANAGER_MB',
   'ROCKSDB_PARALLELISM',
@@ -75,21 +80,24 @@ const CONFIG_ENV_KEYS = [
   'ROCKSDB_QUERY_MAX_SCANNED_ROWS',
   'ROCKSDB_COMPACTION_MIN_FREE_GB',
   'SORA_WS_ENDPOINT',
+  'SORA_ARCHIVE_WS_ENDPOINT',
   'CHAIN_START_BLOCK',
   'CHAIN_BATCH_SIZE',
   'CHAIN_STATE_REFRESH_INTERVAL_BLOCKS',
   'CHAIN_SNAPSHOT_INTERVAL_BLOCKS',
+  'CHAIN_SNAPSHOT_RETENTION_MODE',
   'CHAIN_STATE_FULL_RECONCILIATION_INTERVAL_BLOCKS',
   'CHAIN_SHUTDOWN_TIMEOUT_MS',
   'CHAIN_RPC_TIMEOUT_MS',
   'CHAIN_RPC_MAX_IN_FLIGHT',
+  'CHAIN_DERIVED_STORAGE_ENTRIES_PAGE_SIZE',
+  'CHAIN_DERIVED_STORAGE_LOAD_MAX_BYTES',
   'CHAIN_DERIVED_STORAGE_CACHE_MAX_BYTES',
   'CHAIN_ANALYTICS_INPUT_CACHE_MAX_BYTES',
   'CHAIN_BACKFILL_PREFETCH_CONCURRENCY',
   'CHAIN_FINALIZED_CATCHUP_PREFETCH_CONCURRENCY',
   'CHAIN_PRICE_STREAM_REFRESH_INTERVAL_BLOCKS',
   'CHAIN_LEGACY_SORA_BLOCK_TYPES',
-  'SORA_ARCHIVE_WS_ENDPOINT',
   'WORKER_READINESS_MAX_LAG_BLOCKS',
   'WORKER_READINESS_MAX_STALENESS_SECONDS',
   'WORKER_METRICS_HOST',
@@ -112,6 +120,10 @@ const restoreEnv = () => {
   }
 };
 
+const setEnv = (values: Record<string, string>) => {
+  for (const [key, value] of Object.entries(values)) process.env[key] = value;
+};
+
 describe('runtime configuration', () => {
   beforeEach(() => {
     for (const key of CONFIG_ENV_KEYS) delete process.env[key];
@@ -121,6 +133,8 @@ describe('runtime configuration', () => {
 
   it('uses documented development defaults when environment variables are absent', () => {
     expect(readConfig()).toEqual({
+      burnRecoveryPolicy: null,
+      statsRecoveryAdmission: null,
       host: '0.0.0.0',
       port: 4350,
       graphqlPath: '/graphql',
@@ -172,6 +186,7 @@ describe('runtime configuration', () => {
       postgresWatchReconnectMinDelayMs: 100,
       postgresWatchReconnectMaxDelayMs: 10_000,
       rocksdbPath: './data/polkaswap-indexer.rocksdb',
+      rocksdbDocumentCompression: 'none',
       rocksdbBlockCacheMb: 512,
       rocksdbWriteBufferManagerMb: 256,
       rocksdbParallelism: 4,
@@ -182,14 +197,17 @@ describe('runtime configuration', () => {
       rocksdbQueryMaxScannedRows: 100_000,
       rocksdbCompactionMinFreeGb: 10,
       soraWsEndpoint: 'wss://mof2.sora.org',
+      soraArchiveWsEndpoint: null,
       chainStartBlock: 0,
       chainBatchSize: 25,
       stateRefreshIntervalBlocks: 25,
       snapshotIntervalBlocks: 25,
+      snapshotRetentionMode: 'all',
       fullReconciliationIntervalBlocks: 250,
       chainShutdownTimeoutMs: 30_000,
       chainRpcTimeoutMs: 15_000,
       chainRpcMaxInFlight: 256,
+      derivedStorageEntriesPageSize: 256,
       derivedStorageLoadMaxBytes: 268_435_456,
       derivedStorageCacheMaxBytes: 67_108_864,
       analyticsInputCacheMaxBytes: 134_217_728,
@@ -304,13 +322,23 @@ describe('runtime configuration', () => {
     expect(() => assertExplicitProductionWorkerChainInputs()).not.toThrow();
   });
 
-  it('rejects primary/archive hostname aliases regardless of case or a trailing dot', () => {
-    expect(() =>
-      assertIndependentSoraRpcEndpoints(
-        'wss://PRIMARY.example.invalid:443',
-        'wss://primary.example.invalid.:9944'
-      )
-    ).toThrow(/must use different reviewed hosts/);
+  it('accepts an explicitly configured historical node for both production RocksDB roles', () => {
+    setEnv({
+      NODE_ENV: 'production',
+      STORAGE_ENGINE: 'rocksdb',
+      ROCKSDB_PATH: '/tmp/polkaswap-indexer-config-test',
+      SORA_WS_ENDPOINT: 'wss://mof2.sora.org',
+      SORA_ARCHIVE_WS_ENDPOINT: 'wss://mof2.sora.org',
+      CHAIN_START_BLOCK: '26872383',
+    });
+
+    expect(() => assertExplicitProductionWorkerChainInputs()).not.toThrow();
+    expect(readConfig()).toMatchObject({
+      storageEngine: 'rocksdb',
+      soraWsEndpoint: 'wss://mof2.sora.org',
+      archiveSoraWsEndpoint: 'wss://mof2.sora.org',
+    });
+    expect(readSoraArchiveWsEndpoint(true)).toBe('wss://mof2.sora.org');
   });
 
   it('parses every supported override without coercing its type', () => {
@@ -366,6 +394,7 @@ describe('runtime configuration', () => {
       POSTGRES_WATCH_RECONNECT_MIN_DELAY_MS: '250',
       POSTGRES_WATCH_RECONNECT_MAX_DELAY_MS: '5000',
       ROCKSDB_PATH: '/tmp/polkaswap.rocksdb',
+      ROCKSDB_DOCUMENT_COMPRESSION: 'BROTLI',
       ROCKSDB_BLOCK_CACHE_MB: '1024',
       ROCKSDB_WRITE_BUFFER_MANAGER_MB: '512',
       ROCKSDB_PARALLELISM: '8',
@@ -384,6 +413,7 @@ describe('runtime configuration', () => {
       CHAIN_SHUTDOWN_TIMEOUT_MS: '45000',
       CHAIN_RPC_TIMEOUT_MS: '12000',
       CHAIN_RPC_MAX_IN_FLIGHT: '128',
+      CHAIN_DERIVED_STORAGE_ENTRIES_PAGE_SIZE: '1000',
       CHAIN_DERIVED_STORAGE_LOAD_MAX_BYTES: '201326592',
       CHAIN_DERIVED_STORAGE_CACHE_MAX_BYTES: '33554432',
       CHAIN_ANALYTICS_INPUT_CACHE_MAX_BYTES: '67108864',
@@ -405,6 +435,8 @@ describe('runtime configuration', () => {
     });
 
     expect(readConfig()).toEqual({
+      burnRecoveryPolicy: null,
+      statsRecoveryAdmission: null,
       host: '127.0.0.1',
       port: 4444,
       graphqlPath: '/alt-graphql',
@@ -456,6 +488,7 @@ describe('runtime configuration', () => {
       postgresWatchReconnectMinDelayMs: 250,
       postgresWatchReconnectMaxDelayMs: 5_000,
       rocksdbPath: '/tmp/polkaswap.rocksdb',
+      rocksdbDocumentCompression: 'brotli',
       rocksdbBlockCacheMb: 1024,
       rocksdbWriteBufferManagerMb: 512,
       rocksdbParallelism: 8,
@@ -466,14 +499,17 @@ describe('runtime configuration', () => {
       rocksdbQueryMaxScannedRows: 250_000,
       rocksdbCompactionMinFreeGb: 20.5,
       soraWsEndpoint: 'wss://example.invalid:9944',
+      soraArchiveWsEndpoint: 'wss://archive.example.invalid:9944',
       chainStartBlock: 100,
       chainBatchSize: 50,
       stateRefreshIntervalBlocks: 60,
       snapshotIntervalBlocks: 75,
+      snapshotRetentionMode: 'all',
       fullReconciliationIntervalBlocks: 300,
       chainShutdownTimeoutMs: 45_000,
       chainRpcTimeoutMs: 12_000,
       chainRpcMaxInFlight: 128,
+      derivedStorageEntriesPageSize: 1000,
       derivedStorageLoadMaxBytes: 201_326_592,
       derivedStorageCacheMaxBytes: 33_554_432,
       analyticsInputCacheMaxBytes: 67_108_864,
@@ -497,6 +533,186 @@ describe('runtime configuration', () => {
     });
   });
 
+  it('uses bounded abuse-control defaults and disables introspection in production', () => {
+    expect(readRuntimeSecurityConfig()).toEqual({
+      httpMaxBodyBytes: 65_536,
+      httpMaxHeaderBytes: 16_384,
+      httpListenBacklog: 4_096,
+      httpShutdownTimeoutMs: 30_000,
+      httpKeepAliveTimeoutMs: 75_000,
+      httpHeadersTimeoutMs: 80_000,
+      httpRequestTimeoutMs: 30_000,
+      httpMaxConnections: 2_048,
+      httpMaxRequestsPerSocket: 1_000,
+      rateLimitWindowMs: 60_000,
+      rateLimitMax: 600,
+      rateLimitMaxKeys: 20_000,
+      rateLimitGlobalWindowMs: 60_000,
+      rateLimitGlobalMax: 50_000,
+      graphqlMaxDepth: 12,
+      graphqlMaxFields: 300,
+      graphqlMaxAliases: 50,
+      graphqlAllowIntrospection: true,
+      graphqlWsMaxPayloadBytes: 65_536,
+      graphqlWsMaxConnections: 512,
+      graphqlWsMaxConnectionsPerClient: 16,
+      graphqlWsMaxOperationsPerConnection: 32,
+      graphqlWsConnectionInitTimeoutMs: 10_000,
+    });
+
+    process.env.NODE_ENV = 'production';
+    expect(readRuntimeSecurityConfig().graphqlAllowIntrospection).toBe(false);
+    process.env.GRAPHQL_ALLOW_INTROSPECTION = 'true';
+    expect(readRuntimeSecurityConfig().graphqlAllowIntrospection).toBe(true);
+  });
+
+  it('accepts canonical security-limit overrides', () => {
+    setEnv({
+      GRAPHQL_HTTP_MAX_BODY_BYTES: '32768',
+      HTTP_MAX_HEADER_BYTES: '8192',
+      HTTP_LISTEN_BACKLOG: '256',
+      HTTP_SHUTDOWN_TIMEOUT_MS: '5000',
+      HTTP_KEEP_ALIVE_TIMEOUT_MS: '10000',
+      HTTP_HEADERS_TIMEOUT_MS: '11000',
+      HTTP_REQUEST_TIMEOUT_MS: '12000',
+      HTTP_MAX_CONNECTIONS: '128',
+      HTTP_MAX_REQUESTS_PER_SOCKET: '100',
+      RATE_LIMIT_WINDOW_MS: '10000',
+      RATE_LIMIT_MAX: '50',
+      RATE_LIMIT_MAX_KEYS: '500',
+      RATE_LIMIT_GLOBAL_WINDOW_MS: '20000',
+      RATE_LIMIT_GLOBAL_MAX: '1000',
+      GRAPHQL_MAX_DEPTH: '8',
+      GRAPHQL_MAX_FIELDS: '100',
+      GRAPHQL_MAX_ALIASES: '10',
+      GRAPHQL_ALLOW_INTROSPECTION: 'false',
+      GRAPHQL_WS_MAX_PAYLOAD_BYTES: '16384',
+      GRAPHQL_WS_MAX_CONNECTIONS: '100',
+      GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT: '4',
+      GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION: '8',
+      GRAPHQL_WS_CONNECTION_INIT_TIMEOUT_MS: '5000',
+    });
+    const security = readRuntimeSecurityConfig();
+    expect(security.httpMaxBodyBytes).toBe(32_768);
+    expect(security.httpMaxConnections).toBe(128);
+    expect(security.rateLimitMaxKeys).toBe(500);
+    expect(security.graphqlMaxDepth).toBe(8);
+    expect(security.graphqlAllowIntrospection).toBe(false);
+    expect(security.graphqlWsMaxOperationsPerConnection).toBe(8);
+  });
+
+  it('rejects malformed, ambiguous, unsafe, and out-of-range scalar settings', () => {
+    const cases: Array<[Record<string, string>, RegExp]> = [
+      [{ NODE_ENV: '' }, /NODE_ENV must be development, test, or production/],
+      [{ NODE_ENV: 'prod' }, /NODE_ENV must be development, test, or production/],
+      [{ HOST: 'bad host' }, /HOST must be a hostname or IP address/],
+      [{ HOST: '   ' }, /HOST must be a non-empty single-line value/],
+      [{ PORT: '' }, /PORT must be an integer/],
+      [{ PORT: '0' }, /PORT must be an integer/],
+      [{ PORT: '-1' }, /PORT must be an integer/],
+      [{ PORT: '+4350' }, /PORT must be an integer/],
+      [{ PORT: '04350' }, /PORT must be an integer/],
+      [{ PORT: '4350.5' }, /PORT must be an integer/],
+      [{ PORT: '4e3' }, /PORT must be an integer/],
+      [{ PORT: '65536' }, /PORT must be an integer/],
+      [{ PORT: '9007199254740993' }, /PORT must be an integer/],
+      [{ GRAPHQL_PATH: 'graphql' }, /GRAPHQL_PATH must be an absolute URL path/],
+      [{ GRAPHQL_PATH: '//evil.example/graphql' }, /GRAPHQL_PATH must be an absolute URL path/],
+      [{ GRAPHQL_PATH: '/graphql?admin=true' }, /GRAPHQL_PATH must be an absolute URL path/],
+      [{ GRAPHQL_PATH: '/graphql#fragment' }, /GRAPHQL_PATH must be an absolute URL path/],
+      [{ GRAPHQL_PATH: '/../graphql' }, /GRAPHQL_PATH must be an absolute URL path/],
+      [{ GRAPHQL_PATH: '/%2e%2e/graphql' }, /GRAPHQL_PATH must be an absolute URL path/],
+      [{ CHAIN_START_BLOCK: '-1' }, /CHAIN_START_BLOCK must be an integer/],
+      [{ CHAIN_BATCH_SIZE: '0' }, /CHAIN_BATCH_SIZE must be an integer/],
+      [{ CHAIN_BATCH_SIZE: '25junk' }, /CHAIN_BATCH_SIZE must be an integer/],
+      [{ CHAIN_STATE_REFRESH_INTERVAL_BLOCKS: '1.5' }, /must be an integer/],
+      [{ CHAIN_SNAPSHOT_INTERVAL_BLOCKS: '0' }, /must be an integer/],
+    ];
+
+    for (const [values, expected] of cases) {
+      setEnv(values);
+      expect(readConfig).toThrow(expected);
+      for (const key of Object.keys(values)) delete process.env[key];
+    }
+  });
+
+  it('fails closed on invalid service URLs and missing production database configuration', () => {
+    const cases: Array<[Record<string, string>, RegExp]> = [
+      [{ NODE_ENV: 'production' }, /DATABASE_URL is required/],
+      [{ DATABASE_URL: 'not-a-url' }, /DATABASE_URL must be a valid URL/],
+      [{ DATABASE_URL: 'https://db.example.invalid/indexer' }, /unsupported URL scheme/],
+      [{ DATABASE_URL: 'postgres://db.example.invalid' }, /must include a database name/],
+      [{ DATABASE_URL: 'postgres://db.example.invalid/indexer#secret' }, /must not contain a URL fragment/],
+      [{ SORA_WS_ENDPOINT: 'not-a-url' }, /SORA_WS_ENDPOINT must be a valid URL/],
+      [{ SORA_WS_ENDPOINT: 'https://sora.example.invalid' }, /unsupported URL scheme/],
+      [{ SORA_WS_ENDPOINT: 'ws://sora.example.invalid' }, /must use TLS outside localhost/],
+      [{ SORA_WS_ENDPOINT: 'wss://operator:secret@sora.example.invalid' }, /must not contain URL credentials/],
+      [{ SORA_WS_ENDPOINT: 'wss://sora.example.invalid/socket?api_key=secret' }, /must not contain URL credentials or a query string/],
+      [{ SORA_WS_ENDPOINT: 'wss://sora.example.invalid/socket#secret' }, /must not contain a URL fragment/],
+    ];
+
+    for (const [values, expected] of cases) {
+      setEnv(values);
+      expect(readConfig).toThrow(expected);
+      for (const key of Object.keys(values)) delete process.env[key];
+    }
+
+    process.env.SORA_WS_ENDPOINT = 'ws://127.0.0.1:9944';
+    expect(readConfig().soraWsEndpoint).toBe('ws://127.0.0.1:9944');
+  });
+
+  it('reads an optional archive endpoint and requires it for production worker startup', () => {
+    expect(readSoraArchiveWsEndpoint()).toBeNull();
+    expect(() => readSoraArchiveWsEndpoint(true)).toThrow(
+      /SORA_ARCHIVE_WS_ENDPOINT:.*required for the production worker/,
+    );
+
+    process.env.SORA_ARCHIVE_WS_ENDPOINT = 'wss://archive.sora.example/ws';
+    expect(readSoraArchiveWsEndpoint(true)).toBe('wss://archive.sora.example/ws');
+    process.env.SORA_ARCHIVE_WS_ENDPOINT = 'ws://127.0.0.1:9944';
+    expect(readSoraArchiveWsEndpoint(true)).toBe('ws://127.0.0.1:9944');
+  });
+
+  it.each([
+    ['   ', /non-empty single-line value/],
+    ['not a URL', /must be a valid URL/],
+    ['https://archive.sora.org', /unsupported URL scheme/],
+    ['ftp://archive.sora.org', /unsupported URL scheme/],
+    ['ws://archive.sora.org', /must use TLS outside localhost/],
+    ['wss://user:secret@archive.sora.org', /must not contain URL credentials/],
+    ['wss://archive.sora.org/?token=secret', /must not contain URL credentials or a query string/],
+    ['wss://archive.sora.org/#mainnet', /must not contain a URL fragment/],
+    ['wss://archive.sora.org/\nsecond-line', /non-empty single-line value/],
+  ])('rejects malformed archive endpoint %j', (value, expected) => {
+    process.env.SORA_ARCHIVE_WS_ENDPOINT = value;
+    expect(readSoraArchiveWsEndpoint).toThrow(expected);
+  });
+
+  it('rejects malformed and unsafe security-limit settings', () => {
+    const cases: Array<[Record<string, string>, RegExp]> = [
+      [{ GRAPHQL_HTTP_MAX_BODY_BYTES: '1023' }, /GRAPHQL_HTTP_MAX_BODY_BYTES must be an integer/],
+      [{ HTTP_MAX_HEADER_BYTES: '65537' }, /HTTP_MAX_HEADER_BYTES must be an integer/],
+      [{ HTTP_MAX_CONNECTIONS: '0' }, /HTTP_MAX_CONNECTIONS must be an integer/],
+      [{ HTTP_KEEP_ALIVE_TIMEOUT_MS: '10000', HTTP_HEADERS_TIMEOUT_MS: '10000' }, /HTTP_HEADERS_TIMEOUT_MS must be an integer/],
+      [{ RATE_LIMIT_MAX: '0' }, /RATE_LIMIT_MAX must be an integer/],
+      [{ RATE_LIMIT_MAX_KEYS: '0' }, /RATE_LIMIT_MAX_KEYS must be an integer/],
+      [{ RATE_LIMIT_GLOBAL_MAX: '0' }, /RATE_LIMIT_GLOBAL_MAX must be an integer/],
+      [{ GRAPHQL_MAX_DEPTH: '0' }, /GRAPHQL_MAX_DEPTH must be an integer/],
+      [{ GRAPHQL_MAX_FIELDS: '10001' }, /GRAPHQL_MAX_FIELDS must be an integer/],
+      [{ GRAPHQL_MAX_ALIASES: '-1' }, /GRAPHQL_MAX_ALIASES must be an integer/],
+      [{ GRAPHQL_ALLOW_INTROSPECTION: 'sometimes' }, /GRAPHQL_ALLOW_INTROSPECTION must be one of/],
+      [{ GRAPHQL_WS_MAX_PAYLOAD_BYTES: '1e5' }, /GRAPHQL_WS_MAX_PAYLOAD_BYTES must be an integer/],
+      [{ GRAPHQL_WS_MAX_CONNECTIONS: '0' }, /GRAPHQL_WS_MAX_CONNECTIONS must be an integer/],
+      [{ GRAPHQL_WS_MAX_CONNECTIONS_PER_CLIENT: '0' }, /must be an integer/],
+      [{ GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION: '0' }, /must be an integer/],
+      [{ GRAPHQL_WS_CONNECTION_INIT_TIMEOUT_MS: '999' }, /must be an integer/],
+    ];
+    for (const [values, expected] of cases) {
+      setEnv(values);
+      expect(readRuntimeSecurityConfig).toThrow(expected);
+      for (const key of Object.keys(values)) delete process.env[key];
+    }
+  });
   it.each([
     ['PORT', '0', 'at least 1'],
     ['PORT', '65536', 'at most 65535'],
@@ -679,6 +895,16 @@ describe('runtime configuration', () => {
     expect(readConfig().finalizedCatchupPrefetchConcurrency).toBe(7);
   });
 
+  it.each(['all', 'rolling'])('accepts the explicit %s snapshot retention mode', (mode) => {
+    process.env.CHAIN_SNAPSHOT_RETENTION_MODE = mode;
+    expect(readConfig().snapshotRetentionMode).toBe(mode);
+  });
+
+  it.each(['', 'none', 'all,rolling'])('rejects invalid snapshot retention mode %j', (mode) => {
+    process.env.CHAIN_SNAPSHOT_RETENTION_MODE = mode;
+    expect(() => readConfig()).toThrow(/Invalid CHAIN_SNAPSHOT_RETENTION_MODE:.*all, rolling/);
+  });
+
   it('rejects HTTP timeout relationships that allow slow or ambiguous connection teardown', () => {
     process.env.HTTP_HEADERS_TIMEOUT_MS = '75000';
     expect(() => readConfig()).toThrow(/Invalid HTTP_HEADERS_TIMEOUT_MS:.*greater than HTTP_KEEP_ALIVE_TIMEOUT_MS/);
@@ -694,5 +920,30 @@ describe('runtime configuration', () => {
     expect(() => readConfig()).toThrow(
       /Invalid POSTGRES_WATCH_RECONNECT_MAX_DELAY_MS:.*POSTGRES_WATCH_RECONNECT_MIN_DELAY_MS/
     );
+  });
+});
+
+describe('checked hourly repair startup configuration', () => {
+  it('requires the explicit artifact path and SHA together', () => {
+    process.env.CHAIN_HOURLY_REPAIR_FILE = '/tmp/checked-history.jsonl';
+    expect(() => readConfig()).toThrow('both values');
+    process.env.CHAIN_HOURLY_REPAIR_SHA256 = 'not-a-checksum';
+    expect(() => readConfig()).toThrow('lowercase SHA-256');
+    process.env.CHAIN_HOURLY_REPAIR_SHA256 = 'a'.repeat(64);
+    expect(readConfig()).toMatchObject({ hourlyRepairFile: '/tmp/checked-history.jsonl', hourlyRepairSha256: 'a'.repeat(64) });
+  });
+});
+
+
+describe('fresh RocksDB document compression configuration', () => {
+  beforeEach(() => { for (const key of CONFIG_ENV_KEYS) delete process.env[key]; });
+  afterEach(restoreEnv);
+  it.each(['none', 'brotli'] as const)('accepts only the explicit %s mode', (mode) => {
+    process.env.ROCKSDB_DOCUMENT_COMPRESSION = mode;
+    expect(readConfig().rocksdbDocumentCompression).toBe(mode);
+  });
+  it.each(['gzip', 'br', 'true', '3'])('rejects unsupported mode %s', (mode) => {
+    process.env.ROCKSDB_DOCUMENT_COMPRESSION = mode;
+    expect(() => readConfig()).toThrow(/ROCKSDB_DOCUMENT_COMPRESSION/);
   });
 });

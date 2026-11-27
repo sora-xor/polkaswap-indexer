@@ -1,9 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
+import { TypeRegistry } from '@polkadot/types';
+import legacyTypes from '../src/runtime/sora-legacy-types.json' with { type: 'json' };
+import sixFieldAsset from './fixtures/historical-assets/asset-infos-six-field.json' with { type: 'json' };
 
 import { readConfig } from '../src/config.js';
 import { MemoryRepository } from '../src/repository/memory.js';
 import { SORA_MAINNET_GENESIS_HASH } from '../src/soraIdentity.js';
 import { ChainIndexer, summarizeExactPoolLiquidity } from '../src/worker/chain.js';
+import { assetHourlyCloseId, directXorPoolEvidence, HOURLY_HISTORY_ASSETS, selectHourlyHistoryTargets } from '../src/worker/hourly-history.js';
+import { pinnedValuationStorage } from './pinned-valuation-storage.js';
 
 const SCALE = 10n ** 18n;
 const XOR = '0x0200000000000000000000000000000000000000000000000000000000000000';
@@ -83,6 +88,7 @@ const fetchedBlock = (
   timestamp = 1_700_000_000 + height
 ) => {
   const requestedHash = `0x${height.toString(16).padStart(64, '0')}`;
+
   return {
     requestedHash,
     signedBlock: {
@@ -90,6 +96,7 @@ const fetchedBlock = (
         header: {
           number: { toNumber: () => height },
           hash: { toString: () => requestedHash },
+          parentHash: { toString: () => `0x${(height - 1).toString(16).padStart(64, '0')}` },
         },
         extrinsics,
       },
@@ -129,15 +136,173 @@ const historicalState = (blockHeight = 9) => ({
   orderBookLiquidityComplete: false,
 });
 
+/** Models ValueQuery: missing storage decodes to zero, but its pinned size is zero. */
+const poolStorage = (stored: Map<string, string[]>) => Object.assign(
+  vi.fn(async (base: string, target: string) => stored.get(`${base}\0${target}`) ?? ['0', '0']),
+  {
+    size: vi.fn(async (base: string, target: string) => ({ toString: (): string => stored.has(`${base}\0${target}`) ? '32' : '0' })),
+    // Full pinned scans (hourly closes and unattributed swaps) see exactly the stored keys.
+    entriesPaged: vi.fn(async () => [...stored].map(([key, value]) => [{ args: key.split('\0') }, value])),
+  },
+);
+
 const prepareState = (indexer: ChainIndexer, blockHeight = 9) => {
   (indexer as unknown as { observedGenesisHash: string }).observedGenesisHash =
     SORA_MAINNET_GENESIS_HASH;
   const state = historicalState(blockHeight);
+  (indexer as any).observedGenesisHash = SORA_MAINNET_GENESIS_HASH;
   (indexer as any).recalculateHistoricalValuationState(state);
   return state;
 };
 
 describe('historical valuation state', () => {
+  it('loads the original assetInfos tuples from the pinned pre-v2 runtime', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const assetInfos = { entriesPaged: vi.fn(async () => [
+      [{ args: [XOR] }, { toHuman: () => ['XOR', 'SORA Nexus', '18', true] }],
+      [{ args: [KUSD] }, { toHuman: () => ['KUSD', 'Kensetsu USD', '6', false] }],
+    ]) };
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({
+      assets: { assetInfos }, poolXYK: { reserves: { entriesPaged: async () => [] } },
+    }));
+    const state = await indexer.initializeHistoricalValuationState(1);
+    expect(indexer.getHistoricalValuationQueryAt).toHaveBeenCalledWith(0, undefined, expect.any(Function));
+    expect(state.assets.get(XOR)).toEqual({ id: XOR, symbol: 'XOR', name: 'SORA Nexus', decimals: 18, supply: 0n });
+    expect(state.assets.get(KUSD).decimals).toBe(6);
+    expect(assetInfos.entriesPaged).toHaveBeenCalled();
+  });
+
+  it.each([sixFieldAsset.codecType, sixFieldAsset.laterCodec.codecType])('decodes historical six-field AssetInfos bytes as %s', codecType => {
+    const registry = new TypeRegistry(); registry.register(legacyTypes);
+    const tuple = registry.createType(codecType, sixFieldAsset.scaleHex);
+    expect(tuple.toHuman()).toEqual(sixFieldAsset.human);
+    expect(tuple.toHex()).toBe(sixFieldAsset.scaleHex);
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    expect(indexer.parseHistoricalAssetInfo(sixFieldAsset.assetId, tuple)).toEqual({
+      id: sixFieldAsset.assetId, symbol: 'TINFOIL', name: 'Tinfoil Brigade', decimals: 18, supply: 0n,
+    });
+  });
+
+  it('retains six-field metadata with present optional text without changing valuation fields', () => {
+    const registry = new TypeRegistry(); registry.register(legacyTypes);
+    const tuple = registry.createType(sixFieldAsset.codecType,
+      ['TINFOIL', 'Tinfoil Brigade', 18, true, 'ipfs://historical-content', 'Historical description']);
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    expect(indexer.parseHistoricalAssetInfo(sixFieldAsset.assetId, tuple)).toEqual({
+      id: sixFieldAsset.assetId, ...sixFieldAsset.normalized, supply: 0n,
+    });
+  });
+
+  it('uses legacy point reads for changed asset metadata without changing amounts', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const state = prepareState(indexer);
+    const assetInfos = Object.assign(vi.fn(async () => ({ toHuman: () => ['KUSD', 'Kensetsu USD', '6', true] })),
+      { size: vi.fn(async () => '32') });
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ assets: { assetInfos } }));
+    indexer.collectHistoricalValuationTouches = vi.fn(() => ({ assets: new Map([[KUSD, KUSD]]),
+      pools: new Map(), invalidated: false, orderBookChanged: false }));
+    const advance = await indexer.prepareHistoricalValuationAdvance(state, 10, [], []);
+    expect(assetInfos).toHaveBeenCalledWith(KUSD);
+    expect(assetInfos.size).toHaveBeenCalledWith(KUSD);
+    expect(advance.assets).toEqual([{ id: KUSD, value: { id: KUSD, symbol: 'KUSD', name: 'Kensetsu USD', decimals: 6, supply: 0n } }]);
+    expect(state.assets.get(KUSD)?.decimals).toBe(18);
+  });
+
+  it('distinguishes a removed legacy asset from its ValueQuery default and rejects unknown presence', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const state = prepareState(indexer);
+    const assetInfos = Object.assign(vi.fn(async () => ({ toHuman: () => ['', '', '0', false] })),
+      { size: vi.fn(async () => '0') });
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ assets: { assetInfos } }));
+    indexer.collectHistoricalValuationTouches = vi.fn(() => ({ assets: new Map([[KUSD, KUSD]]),
+      pools: new Map(), invalidated: false, orderBookChanged: false }));
+    const advance = await indexer.prepareHistoricalValuationAdvance(state, 10, [], []);
+    expect(advance.assets).toEqual([{ id: KUSD, value: null }]);
+    expect(assetInfos).not.toHaveBeenCalled();
+    assetInfos.size.mockResolvedValue('invalid');
+    await expect(indexer.prepareHistoricalValuationAdvance(state, 10, [], [])).rejects.toThrow('invalid storage size');
+    indexer.getHistoricalValuationQueryAt.mockResolvedValue({ assets: { assetInfos: vi.fn() } });
+    await expect(indexer.prepareHistoricalValuationAdvance(state, 10, [], [])).rejects.toThrow('assets.assetInfos.size is required');
+    expect(state.assets.has(KUSD)).toBe(true);
+  });
+
+  it('prefers declared v2 storage and never hides a broken v2 reader with legacy data', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const assetInfos = { entriesPaged: vi.fn(async () => []) };
+    const assetInfosV2 = { entriesPaged: vi.fn(async () => []) };
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ assets: { assetInfos, assetInfosV2 },
+      poolXYK: { reserves: { entriesPaged: async () => [] } } }));
+    await indexer.initializeHistoricalValuationState(10);
+    expect(assetInfosV2.entriesPaged).toHaveBeenCalled();
+    expect(assetInfos.entriesPaged).not.toHaveBeenCalled();
+    indexer.getHistoricalValuationQueryAt.mockResolvedValue({ assets: { assetInfos, assetInfosV2: {} } });
+    await expect(indexer.initializeHistoricalValuationState(10)).rejects.toThrow('assets.assetInfosV2.entriesPaged is required');
+    expect(assetInfos.entriesPaged).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['XOR', 'SORA Nexus', '18'], ['XOR', 'SORA Nexus', '18', 'true'],
+    ['XOR', 'SORA Nexus', '-1', true], ['XOR', 'SORA Nexus', '256', true],
+    ['XOR', 'SORA Nexus', '18', true, null], ['XOR', 'SORA Nexus', '18', true, null, null, null],
+    ['XOR', 'SORA Nexus', '18', true, {}, null], ['XOR', 'SORA Nexus', '18', true, null, 3],
+    ['XOR', 'SORA Nexus', '18', true, undefined, null],
+  ])('rejects malformed legacy asset tuple %j', (...tuple) => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    expect(() => indexer.parseHistoricalAssetInfo(XOR, { toHuman: () => tuple })).toThrow(/legacy tuple|precision/);
+  });
+
+  it('retains the exact recovery baseline query hash and rejects a different archive or primary hash', async () => {
+    const indexer = new ChainIndexer({ ...config, burnRecoveryPolicy: {} as never }, new MemoryRepository()) as any;
+    const state = historicalState();
+    const hash = `0x${'09'.repeat(32)}`, otherHash = `0x${'0a'.repeat(32)}`;
+    const archiveHash = vi.fn(async () => ({ toString: () => hash }));
+    const primaryHash = vi.fn(async () => ({ toString: () => hash }));
+    const archiveAt = vi.fn(async () => ({ query: pinnedValuationStorage(() => state) }));
+    const archive = { rpc: { chain: { getBlockHash: archiveHash } }, at: archiveAt };
+    indexer.api = { rpc: { chain: { getBlockHash: primaryHash } } };
+    indexer.getBlockDataApi = vi.fn(async () => archive);
+    const loaded = await indexer.loadHistoricalValuationBaseline(9, 'recovery-test', hash);
+    expect(loaded).toMatchObject({ blockHeight: 9, blockHash: hash });
+    expect(archiveAt).toHaveBeenCalledWith(hash);
+    archiveAt.mockClear(); archiveHash.mockImplementationOnce(async () => ({ toString: () => otherHash }));
+    await expect(indexer.loadHistoricalValuationBaseline(9, 'recovery-test', hash)).rejects.toThrow('verified parent hash');
+    expect(archiveAt).not.toHaveBeenCalled();
+    primaryHash.mockImplementationOnce(async () => ({ toString: () => otherHash }));
+    await expect(indexer.loadHistoricalValuationBaseline(9, 'recovery-test', hash)).rejects.toThrow('verified parent hash');
+    expect(archiveAt).not.toHaveBeenCalled();
+  });
+
+  it('pins recovery point reads and full reloads to the indexed hash and advances identity only after application', async () => {
+    const indexer = new ChainIndexer({ ...config, burnRecoveryPolicy: {} as never }, new MemoryRepository()) as any;
+    const state = { ...prepareState(indexer), blockHash: `0x${'09'.repeat(32)}` };
+    const hash = `0x${'0a'.repeat(32)}`;
+    const query = { poolXYK: { reserves: poolStorage(new Map([[`${XOR}\0${KUSD}`, ['100', '400']]])) } };
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => query);
+    const events = [eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD })];
+    await expect(indexer.prepareHistoricalValuationAdvance(state, 10, [], events)).rejects.toThrow('exact indexed block hash');
+    const advance = await indexer.prepareHistoricalValuationAdvance(state, 10, [], events, hash);
+    expect(indexer.getHistoricalValuationQueryAt).toHaveBeenCalledWith(10, hash);
+    expect(state).toMatchObject({ blockHeight: 9, blockHash: `0x${'09'.repeat(32)}` });
+    indexer.applyHistoricalValuationAdvance(state, advance);
+    expect(state).toMatchObject({ blockHeight: 10, blockHash: hash });
+    const reloaded = { ...state, blockHeight: 11, blockHash: `0x${'0b'.repeat(32)}` };
+    indexer.loadHistoricalValuationBaseline = vi.fn(async () => reloaded);
+    indexer.collectHistoricalValuationTouches = vi.fn(() => ({ assets: new Map(), pools: new Map(), invalidated: true, orderBookChanged: false }));
+    const replacement = await indexer.prepareHistoricalValuationAdvance(state, 11, [], [], reloaded.blockHash);
+    expect(indexer.loadHistoricalValuationBaseline).toHaveBeenCalledWith(11, 'invalidated', reloaded.blockHash);
+    expect(state.blockHeight).toBe(10);
+    indexer.applyHistoricalValuationAdvance(state, replacement);
+    expect(state).toMatchObject({ blockHeight: 11, blockHash: reloaded.blockHash });
+  });
+
+  it('does not publish an unbound live cache over the recovery historical state', () => {
+    const indexer = new ChainIndexer({ ...config, burnRecoveryPolicy: {} as never }, new MemoryRepository()) as any;
+    const state = { ...prepareState(indexer), blockHash: `0x${'09'.repeat(32)}` };
+    indexer.liveValuationState = state;
+    expect(indexer.publishLiveValuationState(9, state.assets, state.pools.values(), new Map([[XOR, 99n * SCALE]]), state.networkLiquidityStats)).toBe(false);
+    expect(indexer.liveValuationState).toBe(state);
+  });
+
   it('sums exact pool liquidity before display rounding and counts positive dust pools', () => {
     expect(summarizeExactPoolLiquidity([5_000_000_000n, 5_000_000_000n, 5_000_000_000n, 5_000_000_000n])).toEqual({
       poolLiquidityUSD: '0.00000002',
@@ -169,7 +334,8 @@ describe('historical valuation state', () => {
     const account = await repository.get('accountMeta', 'alice');
     expect(history?.data.data).toMatchObject({ amountUSD: '2' });
     expect(network?.data).toMatchObject({
-      volumeUSD: '2',
+      volumeUSD: '0',
+      swaps: 0,
       poolLiquidityUSD: '400',
       liquidityUSD: null,
       orderBookLiquidityUSD: null,
@@ -197,7 +363,7 @@ describe('historical valuation state', () => {
     });
     indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({
       assets: {},
-      poolXYK: { reserves },
+      poolXYK: { reserves: Object.assign(reserves, { size: async (base: string, target: string) => base === XOR && target === KUSD ? 32 : 0 }) },
     }));
 
     await indexer.indexFetchedBlock(
@@ -216,7 +382,7 @@ describe('historical valuation state', () => {
     expect(state.blockHeight).toBe(10);
     expect(state.prices.get(XOR)).toBe(4n * SCALE);
     expect(maximumActiveReads).toBe(1);
-    expect(reserves).toHaveBeenCalledTimes(2);
+    expect(reserves).toHaveBeenCalledTimes(1);
 
     await indexer.indexFetchedBlock(
       fetchedBlock(
@@ -245,10 +411,7 @@ describe('historical valuation state', () => {
     indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({
       assets: {},
       poolXYK: {
-        reserves: async (base: string, target: string) =>
-          base === XOR && target === KUSD
-            ? [(100n * SCALE).toString(), (400n * SCALE).toString()]
-            : { isNone: true },
+        reserves: poolStorage(new Map([[`${XOR}\0${KUSD}`, [(100n * SCALE).toString(), (400n * SCALE).toString()]]])),
       },
     }));
     vi.spyOn(repository, 'upsertMany').mockRejectedValueOnce(new Error('atomic write failed'));
@@ -267,6 +430,148 @@ describe('historical valuation state', () => {
     expect(state.blockHeight).toBe(9);
     expect(state.prices.get(XOR)).toBe(2n * SCALE);
     expect(await repository.get('updatesStreams', 'chainState')).toBeNull();
+  });
+
+  it('removes absent ValueQuery reverse keys without creating duplicate hourly evidence', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const state = prepareState(indexer);
+    const reserves = poolStorage(new Map([[`${XOR}\0${KUSD}`, ['100', '200']]]));
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    const advance = await indexer.prepareHistoricalValuationAdvance(state, 10, [], [
+      eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD }),
+    ]);
+    expect(reserves.size).toHaveBeenCalledWith(XOR, KUSD);
+    expect(reserves.size).toHaveBeenCalledWith(KUSD, XOR);
+    expect(reserves).not.toHaveBeenCalledWith(KUSD, XOR);
+    expect(advance.pools).toContainEqual({ id: `${KUSD}\0${XOR}`, value: null });
+    indexer.applyHistoricalValuationAdvance(state, advance);
+    expect(state.pools.size).toBe(1);
+    expect(() => selectHourlyHistoryTargets(state.assets, [...state.pools.values()], HOURLY_HISTORY_ASSETS)).not.toThrow();
+  });
+
+  it('retains an explicitly stored zero-reserve pool as real direct XOR evidence', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const state = prepareState(indexer);
+    const reserves = poolStorage(new Map([[`${XOR}\0${KUSD}`, ['0', '0']]]));
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    const advance = await indexer.prepareHistoricalValuationAdvance(state, 10, [], [
+      eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD }),
+    ]);
+    indexer.applyHistoricalValuationAdvance(state, advance);
+    expect(state.pools.size).toBe(1);
+    expect(directXorPoolEvidence(KUSD, { assets: state.assets, pools: [...state.pools.values()], xorPoolsComplete: true }))
+      .toMatchObject({ baseAssetReserves: '0', targetAssetReserves: '0' });
+  });
+
+  it('represents reversed remove/recreate and later removal from the same pinned storage presence', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const state = prepareState(indexer);
+    const stored = new Map([[`${KUSD}\0${XOR}`, ['200', '100']]]);
+    const reserves = poolStorage(stored);
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    const events = [eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD })];
+    indexer.applyHistoricalValuationAdvance(state, await indexer.prepareHistoricalValuationAdvance(state, 10, [], events));
+    expect([...state.pools.keys()]).toEqual([`${KUSD}\0${XOR}`]);
+    stored.clear();
+    indexer.applyHistoricalValuationAdvance(state, await indexer.prepareHistoricalValuationAdvance(state, 11, [], events));
+    expect(state.pools.size).toBe(0);
+    stored.set(`${XOR}\0${KUSD}`, ['0', '0']);
+    indexer.applyHistoricalValuationAdvance(state, await indexer.prepareHistoricalValuationAdvance(state, 12, [], events));
+    expect([...state.pools.keys()]).toEqual([`${XOR}\0${KUSD}`]);
+  });
+
+  it.each(['size', 'value'])('fails atomically on a %s query error and retries the same block', async (failure) => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as any;
+    const state = prepareState(indexer);
+    const original = structuredClone(state);
+    const reserves = poolStorage(new Map([[`${XOR}\0${KUSD}`, ['100', '400']]]));
+    if (failure === 'size') reserves.size.mockRejectedValueOnce(new Error('pinned size unavailable'));
+    else reserves.mockRejectedValueOnce(new Error('pinned value unavailable'));
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    const block = fetchedBlock(10, [], [eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD })]);
+    const writes = vi.spyOn(repository, 'upsertMany');
+    await expect(indexer.indexFetchedBlock(block, { historicalValuationState: state })).rejects.toThrow(/pinned .* unavailable/);
+    expect(state).toEqual(original);
+    expect(writes).not.toHaveBeenCalled();
+    expect(await repository.get('updatesStreams', 'chainState')).toBeNull();
+    await indexer.indexFetchedBlock(block, { historicalValuationState: state });
+    expect(state.blockHeight).toBe(10);
+    expect(state.pools.size).toBe(1);
+    expect((await repository.get('updatesStreams', 'chainState'))?.blockHeight).toBe(10);
+  });
+
+  it('requires a pinned presence capability instead of falling back to decoded reserve amounts', async () => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const state = prepareState(indexer);
+    const reserves = vi.fn(async () => ['0', '0']);
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    await expect(indexer.prepareHistoricalValuationAdvance(state, 10, [], [
+      eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD }),
+    ])).rejects.toThrow('point and size reads are required');
+    expect(reserves).not.toHaveBeenCalled();
+    expect(state.blockHeight).toBe(9);
+  });
+
+  it.each(['-1', 'NaN', '9007199254740992', ''])('rejects malformed pinned size %j without treating it as absence', async (size) => {
+    const indexer = new ChainIndexer(config, new MemoryRepository()) as any;
+    const state = prepareState(indexer);
+    const reserves = poolStorage(new Map());
+    reserves.size.mockResolvedValue({ toString: () => size });
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    await expect(indexer.prepareHistoricalValuationAdvance(state, 10, [], [
+      eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD }),
+    ])).rejects.toThrow('invalid storage size');
+    expect(reserves).not.toHaveBeenCalled();
+    expect(state.blockHeight).toBe(9);
+  });
+
+  it('still rejects genuinely stored duplicate XOR orientations at an hourly boundary', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as any;
+    const state = prepareState(indexer);
+    const reserves = poolStorage(new Map([[`${XOR}\0${KUSD}`, ['0', '0']], [`${KUSD}\0${XOR}`, ['0', '0']]]));
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({ poolXYK: { reserves } }));
+    const advance = await indexer.prepareHistoricalValuationAdvance(state, 10, [], [
+      eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD }),
+    ]);
+    indexer.applyHistoricalValuationAdvance(state, advance);
+    expect(state.pools.size).toBe(2);
+    expect(() => selectHourlyHistoryTargets(state.assets, [...state.pools.values()], HOURLY_HISTORY_ASSETS)).toThrow('Ambiguous direct XOR pool evidence');
+  });
+
+  it('retries a failed hour-boundary read and commits the close and checkpoint exactly once', async () => {
+    const repository = new MemoryRepository();
+    const indexer = new ChainIndexer(config, repository) as any;
+    const state = prepareState(indexer);
+    indexer.api = { genesisHash: { toString: () => SORA_MAINNET_GENESIS_HASH } };
+    indexer.previousHourlyHistoryBlock = { height: 9, hash: `0x${'9'.padStart(64, '0')}`, timestamp: 7198 };
+    const reserves = poolStorage(new Map([[`${XOR}\0${KUSD}`, [(100n * SCALE).toString(), (400n * SCALE).toString()]]]));
+    indexer.getHistoricalValuationQueryAt = vi.fn(async () => ({
+      assets: pinnedValuationStorage(() => state).assets,
+      poolXYK: { reserves }, denomination: { denominator: async () => ({ toString: (): string => '100000000000000000000000000000000000000' }) },
+    }));
+    const events = [eventRecord('poolXYK', 'ReservesChanged', { baseAssetId: XOR, targetAssetId: KUSD })];
+    await indexer.indexFetchedBlock(fetchedBlock(10, [], events, 7199), { historicalValuationState: state, refreshDerivedState: false });
+    expect(state.pools.size).toBe(1);
+    const closeId = assetHourlyCloseId(KUSD, 7199);
+    const block = fetchedBlock(11, [], events, 7201);
+    reserves.size.mockRejectedValueOnce(new Error('boundary size unavailable'));
+    await expect(indexer.indexFetchedBlock(block, { historicalValuationState: state, refreshDerivedState: false })).rejects.toThrow('boundary size unavailable');
+    expect(state.blockHeight).toBe(10);
+    expect(indexer.previousHourlyHistoryBlock.height).toBe(10);
+    expect((await repository.get('updatesStreams', 'chainState'))?.blockHeight).toBe(10);
+    expect(await repository.get('assetSnapshots', closeId)).toBeNull();
+    const writes = vi.spyOn(repository, 'upsertMany');
+    await indexer.indexFetchedBlock(block, { historicalValuationState: state, refreshDerivedState: false });
+    const commits = writes.mock.calls.filter(([documents]) => documents.some(({ id }) => id === 'chainState'));
+    expect(commits).toHaveLength(1);
+    expect(commits[0]![0].map(({ id }) => id)).toContain(closeId);
+    expect((await repository.get('assetSnapshots', closeId))?.data.closeEvidence).toMatchObject({
+      xorPool: { baseAssetReserves: (100n * SCALE).toString(), targetAssetReserves: (400n * SCALE).toString() },
+    });
+    expect((await repository.get('updatesStreams', 'chainState'))?.blockHeight).toBe(11);
+    expect(state.pools.size).toBe(1);
   });
 
   it('collects every event and nested-call pool touch, probes reverse keys, and invalidates ambiguity', () => {

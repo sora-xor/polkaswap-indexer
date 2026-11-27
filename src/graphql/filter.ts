@@ -1,5 +1,6 @@
 import { getOrderField, NUMERIC_ORDER_FIELDS } from './order.js';
 import { compareLexical } from '../lexical.js';
+import { finiteNumberToPlainDecimal } from '../decimal-number.js';
 
 export type FilterValue = Record<string, unknown> | null | undefined;
 
@@ -168,8 +169,8 @@ type NormalizedDecimal = { sign: -1 | 0 | 1; integer: string; fraction: string }
 
 export const normalizeDecimal = (value: unknown): NormalizedDecimal | null => {
   if (value === null || value === undefined || typeof value === 'boolean') return null;
-  const text = String(value);
-  if (!/^-?\d+(\.\d+)?$/.test(text)) return null;
+  const text = typeof value === 'number' ? finiteNumberToPlainDecimal(value) : String(value);
+  if (text === null || !/^-?\d+(\.\d+)?$/.test(text)) return null;
 
   const negative = text.startsWith('-');
   const [integerRaw = '0', fractionRaw = ''] = (negative ? text.slice(1) : text).split('.');

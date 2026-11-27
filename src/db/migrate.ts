@@ -7,6 +7,12 @@ import { POSTGRES_TRUSTED_SESSION_OPTIONS } from '../postgres-session.js';
 import { POSTGRES_WORKER_LEASE_FENCE_TABLE_SQL } from '../postgres-worker-fence.js';
 import { INDEXER_COLLECTIONS } from '../repository/types.js';
 import {
+  parseStoredSoraChainIdentity,
+  parseStoredSoraChainState,
+  SORA_MAX_BLOCK_NUMBER,
+} from '../soraIdentity.js';
+import { WORKER_STATUS_DOCUMENT_ID } from '../worker/status.js';
+import {
   INDEXED_EQUALITY_DATA_FIELDS,
   QUERYABLE_DECIMAL_FIELDS_BY_COLLECTION,
 } from '../repository/validation.js';
@@ -15,6 +21,226 @@ const { Pool } = pg;
 
 const NUMERIC_TEXT_PATTERN = "^-?[0-9]+(\\.[0-9]+)?$";
 const MIGRATION_LOCK_KEY = 4_350_435_000;
+const MIGRATION_PREFLIGHT_DOCUMENT_MAX_BYTES = 65_536;
+const MIGRATION_PREFLIGHT_ERROR_CODES = [
+  'indexer-documents-table-shape',
+  'indexer-documents-key-collation',
+  'indexer-documents-primary-key',
+  'chain-identity-malformed',
+  'chain-state-missing-or-malformed',
+  'chain-state-block-snapshot-missing-or-malformed',
+] as const;
+type MigrationPreflightErrorCode = (typeof MIGRATION_PREFLIGHT_ERROR_CODES)[number];
+const MIGRATION_PREFLIGHT_DOCUMENT_SQL = `
+  select collection, id, block_height::text as "blockHeight", timestamp::text as "timestamp",
+         case when octet_length(data::text) <= $3 then data else null end as data
+    from public.indexer_documents
+   where collection = $1 and id = $2
+   limit 1
+`;
+
+type MigrationPreflightClient = Pick<pg.PoolClient, 'query'>;
+type MigrationPreflightDocumentRow = {
+  collection: string;
+  id: string;
+  blockHeight: string | null;
+  timestamp: string | null;
+  data: unknown;
+};
+
+export class MigrationPreflightError extends Error {
+  constructor(readonly code: MigrationPreflightErrorCode) {
+    super(`PostgreSQL migration preflight failed: ${code}`);
+  }
+}
+
+/** The production CLI may print only these fixed codes, never driver errors. */
+export const safeMigrationPreflightErrorMessage = (error: unknown): string | null =>
+  error instanceof MigrationPreflightError &&
+    MIGRATION_PREFLIGHT_ERROR_CODES.includes(error.code)
+    ? `PostgreSQL migration preflight failed: ${error.code}`
+    : null;
+
+const migrationPreflightError = (code: MigrationPreflightErrorCode): Error =>
+  new MigrationPreflightError(code);
+
+const isExactRecord = (value: unknown, keys: readonly string[]): value is Record<string, unknown> => {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+};
+
+const positiveIntegerText = (value: unknown): number | null => {
+  if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+};
+
+const checkpointForMigrationPreflight = (
+  row: MigrationPreflightDocumentRow
+): { block: number; timestamp: number | null } | null => {
+  const block = positiveIntegerText(row.blockHeight);
+  if (row.collection !== 'updatesStreams' || row.id !== 'chainState' ||
+      block === null || block > SORA_MAX_BLOCK_NUMBER || positiveIntegerText(row.timestamp) === null ||
+      !isExactRecord(row.data, ['block', 'data', 'id']) ||
+      row.data.id !== 'chainState' || row.data.block !== block ||
+      typeof row.data.data !== 'string' ||
+      Buffer.byteLength(row.data.data, 'utf8') > MIGRATION_PREFLIGHT_DOCUMENT_MAX_BYTES) {
+    return null;
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(row.data.data);
+  } catch {
+    return null;
+  }
+  const current = parseStoredSoraChainState(payload);
+  if (current && current.lastIndexedBlock === block) {
+    return { block, timestamp: current.blockTimestamp };
+  }
+  if (isExactRecord(payload, ['lastIndexedBlock']) && payload.lastIndexedBlock === block) {
+    return { block, timestamp: null };
+  }
+  return null;
+};
+
+const identityOnlyStateIsValid = (row: MigrationPreflightDocumentRow): boolean => {
+  if (row.collection !== 'updatesStreams' || row.id !== 'chainIdentity' ||
+      !isExactRecord(row.data, ['block', 'data', 'id']) ||
+      row.data.id !== 'chainIdentity' || typeof row.data.data !== 'string' ||
+      Buffer.byteLength(row.data.data, 'utf8') > MIGRATION_PREFLIGHT_DOCUMENT_MAX_BYTES) {
+    return false;
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(row.data.data);
+  } catch {
+    return false;
+  }
+  const identity = parseStoredSoraChainIdentity(payload);
+  return identity !== null && row.data.block === identity.verificationBlock &&
+    positiveIntegerText(row.blockHeight) === identity.verificationBlock &&
+    positiveIntegerText(row.timestamp) === identity.verificationBlockTimestamp;
+};
+
+/** Reject known incompatible stored state before the first migration DDL. */
+export const preflightExistingPostgresDocuments = async (
+  client: MigrationPreflightClient
+): Promise<void> => {
+  await client.query('begin transaction isolation level repeatable read read only;');
+  try {
+    // Never scan a production document heap to establish whether it is empty.
+    await client.query("set local statement_timeout = '5000ms';");
+    await client.query("set local lock_timeout = '1000ms';");
+    await client.query('set local enable_seqscan = off;');
+    const relation = await client.query<{
+      relationKind: string;
+      keyColumnsValid: boolean;
+      primaryKeyValid: boolean;
+      rowSecurityEnabled: boolean;
+    }>(`
+      select documents.relkind as "relationKind",
+             (select count(*) = 2
+                from pg_catalog.pg_attribute a
+               where a.attrelid = documents.oid
+                 and a.attname in ('collection', 'id')
+                 and not a.attisdropped
+                 and a.atttypid = 'pg_catalog.text'::pg_catalog.regtype
+                 and a.attcollation = '"C"'::pg_catalog.regcollation) as "keyColumnsValid",
+             exists (
+               select 1
+                 from pg_catalog.pg_constraint pk
+                 join pg_catalog.pg_index idx on idx.indexrelid = pk.conindid
+                where pk.conrelid = documents.oid
+                  and pk.contype = 'p'
+                  and pk.conkey = array[
+                    (select a.attnum from pg_catalog.pg_attribute a
+                      where a.attrelid = documents.oid and a.attname = 'collection' and not a.attisdropped),
+                    (select a.attnum from pg_catalog.pg_attribute a
+                      where a.attrelid = documents.oid and a.attname = 'id' and not a.attisdropped)
+                  ]::smallint[]
+                  and idx.indisvalid and idx.indisready and idx.indislive
+                  and idx.indnkeyatts = 2
+             ) as "primaryKeyValid",
+             (documents.relrowsecurity or documents.relforcerowsecurity) as "rowSecurityEnabled"
+        from pg_catalog.pg_class documents
+       where documents.oid = pg_catalog.to_regclass('public.indexer_documents')
+    `);
+    if (relation.rows.length === 0) {
+      await client.query('commit;');
+      return;
+    }
+    const metadata = relation.rows[0]!;
+    if (metadata.relationKind !== 'r' || metadata.rowSecurityEnabled !== false) {
+      throw migrationPreflightError('indexer-documents-table-shape');
+    }
+    if (metadata.keyColumnsValid !== true) {
+      throw migrationPreflightError('indexer-documents-key-collation');
+    }
+    if (metadata.primaryKeyValid !== true) {
+      throw migrationPreflightError('indexer-documents-primary-key');
+    }
+
+    const first = await client.query<{ collection: string; id: string }>(
+      'select collection, id from public.indexer_documents order by collection, id limit 3;'
+    );
+    if (first.rows.length === 0) {
+      await client.query('commit;');
+      return;
+    }
+
+    const isStartupOnlyState = first.rows.length <= 2 && first.rows.every((row) =>
+      row.collection === 'updatesStreams' &&
+      (row.id === 'chainIdentity' || row.id === WORKER_STATUS_DOCUMENT_ID)
+    );
+    if (isStartupOnlyState) {
+      if (first.rows.some((row) => row.id === 'chainIdentity')) {
+        const identity = await client.query<MigrationPreflightDocumentRow>(
+          MIGRATION_PREFLIGHT_DOCUMENT_SQL,
+          ['updatesStreams', 'chainIdentity', MIGRATION_PREFLIGHT_DOCUMENT_MAX_BYTES]
+        );
+        if (identity.rows.length !== 1 || !identityOnlyStateIsValid(identity.rows[0]!)) {
+          throw migrationPreflightError('chain-identity-malformed');
+        }
+      }
+      await client.query('commit;');
+      return;
+    }
+
+    const state = await client.query<MigrationPreflightDocumentRow>(
+      MIGRATION_PREFLIGHT_DOCUMENT_SQL,
+      ['updatesStreams', 'chainState', MIGRATION_PREFLIGHT_DOCUMENT_MAX_BYTES]
+    );
+    const checkpoint = state.rows.length === 1
+      ? checkpointForMigrationPreflight(state.rows[0]!)
+      : null;
+    if (!checkpoint) throw migrationPreflightError('chain-state-missing-or-malformed');
+
+    const snapshotId = `block-${checkpoint.block}`;
+    const snapshot = await client.query<MigrationPreflightDocumentRow>(
+      MIGRATION_PREFLIGHT_DOCUMENT_SQL,
+      ['networkSnapshots', snapshotId, MIGRATION_PREFLIGHT_DOCUMENT_MAX_BYTES]
+    );
+    const row = snapshot.rows[0];
+    const snapshotTimestamp = row ? positiveIntegerText(row.timestamp) : null;
+    if (snapshot.rows.length !== 1 || !row || row.collection !== 'networkSnapshots' ||
+        row.id !== snapshotId || positiveIntegerText(row.blockHeight) !== checkpoint.block ||
+        snapshotTimestamp === null ||
+        (checkpoint.timestamp !== null && snapshotTimestamp !== checkpoint.timestamp) ||
+        !row.data || typeof row.data !== 'object' || Array.isArray(row.data) ||
+        (row.data as Record<string, unknown>).id !== snapshotId ||
+        (row.data as Record<string, unknown>).type !== 'BLOCK' ||
+        (row.data as Record<string, unknown>).timestamp !== snapshotTimestamp) {
+      throw migrationPreflightError('chain-state-block-snapshot-missing-or-malformed');
+    }
+    await client.query('commit;');
+  } catch (error) {
+    await client.query('rollback;').catch(() => undefined);
+    throw error;
+  }
+};
 
 export type MigrationRuntimeConfig = Pick<
   import('../config.js').AppConfig,
@@ -127,11 +353,65 @@ export const POSTGRES_EXACT_JSON_NUMERIC_FUNCTIONS_SQL = `
        end
     )
   $$;
+
+  create or replace function public.indexer_json_runtime_u32_array_is_valid_v1(candidate jsonb)
+  returns boolean
+  language plpgsql
+  immutable
+  strict
+  parallel safe
+  as $$
+  declare
+    element jsonb;
+    rendered text;
+    parsed numeric;
+    seen text[] := array[]::text[];
+  begin
+    if jsonb_typeof(candidate) <> 'array' then
+      return false;
+    end if;
+    if jsonb_array_length(candidate) not between 1 and 24 then
+      return false;
+    end if;
+
+    for element in select value from jsonb_array_elements(candidate) as entries(value) loop
+      if jsonb_typeof(element) not in ('string', 'number') then return false; end if;
+      rendered := element #>> '{}';
+      if octet_length(rendered) > 10 or rendered collate "C" !~ '^(0|[1-9][0-9]*)$' then
+        return false;
+      end if;
+      begin
+        parsed := rendered::numeric;
+      exception when numeric_value_out_of_range then
+        return false;
+      end;
+      if parsed not between 0 and 4294967295 or rendered = any(seen) then return false; end if;
+      seen := array_append(seen, rendered);
+    end loop;
+
+    return true;
+  end;
+  $$;
 `;
 
 const quotedIndexerCollections = INDEXER_COLLECTIONS.map(
   (collection) => `'${collection.replace(/'/g, "''")}'`
 ).join(', ');
+
+const postgresRuntimeUInt32FieldCheck = (field: string): string =>
+  `(case ` +
+  `when not data ? '${field}' or jsonb_typeof(data->'${field}') = 'null' then true ` +
+  `when jsonb_typeof(data->'${field}') not in ('string', 'number') then false ` +
+  `when octet_length(data->>'${field}') > 10 or data->>'${field}' collate "C" !~ '^(0|[1-9][0-9]*)$' then false ` +
+  `else (data->>'${field}')::numeric between 0 and 4294967295 end)`;
+const postgresPolkamarktProjection =
+  `(collection in ('markets', 'marketSnapshots', 'accountPositions', 'accountTrades') ` +
+  `or lower(coalesce(data->>'module', '')) = 'polkamarkt' ` +
+  `or (collection = 'accountTransactions' and (data ? 'marketId' or data ? 'marketIds')))`;
+const postgresPolkamarktMarketIdsCheck =
+  `(case when not data ? 'marketIds' or jsonb_typeof(data->'marketIds') = 'null' then true ` +
+  `when not public.indexer_json_runtime_u32_array_is_valid_v1(data->'marketIds') then false ` +
+  `else data ? 'marketId' and data->'marketIds'->>0 = data->>'marketId' end)`;
 
 /** Database-level backstop for the repository write contract. */
 export const POSTGRES_DOCUMENT_CHECK_CONSTRAINTS: readonly PostgresDocumentCheckConstraint[] = [
@@ -184,6 +464,14 @@ export const POSTGRES_DOCUMENT_CHECK_CONSTRAINTS: readonly PostgresDocumentCheck
           `(jsonb_typeof(data->'data') <> 'object' or not (data->'data') ? '${field}' or jsonb_typeof(data->'data'->'${field}') = 'null' or (jsonb_typeof(data->'data'->'${field}') = 'string' and octet_length(data->'data'->>'${field}') <= 256))`
       ),
     ].join(' and ')})`,
+  },
+  {
+    name: 'indexer_documents_polkamarkt_u32_v2_check',
+    expression:
+      `(case when ${postgresPolkamarktProjection} then (` +
+      `${['marketId', 'conditionId', 'closeBlock'].map(postgresRuntimeUInt32FieldCheck).join(' and ')}` +
+      ` and ${postgresPolkamarktMarketIdsCheck}` +
+      `) else true end)`,
   },
   {
     name: 'indexer_documents_indexed_decimals_v1_check',
@@ -503,6 +791,9 @@ const OBSOLETE_BROAD_QUERY_INDEXES = [
   'indexer_documents_collection_commission_idx',
   'indexer_documents_collection_reward_points_idx',
 ] as const;
+const OBSOLETE_DOCUMENT_CHECK_CONSTRAINTS = [
+  'indexer_documents_polkamarkt_u32_v1_check',
+] as const;
 
 export async function migrate(input: string | MigrationRuntimeConfig = readConfig()): Promise<void> {
   const config = migrationRuntimeConfig(input);
@@ -583,6 +874,7 @@ export async function migrate(input: string | MigrationRuntimeConfig = readConfi
 
   try {
     await client.query('select pg_advisory_lock($1);', [MIGRATION_LOCK_KEY]);
+    await preflightExistingPostgresDocuments(client);
     await client.query(POSTGRES_EXACT_JSON_NUMERIC_FUNCTIONS_SQL);
     await client.query(`
       create table if not exists public.indexer_documents (
@@ -620,6 +912,13 @@ export async function migrate(input: string | MigrationRuntimeConfig = readConfi
     for (const { name } of pendingConstraintValidation) {
       await client.query(
         `alter table public.indexer_documents validate constraint ${quoteIdentifier(name)};`
+      );
+    }
+    // Keep the prior constraint active until its reviewed replacement both
+    // protects new writes and validates retained documents.
+    for (const name of OBSOLETE_DOCUMENT_CHECK_CONSTRAINTS) {
+      await client.query(
+        `alter table public.indexer_documents drop constraint if exists ${quoteIdentifier(name)};`
       );
     }
     await client.query(

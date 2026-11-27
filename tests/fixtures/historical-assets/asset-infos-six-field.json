@@ -1,0 +1,27 @@
+{
+  "block": 5000000,
+  "specVersion": 30,
+  "assetId": "0x00e4be1d0f2cc2a116734bb7e300bfbb33fd31e320ad47fe8daa223e31223918",
+  "codecType": "(AssetSymbol,AssetName,BalancePrecision,bool,Option<ContentSource>,Option<Description>)",
+  "scaleHex": "0x1c54494e464f494c3c54696e666f696c204272696761646512010000",
+  "human": [
+    "TINFOIL",
+    "Tinfoil Brigade",
+    "18",
+    true,
+    null,
+    null
+  ],
+  "normalized": {
+    "symbol": "TINFOIL",
+    "name": "Tinfoil Brigade",
+    "decimals": 18
+  },
+  "blockHash": "0x2a95fa6d49f67e13082721323a8c7a72420f6f3e08331544220a03351c5c6c0e",
+  "laterCodec": {
+    "block": 10000000,
+    "blockHash": "0xb4b4a4829d09fab46e707c68c8e66f62bc4e52876302d7df3adcb5cb22ff513a",
+    "specVersion": 50,
+    "codecType": "(Bytes,Bytes,u8,bool,Option<Bytes>,Option<Bytes>)"
+  }
+}

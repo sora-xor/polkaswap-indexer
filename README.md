@@ -6,6 +6,12 @@ The API intentionally exposes SubQuery-compatible GraphQL field names so the
 static Polkaswap UI can use a single external endpoint without depending on
 SubQuery or Subsquid from the browser.
 
+Production recovery status (31 October 2026): the Pi API is in native read-only
+hold while a canonical replacement is prepared. MOF2's retained old archive
+passed historical availability checks; live indexing is not yet restored.
+See [post-fork recovery](docs/post-fork-recovery-20261031.md) for the archive,
+service paths, validation and cutover prerequisites.
+
 ## Runtime
 
 - Node.js 24+
@@ -50,9 +56,31 @@ both complete profiles together because they intentionally publish the same
 host port.
 
 By default the worker reads finalized SORA blocks from `wss://mof2.sora.org`.
-The direct `@babel/runtime` dependency is intentional: the published
-`@sora-substrate/type-definitions` CommonJS build imports Babel helpers at
-runtime without declaring that package itself.
+Before it constructs or migrates the database, startup proves both the reviewed
+SORA mainnet genesis
+`0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5`
+and audited history anchor block `26872383` with hash
+`0x28dd415867e637e5c70056a564cfa4e81f0f3df3a18d1132ccc61fe5025c762c`.
+The worker repeats that proof before any repository read, persists the fixed
+audited anchor as an immutable `chainIdentity` checkpoint, and validates every
+configured archive endpoint independently. There is no environment override or
+skip switch for this proof.
+
+The startup identity preflight reads the pinned anchor's `Timestamp.Now` storage
+key directly and accepts only its exact eight-byte SCALE `u64` millisecond value.
+It retains the fixed genesis, anchor hash, and audited timestamp checks without
+downloading historical runtime metadata merely to decode that one known value.
+Connection and individual RPC calls remain bounded at 15 seconds, with no
+automatic reconnect. Normal block indexing still uses runtime metadata and its
+separately configured `CHAIN_RPC_TIMEOUT_MS` budget.
+
+Legacy archive decoding uses repository-owned, inert SCALE schema data in
+`src/runtime/sora-legacy-types.json`; no external SORA JavaScript package is loaded.
+The API serves the reviewed runtime-130 native aliases at
+`/runtime/sora-mobile-types.json`, and `mobileConfig.substrateTypesUrl` points to
+that route on `https://pi.soramitsu.io`. Ensure the production reverse proxy
+forwards this route to the same API process before deploying the config change.
+See `src/runtime/README.md` for provenance and schema validation.
 
 For the embedded RocksDB backend, migrate existing Postgres documents first and
 then run API and worker in one process so they share the same local database
@@ -75,6 +103,13 @@ SOLSWAP burn campaign history used by the burn page stats:
 ```sh
 yarn seed:swap-chart
 ```
+
+Run `yarn test:coverage` with `POSTGRES_TEST_DATABASE_URL` pointing at a disposable
+test database to include the PostgreSQL integration tests. The command and CI
+enforce at least 90.01% line, statement, function, and branch coverage over all `src/**/*.ts` production files,
+including unimported worker and CLI entry points; only TypeScript declarations
+are excluded. Reports are written to `coverage/index.html`,
+`coverage/coverage-summary.json`, and `coverage/lcov.info`.
 
 The UI should point `POLKASWAP_INDEXER_ENDPOINT` at the hosted GraphQL URL:
 `https://pi.soramitsu.io/graphql`.
@@ -103,9 +138,65 @@ schema projects those documents into the fields consumed by Polkaswap:
 When `STORAGE_ENGINE=rocksdb`, the same document model is stored in RocksDB
 under `ROCKSDB_PATH`. The RocksDB repository keeps secondary indexes for common
 timestamp, block-height, equality, and numeric sort query shapes. Public
-GraphQL connections accept only the supported, indexed filter/order policies
-and fail closed before repository execution for unsupported shapes. Bounded
-scan/sort fallback is reserved for trusted internal repository callers.
+GraphQL connections validate supported filter and order shapes before repository
+execution. Asset connections support all declared numeric fields for filtering
+and ordering: price and liquidity orders use existing indexes, while other Asset
+orders and residual filters obey the configured native row-scan limit. Other
+collections retain their indexed query policies.
+
+Swap History seeks a compact timestamp/ID index for each distinct string asset
+on `liquidityProxy.swap` documents. Its exact counts and remaining filter
+predicates retain the configured row-scan limit. Existing address and address-OR
+query plans retain priority over the new asset prefix. On the first writable open,
+`prepare()` derives this index from existing history before the API or worker is
+ready. Each native transaction processes at most 256 documents and stops after
+an 8 MiB retained-value estimate (one larger document remains atomic). Index
+keys and the resume position commit together, so interrupted preparation resumes
+without rewriting history or chain checkpoints. Subsequent opens use its
+completion marker; malformed markers fail closed. A read-only open requires the
+index preparation to have completed. Preparation adds one key per distinct
+string asset in a swap and does not duplicate document payloads.
+Asset prefixes are fixed text of at most 43 characters, keeping keys small even
+for large valid payloads. Ordinary prefixes are 43-character base64url digests. Well-formed strings without U+FFFD hash their exact
+UTF-16 code units. Strings containing U+FFFD or an unpaired surrogate share one
+distinct conservative bucket because the existing native document codec may replace lone
+surrogates during persistence. Every candidate still passes the full filter,
+preserving the existing persisted/cached results and exact counts while charging
+all alias collisions and residual misses to the same scan limit.
+The writable format-1 upgrade atomically sets storage format 2 and the initial
+index progress marker before adding keys. Earlier indexer binaries reject format
+2, preventing an older writer from invalidating the derived index. Rolling back
+to an earlier binary requires restoration of a verified complete pre-upgrade
+database backup; manually downgrading the format marker is unsafe.
+
+For a **fresh** recovery database only, `ROCKSDB_DOCUMENT_COMPRESSION=brotli`
+selects storage format 3. The default `none` keeps format 2 unchanged, including
+its existing format-1 upgrade. Enabling compression against any existing
+format-1/2 or nonempty unversioned database fails before preparation writes;
+there is no in-place conversion. Every writable format-3 resume must retain the
+`brotli` option. New read-only readers support formats 2 and 3 without a writer
+option; older binaries reject the format-3 marker. Never downgrade that marker.
+Compression changes physical document storage, not normalized amounts, query
+indexes, receipt hashes, journal data or recovery admission. See
+[`docs/rocksdb-compression.md`](docs/rocksdb-compression.md) for the format,
+bounded decoding rules, compatible tooling and validation requirements.
+
+Collection connections accept `first`, `last`, `offset`, and `after`. Both page
+sizes are limited to 100, and explicit offsets and numeric continuation positions
+are bounded by 100,000. Returned opaque cursors are scoped to the connection,
+order, and filter; existing safe numeric positions remain accepted. `last` selects
+the tail of the requested window before its response byte budget is applied.
+`before` retains the previous API's ignored-argument behavior; it does not select
+a backward cursor window. Asset day/week USD volumes retain their GraphQL `Float`
+output types while their stored decimal values remain lossless.
+
+Bots uses `assetHourlyCoverage` and `AssetSnapshot.closeEvidence` to distinguish
+verified finalized hourly closes from missing, legacy, or invalid history.
+Coverage reads at most 2160 completed UTC hours for one canonical asset ID through
+bounded indexed pages. The worker commits each close with its adjacent finalized
+block evidence and retains its tracked hourly rows in either retention
+mode. Historical repair requires captured, verified archive evidence; see
+[`docs/bot-history.md`](docs/bot-history.md).
 
 The chain worker reads finalized SORA blocks for transaction history and uses
 SORA storage refreshes to maintain the current asset, pool, order-book,
@@ -118,8 +209,14 @@ accounts from that collection over a requested timestamp range for the exchange
 stats page. It rejects ranges longer than 366 days and enforces one 100,000-row
 scan budget across all pages and source collections. Public collection
 connections also enforce collection-specific filter/order policies; unsupported
-shapes fail before repository execution. Scan/sort fallbacks remain available
-only to bounded, trusted internal repository callers.
+shapes fail before repository execution. The Asset query paths and trusted
+internal scan/sort fallbacks retain the native row-scan and response byte limits.
+
+`polkamarktSignals` likewise uses stable ID-keyset pagination rather than a
+top-1,000 approximation. It detects repeated pages and enforces a separate
+100,000-document ceiling for markets and Polkamarkt activity; exceeding either
+ceiling fails the field instead of publishing incomplete volume, liquidity,
+market, account, or accuracy aggregates.
 
 ## Production Notes
 
@@ -173,11 +270,15 @@ the development database fallback.
 For a fresh production deployment, set `CHAIN_START_BLOCK` to the earliest
 block you need indexed; a full-chain backfill is intentionally long. Primary
 and archive SORA URLs must be
-credential-free `wss:` endpoints without query strings or fragments, on
-different hosts. The production worker requires `SORA_ARCHIVE_WS_ENDPOINT`.
+credential-free `wss:` endpoints without query strings or fragments. The
+production worker requires an explicit `SORA_ARCHIVE_WS_ENDPOINT`; it may equal
+`SORA_WS_ENDPOINT` when that node serves the required historical blocks,
+metadata, events, timestamps, and storage. Both RPC handles retain the same
+identity and payload checks when they use one endpoint, but this provides no
+independent operator verification.
 After the chain-neutral schema migration completes and before constructing,
 reading, or writing its runtime repository, the worker proves the reviewed SORA
-mainnet genesis and immutable history anchor independently on both endpoints.
+mainnet genesis and immutable history anchor on both RPC handles.
 The in-process worker repeats the primary proof and validates a self-consistent
 finalized head before it may persist even its first heartbeat. Every archived
 block then has to match the primary endpoint by height/hash, raw SCALE block and
@@ -187,7 +288,10 @@ The one-shot `dist/src/scripts/production-migrate.js` wrapper validates the URL
 topology, all three live database session identities, and pre-DDL role
 privileges, then invokes the PostgreSQL schema migration with the owner
 configuration, atomically applies the exact per-table runtime grants, and
-verifies them. The migration uses
+verifies them. Storage-derived analytics still treat the reviewed primary RPC
+as a trusted input, so operators must use a locally controlled verifying primary
+and an independently operated archival endpoint rather than public convenience
+RPCs for release evidence. The migration uses
 `POSTGRES_MIGRATION_QUERY_TIMEOUT_MS` and
 `POSTGRES_MIGRATION_STATEMENT_TIMEOUT_MS`, both defaulting to `0` (unlimited),
 instead of the bounded runtime query deadlines. Check constraints are installed
@@ -198,6 +302,64 @@ re-adding it; PostgreSQL restarts that constraint's table scan. Set a positive
 migration timeout only when an operator intentionally wants to cap these
 production-scale scans and concurrent index builds.
 
+In the GraphQL market contract, `probability` is an exact decimal percentage
+from 0 through 100, while `priceYes` and `priceNo` are exact unit prices from 0
+through 1. Every mobile-consumed balance, fee, pool, market, position, and trade
+quantity is serialized through an explicit canonical decimal resolver; unsafe
+legacy JavaScript numbers fail the GraphQL field instead of being rounded into
+a string. Realized and unrealized P&L accept a minus sign; volumes and all other
+mobile quantities remain unsigned. Asset price-change percentages remain
+presentation-only GraphQL floats and are never used for balances or mutations.
+Polkamarkt market identifiers, condition identifiers, and close blocks use the
+custom `UInt32` scalar so the complete runtime `u32` domain remains
+representable beyond GraphQL's signed 32-bit `Int` ceiling.
+
+Batch-claim account trade rows expose every claimed market through the bounded,
+ordered `marketIds` list while retaining `marketId` as the first market for
+legacy clients. Worker projection, repository writes, GraphQL reads, and the
+PostgreSQL check constraint all require those two representations to agree.
+Successful trade and claim rows must have a canonical `marketId`; no-op batch
+claim transactions still count as network activity but are excluded from the
+account-trade connection. The migration removes the superseded v1 Polkamarkt
+u32 constraint under its schema advisory lock only after installing and
+validating the scoped v2 contract, so writes never pass through an unprotected
+replacement gap.
+
+The versioned `accountTransactionsBackfill-v2` projection repairs
+already-indexed history instead of trusting a completed v1 marker. It first
+pages source history and upserts canonical rows in bounded calls, then makes one
+finalized-cutoff `ID_ASC` keyset pass over `accountTransactions`. Each bounded
+transaction page loads only its referenced source-history rows and removes
+obsolete v1-derived identifiers; rows whose source history is missing or cannot
+reconstruct any canonical local account are retained for recovery. The
+validated repository history key is authoritative over any conflicting
+denormalized `data.id`, so corrupt payload metadata cannot redirect projection
+or cleanup identifiers. Every canonical account projection is read back in
+bounded batches after its idempotent upsert; stale-write rejection or partial
+persistence aborts without a completion marker and before focused deletion.
+
+Every keyset/seek page must advance monotonically; repeated, overlapping,
+out-of-order, or invalid-cursor pages abort without a completion marker.
+Reconstruction and pruning share the startup finalized-block cutoff, which is
+recorded in the receipt; history finalized while the repair is running is left
+to normal indexing and cannot abort the fixed snapshot or make it prune newer
+account rows. The completion marker is written only after the full prune pass,
+so interruption remains retry-safe and excluded external identifiers cannot
+remain visible to active-account statistics after a completed upgrade.
+
+Both migration receipts must agree with their validated envelope block;
+malformed receipts are removed before conservative replay so a corrupt high
+block cannot defeat stale-write protection. An account-projection receipt ahead
+of startup finality is removed and replayed, while any source-history row ahead
+of that checkpoint aborts without publishing completion. A structurally valid
+bridge checkpoint ahead of endpoint finality is a hard identity/availability
+error rather than permission to skip history. The later bridge-history repair
+also derives obsolete account-row IDs directly from each verified history
+record, re-reads those candidates in bounded batches, and removes only rows that
+still reference that exact source after its canonical rows are durable. History
+and account writes are independently call-capped; missing or inconsistent rows
+are retained, and the repair never falls back to an unindexed collection scan.
+
 Use `CHAIN_STATE_REFRESH_INTERVAL_BLOCKS` to control how often storage-derived
 collections are refreshed during block processing, and
 `CHAIN_SNAPSHOT_INTERVAL_BLOCKS` to control chart snapshot density. Both default
@@ -205,29 +367,45 @@ to `25` so stats aggregates stay close to finalized block progress. Between
 refreshes, clean storage domains reuse their last RPC result while event-dirty
 domains are reloaded at the next projection; a full
 reconciliation defaults to every `250` blocks and is configurable with
-`CHAIN_STATE_FULL_RECONCILIATION_INTERVAL_BLOCKS`.
+`CHAIN_STATE_FULL_RECONCILIATION_INTERVAL_BLOCKS`. XYK swaps emit no
+`poolXYK` event, so `technical.SwapSuccess` and liquidity-proxy swap events or
+calls dirty Pool XYK reserves. A projection pinned below a later dirty block
+reloads the domain again at the next refresh.
 
 Backfill and finalized catch-up value each block from its exact parent-block
 asset metadata and Pool XYK reserves. The initial archive state is consumed in
-256-entry pages under one retained-byte ceiling; later blocks point-read only
+pages under one retained-byte ceiling. `CHAIN_DERIVED_STORAGE_ENTRIES_PAGE_SIZE`
+selects 1–1,000 entries per pinned storage page (default 256); 1,000 reduces
+archive round trips during recovery without changing the exact block/hash,
+full-reload rules, pagination checks or `CHAIN_DERIVED_STORAGE_LOAD_MAX_BYTES`
+ceiling. A larger page must still fit that existing byte budget and can be
+reverted to 256 if it does not. Later blocks point-read only
 canonical assets and both possible pool-key orientations touched by successful
-events/calls. Ambiguous runtime mutations fail closed to a bounded full reload,
-and valuation advances only after the block documents and `chainState` commit
-atomically. Historical order-book USD stock cannot be reconstructed from pool
+events/calls. Ambiguous runtime mutations fail closed to a bounded full reload.
+That includes every block with XYK swap evidence, because swap events do not
+name a multi-hop route's pools. Valuation advances only after the block
+documents and `chainState` commit atomically. Historical order-book USD stock cannot be reconstructed from pool
 state alone, so `liquidityUSD`, `orderBookLiquidityUSD`, and
 `activeOrderBooks` are `null` until a pinned full projection has recomputed raw
 orders at the same height. The worker never substitutes a misleading zero.
 
-Public asset, pool, order-book, market, and network chart snapshots use only
-`DEFAULT`, `HOUR`, `DAY`, and `MONTH`; per-block entity chart snapshots are not
-stored. `DEFAULT` buckets are retained for 48 hours and `HOUR` buckets for 8
-days, while `DAY` and `MONTH` remain available for all-time charts.
-Account-liquidity snapshots use `DEFAULT` and the same 48-hour horizon. Raw
-network `BLOCK` rows used by rolling analytics are retained for 31 days.
-Cleanup queries the type/timestamp indexes and deletes a bounded number of
-pages per refresh. Successful deletion is its durable progress marker, so an
-interrupted page is still visible to the next refresh; no retention cursor or
-migration state document is stored.
+`CHAIN_SNAPSHOT_RETENTION_MODE=all` is the default. It preserves historical
+snapshots without age-based deletion and persists completed historical network
+buckets during backfill. Asset, pool, order-book, and market chart projections
+produce `DEFAULT`, `HOUR`, `DAY`, `MONTH`, and `BLOCK` at the configured snapshot
+cadence. Network aggregates use the four time buckets, with a separate network
+`BLOCK` row committed for every indexed block. Account-liquidity snapshots use
+`DEFAULT`. Rolling analytics still reads its bounded time horizon without
+deleting the historical inputs.
+
+Explicitly setting `CHAIN_SNAPSHOT_RETENTION_MODE=rolling` changes history
+availability: entity chart projections omit `BLOCK`, `DEFAULT` buckets are
+retained for 48 hours, `HOUR` for 8 days, and network `BLOCK` inputs for 31 days.
+`DAY` and `MONTH` remain available for all-time charts. Cleanup queries the
+type/timestamp indexes and deletes bounded pages per refresh. Interrupted pages
+remain visible to the next refresh; no retention cursor or migration state
+document is stored. Use `all` when retaining existing historical queries is
+required.
 
 Worker backfill controls are parsed once into each indexer instance's runtime
 configuration. `CHAIN_BACKFILL_PREFETCH_CONCURRENCY` defaults to `1`; finalized
@@ -418,8 +596,9 @@ migrator and both verification modes read `data::text` and validate every
 numeric token before `JSON.parse`; an unsafe source can never pass by comparing
 two identically rounded values.
 
-The first release has one mandatory RocksDB format (version 1) and writes
-compact documents/indexes from the first row. There is no pre-v1 upgrade mode:
+The PostgreSQL migrator writes ordinary format-2 compact documents/indexes
+from the first row and requires `ROCKSDB_DOCUMENT_COMPRESSION=none`. It does not
+create compressed recovery databases. There is no pre-v1 upgrade mode:
 the migrator refuses a non-empty destination without its exact versioned
 destination/run/source state. Rebuild an unversioned or incompatible artifact
 from an empty path.
@@ -473,6 +652,23 @@ The capture protocol protects ordinary DML and `TRUNCATE`, not a privileged
 `DROP TABLE`, `ALTER TABLE`, trigger disable, or direct catalog change. Restrict
 DDL and trigger-management privileges to the migration operator; the runtime
 worker role should have only the DML privileges it needs.
+
+For an existing legacy checkpoint whose exact current `BLOCK` is missing,
+`storage:repair:rocksdb-legacy-checkpoint` can add one derived row after the
+complete migration, original-row parity checks, and an independent backup.
+Stop the service first. Set `ROCKSDB_CHECKPOINT_REPAIR_BLOCK` to the existing
+checkpoint height, `ROCKSDB_CHECKPOINT_REPAIR_CONFIRM=add-derived-block-<height>`,
+and `ROCKSDB_CHECKPOINT_REPAIR_RECEIPT` to an absolute path in an existing
+owner-only directory outside the database. Both explicit RPC roles must use
+`wss://mof2.sora.org`. The tool requires the exact prior `BLOCK` and audited
+anchor, proves finalized history and a single unsigned timestamp inherent with
+only its success event, then captures the normal kernel using verified parent
+asset metadata and pool reserves. It persists only the missing `BLOCK`, with
+zero flows and derived pool stocks. Unavailable order-book stocks remain null.
+The private receipt records a separate one-row addition and supports recovery
+after a crash; it does not claim to recover the legacy asynchronous cache or
+renew PostgreSQL/RocksDB equality. Every original row, migration receipt, and
+legacy `chainState` remains intact for the unchanged startup identity checks.
 
 RocksDB maintenance commands:
 
@@ -562,8 +758,9 @@ docker compose -f docker-compose.production.yml config --quiet
 docker compose -f docker-compose.production.yml up -d
 ```
 
-The five mobile capability values are explicit deployment inputs. Their tester
-defaults are `true,false,true,false,true` in the order shown above.
+The five mobile capability values are required explicit production deployment
+inputs; Compose validation fails if any value is missing or empty. The example
+tester projection is `true,false,true,false,true` in the order shown above.
 `MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=true` requires Nexus availability, while
 Polkamarkt mutations require Polkamarkt visibility. Taira's remote default
 remains independent because each mobile client applies the Nexus kill switch to
@@ -582,7 +779,6 @@ the one-shot credential preflight is the fail-closed URL and live-session role
 and privilege check and runs before every schema migration.
 Production services retain four minutes of graceful-stop time—longer than the
 internal 30-second shutdown deadline—and use bounded local log rotation.
-
 The production worker overrides the image's API healthcheck with
 `dist/src/scripts/worker-health.js`. This probe has no HTTP or API-container
 dependency. It uses the worker's existing `DATABASE_URL` to require the exact
@@ -593,6 +789,13 @@ ahead. PostgreSQL connection, statement/query, and cleanup waits are bounded;
 the 4-second hard process deadline remains below the 5-second container timeout.
 Diagnostics contain only fixed failure codes and never include the database URL
 or raw driver error text.
+
+Before starting this worker against a legacy database without `chainIdentity`,
+run the direct PostgreSQL preflight in [the release checklist](docs/release-checklist.md#legacy-database-identity-preflight).
+The audited historical `BLOCK` row can expire under the worker's 31-day
+retention policy. A healthy current checkpoint does not prove that the row is
+still present; recover it from a verified backup or backfill an empty parallel
+database before cutover.
 
 During rollout, confirm worker health independently of GraphQL:
 
@@ -627,12 +830,39 @@ route points at the TON or Solana indexer contracts. Production smoke always
 requires an available, ready, running, startup-complete worker with internally
 consistent finalized, indexed, lag, heartbeat, and commit-time details.
 
+The same request requires the exact reviewed genesis in `_health`, a strictly
+shaped immutable `chainIdentity`, and a `chainState` containing the same genesis,
+a positive block height, its nonzero lowercase 32-byte hash, and its chain
+timestamp. `_health` must reproduce that checkpoint exactly, and the latest
+filtered `BLOCK` snapshot must have ID `block-<height>` and the same timestamp.
+The checkpoint may be at most 300 seconds old or 30 seconds ahead of the smoke
+clock. Static `chainId`/`network` labels alone never satisfy the contract. The
+client refuses
+redirects, uses a 10-second total deadline, accepts exact JSON media types
+(including `application/graphql-response+json`), and caps decoded responses at
+1 MiB. Diagnostic overrides are bounded by 60 seconds, 5 MiB, and one hour via
+`POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS`,
+`POLKASWAP_INDEXER_SMOKE_MAX_RESPONSE_BYTES`, and
+`POLKASWAP_INDEXER_SMOKE_MAX_INDEXER_AGE_SEC`.
+
+Current checkpoint fields share one bounded read per GraphQL execution context.
+`_health`, explicit `chainState`/`chainIdentity` reads, and the stock-only latest
+`BLOCK` connection (`first: 1`, `TIMESTAMP_DESC`, exact `type.equalTo: BLOCK`)
+bypass the cross-request TTL cache. The API reads the actual persisted documents
+between state and worker-status fences, retrying only observed movement at most
+three times. Continued movement returns `CHECKPOINT_VIEW_UNAVAILABLE`; a caller
+may issue a new bounded request. A stable disagreement remains unhealthy, and
+missing or mismatched persisted BLOCK evidence cannot produce healthy status.
+Historical connections retain their existing cache behavior. All capture and
+retry reads consume the operation's existing materialization budget.
+
 Production release evidence is tracked in
 `scripts/production-deployment-evidence.json`. The committed manifest must stay
 blocked on `production-deployment-evidence-missing` and
 `live-production-smoke-failing` until the current public smoke passes and an
 operator records the deployed image digest, git commit, deployment id, PI health
-response, and live smoke timestamp for the intended release. The attested health
+response, the exact five-boolean public `mobileConfig` readback, and live smoke
+timestamp for the intended release. The attested health
 response must
 contain the exact SORA mainnet genesis hash
 `0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5`,
@@ -651,13 +881,68 @@ enforces 600 HTTP requests per client per 60 seconds, permits at most 600
 WebSocket upgrades per client per 60 seconds, and caps concurrent WebSockets at
 16 per client.
 
-Prepare the operator template and run the ready gate before enabling release
-routing:
+Prepare and test the evidence template before deployment:
 
 ```sh
 yarn test:deployment-evidence-template
 yarn generate:deployment-evidence-template --output build/reports/production-deployment-evidence-template.json
 yarn test:deployment-evidence-audit
-yarn audit:deployment-evidence --require-ready
-POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production
 ```
+
+Deploy the reviewed image with its immutable digest on the provisioned target.
+After the migration, API, worker, and internal health pass, route the public
+endpoint to that candidate while keeping the previous service available for
+rollback. Run the public smoke against the routed candidate, record the observed
+health, five mobile booleans, image digest, deployment identity, RPC/TLS
+controls, and smoke timestamp in operator-attested evidence, then run the ready
+audit before declaring the deployment ready or enabling mobile release flags:
+
+```sh
+POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production
+yarn audit:deployment-evidence --require-ready
+```
+
+### Pruned primary timestamp verification
+
+A local pruned SORA primary remains authoritative for canonical hashes and
+finality. If historical `timestamp.now.at` explicitly reports `State already
+discarded`, identity and checkpoint checks may read that exact hash from the
+configured `SORA_ARCHIVE_WS_ENDPOINT`. The archive must independently prove the
+reviewed mainnet genesis and history anchor, and the timestamp must still match
+the audited anchor or stored checkpoint. Connection failures, unknown hashes,
+malformed timestamps, and conflicting identity never trigger this fallback.
+All archive connection and query operations retain their existing time bounds.
+
+This timestamp fallback does not permit replay through a pruned primary:
+`fetchBlockByHash` still requires primary/archive agreement on the complete
+block, events, and timestamp. A restored checkpoint older than the primary's
+retention therefore needs an explicitly approved historical recovery primary.
+Keep that replay isolated from public routing, record the temporary endpoint,
+and retain all identity and payload checks. A return to a pruned primary remains vulnerable to the next gap beyond its
+retention. Use the approved archival endpoint for durable worker reads unless
+a local node retains the full required recovery history. API/database placement
+and the frontend RPC endpoint can remain local. Two handles to the same archive
+retain consistency checks but do not provide independent operator verification.
+Verify fresh progress and complete API qualification before public cutover.
+
+
+The current Pi deployment is on the MOF MacStadium host `207.254.29.218`.
+Its local SORA RPC node uses constrained `--pruning 256`; it is not an archive.
+The approved OVH MOF2 node (`51.161.218.175`, `wss://mof2.sora.org`) uses
+`--state-pruning archive-canonical --blocks-pruning archive-canonical`, retaining
+both canonical state and blocks. The durable MOF Pi worker uses this archive for
+both configured chain endpoints, including after catch-up. Recovery stays
+isolated from public routing until its data and API checks pass.
+
+### Pi host capacity safeguards
+
+The production host runs a five-minute capacity and explicit-retirement guard,
+maintenance free-space preflights, and supervised log rotation. See
+[host storage safeguards](docs/host-storage-safeguards.md) for thresholds,
+protected backups, alert delivery, validation, and release/rollback procedures.
+
+An inactive, separately admitted canonical statistics/history recovery candidate
+is documented in [docs/canonical-stats-history.md](docs/canonical-stats-history.md).
+It preserves full-recovery admission requirements, exposes explicit partial
+capabilities, and never certifies point/burn entitlements. Its private clone must
+be independently qualified before the explicit initializer or worker is run.

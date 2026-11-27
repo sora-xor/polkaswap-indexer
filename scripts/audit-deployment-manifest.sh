@@ -9,7 +9,7 @@ README_FILE="${4:-$ROOT_DIR/README.md}"
 ENV_EXAMPLE="${5:-$ROOT_DIR/.env.example}"
 RESOLVED_AUDIT_SCRIPT="$ROOT_DIR/scripts/audit-resolved-deployment-manifest.mjs"
 FAILURES=0
-NODE_IMAGE='node:24-bookworm-slim@sha256:cb4e8f7c443347358b7875e717c29e27bf9befc8f5a26cf18af3c3dec80e58c5'
+NODE_IMAGE='node:24-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea'
 
 fail() {
   echo "[deployment-manifest][error] $*" >&2
@@ -21,6 +21,14 @@ require_literal() {
   local literal="$2"
   local label="$3"
   if ! grep -Fq -- "$literal" "$file"; then
+    fail "$label"
+  fi
+}
+
+require_healthcheck_literal() {
+  local literal="$1"
+  local label="$2"
+  if [[ "$RUNTIME_HEALTHCHECK_SOURCE" != *"$literal"* ]]; then
     fail "$label"
   fi
 }
@@ -123,6 +131,43 @@ if [[ "$(grep -Fxc 'CMD ["node", "dist/src/index.js"]' "$DOCKERFILE")" -ne 1 ]] 
    [[ "$(grep -Ec '^CMD ' "$DOCKERFILE")" -ne 1 ]]; then
   fail "runtime image must use exactly the compiled API default command"
 fi
+RUNTIME_HEALTHCHECK_SOURCE=''
+if ! RUNTIME_HEALTHCHECK_SOURCE="$(node - "$DOCKERFILE" <<'NODE'
+const fs = require('node:fs');
+
+const lines = fs.readFileSync(process.argv[2], 'utf8').split(/\r?\n/);
+const healthcheckIndexes = lines
+  .map((line, index) => line.startsWith('HEALTHCHECK ') ? index : -1)
+  .filter((index) => index >= 0);
+if (healthcheckIndexes.length !== 1) process.exit(1);
+
+const commandLine = lines[healthcheckIndexes[0] + 1]?.trimStart() ?? '';
+if (!commandLine.startsWith('CMD [')) process.exit(1);
+
+let command;
+try {
+  command = JSON.parse(commandLine.slice('CMD '.length));
+} catch {
+  process.exit(1);
+}
+if (
+  !Array.isArray(command) ||
+  command.length !== 3 ||
+  command[0] !== 'node' ||
+  command[1] !== '-e' ||
+  typeof command[2] !== 'string'
+) process.exit(1);
+
+try {
+  new Function(command[2]);
+} catch {
+  process.exit(1);
+}
+process.stdout.write(command[2]);
+NODE
+)"; then
+  fail "runtime healthcheck must use exactly one syntactically valid JSON exec-form Node command"
+fi
 require_literal "$DOCKERFILE" 'GRAPHQL_HTTP_MAX_BODY_BYTES=65536' "runtime image must default to a bounded GraphQL HTTP body"
 require_literal "$DOCKERFILE" 'RATE_LIMIT_MAX_KEYS=20000' "runtime image must bound rate-limit identities"
 require_literal "$DOCKERFILE" 'RATE_LIMIT_GLOBAL_MAX=50000' "runtime image must enable the global rate bucket"
@@ -137,6 +182,13 @@ mobile_capability_suffixes=(
   TAIRA_DEFAULT_VISIBLE
 )
 mobile_capability_defaults=(true false true false true)
+mobile_capability_required_messages=(
+  'Set the reviewed Nexus availability value'
+  'Set the reviewed Nexus sends value'
+  'Set the reviewed Polkamarkt visibility value'
+  'Set the reviewed Polkamarkt mutations value'
+  'Set the reviewed Taira default visibility value'
+)
 for index in "${!mobile_capability_suffixes[@]}"; do
   capability="MOBILE_CONFIG_${mobile_capability_suffixes[$index]}"
   deployment_input="POLKASWAP_${capability}"
@@ -149,9 +201,15 @@ for index in "${!mobile_capability_suffixes[@]}"; do
   require_literal "$ENV_EXAMPLE" "${capability}=${capability_default}" ".env.example must document the direct-process ${capability} tester default"
   require_literal "$ENV_EXAMPLE" "${deployment_input}=${capability_default}" ".env.example must document the production Compose ${deployment_input} tester default"
 done
-require_literal "$DOCKERFILE" 'POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS=4000' "runtime healthcheck must use a deadline shorter than its container timeout"
-require_literal "$DOCKERFILE" 'node dist/src/scripts/production-smoke.js' "runtime healthcheck must reuse the complete PI identity smoke contract"
-require_literal "$DOCKERFILE" 'http://127.0.0.1:${PORT:-4350}${GRAPHQL_PATH:-/graphql}' "runtime healthcheck must probe the loopback GraphQL endpoint"
+require_healthcheck_literal "spawn(process.execPath,['dist/src/scripts/production-smoke.js',endpoint]" "runtime healthcheck must reuse the complete PI identity smoke contract"
+require_healthcheck_literal "stdio:'ignore'" "runtime healthcheck must isolate smoke output from container health status"
+require_healthcheck_literal "POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS:'4000'" "runtime healthcheck must use a deadline shorter than its container timeout"
+require_healthcheck_literal "process.env.PORT??'4350'" "runtime healthcheck must derive its port from the runtime environment"
+require_healthcheck_literal "process.env.GRAPHQL_PATH??'/graphql'" "runtime healthcheck must derive its GraphQL path from the runtime environment"
+require_healthcheck_literal "const endpoint='http://127.0.0.1:'+port+path" "runtime healthcheck must probe the loopback GraphQL endpoint"
+require_healthcheck_literal "child.once('error',()=>process.exit(1))" "runtime healthcheck must fail closed when the smoke child cannot start"
+require_healthcheck_literal "child.once('exit',code=>process.exit(code??1))" "runtime healthcheck must propagate the smoke child exit status"
+require_healthcheck_literal ".catch(()=>process.exit(1))" "runtime healthcheck must fail closed when healthcheck setup fails"
 
 require_literal "$PRODUCTION_COMPOSE" 'image: "${POLKASWAP_INDEXER_IMAGE_REPOSITORY:?' "Production Compose must require an external image repository"
 require_literal "$PRODUCTION_COMPOSE" '@sha256:${POLKASWAP_INDEXER_IMAGE_DIGEST:?' "Production Compose must require an immutable image digest"
@@ -181,8 +239,8 @@ require_literal "$PRODUCTION_COMPOSE" 'GRAPHQL_WS_MAX_OPERATIONS_PER_CONNECTION:
 for index in "${!mobile_capability_suffixes[@]}"; do
   capability="MOBILE_CONFIG_${mobile_capability_suffixes[$index]}"
   deployment_input="POLKASWAP_${capability}"
-  capability_default="${mobile_capability_defaults[$index]}"
-  require_literal "$PRODUCTION_COMPOSE" "      ${capability}: \"\${${deployment_input}:-${capability_default}}\"" "Production Compose must expose ${capability} through its exact reviewed deployment input"
+  required_message="${mobile_capability_required_messages[$index]}"
+  require_literal "$PRODUCTION_COMPOSE" "      ${capability}: \"\${${deployment_input}:?${required_message}}\"" "Production Compose must require ${capability} through its exact reviewed deployment input"
 done
 
 if [[ "$(grep -Fc '<<: *runtime-security' "$PRODUCTION_COMPOSE")" -ne 3 ]]; then
@@ -252,9 +310,9 @@ else
   for index in "${!mobile_capability_suffixes[@]}"; do
     capability="MOBILE_CONFIG_${mobile_capability_suffixes[$index]}"
     deployment_input="POLKASWAP_${capability}"
-    capability_default="${mobile_capability_defaults[$index]}"
-    if [[ "$(grep -Fxc "      ${capability}: \"\${${deployment_input}:-${capability_default}}\"" <<<"$api_service")" -ne 1 ]]; then
-      fail "api must expose ${capability} through its exact reviewed deployment input"
+    required_message="${mobile_capability_required_messages[$index]}"
+    if [[ "$(grep -Fxc "      ${capability}: \"\${${deployment_input}:?${required_message}}\"" <<<"$api_service")" -ne 1 ]]; then
+      fail "api must require ${capability} through its exact reviewed deployment input"
     fi
   done
 fi
@@ -357,7 +415,7 @@ else
 fi
 
 if [[ "${#compose_command[@]}" -gt 0 ]]; then
-  if resolved_compose="$(
+  if (
     env \
     -u POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE \
     -u POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE \
@@ -372,6 +430,25 @@ if [[ "${#compose_command[@]}" -gt 0 ]]; then
     POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
     POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
     POLKASWAP_CHAIN_START_BLOCK=14000000 \
+      "${compose_command[@]}" -f "$PRODUCTION_COMPOSE" config --quiet >/dev/null 2>&1
+  ); then
+    fail "Production Compose must reject missing mobile capability deployment inputs"
+  fi
+
+  if resolved_compose="$(
+    POLKASWAP_INDEXER_IMAGE_REPOSITORY=registry.invalid/polkaswap-indexer \
+    POLKASWAP_INDEXER_IMAGE_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    POLKASWAP_MIGRATION_OWNER_DATABASE_URL='postgresql://manifest_migration_owner:owner-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_API_DATABASE_URL='postgresql://manifest_api:api-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_WORKER_DATABASE_URL='postgresql://manifest_worker:worker-test-only@database.invalid/polkaswap?sslmode=verify-full' \
+    POLKASWAP_SORA_WS_ENDPOINT=wss://primary.invalid \
+    POLKASWAP_SORA_ARCHIVE_WS_ENDPOINT=wss://archive.invalid \
+    POLKASWAP_CHAIN_START_BLOCK=14000000 \
+    POLKASWAP_MOBILE_CONFIG_NEXUS_AVAILABLE=true \
+    POLKASWAP_MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=false \
+    POLKASWAP_MOBILE_CONFIG_POLKAMARKT_VISIBLE=true \
+    POLKASWAP_MOBILE_CONFIG_POLKAMARKT_MUTATIONS_AVAILABLE=false \
+    POLKASWAP_MOBILE_CONFIG_TAIRA_DEFAULT_VISIBLE=true \
       "${compose_command[@]}" -f "$PRODUCTION_COMPOSE" config --format json 2>/dev/null
   )"; then
     if ! node "$RESOLVED_AUDIT_SCRIPT" <<<"$resolved_compose"; then
