@@ -28,7 +28,16 @@ const STABLE_ASSET_IDS = new Set([
 ]);
 // Preserve the existing global-price policy: shallow pools cannot become oracles.
 const MIN_PRICE_DISCOVERY_LIQUIDITY_USD = 100n * SCALE;
+// Legacy absolute floor (0.5 natural tokens), kept for every candidate except a non-dust
+// direct XOR pair. The other routes are anchored on the $1-assumed KUSD/XSTUSD DEX bases or
+// on derived tokens, so their USD gate cannot vouch for a shallow pool. Dropping it would newly
+// price XSTUSD-only tokens from pools holding a fraction of a token (CERES at ~$518 and XSTBTC
+// at ~$134,668 on 2026-10-13 mainnet state).
 const MIN_PRICE_DISCOVERY_AMOUNT = SCALE / 2n;
+// A direct XOR quote is dust when its pool holds less than 1/100 of the asset's deepest
+// reserve in any pool. The ratio has no unit, so it suits high-value tokens and any precision.
+const DIRECT_XOR_DUST_DIVISOR = 100n;
+const XOR_ASSET_ID = HOURLY_HISTORY_ASSETS[0]!.id;
 const scaledMul = (left: bigint, right: bigint): bigint => (left * right) / SCALE;
 const scaledDiv = (left: bigint, right: bigint): bigint => right === 0n ? 0n : (left * SCALE) / right;
 const reserveToNaturalScaled = (reserve: bigint, decimals: number): bigint => scaledDiv(reserve, 10n ** BigInt(decimals));
@@ -183,98 +192,105 @@ export function directXorPoolEvidence(
   };
 }
 
-/** Shared existing stable-anchored, liquidity-gated pool valuation; no latest-state inputs. */
+/**
+ * Shared stable-anchored, liquidity-gated pool valuation; no latest-state inputs. The worker's
+ * current projections, price stream, historical valuation and hourly closes all use it.
+ *
+ * Prices are assigned once, in layers, so neither pool order nor a cycle can change them:
+ * 1. DAI, XSTUSD and KUSD are fixed at $1.
+ * 2. XOR is quoted only from pools pairing it with one of those stables: deepest XOR reserve,
+ *    then the larger stable side. No derived token can reprice it afterwards.
+ * 3. Every other asset is quoted from anchors priced in an earlier layer: first the stables and
+ *    XOR, then the assets priced in that layer, and so on. A quote is final once published, so
+ *    an asset reachable in fewer hops is never requoted through a deeper multi-hop pool. Within
+ *    a layer a non-dust direct XOR pair outranks other anchors, then the deeper reserve of the
+ *    priced asset wins, then the larger anchored liquidity, then the pool key. A route never
+ *    revisits an asset, and its pools reproduce the published price exactly.
+ *
+ * Direct XOR pairs outrank the other DEX bases because KUSD and XSTUSD are fixed at $1 here
+ * but trade well below it on-chain, and VXOR or multi-hop anchors are derived. Token depth alone
+ * is not comparable across those anchors: ranking by it would let a 0.014 ETH trade move ETH
+ * between its XOR/ETH and KUSD/ETH quotes, which differ by almost 2x. Re-ranking every asset
+ * from the previous round's prices instead of using layers is not safe: two assets that are each
+ * other's deepest market alternate between routes through each other and their own anchors.
+ *
+ * Every candidate needs $100 of anchored liquidity, the minimum along its route. A direct XOR
+ * pair must also hold at least 1/100 of the asset's deepest pool reserve, instead of 0.5 tokens,
+ * which excluded high-value assets such as ETH. A pair that fails this check, and every other
+ * route, keeps the 0.5-token floor.
+ */
 export function deriveAssetPrices(
   assets: Map<string, Pick<HourlyAssetMetadata, 'id' | 'decimals'>>,
   pools: HourlyPoolReserves[],
   evidence?: Map<string, HourlyPoolReserves[]>
 ): Map<string, bigint> {
-    evidence?.clear();
-    const prices = new Map<string, bigint>();
-    const confidence = new Map<string, bigint>();
-    const depth = new Map<string, bigint>();
-    const fixedAssets = new Set<string>();
+  evidence?.clear();
+  // Positive reserves in natural units. The deepest reserve per asset does not depend on prices.
+  const legs: Array<{ pool: HourlyPoolReserves; key: string; base: bigint; target: bigint }> = [];
+  const deepestReserve = new Map<string, bigint>();
+  for (const pool of pools) {
+    const baseInfo = assets.get(pool.baseAssetId);
+    const targetInfo = assets.get(pool.targetAssetId);
+    if (!baseInfo || !targetInfo || pool.baseAssetReserves === 0n || pool.targetAssetReserves === 0n) continue;
+    const base = reserveToNaturalScaled(pool.baseAssetReserves, baseInfo.decimals);
+    const target = reserveToNaturalScaled(pool.targetAssetReserves, targetInfo.decimals);
+    if (base === 0n || target === 0n) continue;
+    legs.push({ pool, key: `${pool.baseAssetId}:${pool.targetAssetId}`, base, target });
+    if (base > (deepestReserve.get(pool.baseAssetId) ?? 0n)) deepestReserve.set(pool.baseAssetId, base);
+    if (target > (deepestReserve.get(pool.targetAssetId) ?? 0n)) deepestReserve.set(pool.targetAssetId, target);
+  }
 
-    for (const asset of assets.values()) {
-      if (STABLE_ASSET_IDS.has(asset.id)) {
-        prices.set(asset.id, SCALE);
-        evidence?.set(asset.id, []);
-        fixedAssets.add(asset.id);
+  // Final quotes. A fixed stable has no liquidity bound of its own.
+  type Quote = { price: bigint; confidence: bigint | null; route: HourlyPoolReserves[] };
+  type Candidate = Quote & { confidence: bigint; tier: number; depth: bigint; key: string };
+  const quotes = new Map<string, Quote>();
+  for (const asset of assets.values()) {
+    if (STABLE_ASSET_IDS.has(asset.id)) quotes.set(asset.id, { price: SCALE, confidence: null, route: [] });
+  }
+  const outranks = (next: Candidate, current: Candidate | undefined): boolean => {
+    if (!current) return true;
+    if (next.tier !== current.tier) return next.tier > current.tier;
+    if (next.depth !== current.depth) return next.depth > current.depth;
+    if (next.confidence !== current.confidence) return next.confidence > current.confidence;
+    return next.key < current.key;
+  };
+
+  /** Quotes each eligible unpriced asset from anchors priced before this layer; returns the count. */
+  const priceLayer = (eligible: (assetId: string) => boolean, isAnchor: (assetId: string) => boolean): number => {
+    const best = new Map<string, Candidate>();
+    for (const leg of legs) {
+      const sides = [
+        [leg.pool.targetAssetId, leg.target, leg.pool.baseAssetId, leg.base],
+        [leg.pool.baseAssetId, leg.base, leg.pool.targetAssetId, leg.target],
+      ] as const;
+      for (const [assetId, depth, anchorId, anchorNatural] of sides) {
+        const anchor = quotes.get(anchorId);
+        if (!anchor || quotes.has(assetId) || !eligible(assetId) || !isAnchor(anchorId)) continue;
+        const anchoredUSD = scaledMul(anchorNatural, anchor.price);
+        const confidence = anchor.confidence !== null && anchor.confidence < anchoredUSD ? anchor.confidence : anchoredUSD;
+        const price = scaledDiv(anchoredUSD, depth);
+        if (price <= 0n || confidence < MIN_PRICE_DISCOVERY_LIQUIDITY_USD) continue;
+        const tier = anchorId === XOR_ASSET_ID && depth * DIRECT_XOR_DUST_DIVISOR >= (deepestReserve.get(assetId) ?? 0n) ? 1 : 0;
+        if (tier === 0 && depth < MIN_PRICE_DISCOVERY_AMOUNT) continue;
+        const candidate = { price, confidence, route: [...anchor.route, leg.pool], tier, depth, key: leg.key };
+        if (outranks(candidate, best.get(assetId))) best.set(assetId, candidate);
       }
     }
+    for (const [assetId, { price, confidence, route }] of best) quotes.set(assetId, { price, confidence, route });
+    return best.size;
+  };
 
-    for (let round = 0; round < 12; round += 1) {
-      let changed = false;
+  priceLayer((assetId) => assetId === XOR_ASSET_ID, (assetId) => STABLE_ASSET_IDS.has(assetId));
+  for (let layer = 0; layer < 12; layer += 1) {
+    if (!priceLayer((assetId) => assetId !== XOR_ASSET_ID, () => true)) break;
+  }
 
-      for (const pool of pools) {
-        if (pool.baseAssetReserves === 0n || pool.targetAssetReserves === 0n) continue;
-
-        const baseInfo = assets.get(pool.baseAssetId);
-        const targetInfo = assets.get(pool.targetAssetId);
-        if (!baseInfo || !targetInfo) continue;
-
-        const baseNatural = reserveToNaturalScaled(pool.baseAssetReserves, baseInfo.decimals);
-        const targetNatural = reserveToNaturalScaled(pool.targetAssetReserves, targetInfo.decimals);
-        if (baseNatural === 0n || targetNatural === 0n) continue;
-
-        const basePrice = prices.get(pool.baseAssetId);
-        const targetPrice = prices.get(pool.targetAssetId);
-        const baseRoute = evidence?.get(pool.baseAssetId) ?? [];
-        const targetRoute = evidence?.get(pool.targetAssetId) ?? [];
-
-        const applyCandidate = (assetId: string, price: bigint, candidateConfidence: bigint, candidateDepth: bigint, parentRoute: HourlyPoolReserves[]) => {
-          if (
-            fixedAssets.has(assetId) ||
-            price <= 0n ||
-            candidateConfidence < MIN_PRICE_DISCOVERY_LIQUIDITY_USD ||
-            candidateDepth < MIN_PRICE_DISCOVERY_AMOUNT
-          ) {
-            return;
-          }
-
-          const currentDepth = depth.get(assetId) ?? 0n;
-          const currentConfidence = confidence.get(assetId) ?? 0n;
-
-          if (candidateDepth > currentDepth || (candidateDepth === currentDepth && candidateConfidence > currentConfidence)) {
-            prices.set(assetId, price);
-            confidence.set(assetId, candidateConfidence);
-            depth.set(assetId, candidateDepth);
-            evidence?.set(assetId, [...new Map([...parentRoute, pool].map((item) => [`${item.baseAssetId}:${item.targetAssetId}`, { ...item }])).values()]);
-            changed = true;
-          }
-        };
-
-        if (basePrice && basePrice > 0n) {
-          const baseLiquidityUSD = scaledMul(baseNatural, basePrice);
-          const baseConfidence = confidence.get(pool.baseAssetId);
-          applyCandidate(
-            pool.targetAssetId,
-            scaledDiv(baseLiquidityUSD, targetNatural),
-            baseConfidence ? baseConfidence < baseLiquidityUSD ? baseConfidence : baseLiquidityUSD : baseLiquidityUSD,
-            targetNatural,
-            baseRoute
-          );
-        }
-
-        if (targetPrice && targetPrice > 0n) {
-          const targetLiquidityUSD = scaledMul(targetNatural, targetPrice);
-          const targetConfidence = confidence.get(pool.targetAssetId);
-          applyCandidate(
-            pool.baseAssetId,
-            scaledDiv(targetLiquidityUSD, baseNatural),
-            targetConfidence ? targetConfidence < targetLiquidityUSD ? targetConfidence : targetLiquidityUSD : targetLiquidityUSD,
-            baseNatural,
-            targetRoute
-          );
-        }
-      }
-
-      if (!changed) {
-        break;
-      }
-    }
-
-    return prices;
+  const prices = new Map<string, bigint>();
+  for (const [assetId, quote] of quotes) {
+    prices.set(assetId, quote.price);
+    evidence?.set(assetId, quote.route.map((pool) => ({ ...pool })));
+  }
+  return prices;
 }
 
 /** Format a nonnegative scaled price exactly without float conversion or artificial precision. */

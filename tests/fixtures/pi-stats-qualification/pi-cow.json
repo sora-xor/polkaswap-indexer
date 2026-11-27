@@ -1,0 +1,109 @@
+{
+  "schema": "sora-nexus-pi-stats-cow-byte-clone-v1",
+  "sourceDatabasePath": "/Users/administrator/apps/pi-indexer-recovery-20261009/restores/pi-canonical-prefix-20261101-return-01",
+  "databasePath": "/Users/administrator/apps/pi-indexer-recovery-20261009/restores/pi-stats-history-private-20261101",
+  "sourceFilesSha256": "987715ca7ca04e77f4dd78d87aacf70a5c762d745e293f953deb5cbadb9ac8c6",
+  "sourceNativeAuditSha256": "786455fba448810322010a84badc80e4f1a122da3b683cbcee397ec09db96c1f",
+  "sourceNativeExecutorSha256": "650d350b22371d2795f0cb43b08f175d269feb39d625cec2743ce4d2910c35a6",
+  "sourceFiles": {
+    "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/pi-stats-clone-20261101/tools-v2/source-files.json",
+    "sha256": "987715ca7ca04e77f4dd78d87aacf70a5c762d745e293f953deb5cbadb9ac8c6"
+  },
+  "targetFiles": {
+    "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/pi-stats-clone-20261101/evidence/target-files.json",
+    "sha256": "987715ca7ca04e77f4dd78d87aacf70a5c762d745e293f953deb5cbadb9ac8c6"
+  },
+  "sourceBeforePosix": {
+    "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/pi-stats-clone-20261101/evidence/source-before-posix.json",
+    "sha256": "dd14c0631d5b44298b3f757cbb538411a402ca62b29663e7c344a1e3f4a49b1b"
+  },
+  "sourceAfterPosix": {
+    "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/pi-stats-clone-20261101/evidence/source-after-posix.json",
+    "sha256": "dd14c0631d5b44298b3f757cbb538411a402ca62b29663e7c344a1e3f4a49b1b"
+  },
+  "piSourceNativeAudit": {
+    "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/prefix-return-20261101/native-audit-return-02/native-output.json",
+    "sha256": "786455fba448810322010a84badc80e4f1a122da3b683cbcee397ec09db96c1f"
+  },
+  "piSourceNativeExecutor": {
+    "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/prefix-return-20261101/native-audit-return-02/NATIVE-AUDIT.json",
+    "sha256": "650d350b22371d2795f0cb43b08f175d269feb39d625cec2743ce4d2910c35a6"
+  },
+  "sourcePosixMetadataFields": [
+    "device",
+    "inode",
+    "mode",
+    "uid",
+    "gid",
+    "size",
+    "mtimeNs",
+    "ctimeNs",
+    "nlink",
+    "flags"
+  ],
+  "files": 499,
+  "logicalBytes": 18786660488,
+  "sourceLockHeldThroughout": true,
+  "allSourceBytesAndPosixMetadataUnchanged": true,
+  "allTargetBytesMatch": true,
+  "allTargetInodesIndependent": true,
+  "allTargetNlinkOne": true,
+  "fclonefileatFlags": 24,
+  "copyFallbackUsed": false,
+  "sourceReadOnlyApiUnchanged": true,
+  "sourceReadOnlyApiIdentity": {
+    "supervisor": {
+      "pid": 88884,
+      "ppid": 1,
+      "uid": 501,
+      "birth": "Sat Oct 31 19:26:36 2026",
+      "command": "/bin/bash /Library/PolkaswapStorage/run-pi-supervised.sh /Users/administrator/apps/pi-indexer-recovery-20261009/run-pi-qualified.sh"
+    },
+    "node": {
+      "pid": 88890,
+      "ppid": 88884,
+      "uid": 501,
+      "birth": "Sat Oct 31 19:26:36 2026",
+      "command": "/opt/homebrew/opt/node@24/bin/node --require=/Library/PolkaswapStorage/storage-preflight.cjs --max-old-space-size=3072 dist/src/scripts/serve-recovery-hold.js /Users/administrator/apps/pi-indexer-recovery-20261009/prefix-activation-20261101/prefix-hold-manifest.json"
+    }
+  },
+  "workerIdentity": {
+    "pid": 94722,
+    "ppid": 94677,
+    "uid": 501,
+    "realUid": 501,
+    "gid": 20,
+    "pgid": 94722,
+    "birth": "Sat Oct 31 20:15:48 2026",
+    "command": [
+      "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9",
+      "-u",
+      "/Users/administrator/apps/pi-indexer-recovery-20261009/pi-stats-clone-20261101/evidence/bound-worker.py",
+      "f91b0140173ecc7bb6decadb9a4cad99ec83d067ffe291ef6bfbdf3349261e6f",
+      "5ad38d740b9f1ac2df254166b7fd75fd9535a601650199cbc30023aa9f48bec8"
+    ]
+  },
+  "workerReaped": true,
+  "workerParentVerifiedEveryTick": true,
+  "availableBytes": 88485249024,
+  "minimumAvailableBytes": 81604378624,
+  "admissionSha256": "f91b0140173ecc7bb6decadb9a4cad99ec83d067ffe291ef6bfbdf3349261e6f",
+  "cloneAllocationBudgetBytes": 134217728,
+  "observedAvailableDeltaBytes": 10813440,
+  "allocationDeltaMayIncludeOtherWriters": true,
+  "suffixWorkingBudgetProved": false,
+  "sourceAccessMode": "active-qualified-readonly-api-plus-parent-posix-lock",
+  "copyMechanism": "apfs-fclonefileat-cow",
+  "piSourceReadySha256": "41c72841be3c8fb12cbc5cd2df151998792c1308ead4c469265b94cd70c348d3",
+  "sourceQualification": {
+    "databaseFilesSha256": "987715ca7ca04e77f4dd78d87aacf70a5c762d745e293f953deb5cbadb9ac8c6",
+    "nativeAuditSha256": "786455fba448810322010a84badc80e4f1a122da3b683cbcee397ec09db96c1f",
+    "completionReceiptSha256": "6d0618532b04d9cfa4f3e2a0687d3798b7955ace84e553125200e561f43315a4"
+  },
+  "nativeDbOpened": false,
+  "normalizedScanPerformed": false,
+  "initializerRun": false,
+  "servicesChanged": false,
+  "candidatePromotionReady": false,
+  "entitlementsReady": false
+}

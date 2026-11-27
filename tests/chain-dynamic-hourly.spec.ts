@@ -8,6 +8,7 @@ import {
   HOURLY_HISTORY_ASSETS, HOURLY_HISTORY_GENESIS,
   type HourlyHistoryTarget,
 } from '../src/worker/hourly-history.js';
+import { pinnedValuationStorage } from './pinned-valuation-storage.js';
 
 const SCALE = 10n ** 18n;
 const XOR = HOURLY_HISTORY_ASSETS[0]!.id;
@@ -40,7 +41,11 @@ function worker() {
   internal.api = { genesisHash: { toString: () => HOURLY_HISTORY_GENESIS } };
   internal.observedGenesisHash = HOURLY_HISTORY_GENESIS;
   internal.previousHourlyHistoryBlock = { ...before };
-  internal.getHistoricalValuationQueryAt = vi.fn(async () => ({ denomination: { denominator: async () => ({ toString: (): string => denominator }) } }));
+  internal.getHistoricalValuationQueryAt = vi.fn(async () => ({
+    // The close reads metadata and reserves from the pinned `before` state, which matches `state` here.
+    ...pinnedValuationStorage(() => state),
+    denomination: { denominator: async () => ({ toString: (): string => denominator }) },
+  }));
   internal.prepareHistoricalValuationAdvance = vi.fn(async () => ({ blockHeight: after.height, assets: [], pools: [] }));
   const assets = new Map([...HOURLY_HISTORY_ASSETS, EXTRA, ADDED].map((asset) => [asset.id, { ...asset, decimals: 18, name: asset.symbol, supply: SCALE }]));
   const pool = { id: 'extra-pool', baseAssetId: XOR, targetAssetId: EXTRA.id, baseAssetReserves: 2n * SCALE, targetAssetReserves: SCALE };

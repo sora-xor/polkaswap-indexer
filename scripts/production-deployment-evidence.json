@@ -29,6 +29,7 @@
     "deployedAt",
     "smokePassedAt",
     "healthInfo",
+    "mobileConfig",
     "soraRpcControls",
     "tlsEdgeControls",
     "operator"

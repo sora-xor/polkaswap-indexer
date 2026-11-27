@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 const apiCreate = vi.hoisted(() => vi.fn());
 vi.mock('@polkadot/api', () => ({ ApiPromise: { create: apiCreate }, HttpProvider: class {} }));
 
-import { createArchiveHourlyBackfillSource } from '../src/scripts/hourly-backfill-archive.js';
+import { createArchiveHourlyBackfillSource, HourlyArchiveHttpProvider, readHourlyArchiveEntries } from '../src/scripts/hourly-backfill-archive.js';
 import { HOURLY_GENESIS_HASH } from '../src/scripts/hourly-backfill-constants.js';
 import { buildAssetHourlyCloseDocumentsAtBoundary, HOURLY_HISTORY_ASSETS } from '../src/worker/hourly-history.js';
 import { prepareHourlyBackfill } from '../src/scripts/backfill-hourly-history.js';
@@ -48,7 +48,111 @@ function setup() {
   return { api, at, assetPages, reservePages, denominator, getStorage, getHeader, disconnect };
 }
 
-afterEach(() => vi.clearAllMocks());
+afterEach(() => { vi.clearAllMocks(); vi.unstubAllGlobals(); });
+
+describe('archive observation rejection boundaries', () => {
+  const before = { height: 10, hash: hash(10), parentHash: hash(9), timestamp: 7_199 };
+  it('disconnects a source from the wrong genesis before returning it', async () => {
+    const f = setup(); f.api.genesisHash.toHex = () => hash(1);
+    await expect(createArchiveHourlyBackfillSource()).rejects.toThrow(/genesis/); expect(f.disconnect).toHaveBeenCalledOnce();
+  });
+  it.each([0, -1, 1.5, NaN])('rejects invalid block height %s before RPC', async height => {
+    const f = setup(), source = await createArchiveHourlyBackfillSource();
+    await expect(source.block(height)).rejects.toThrow(/height/); expect(f.getHeader).not.toHaveBeenCalled();
+  });
+  it('rejects a malformed block hash and a mismatched fixed anchor', async () => {
+    const f = setup(), source = await createArchiveHourlyBackfillSource();
+    f.api.rpc.chain.getBlockHash.mockResolvedValue({ toHex: () => 'malformed' });
+    await expect(source.block(10)).rejects.toThrow(/identity/);
+    f.api.rpc.chain.getBlockHash.mockResolvedValue({ toHex: () => hash(25059555) });
+    await expect(source.block(25059555)).rejects.toThrow(/identity/);
+  });
+  it.each(['0x01', '0xFFFFFFFFFFFFFFFF', '0xffffffffffffffff'])('rejects malformed or unsafe timestamp %s', async value => {
+    const f = setup(), source = await createArchiveHourlyBackfillSource(); f.getStorage.mockResolvedValue({ toHex: () => value });
+    await expect(source.block(10)).rejects.toThrow(/timestamp/);
+  });
+  it('rejects a header whose height disagrees with its request', async () => {
+    const f = setup(), source = await createArchiveHourlyBackfillSource();
+    f.getHeader.mockResolvedValue({ number: { toNumber: () => 11 }, parentHash: { toHex: () => hash(9) } });
+    await expect(source.block(10)).rejects.toThrow(/header/);
+  });
+  it.each(['assets', 'poolXYK', 'denomination'])('requires the historical %s pallet', async pallet => {
+    const f = setup(); const at = await f.at(); delete at.query[pallet];
+    const source = await createArchiveHourlyBackfillSource(); await expect(source.observation(before)).rejects.toThrow(/unavailable/);
+  });
+  it.each([null, [], {}, { precision: 18 }, { symbol: 'XOR' }])('rejects malformed asset metadata %j', async value => {
+    const f = setup(); f.assetPages.mockResolvedValue([[{ args: [key(xor.id)] }, metadata(value)]]);
+    const source = await createArchiveHourlyBackfillSource(); await expect(source.observation(before)).rejects.toThrow(/metadata/);
+  });
+  it.each([null, {}, { code: 'invalid' }, 'invalid'])('rejects malformed asset identities %j', async value => {
+    const f = setup(); f.assetPages.mockResolvedValue([[{ args: [{ toJSON: () => value }] }, metadata({ symbol: 'XOR', precision: 18 })]]);
+    const source = await createArchiveHourlyBackfillSource(); await expect(source.observation(before)).rejects.toThrow(/asset storage key/);
+  });
+  it.each([null, [], ['1'], ['1', '2', '3'], {}])('rejects malformed reserve tuple %j', async value => {
+    const f = setup(); f.reservePages.mockResolvedValue([[{ args: [key(xor.id), key(dai.id)] }, { toJSON: () => value }]]);
+    const source = await createArchiveHourlyBackfillSource(); await expect(source.observation(before)).rejects.toThrow(/reserves are malformed/);
+  });
+  it('skips None asset options and unwraps present options with string asset IDs', async () => {
+    const f = setup(); f.assetPages.mockResolvedValue([
+      [{ args: [key(dai.id)] }, { isNone: true }],
+      [{ args: [{ toJSON: () => xor.id.toUpperCase() }] }, { unwrap: () => metadata({ symbol: 'XOR', precision: 18 }) }],
+    ]); f.reservePages.mockResolvedValue([]);
+    const source = await createArchiveHourlyBackfillSource({ targets: [xor] });
+    expect((await source.observation(before)).assets).toEqual([{ ...xor, decimals: 18 }]);
+  });
+  it('reports finalized identity and provider progress without fetching the block hash again', async () => {
+    const f = setup(); Object.assign(f.api.rpc.chain, { getFinalizedHead: async () => ({ toHex: () => hash(10) }) });
+    const source = await createArchiveHourlyBackfillSource();
+    expect(await source.finalized()).toEqual(before); expect(await source.genesisHash()).toBe(HOURLY_GENESIS_HASH);
+    expect(source.progress?.()).toMatchObject({ rpcCalls: 0, httpRequests: 0 }); expect(f.api.rpc.chain.getBlockHash).not.toHaveBeenCalled();
+  });
+  it('rejects oversized archive pages and nonadvancing continuation keys', async () => {
+    const page = Array.from({ length: 256 }, () => [{ toHex: () => '0x01', args: [] }, {}]);
+    const collect = async (rows: any[]) => { for await (const _entry of readHourlyArchiveEntries({ entriesPaged: async () => rows } as any)) {} };
+    await expect(collect([...page, page[0]])).rejects.toThrow(/entry limit/);
+    await expect(collect(page)).rejects.toThrow(/did not advance/);
+  });
+});
+
+describe('archive batched HTTP protocol', () => {
+  const provider = () => new HourlyArchiveHttpProvider('https://archive.invalid');
+  it.each(['author_submitExtrinsic', 'state_call', 'system_health'])('rejects non-approved RPC method %s without fetching', async method => {
+    const fetch = vi.fn(); vi.stubGlobal('fetch', fetch);
+    await expect(provider().send(method, [])).rejects.toThrow(/read-only/); expect(fetch).not.toHaveBeenCalled();
+  });
+  it('stops at the absolute call limit before making another HTTP request', async () => {
+    const p = provider(); (p as any).calls = 300000; await expect(p.send('chain_getHeader', [])).rejects.toThrow(/limit/);
+  });
+  it.each([
+    ['HTTP failure', () => new Response('', { status: 503 }), /HTTP 503/],
+    ['missing body', () => new Response(null, { status: 200 }), /HTTP 200/],
+    ['non-array response', () => Response.json({}), /invalid RPC data/],
+    ['wrong batch length', () => Response.json([]), /invalid RPC data/],
+    ['missing item', () => Response.json([null]), /identities/],
+    ['wrong version', () => Response.json([{ jsonrpc: '1.0', id: 1, result: true }]), /identities/],
+    ['wrong ID type', () => Response.json([{ jsonrpc: '2.0', id: '1', result: true }]), /identities/],
+    ['unrequested ID', () => Response.json([{ jsonrpc: '2.0', id: 2, result: true }]), /identities/],
+    ['RPC error', () => Response.json([{ jsonrpc: '2.0', id: 1, error: { code: -1 } }]), /RPC error/],
+    ['missing result', () => Response.json([{ jsonrpc: '2.0', id: 1 }]), /RPC error/],
+    ['byte budget', () => new Response(new Uint8Array(8 * 1024 * 1024 + 1)), /exceeded/],
+  ])('rejects %s without hanging a caller', async (_name, response, error) => {
+    vi.stubGlobal('fetch', vi.fn(async () => (response as () => Response)()));
+    await expect(provider().send('chain_getHeader', [])).rejects.toThrow(error as RegExp);
+  });
+  it('rejects duplicate response identities for every caller in the batch', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json([{ jsonrpc: '2.0', id: 1, result: true }, { jsonrpc: '2.0', id: 1, result: true }])));
+    const p = provider(), values = await Promise.allSettled([p.send('chain_getHeader', []), p.send('chain_getBlockHash', [])]);
+    expect(values.every(value => value.status === 'rejected')).toBe(true);
+  });
+  it('serializes a second full batch and matches shuffled responses by ID', async () => {
+    const fetch = vi.fn(async (_url, request) => {
+      const calls = JSON.parse(request.body); return Response.json(calls.reverse().map((call: any) => ({ jsonrpc: '2.0', id: call.id, result: call.params[0] })));
+    }); vi.stubGlobal('fetch', fetch); const p = provider();
+    const values = await Promise.all(Array.from({ length: 34 }, (_, i) => p.send('chain_getHeader', [i])));
+    expect(values).toEqual(Array.from({ length: 34 }, (_, i) => i)); expect(fetch).toHaveBeenCalledTimes(2);
+    expect(p.progress()).toMatchObject({ rpcCalls: 34, httpRequests: 2, methods: { chain_getHeader: 34 } });
+  });
+});
 
 describe('pinned archive hourly source', () => {
   it('validates an explicit target catalogue before opening the archive connection', async () => {

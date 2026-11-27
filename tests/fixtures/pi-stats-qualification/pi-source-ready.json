@@ -1,0 +1,107 @@
+{
+  "activationPerformed": false,
+  "gateSha256": "58b6b6f0c71ac2062d00d5abc87bd68cb9c2aea03fcad90308ab8eb4f5290d6f",
+  "generated": {
+    "prefix-expected.json": "7c94d7841d776262edf4b68a0c48c5cfb2189542d47870882d1d247449aa04c7",
+    "prefix-hold-manifest.json": "87b02f87b75a1f9c43c8e1c3ef7aa12d8ba6e256efa478e9792b6d49f221b7be",
+    "prefix-launcher.sh": "b02772e885ca1bae3643fccb5fdeae0051513fba4d4dd92fa925933c00afc77a",
+    "prefix.env": "1ccfcec2bbe86c9612a0334cb59a5d9789b566c39712565555cb736cab81cf00",
+    "qualified-db-files.json": "1e34f579c7caad57fff94529f8a01fa9ccdb225a2002c18f4a6573015ffc4725",
+    "rollback-expected.json": "195f9476c5b812697b24503536051d5a84ad414c29f1132e04e3ce04f63502ac"
+  },
+  "inputs": {
+    "after": {
+      "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/prefix-return-20261101/native-audit-return-02/after-manifest.json",
+      "sha256": "aa5f1c0a540b9a22d0e612c83dcded9d659da93aa37039fc30b523afe9549892"
+    },
+    "before": {
+      "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/prefix-return-20261101/native-audit-return-02/before-manifest.json",
+      "sha256": "aa5f1c0a540b9a22d0e612c83dcded9d659da93aa37039fc30b523afe9549892"
+    },
+    "database": "/Users/administrator/apps/pi-indexer-recovery-20261009/restores/pi-canonical-prefix-20261101-return-01",
+    "executor": {
+      "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/prefix-return-20261101/native-audit-return-02/NATIVE-AUDIT.json",
+      "sha256": "650d350b22371d2795f0cb43b08f175d269feb39d625cec2743ce4d2910c35a6"
+    },
+    "finalizedObservation": {
+      "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/prefix-activation-20261101/finality-return-02.json",
+      "sha256": "907f87724762b2fb877911d7a27f7e4b07827154aaa5af3e8649d34aecbd9c46"
+    },
+    "native": {
+      "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/prefix-return-20261101/native-audit-return-02/native-output.json",
+      "sha256": "786455fba448810322010a84badc80e4f1a122da3b683cbcee397ec09db96c1f"
+    },
+    "receiverCodeSha256": "92ad60058bd93918917b0f69fad4d5aa9ee6fc99a632d89f6cb90a293f16ceac",
+    "schemaVersion": 1,
+    "sourceTransport": {
+      "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/prefix-return-20261101/return-01-transport-run.json.result.json",
+      "sha256": "f3ad140f6f09ee2ba607cffa9be28dc8c4d08e4534a91fffeeab4a9cf2080921"
+    },
+    "transferPlan": {
+      "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/prefix-return-20261101/approved-plan.json",
+      "sha256": "e66872dae33c68255e870a6112f9ef6966793b401af890674aa0328cf176cc3f"
+    },
+    "transferReceipt": {
+      "path": "/Users/administrator/apps/pi-indexer-recovery-20261009/prefix-return-20261101/transfer-return-01.intent.json.verified.json",
+      "sha256": "bfaa8e4df2853d6294146e6ee34052189db81e3bf3e9d09d4b71153a7b17043f"
+    }
+  },
+  "newRunnerSha256": "b02772e885ca1bae3643fccb5fdeae0051513fba4d4dd92fa925933c00afc77a",
+  "observedFinality": {
+    "endpoints": [
+      {
+        "finalizedBlock": 28194663,
+        "finalizedHash": "0x7dde912e8ce0679121a3c9a0fd23e92aba3dda55707c0c377d81e22220848d00",
+        "genesisHash": "0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5",
+        "sharedBlockHash": "0x7dde912e8ce0679121a3c9a0fd23e92aba3dda55707c0c377d81e22220848d00",
+        "sharedHeader": {
+          "digest": {
+            "logs": [
+              "0x0642414245340206000000c50ad11100000000",
+              "0x004101736f72616e782d7265636f762d7631007f7c253fa72f32e7b03f32bdc9ae456fd7174fb131b689be6d876006124129f01f4e11427a9c0a61a4868af40c9e0bdf263bb44a9ee59886a537c52164f3cdbb",
+              "0x05424142450101408be7d7d175f5121d33660cd06146c277ed3a352d3496c5760ab302f44779474500ae5168f62e8176cf0d0885d55ed7ce3e1c7e525be7189e088a01b2bc7e84"
+            ]
+          },
+          "extrinsicsRoot": "0x7ce900d95fee302873adda047744e13024a796b457b67d161068ec8a9503d3a4",
+          "number": "0x1ae3767",
+          "parentHash": "0xbf95ab51b0bac3d1d25c29e973d8278693aba2c81a9821d74a3b7d1cf4e8b6f3",
+          "stateRoot": "0xa726d0d5f74dd7373d214752766803fccae8c999c85948beebce3c5d7af1016f"
+        },
+        "sharedHeaderNumber": 28194663,
+        "url": "https://ws.mof.sora.org/"
+      },
+      {
+        "finalizedBlock": 28194663,
+        "finalizedHash": "0x7dde912e8ce0679121a3c9a0fd23e92aba3dda55707c0c377d81e22220848d00",
+        "genesisHash": "0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5",
+        "sharedBlockHash": "0x7dde912e8ce0679121a3c9a0fd23e92aba3dda55707c0c377d81e22220848d00",
+        "sharedHeader": {
+          "digest": {
+            "logs": [
+              "0x0642414245340206000000c50ad11100000000",
+              "0x004101736f72616e782d7265636f762d7631007f7c253fa72f32e7b03f32bdc9ae456fd7174fb131b689be6d876006124129f01f4e11427a9c0a61a4868af40c9e0bdf263bb44a9ee59886a537c52164f3cdbb",
+              "0x05424142450101408be7d7d175f5121d33660cd06146c277ed3a352d3496c5760ab302f44779474500ae5168f62e8176cf0d0885d55ed7ce3e1c7e525be7189e088a01b2bc7e84"
+            ]
+          },
+          "extrinsicsRoot": "0x7ce900d95fee302873adda047744e13024a796b457b67d161068ec8a9503d3a4",
+          "number": "0x1ae3767",
+          "parentHash": "0xbf95ab51b0bac3d1d25c29e973d8278693aba2c81a9821d74a3b7d1cf4e8b6f3",
+          "stateRoot": "0xa726d0d5f74dd7373d214752766803fccae8c999c85948beebce3c5d7af1016f"
+        },
+        "sharedHeaderNumber": 28194663,
+        "url": "https://mof2.sora.org/"
+      }
+    ],
+    "genesisHash": "0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5",
+    "observedAtUnix": 1793474742,
+    "schemaVersion": 1,
+    "sharedFinalizedBlock": 28194663,
+    "sharedFinalizedHash": "0x7dde912e8ce0679121a3c9a0fd23e92aba3dda55707c0c377d81e22220848d00",
+    "startedAtUnix": 1793474736
+  },
+  "oldDatabase": "/Users/administrator/apps/pi-indexer-recovery-20261009/restores/pi-return-8fcff452-4063-442e-bf1c-6fc1ef14e909.rocksdb",
+  "oldRunnerSha256": "b02ed6cb747ca13119af7d76a54def80e27937a6d6ed2435144952b5f15ab9a3",
+  "packageSha256": "2bab1b8fe3e8e3a2cce0e3617be80a154ef2931d606319250c90ebe884a71fd6",
+  "schemaVersion": 1,
+  "target": "/Users/administrator/apps/pi-indexer-recovery-20261009/restores/pi-canonical-prefix-20261101-return-01"
+}

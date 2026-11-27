@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "database": "/Users/administrator/apps/pi-indexer-recovery-20261009/restores/pi-canonical-prefix-20261101-return-01",
+  "inspectorSha256": "4db6ba97e6305c6ba4e41f71cd1e5510d22edb954f5b0adac9fced3e86ed879a",
+  "nativeOutputSha256": "786455fba448810322010a84badc80e4f1a122da3b683cbcee397ec09db96c1f",
+  "beforeManifestSha256": "aa5f1c0a540b9a22d0e612c83dcded9d659da93aa37039fc30b523afe9549892",
+  "afterManifestSha256": "aa5f1c0a540b9a22d0e612c83dcded9d659da93aa37039fc30b523afe9549892",
+  "exitCode": 0,
+  "readOnly": true,
+  "sourceNativeAuditSha256": "786455fba448810322010a84badc80e4f1a122da3b683cbcee397ec09db96c1f",
+  "allNativeFieldsMatchSource": true,
+  "process": {
+    "pid": 86013,
+    "uid": 501,
+    "realUid": 501,
+    "gid": 20,
+    "started": "Sat Oct 31 18:59:30 2026",
+    "command": [
+      "/opt/homebrew/opt/node@24/bin/node",
+      "--max-old-space-size=6144",
+      "/Users/administrator/apps/pi-indexer-recovery-20261009/prefix-return-20261101/inspect-prefix.mjs",
+      "/Users/administrator/apps/pi-indexer-recovery-20261009/restores/pi-canonical-prefix-20261101-return-01"
+    ]
+  },
+  "nodeSha256": "dbd06835a04a78ea89dc4f72694a68241cf3659d452fbcae666733d684fcf1ef",
+  "heldPosixLockDuringAudit": true,
+  "servicesChanged": false,
+  "liveIndexerRecovered": false
+}

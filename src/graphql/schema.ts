@@ -47,6 +47,21 @@ export const typeDefs = /* GraphQL */ `
     DELETE
   }
 
+  type IndexerCapabilities {
+    schemaVersion: Int!
+    genesisHash: String!
+    policyHash: String
+    mode: String!
+    statsReady: Boolean!
+    historyReady: Boolean!
+    currentViewsReady: Boolean!
+  coreViewsReady: Boolean!
+    entitlementsReady: Boolean!
+    indexedBlock: Int
+    indexedBlockHash: String
+    reason: String
+  }
+
   type Health {
     ok: Boolean!
     repositoryReady: Boolean!
@@ -129,6 +144,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type AccountMeta {
+    recoveryPolicyHash: String
     id: String!
     accountId: String
     createdAtTimestamp: Int
@@ -142,7 +158,25 @@ export const typeDefs = /* GraphQL */ `
     deposit: JSON
   }
 
+  type SoratopiaPointHistorySource {
+    account: String!
+    firstBlock: Int!
+    lastBlock: Int
+  }
+
+  type SoratopiaPointOwnership {
+    referralRewardsCodec: String!
+    status: String!
+    ready: Boolean!
+    accountId: String!
+    policyHash: String
+    checkpointBlock: Int
+    checkpointHash: String
+    sources: [SoratopiaPointHistorySource!]!
+  }
+
   type AccountPointSystem {
+    recoveryPolicyHash: String
     id: String!
     accountId: String
     version: Int
@@ -758,6 +792,13 @@ export const typeDefs = /* GraphQL */ `
 
   type XorBurn {
     id: String!
+    receiptId: String
+    blockHash: String
+    eventIndex: Int
+    originalAddress: String
+    claimOwner: String
+    recoveryPolicyHash: String
+    claimStatus: String
     address: String
     amount: String
     assetId: String
@@ -770,6 +811,9 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type TonswapBurnSnapshotConnection {
+    recoveryPolicyHash: String
+    postForkAnchorBlock: Int
+    postForkAnchorHash: String
     fresh: Boolean!
     genesisHash: String!
     startBlock: Int!
@@ -941,6 +985,7 @@ export const typeDefs = /* GraphQL */ `
   }
 
   type Query {
+    indexerCapabilities: IndexerCapabilities!
     _health: Health!
     mobileConfig: MobileConfig!
     account(id: String!): JSON
@@ -968,6 +1013,7 @@ export const typeDefs = /* GraphQL */ `
     vaults(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: VaultFilter): VaultConnection!
     vaultEvents(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: VaultEventFilter): VaultEventConnection!
     updatesStream(id: String!): UpdatesStream
+    soratopiaPointOwnership(id: String!): SoratopiaPointOwnership!
     accountMeta(id: String!): AccountMeta
     accountPointSystems(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountFilter): AccountPointSystemConnection!
     accountPositions(first: Int, last: Int, offset: Int, after: Cursor, before: Cursor, orderBy: [OrderBy!], filter: AccountPositionFilter, where: AccountPositionFilter): AccountPositionConnection!

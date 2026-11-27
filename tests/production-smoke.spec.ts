@@ -99,6 +99,72 @@ const validWorkerState = (
 const fetchWithHealth = (health: Record<string, unknown>) =>
   vi.fn(async () => jsonResponse({ data: { _health: health, ...validWorkerState() } }));
 
+describe('production smoke diagnostic and transport boundaries', () => {
+  const endpoint = 'https://pi.soramitsu.io/graphql';
+  it('rejects unsupported protocols before requesting a response', async () => {
+    const fetch = vi.fn(); await expect(runProductionSmoke('file:///graphql', fetch)).rejects.toThrow(/http or https/); expect(fetch).not.toHaveBeenCalled();
+  });
+  it.each([
+    { timeoutMs: 0 }, { timeoutMs: 60_001 }, { timeoutMs: 1.5 }, { timeoutMs: Infinity },
+    { maxResponseBytes: 5_242_881 }, { maxResponseBytes: -1 }, { maxIndexerAgeSec: 3_601 },
+  ])('rejects invalid request bounds %j before transport', async options => {
+    const fetch = vi.fn(); await expect(runProductionSmoke(endpoint, fetch, options)).rejects.toThrow(/integer between/); expect(fetch).not.toHaveBeenCalled();
+  });
+  it('supports a response implementation with a text-only body', async () => {
+    const response = { status: 200, ok: true, headers: new Headers({ 'content-type': 'application/json' }), text: async () => JSON.stringify({ data: { _health: validHealth, ...validWorkerState() } }) } as Response;
+    await expect(runProductionSmoke(endpoint, async () => response)).resolves.toBeUndefined();
+  });
+  it('applies the same byte limit to a text-only response', async () => {
+    const response = { status: 200, ok: true, headers: new Headers({ 'content-type': 'application/json' }), text: async () => 'é'.repeat(100) } as Response;
+    await expect(runProductionSmoke(endpoint, async () => response, { maxResponseBytes: 150 })).rejects.toThrow(/150/);
+  });
+  it.each(['', ' ', 'x'.repeat(1000)])('bounds and identifies non-JSON diagnostic bodies %j', async body => {
+    const error = await runProductionSmoke(endpoint, async () => new Response(body, { headers: { 'content-type': 'text/html' } })).catch(e => e);
+    expect(error).toBeInstanceOf(Error); expect(error.message.length).toBeLessThan(1000);
+    if (!body.trim()) expect(error.message).toContain('<empty body>'); else expect(error.message).toContain('...');
+  });
+  it.each([undefined, null, 'plain failure', 5, { description: 'failed' }])('formats a non-Error transport failure %j', async failure => {
+    await expect(runProductionSmoke(endpoint, async () => { throw failure; })).rejects.toThrow(/request .* failed/);
+  });
+  it('caps nested transport causes and emits bounded system diagnostics', async () => {
+    const cause = Object.assign(new Error(''), { code: 'ECONNRESET', errno: -1, syscall: 'read', hostname: 'fixture.invalid', address: '127.0.0.1', port: 443,
+      cause: new Error('second', { cause: new Error('third', { cause: new Error('fourth') }) }) });
+    const error = await runProductionSmoke(endpoint, async () => { throw new Error('transport', { cause }); }).catch(e => e);
+    expect(error.message).toContain('ECONNRESET'); expect(error.message).toContain('<nested cause omitted>'); expect(error.message).not.toContain('fourth');
+  });
+  it('formats string and circular object causes without masking the request failure', async () => {
+    const circular: any = {}; circular.self = circular;
+    for (const cause of ['upstream failed', circular, undefined]) {
+      await expect(runProductionSmoke(endpoint, async () => { throw new Error('request unavailable', { cause }); })).rejects.toThrow(/request unavailable/);
+    }
+  });
+  it.each([null, [null, {}, { message: 4 }], 'invalid'])('rejects malformed GraphQL errors %j', async errors => {
+    await expect(runProductionSmoke(endpoint, async () => jsonResponse({ errors }))).rejects.toThrow(/returned errors/);
+  });
+  it.each([undefined, null, [], {}, 'invalid'])('rejects missing health from data %j', async data => {
+    await expect(runProductionSmoke(endpoint, async () => jsonResponse({ data }))).rejects.toThrow(/data._health/);
+  });
+  it.each([
+    [{ workerLastSuccessfulIndexTimestamp: 0 }, /must be positive/],
+    [{ workerLastError: 3 }, /workerLastError must/],
+    [{ workerLastError: 'x'.repeat(1001) }, /workerLastError must/],
+    [{ workerLastError: 'failed', workerLastErrorTimestamp: -1 }, /workerLastErrorTimestamp/],
+    [{ workerLastError: 'failed', workerLastErrorTimestamp: 1.5 }, /workerLastErrorTimestamp/],
+  ])('rejects malformed worker failure metadata %j', async (patch, expected) => {
+    await expect(runProductionSmoke(endpoint, fetchWithHealth({ ...validHealth, ...patch }))).rejects.toThrow(expected as RegExp);
+  });
+  it('rejects capabilities missing entirely from an otherwise valid response', async () => {
+    const data = { _health: validHealth, ...validWorkerState(), mobileConfig: null };
+    await expect(runProductionSmoke(endpoint, async () => jsonResponse({ data }))).rejects.toThrow(/data.mobileConfig/);
+  });
+  it.each(['chainIdentity', 'chainState'] as const)('requires JSON text in %s checkpoint evidence', async field => {
+    for (const value of [null, {}, '{']) {
+      const data = { _health: validHealth, ...validWorkerState() }; (data[field] as any).data = value;
+      await expect(runProductionSmoke(endpoint, async () => jsonResponse({ data }))).rejects.toThrow(/data must be/);
+    }
+  });
+});
+
 describe('Polkaswap production smoke', () => {
   it('normalizes host-only endpoints to the GraphQL path', () => {
     expect(normalizeGraphqlUrl('https://pi.soramitsu.io').toString()).toBe('https://pi.soramitsu.io/graphql');
@@ -755,11 +821,15 @@ describe('Polkaswap production smoke', () => {
     );
   });
 
-  it('rejects stale or future coherent worker checkpoint timestamps', async () => {
-    for (const timestamp of [
-      Math.floor(Date.now() / 1000) - 301,
-      Math.floor(Date.now() / 1000) + 31,
-    ]) {
+  it.each([
+    ['stale', -301],
+    ['future', 31],
+  ])('rejects %s coherent worker checkpoint timestamps', async (_label, offset) => {
+    // Hold the same second through the asynchronous response read: advancing
+    // one second would move the future case back inside the allowed skew.
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(VALID_TIMESTAMP * 1_000);
+    try {
+      const timestamp = VALID_TIMESTAMP + offset;
       const worker = validWorkerState(timestamp);
       const fetchImpl = vi.fn(async () => jsonResponse({
         data: {
@@ -774,6 +844,8 @@ describe('Polkaswap production smoke', () => {
       await expect(runProductionSmoke('https://pi.soramitsu.io/graphql', fetchImpl)).rejects.toThrow(
         'worker checkpoint must be within 300 seconds'
       );
+    } finally {
+      clock.mockRestore();
     }
   });
 

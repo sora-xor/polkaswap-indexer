@@ -1,8 +1,18 @@
+import { isAnyArrayBuffer, isDataView, isSharedArrayBuffer } from 'node:util/types';
+
 const ARRAY_OVERHEAD_BYTES = 32;
 const OBJECT_OVERHEAD_BYTES = 64;
 const MAP_ENTRY_OVERHEAD_BYTES = 32;
 const PRIMITIVE_OVERHEAD_BYTES = 16;
 const CODEC_HEAP_MULTIPLIER = 4;
+
+// Read internal binary slots even when an instance shadows the public accessors.
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'buffer')!.get!;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
+const arrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!;
+const sharedArrayBufferLength = Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')!.get!;
+const backingByteLength = (buffer: object): number =>
+  (isSharedArrayBuffer(buffer) ? sharedArrayBufferLength : arrayBufferLength).call(buffer) as number;
 
 type Frame =
   | { kind: 'array'; value: readonly unknown[]; index: number }
@@ -19,9 +29,16 @@ const addBounded = (current: number, amount: number, maximumBytes: number): numb
 const stringBytes = (value: string): number =>
   Math.max(value.length * 2, Buffer.byteLength(value, 'utf8')) + PRIMITIVE_OVERHEAD_BYTES;
 
-const externalByteLength = (value: object): number | null => {
-  if (ArrayBuffer.isView(value)) return value.byteLength + OBJECT_OVERHEAD_BYTES;
-  if (value instanceof ArrayBuffer) return value.byteLength + OBJECT_OVERHEAD_BYTES;
+const externalByteLength = (value: object, seen: WeakSet<object>): number | null => {
+  if (ArrayBuffer.isView(value)) {
+    // Even an empty slice keeps its entire backing allocation alive. Other
+    // views and direct buffer references in this value share that allocation.
+    const backing = (isDataView(value) ? dataViewBuffer : typedArrayBuffer).call(value) as object;
+    if (seen.has(backing)) return OBJECT_OVERHEAD_BYTES;
+    seen.add(backing);
+    return backingByteLength(backing) + 2 * OBJECT_OVERHEAD_BYTES;
+  }
+  if (isAnyArrayBuffer(value)) return backingByteLength(value) + OBJECT_OVERHEAD_BYTES;
 
   // Polkadot codec instances expose their encoded size without allocating a
   // second encoded copy. Do not trust an `encodedLength` field on plain indexed
@@ -139,7 +156,7 @@ export const estimateRetainedValueBytes = (value: unknown, maximumBytes: number)
       const object = current as object;
       if (!seen.has(object)) {
         seen.add(object);
-        const externalBytes = externalByteLength(object);
+        const externalBytes = externalByteLength(object, seen);
         if (externalBytes !== null) {
           if (!add(externalBytes)) break;
         } else if (Array.isArray(object)) {

@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { request } from 'node:http';
 
 import { metrics } from '../src/metrics.js';
 import { MemoryRepository } from '../src/repository/memory.js';
-import { buildWorkerObservabilityResponse, createWorkerObservabilityServer } from '../src/worker/observability.js';
+import { buildWorkerObservabilityResponse, createWorkerObservabilityServer, startWorkerObservabilityServer } from '../src/worker/observability.js';
 
 import type { AppConfig } from '../src/config.js';
 import type { ChainIndexerStatus, ChainIndexerStatusProvider } from '../src/worker/status.js';
@@ -242,5 +243,43 @@ describe('worker observability responses', () => {
       releaseHealth?.();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+});
+
+describe('worker observability listener lifecycle', () => {
+  it('starts on an ephemeral local socket and makes shutdown idempotent', async () => {
+    const log = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    try {
+      const handle = await startWorkerObservabilityServer({ ...config, workerMetricsPort: 0 }, new MemoryRepository(), provider(status()));
+      handle.stopAccepting(); handle.stopAccepting();
+      const first = handle.stop(); expect(handle.stop()).toBe(first); await first;
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('listening on http://127.0.0.1:0'));
+    } finally { log.mockRestore(); }
+  });
+  it('rejects an occupied port and leaves the existing listener usable', async () => {
+    const server = createWorkerObservabilityServer(config, new MemoryRepository(), provider(status()));
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address(); if (!address || typeof address === 'string') throw new Error('Missing TCP address');
+    try {
+      await expect(startWorkerObservabilityServer({ ...config, workerMetricsPort: address.port }, new MemoryRepository(), provider(status()))).rejects.toMatchObject({ code: 'EADDRINUSE' });
+      expect((await fetch(`http://127.0.0.1:${address.port}/health`)).status).toBe(200);
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+  });
+  it('returns bounded noncached HTTP errors for malformed URLs and failed metrics reads', async () => {
+    const server = createWorkerObservabilityServer(config, new MemoryRepository(), { getStatus() { throw new Error('private internal failure'); } });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address(); if (!address || typeof address === 'string') throw new Error('Missing TCP address');
+    const send = (path: string) => new Promise<{ status: number; body: string; cache: string | undefined }>((resolve, reject) => {
+      const req = request({ host: '127.0.0.1', port: address.port, path }, response => {
+        let body = ''; response.setEncoding('utf8'); response.on('data', chunk => { body += chunk; });
+        response.on('end', () => resolve({ status: response.statusCode!, body, cache: response.headers['cache-control'] }));
+      }); req.on('error', reject); req.end();
+    });
+    try {
+      expect(await send('http://[')).toEqual({ status: 400, body: '{"ok":false,"error":"invalid-url"}\n', cache: 'no-store' });
+      expect(await send('/metrics')).toEqual({ status: 500, body: '{"ok":false,"error":"observability-failed"}\n', cache: 'no-store' });
+      expect((await send('/unknown')).status).toBe(404);
+      server.emit('drop'); expect(metrics.render()).toContain('indexer_worker_observability_connection_rejections_total 1');
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
   });
 });

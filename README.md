@@ -6,6 +6,12 @@ The API intentionally exposes SubQuery-compatible GraphQL field names so the
 static Polkaswap UI can use a single external endpoint without depending on
 SubQuery or Subsquid from the browser.
 
+Production recovery status (31 October 2026): the Pi API is in native read-only
+hold while a canonical replacement is prepared. MOF2's retained old archive
+passed historical availability checks; live indexing is not yet restored.
+See [post-fork recovery](docs/post-fork-recovery-20261031.md) for the archive,
+service paths, validation and cutover prerequisites.
+
 ## Runtime
 
 - Node.js 24+
@@ -98,6 +104,13 @@ SOLSWAP burn campaign history used by the burn page stats:
 yarn seed:swap-chart
 ```
 
+Run `yarn test:coverage` with `POSTGRES_TEST_DATABASE_URL` pointing at a disposable
+test database to include the PostgreSQL integration tests. The command and CI
+enforce at least 90.01% line, statement, function, and branch coverage over all `src/**/*.ts` production files,
+including unimported worker and CLI entry points; only TypeScript declarations
+are excluded. Reports are written to `coverage/index.html`,
+`coverage/coverage-summary.json`, and `coverage/lcov.info`.
+
 The UI should point `POLKASWAP_INDEXER_ENDPOINT` at the hosted GraphQL URL:
 `https://pi.soramitsu.io/graphql`.
 
@@ -155,6 +168,18 @@ index progress marker before adding keys. Earlier indexer binaries reject format
 2, preventing an older writer from invalidating the derived index. Rolling back
 to an earlier binary requires restoration of a verified complete pre-upgrade
 database backup; manually downgrading the format marker is unsafe.
+
+For a **fresh** recovery database only, `ROCKSDB_DOCUMENT_COMPRESSION=brotli`
+selects storage format 3. The default `none` keeps format 2 unchanged, including
+its existing format-1 upgrade. Enabling compression against any existing
+format-1/2 or nonempty unversioned database fails before preparation writes;
+there is no in-place conversion. Every writable format-3 resume must retain the
+`brotli` option. New read-only readers support formats 2 and 3 without a writer
+option; older binaries reject the format-3 marker. Never downgrade that marker.
+Compression changes physical document storage, not normalized amounts, query
+indexes, receipt hashes, journal data or recovery admission. See
+[`docs/rocksdb-compression.md`](docs/rocksdb-compression.md) for the format,
+bounded decoding rules, compatible tooling and validation requirements.
 
 Collection connections accept `first`, `last`, `offset`, and `after`. Both page
 sizes are limited to 100, and explicit offsets and numeric continuation positions
@@ -342,15 +367,24 @@ to `25` so stats aggregates stay close to finalized block progress. Between
 refreshes, clean storage domains reuse their last RPC result while event-dirty
 domains are reloaded at the next projection; a full
 reconciliation defaults to every `250` blocks and is configurable with
-`CHAIN_STATE_FULL_RECONCILIATION_INTERVAL_BLOCKS`.
+`CHAIN_STATE_FULL_RECONCILIATION_INTERVAL_BLOCKS`. XYK swaps emit no
+`poolXYK` event, so `technical.SwapSuccess` and liquidity-proxy swap events or
+calls dirty Pool XYK reserves. A projection pinned below a later dirty block
+reloads the domain again at the next refresh.
 
 Backfill and finalized catch-up value each block from its exact parent-block
 asset metadata and Pool XYK reserves. The initial archive state is consumed in
-256-entry pages under one retained-byte ceiling; later blocks point-read only
+pages under one retained-byte ceiling. `CHAIN_DERIVED_STORAGE_ENTRIES_PAGE_SIZE`
+selects 1–1,000 entries per pinned storage page (default 256); 1,000 reduces
+archive round trips during recovery without changing the exact block/hash,
+full-reload rules, pagination checks or `CHAIN_DERIVED_STORAGE_LOAD_MAX_BYTES`
+ceiling. A larger page must still fit that existing byte budget and can be
+reverted to 256 if it does not. Later blocks point-read only
 canonical assets and both possible pool-key orientations touched by successful
-events/calls. Ambiguous runtime mutations fail closed to a bounded full reload,
-and valuation advances only after the block documents and `chainState` commit
-atomically. Historical order-book USD stock cannot be reconstructed from pool
+events/calls. Ambiguous runtime mutations fail closed to a bounded full reload.
+That includes every block with XYK swap evidence, because swap events do not
+name a multi-hop route's pools. Valuation advances only after the block
+documents and `chainState` commit atomically. Historical order-book USD stock cannot be reconstructed from pool
 state alone, so `liquidityUSD`, `orderBookLiquidityUSD`, and
 `activeOrderBooks` are `null` until a pinned full projection has recomputed raw
 orders at the same height. The worker never substitutes a misleading zero.
@@ -562,8 +596,9 @@ migrator and both verification modes read `data::text` and validate every
 numeric token before `JSON.parse`; an unsafe source can never pass by comparing
 two identically rounded values.
 
-The first release has one mandatory RocksDB format (version 1) and writes
-compact documents/indexes from the first row. There is no pre-v1 upgrade mode:
+The PostgreSQL migrator writes ordinary format-2 compact documents/indexes
+from the first row and requires `ROCKSDB_DOCUMENT_COMPRESSION=none`. It does not
+create compressed recovery databases. There is no pre-v1 upgrade mode:
 the migrator refuses a non-empty destination without its exact versioned
 destination/run/source state. Rebuild an unversioned or incompatible artifact
 from an empty path.
@@ -723,8 +758,9 @@ docker compose -f docker-compose.production.yml config --quiet
 docker compose -f docker-compose.production.yml up -d
 ```
 
-The five mobile capability values are explicit deployment inputs. Their tester
-defaults are `true,false,true,false,true` in the order shown above.
+The five mobile capability values are required explicit production deployment
+inputs; Compose validation fails if any value is missing or empty. The example
+tester projection is `true,false,true,false,true` in the order shown above.
 `MOBILE_CONFIG_NEXUS_SENDS_AVAILABLE=true` requires Nexus availability, while
 Polkamarkt mutations require Polkamarkt visibility. Taira's remote default
 remains independent because each mobile client applies the Nexus kill switch to
@@ -753,6 +789,13 @@ ahead. PostgreSQL connection, statement/query, and cleanup waits are bounded;
 the 4-second hard process deadline remains below the 5-second container timeout.
 Diagnostics contain only fixed failure codes and never include the database URL
 or raw driver error text.
+
+Before starting this worker against a legacy database without `chainIdentity`,
+run the direct PostgreSQL preflight in [the release checklist](docs/release-checklist.md#legacy-database-identity-preflight).
+The audited historical `BLOCK` row can expire under the worker's 31-day
+retention policy. A healthy current checkpoint does not prove that the row is
+still present; recover it from a verified backup or backfill an empty parallel
+database before cutover.
 
 During rollout, confirm worker health independently of GraphQL:
 
@@ -818,7 +861,8 @@ Production release evidence is tracked in
 blocked on `production-deployment-evidence-missing` and
 `live-production-smoke-failing` until the current public smoke passes and an
 operator records the deployed image digest, git commit, deployment id, PI health
-response, and live smoke timestamp for the intended release. The attested health
+response, the exact five-boolean public `mobileConfig` readback, and live smoke
+timestamp for the intended release. The attested health
 response must
 contain the exact SORA mainnet genesis hash
 `0x7e4e32d0feafd4f9c9414b0be86373f9a1efa904809b683453a9af6856d38ad5`,
@@ -837,15 +881,25 @@ enforces 600 HTTP requests per client per 60 seconds, permits at most 600
 WebSocket upgrades per client per 60 seconds, and caps concurrent WebSockets at
 16 per client.
 
-Prepare the operator template and run the ready gate before enabling release
-routing:
+Prepare and test the evidence template before deployment:
 
 ```sh
 yarn test:deployment-evidence-template
 yarn generate:deployment-evidence-template --output build/reports/production-deployment-evidence-template.json
 yarn test:deployment-evidence-audit
-yarn audit:deployment-evidence --require-ready
+```
+
+Deploy the reviewed image with its immutable digest on the provisioned target.
+After the migration, API, worker, and internal health pass, route the public
+endpoint to that candidate while keeping the previous service available for
+rollback. Run the public smoke against the routed candidate, record the observed
+health, five mobile booleans, image digest, deployment identity, RPC/TLS
+controls, and smoke timestamp in operator-attested evidence, then run the ready
+audit before declaring the deployment ready or enabling mobile release flags:
+
+```sh
 POLKASWAP_INDEXER_BASE_URL=https://pi.soramitsu.io/graphql yarn smoke:production
+yarn audit:deployment-evidence --require-ready
 ```
 
 ### Pruned primary timestamp verification
@@ -879,3 +933,16 @@ The approved OVH MOF2 node (`51.161.218.175`, `wss://mof2.sora.org`) uses
 both canonical state and blocks. The durable MOF Pi worker uses this archive for
 both configured chain endpoints, including after catch-up. Recovery stays
 isolated from public routing until its data and API checks pass.
+
+### Pi host capacity safeguards
+
+The production host runs a five-minute capacity and explicit-retirement guard,
+maintenance free-space preflights, and supervised log rotation. See
+[host storage safeguards](docs/host-storage-safeguards.md) for thresholds,
+protected backups, alert delivery, validation, and release/rollback procedures.
+
+An inactive, separately admitted canonical statistics/history recovery candidate
+is documented in [docs/canonical-stats-history.md](docs/canonical-stats-history.md).
+It preserves full-recovery admission requirements, exposes explicit partial
+capabilities, and never certifies point/burn entitlements. Its private clone must
+be independently qualified before the explicit initializer or worker is run.

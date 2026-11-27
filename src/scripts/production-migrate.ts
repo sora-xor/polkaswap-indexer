@@ -1,5 +1,5 @@
 import { readConfig } from '../config.js';
-import { migrate } from '../db/migrate.js';
+import { migrate, safeMigrationPreflightErrorMessage } from '../db/migrate.js';
 import {
   findUnsafePostgresProcessEnvironmentOverride,
   POSTGRES_TRUSTED_SEARCH_PATH,
@@ -122,7 +122,7 @@ const preflightError = (code: string): Error => new ProductionDatabasePreflightE
 export const productionMigrationCliErrorMessage = (error: unknown): string =>
   error instanceof ProductionDatabasePreflightError
     ? error.message
-    : 'Production database migration failed';
+    : safeMigrationPreflightErrorMessage(error) ?? 'Production database migration failed';
 
 const requiredUrl = (
   environment: NodeJS.ProcessEnv,

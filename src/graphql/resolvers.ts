@@ -1,3 +1,6 @@
+import { pointAccount, pointOwnership, pointsQueryIdentity } from '../points-recovery.js';
+import { RECOVERY_CHECKPOINT, validateBurnRecoveryPolicy } from '../burn-recovery.js';
+import { assertEntitlementQueriesAvailable, assertStatsPublicRead, assertStatsQueryArguments, statsCoreReadBoundary, indexerCapabilities, statsRecoveryAdmission, type StatsCoreGeneration } from '../stats-recovery.js';
 import { createHash } from 'node:crypto';
 
 import { makeExecutableSchema } from '@graphql-tools/schema';
@@ -41,6 +44,7 @@ import {
 import { typeDefs } from './schema.js';
 import { assertNetworkFlowQuery, networkFlowRepositoryFilter, projectNetworkSnapshotFlows, requestsNetworkFlows } from './network-flow.js';
 import { assetHourlyCoverage } from './hourly-history.js';
+import { unwrapStatsCoreCursor, wrapStatsCoreCursor } from './stats-core-cursor.js';
 
 import type {
   IndexerCollection,
@@ -1348,7 +1352,15 @@ const createConnectionResolver =
   (cache: TtlCache, queryMaxBytes: number) =>
   (collectionName: IndexerCollection) =>
   async (_parent: unknown, args: ConnectionArgs, context: Context, info?: GraphQLResolveInfo) => {
-    const normalizedArgs = normalizeConnectionArgs(args, info);
+    const statsOnly = await assertPublicStatsRead(context, collectionName);
+    const finish = await publicStatsReadBoundary(context, collectionName, [], info);
+    const generation = finish.generation;
+    if (generation && (Number(args.offset ?? 0) !== 0 || args.last != null || (args.before !== undefined && args.before !== null && args.before !== ''))) {
+      throw badUserInput('Stats core pagination requires forward generation-bound cursors');
+    }
+    const normalizedArgs = normalizeConnectionArgs(generation
+      ? { ...args, after: unwrapStatsCoreCursor(args.after, generation) } : args, info);
+    if (statsOnly && collectionName === 'networkSnapshots') assertStatsQueryArguments(normalizedArgs.filter, normalizedArgs.orderBy);
     assertPublicConnectionQuery(collectionName, normalizedArgs.orderBy, normalizedArgs.filter);
     const projectFlows = collectionName === 'networkSnapshots' && requestsNetworkFlows(info);
     if (collectionName === 'networkSnapshots') assertNetworkFlowQuery(normalizedArgs.filter, normalizedArgs.orderBy);
@@ -1390,20 +1402,20 @@ const createConnectionResolver =
         const { end, pageStart: fallbackPageStart } = paginationWindow(normalizedArgs, fallbackTotalCount);
         const pageStart = result.pageStart ?? fallbackPageStart;
         const projected = projectFlows
-          ? await projectNetworkSnapshotFlows(context.repository, result.items, normalizedArgs.filter)
+          ? await projectNetworkSnapshotFlows(context.repository, result.items, normalizedArgs.filter, statsOnly)
           : result.items;
         const nodes = projected.map((document) => toConnectionNode(collectionName, document));
-        const edges: Edge[] = result.items.map((document, index) => ({
-          cursor:
+        const edges: Edge[] = result.items.map((document, index) => {
+          const cursor =
             (!projectFlows ? result.itemCursors?.[index] : undefined) ??
             cursorForDocument(
               collectionName,
               document,
               normalizedArgs.orderBy,
               normalizedArgs.filter
-            ),
-          node: nodes[index]!,
-        }));
+            );
+          return { cursor: generation ? wrapStatsCoreCursor(cursor, generation) : cursor, node: nodes[index]! };
+        });
 
         return {
           nodes,
@@ -1419,25 +1431,32 @@ const createConnectionResolver =
       }
 
       const documents = await context.repository.list(collectionName);
-      return buildConnection(
+      const connection = buildConnection(
         collectionName,
         documents.map((document) => document.data),
         normalizedArgs
       );
+      if (!generation) return connection;
+      return { ...connection, edges: connection.edges.map((edge) => ({ ...edge, cursor: wrapStatsCoreCursor(edge.cursor, generation) })),
+        pageInfo: { ...connection.pageInfo,
+          startCursor: connection.pageInfo.startCursor ? wrapStatsCoreCursor(connection.pageInfo.startCursor, generation) : null,
+          endCursor: connection.pageInfo.endCursor ? wrapStatsCoreCursor(connection.pageInfo.endCursor, generation) : null } };
     };
 
-    if (currentBlockConnection || !shouldCacheConnection(collectionName, normalizedArgs)) return resolveConnection();
+    if (statsOnly || currentBlockConnection || !shouldCacheConnection(collectionName, normalizedArgs)) return finish(await resolveConnection());
 
     const includeTotalCount = selectionIncludesField(info, 'totalCount');
     const key = `connection:${collectionName}:${stableJson({ ...normalizedArgs, includeTotalCount, projectFlows })}`;
 
-    return cache.getOrSet(`connection_${collectionName}`, key, resolveConnection);
+    return finish(await cache.getOrSet(`connection_${collectionName}`, key, resolveConnection));
   };
 
 const createDocumentResolver =
   (cache: TtlCache) =>
   (collectionName: IndexerCollection) =>
-  async (_parent: unknown, args: { id: string }, context: Context): Promise<Record<string, unknown> | null> => {
+  async (_parent: unknown, args: { id: string }, context: Context, info?: GraphQLResolveInfo): Promise<Record<string, unknown> | null> => {
+    const statsOnly = await assertPublicStatsRead(context, collectionName, [args.id]);
+    const finish = await publicStatsReadBoundary(context, collectionName, [args.id], info);
     try {
       assertValidDocumentId(args.id);
     } catch {
@@ -1449,9 +1468,8 @@ const createDocumentResolver =
     }
     const key = `${collectionName}:${args.id}`;
 
-    return cache.getOrSet(`document_${collectionName}`, key, async () => {
-      return (await context.repository.get(collectionName, args.id))?.data ?? null;
-    });
+    const read = async () => (await context.repository.get(collectionName, args.id))?.data ?? null;
+    return finish(await (statsOnly ? read() : cache.getOrSet(`document_${collectionName}`, key, read)));
   };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -1462,42 +1480,6 @@ const readString = (value: unknown): string | null => {
   const text = String(value).trim();
   return text.length ? text : null;
 };
-
-const readEqualFilterValue = (value: unknown): string | null => {
-  const direct = readString(value);
-  if (direct) return direct;
-
-  if (!isRecord(value)) return null;
-
-  return readString(value.equalTo) ?? readString(value.eq) ?? readString(value._eq) ?? null;
-};
-
-const readAccountFromFilter = (filter: unknown): string | null => {
-  if (!isRecord(filter)) return null;
-
-  for (const [key, value] of Object.entries(filter)) {
-    if ((key === 'and' || key === 'or') && Array.isArray(value)) {
-      const nested = value.map(readAccountFromFilter).find((account): account is string => Boolean(account));
-      if (nested) return nested;
-      continue;
-    }
-
-    if (key === 'account_eq' || key === 'accountId_eq' || key === 'account_id_eq') {
-      const account = readString(value);
-      if (account) return account;
-    }
-
-    if (key === 'account' || key === 'accountId' || key === 'account_id') {
-      const account = readEqualFilterValue(value);
-      if (account) return account;
-    }
-  }
-
-  return null;
-};
-
-const readAccountFromArgs = (args: AccountActivityConnectionArgs): string | null =>
-  readAccountFromFilter(args.where) ?? readAccountFromFilter(args.filter);
 
 const addFilterField = (filter: Record<string, unknown>, field: string, condition: unknown): void => {
   const existing = filter[field];
@@ -1512,24 +1494,27 @@ const addFilterField = (filter: Record<string, unknown>, field: string, conditio
   filter.and = [...andFilters, { [field]: existing }, { [field]: condition }];
 };
 
-const normalizeAccountPositionFilter = (filter: unknown): Record<string, unknown> | null => {
+const normalizeAccountActivityFilter = (
+  filter: unknown,
+  accountField: 'account' | 'accountId'
+): Record<string, unknown> | null => {
   if (!isRecord(filter)) return null;
 
   const normalized: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(filter)) {
     if ((key === 'and' || key === 'or') && Array.isArray(value)) {
-      normalized[key] = value.map((entry) => normalizeAccountPositionFilter(entry) ?? entry);
+      normalized[key] = value.map((entry) => normalizeAccountActivityFilter(entry, accountField) ?? entry);
       continue;
     }
 
     if (key === 'account_eq' || key === 'accountId_eq' || key === 'account_id_eq') {
-      addFilterField(normalized, 'account', { equalTo: value });
+      addFilterField(normalized, accountField, { equalTo: value });
       continue;
     }
 
-    if (key === 'accountId' || key === 'account_id') {
-      addFilterField(normalized, 'account', value);
+    if (key === 'account' || key === 'accountId' || key === 'account_id') {
+      addFilterField(normalized, accountField, value);
       continue;
     }
 
@@ -1539,15 +1524,25 @@ const normalizeAccountPositionFilter = (filter: unknown): Record<string, unknown
   return normalized;
 };
 
-const accountPositionFilterFromArgs = (args: AccountActivityConnectionArgs): Record<string, unknown> => {
-  const filters = [normalizeAccountPositionFilter(args.where), normalizeAccountPositionFilter(args.filter)].filter(
-    (filter): filter is Record<string, unknown> => Boolean(filter && Object.keys(filter).length)
-  );
+const accountActivityFilterFromArgs = (
+  args: AccountActivityConnectionArgs,
+  accountField: 'account' | 'accountId'
+): Record<string, unknown> => {
+  const filters = [
+    normalizeAccountActivityFilter(args.where, accountField),
+    normalizeAccountActivityFilter(args.filter, accountField),
+  ].filter((filter): filter is Record<string, unknown> => Boolean(filter && Object.keys(filter).length));
 
   if (filters.length === 0) return {};
   if (filters.length === 1) return filters[0]!;
   return { and: filters };
 };
+
+const accountPositionFilterFromArgs = (args: AccountActivityConnectionArgs): Record<string, unknown> =>
+  accountActivityFilterFromArgs(args, 'account');
+
+const accountTransactionFilterFromArgs = (args: AccountActivityConnectionArgs): Record<string, unknown> =>
+  accountActivityFilterFromArgs(args, 'accountId');
 
 const normalizeAccountPositionOrder = (orderBy: unknown): unknown => {
   const normalizeToken = (token: unknown): unknown => {
@@ -1585,18 +1580,28 @@ const queryDocuments = async (
 
   const documents = await repository.list(collectionName);
   const filtered = sortDocuments(
-    documents.filter((document) => matchesFilter(document.data, filter)),
+    documents.map((document) => ({
+      ...document.data,
+      id: document.id,
+      timestamp: document.timestamp ?? document.data.timestamp,
+      blockHeight: document.blockHeight ?? document.data.blockHeight,
+      document,
+    })).filter((document) => matchesFilter(document, filter)),
     orderBy
   );
   const totalCount = filtered.length;
-  const { end, pageStart } = paginationWindow(normalizedArgs, totalCount);
+  const keyset = queryArgs.keyset;
+  const remaining = keyset ? filtered.filter((document) => isAfterOrderPosition(document, keyset)) : filtered;
+  const { end, pageStart } = paginationWindow(normalizedArgs, remaining.length);
+  const items = remaining.slice(pageStart, end).map(({ document }) => document);
 
   return {
-    items: filtered.slice(pageStart, end),
+    items,
+    itemCursors: items.map((document) => cursorForDocument(collectionName, document, orderBy, filter)),
     totalCount,
     pageStart,
-    hasNextPage: end < totalCount,
-    hasPreviousPage: pageStart > 0,
+    hasNextPage: end < remaining.length,
+    hasPreviousPage: Boolean(keyset) || pageStart > 0,
   };
 };
 
@@ -1697,7 +1702,7 @@ const indexedRuntimeUInt32ListOrNull = (value: unknown): number[] | null => {
 
 const toAccountTradeNode = (
   historyDocument: IndexerDocument | null | undefined,
-  account: string,
+  account: string | null,
   accountTransaction?: IndexerDocument
 ): Record<string, unknown> => {
   const source = historyDocument?.data ?? accountTransaction?.data ?? {};
@@ -1728,7 +1733,7 @@ const toAccountTradeNode = (
     readString(source.id) ??
     readString(accountTransaction?.id) ??
     readString(historyDocument?.id) ??
-    `${account}-${String(timestamp ?? 'activity')}`;
+    `${account ?? 'unknown'}-${String(timestamp ?? 'activity')}`;
 
   return {
     id,
@@ -1795,17 +1800,11 @@ const accountTradesResolver = async (
 ) => {
   const normalizedArgs = normalizeConnectionArgs(args);
   const orderBy = args.orderBy ?? ['TIMESTAMP_DESC'];
-  assertPublicConnectionQuery('accountTrades', orderBy, accountPositionFilterFromArgs(args));
-  const account = readAccountFromArgs(args);
-  if (!account) return buildConnection(collection('accountTrades'), [], normalizedArgs);
-
-  // Account transaction rows also drive network activity. Restrict this
-  // connection to the worker's canonical Polkamarkt projection so unrelated
-  // transfers cannot surface as trades with a null market identifier.
+  const activityFilter = accountTransactionFilterFromArgs(args);
+  assertPublicConnectionQuery('accountTrades', orderBy, activityFilter);
+  // Preserve every caller filter while limiting results to canonical trades.
   const transactionFilter = {
-    accountId: { equalTo: account },
-    module: { equalTo: 'polkamarkt' },
-    marketId: { greaterThanOrEqualTo: 0 },
+    and: [activityFilter, { module: { equalTo: 'polkamarkt' }, marketId: { greaterThanOrEqualTo: 0 } }],
   };
   const accountTransactionResult = await queryDocuments(
     context.repository,
@@ -1817,7 +1816,7 @@ const accountTradesResolver = async (
   );
 
   const nodes = accountTransactionResult.items.map((document) =>
-    toAccountTradeNode(null, account, document)
+    toAccountTradeNode(null, readString(document.data.accountId), document)
   );
   return connectionFromNodes(
     collection('accountTransactions'),
@@ -1909,6 +1908,7 @@ async function* pollSubscription(
   const ids = getSubscriptionIds(args.id);
   const mutations = getSubscriptionMutations(args.mutation);
   const snapshots = new Map<string, string>();
+  let firstPoll = true;
 
   while (!signal.aborted) {
     const seen = new Set<string>();
@@ -1925,11 +1925,13 @@ async function* pollSubscription(
       const fingerprint = subscriptionDocumentFingerprint(document.data);
       if (snapshots.get(document.id) === fingerprint) continue;
 
+      // Preserve the initial snapshot emission; only later appearances are inserts.
+      const mutationType = firstPoll || snapshots.has(document.id) ? 'UPDATE' : 'INSERT';
       snapshots.set(document.id, fingerprint);
       emissions.push({
         collection: collectionName,
         id: document.id,
-        mutationType: 'UPDATE',
+        mutationType,
       });
     }
     for (const id of [...snapshots.keys()]) {
@@ -1937,6 +1939,7 @@ async function* pollSubscription(
       snapshots.delete(id);
       emissions.push({ collection: collectionName, id, mutationType: 'DELETE' });
     }
+    firstPoll = false;
     for (const event of emissions) {
       if (mutations.has(event.mutationType)) yield event;
     }
@@ -1966,15 +1969,36 @@ async function* watchSubscription(
   const sourceRepository = context.streamingRepository ?? context.repository;
 
   if (!sourceRepository.watch) {
+    await assertPublicStatsRead(context, collectionName, ids);
     yield* pollSubscription(collectionName, args, { ...context, repository: sourceRepository }, signal);
     return;
   }
 
-  for await (const event of sourceRepository.watch(collectionName, ids, signal)) {
-    if (event.collection !== collectionName || !ids.includes(event.id)) {
-      throw new Error('Repository watch emitted an event outside its requested subscription scope');
+  // Register the bounded identity-only source before the asynchronous guard so
+  // writes during authorization are not lost. No document or event is exposed
+  // before authorization; rejection also drains this owned listener.
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal.addEventListener('abort', abort, { once: true });
+  if (signal.aborted) abort();
+  const iterator = sourceRepository.watch(collectionName, ids, controller.signal)[Symbol.asyncIterator]();
+  const first = iterator.next();
+  void first.catch(() => undefined);
+  try {
+    await assertPublicStatsRead(context, collectionName, ids);
+    let result = await first;
+    while (!result.done && !signal.aborted) {
+      const event = result.value;
+      if (event.collection !== collectionName || !ids.includes(event.id)) {
+        throw new Error('Repository watch emitted an event outside its requested subscription scope');
+      }
+      if (mutations.has(event.mutationType)) yield event;
+      result = await iterator.next();
     }
-    if (mutations.has(event.mutationType)) yield event;
+  } finally {
+    controller.abort();
+    signal.removeEventListener('abort', abort);
+    await iterator.return?.();
   }
 }
 
@@ -2001,27 +2025,35 @@ const cancellableSubscription = (
 
 const pollingSubscription = (collectionName: IndexerCollection) => ({
   subscribe: (_parent: unknown, args: SubscriptionArgs, context: Context) =>
-    cancellableSubscription((signal) => watchSubscription(collectionName, args, context, signal)),
+    cancellableSubscription(async function* (signal) {
+      yield* watchSubscription(collectionName, args, context, signal);
+    }),
   // This resolver runs after the transport has admitted and reserved the
   // emission. Only now materialize the full document under the operation's
   // aggregate repository byte budget.
   resolve: async (
     event: RepositoryWatchEvent,
     _args: SubscriptionArgs,
-    context: Context
+    context: Context,
+    info?: GraphQLResolveInfo
   ): Promise<MutationPayload> => {
+    // A subscription context may outlive many generations. Refresh only its
+    // checkpoint/operation identity; retain the same aggregate-budgeted handle.
+    const emissionContext = { ...context };
+    await assertPublicStatsRead(emissionContext, collectionName, [event.id]);
+    const finish = await publicStatsReadBoundary(emissionContext, collectionName, [event.id], info);
     if (event.mutationType === 'DELETE') {
-      return { id: event.id, mutation_type: 'DELETE', _entity: { id: event.id } };
+      return finish({ id: event.id, mutation_type: 'DELETE', _entity: { id: event.id } });
     }
-    const document = await context.repository.get(collectionName, event.id);
+    const document = await emissionContext.repository.get(collectionName, event.id);
     if (!document) {
-      return { id: event.id, mutation_type: 'DELETE', _entity: { id: event.id } };
+      return finish({ id: event.id, mutation_type: 'DELETE', _entity: { id: event.id } });
     }
-    return {
+    return finish({
       id: event.id,
       mutation_type: event.mutationType,
       _entity: toMutationEntity(collectionName, document.data),
-    };
+    });
   },
 });
 
@@ -2095,9 +2127,12 @@ const healthResolver = async (_parent: unknown, _args: unknown, context: Context
     state !== null &&
     workerStatus !== null &&
     workerStatus.latestIndexedBlock === state.lastIndexedBlock;
+  const statsOnly = await statsRecoveryAdmission(context.repository);
+  const statsPipelineReady = readiness.ok && checkpointCoherent && checkpointFresh && workerCheckpointCoherent;
 
   return {
-    ok: readiness.ok && checkpointCoherent && checkpointFresh && workerCheckpointCoherent,
+    ok: !statsOnly && statsPipelineReady,
+    statsPipelineReady,
     checkpointCoherent,
     repositoryReady: readiness.repositoryReady,
     service: 'polkaswap-indexer',
@@ -2124,6 +2159,33 @@ const healthResolver = async (_parent: unknown, _args: unknown, context: Context
     workerLastError: workerStatus?.lastError ?? null,
     workerLastErrorTimestamp: workerStatus?.lastErrorTimestamp ?? null,
   };
+};
+
+/** Evaluate the same real readiness used by health before exposing a current statistics projection. */
+const assertPublicStatsRead = (context: Context, collection: IndexerCollection, ids: string[] = []) =>
+  assertStatsPublicRead(context.repository, collection, ids, async () =>
+    (await healthResolver(null, null, { ...context })).statsPipelineReady);
+
+const coreOperationGenerations = new WeakMap<Context, WeakMap<object, StatsCoreGeneration>>();
+
+/** One operation cannot combine successful current-core roots from different receipts. */
+const bindCoreOperationGeneration = (context: Context, info: GraphQLResolveInfo | undefined, generation: StatsCoreGeneration | undefined) => {
+  if (!info || !generation) return;
+  let operations = coreOperationGenerations.get(context);
+  if (!operations) { operations = new WeakMap(); coreOperationGenerations.set(context, operations); }
+  const previous = operations.get(info.operation);
+  if (previous && (previous.generation !== generation.generation || previous.block !== generation.block || previous.hash !== generation.hash)) {
+    throw badUserInput('Stats core generation changed within the operation; retry the complete query');
+  }
+  operations.set(info.operation, generation);
+};
+
+/** Current core reads share an operation anchor and recheck their receipt after materialization. */
+const publicStatsReadBoundary = async (context: Context, collection: IndexerCollection, ids: string[] = [], info?: GraphQLResolveInfo) => {
+  const finish = await statsCoreReadBoundary(context.repository, collection, ids, async () =>
+    (await healthResolver(null, null, { ...context })).statsPipelineReady);
+  bindCoreOperationGeneration(context, info, finish.generation);
+  return finish;
 };
 
 type GraphqlResolverConfig = Pick<
@@ -2158,6 +2220,7 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
     args: { first?: number | null; after?: string | null; atBlock?: number | null; allowStale?: boolean | null },
     context: Context
   ) => {
+    await assertEntitlementQueriesAvailable(context.repository);
     // Coverage and the chain checkpoint commit atomically, but separate reads can
     // straddle that commit. Retry once; never accept mismatched evidence.
     const readProof = async () => {
@@ -2178,10 +2241,13 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
     let proof = await readProof();
     if (!proof.coherent) proof = await readProof();
     const { health, coverage } = proof;
+    const identity = await context.repository.get('updatesStreams', 'burnRecoveryIdentity-v1');
+    const recoveryPolicy = identity ? validateBurnRecoveryPolicy(JSON.parse(String(identity.data.data))) : null;
     const unavailable = () => new GraphQLError('Complete fresh finalized TONSWAP burn coverage is unavailable', {
       extensions: { code: 'TONSWAP_COVERAGE_UNAVAILABLE' },
     });
     if (!proof.coherent || !coverage) throw unavailable();
+    if (coverage.indexedThroughBlock > RECOVERY_CHECKPOINT.block && !recoveryPolicy) throw unavailable();
     const fresh = health.ok && health.workerLag !== null && health.workerLag <= 2 &&
       coverage.indexedThroughBlock === health.workerLatestIndexedBlock &&
       Math.floor(Date.now() / 1_000) - coverage.blockTimestamp <= 60;
@@ -2198,6 +2264,9 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
     }, context);
     return {
       fresh,
+      recoveryPolicyHash: recoveryPolicy?.policyHash ?? null,
+      postForkAnchorBlock: recoveryPolicy?.postForkAnchor.block ?? null,
+      postForkAnchorHash: recoveryPolicy?.postForkAnchor.hash ?? null,
       genesisHash: coverage.genesisHash,
       startBlock: TONSWAP_START_BLOCK,
       indexedThroughBlock: atBlock,
@@ -2209,6 +2278,30 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
     };
   };
   const documentResolver = createDocumentResolver(cache);
+  const recoveryPointMeta = async (parent: unknown, args: { id: string }, context: Context) => {
+    const policy = await pointsQueryIdentity(context.repository);
+    if (!policy) return documentResolver('accountMeta')(parent, args, context);
+    const id = pointAccount(args.id, policy, RECOVERY_CHECKPOINT.block + 1);
+    // Bypass legacy cache: policy/projection readiness is checked on each read.
+    return id === null ? null : (await context.repository.get('accountMeta', id))?.data ?? null;
+  };
+  const recoveryPointSystems = async (parent: unknown, args: ConnectionArgs, context: Context, info?: GraphQLResolveInfo) => {
+    const policy = await pointsQueryIdentity(context.repository);
+    if (!policy) return connectionResolver('accountPointSystems')(parent, args, context, info);
+    const normalized = normalizeConnectionArgs(args, info);
+    assertPublicConnectionQuery('accountPointSystems', normalized.orderBy, normalized.filter);
+    const filter = normalized.filter ?? {};
+    const selector = filter.accountId;
+    if (Object.keys(filter).join(',') !== 'accountId' || !isRecord(selector) ||
+        Object.keys(selector).join(',') !== 'equalTo' || typeof selector.equalTo !== 'string') {
+      throw badUserInput('Recovery point queries require one exact accountId selector');
+    }
+    const id = pointAccount(selector.equalTo, policy, RECOVERY_CHECKPOINT.block + 1);
+    if (id === null) return { nodes: [], edges: [], totalCount: 0,
+      pageInfo: { hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null } };
+    return connectionResolver('accountPointSystems')(parent, { ...args, filter: { accountId: { equalTo: id } } }, context, info);
+  };
+
   const cachedExploreStatsResolver = (
     parent: unknown,
     args: unknown,
@@ -2240,6 +2333,15 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
       ...FilterScalars,
       Query: {
         _health: healthResolver,
+        indexerCapabilities: async (parent: unknown, args: unknown, context: Context, info: GraphQLResolveInfo) => {
+          const result = await indexerCapabilities(context.repository, (await healthResolver(parent, args, context)).statsPipelineReady);
+          if (result.mode !== 'canonical-stats-history' || !result.coreViewsReady) return result;
+          const finish = await publicStatsReadBoundary(context, 'assets', [], info);
+          if (finish.generation?.block !== result.indexedBlock || finish.generation.hash !== result.indexedBlockHash) {
+            throw badUserInput('Stats core capability changed within the operation; retry the complete query');
+          }
+          return finish(result);
+        },
         mobileConfig: () => mobileConfigResolver(mobileCapabilities),
         account: documentResolver(collection('accounts')),
         assets: connectionResolver(collection('assets')),
@@ -2266,14 +2368,29 @@ export function createSchema(config: GraphqlResolverConfig = DEFAULT_GRAPHQL_CAC
         vaults: connectionResolver(collection('vaults')),
         vaultEvents: connectionResolver(collection('vaultEvents')),
         updatesStream: documentResolver(collection('updatesStreams')),
-        accountMeta: documentResolver(collection('accountMeta')),
-        accountPointSystems: connectionResolver(collection('accountPointSystems')),
-        accountPositions: accountPositionsResolver,
+        soratopiaPointOwnership: (_parent: unknown, args: { id: string }, context: Context) => pointOwnership(context.repository, args.id),
+        accountMeta: recoveryPointMeta,
+        accountPointSystems: recoveryPointSystems,
+        accountPositions: async (parent: unknown, args: AccountActivityConnectionArgs, context: Context) => {
+          await assertPublicStatsRead(context, 'accountPositions');
+          return accountPositionsResolver(parent, args, context);
+        },
         accountTrades: accountTradesResolver,
-        exploreStats: cachedExploreStatsResolver,
-        polkamarktSignals: cachedPolkamarktSignalsResolver,
+        exploreStats: async (parent: unknown, args: unknown, context: Context, info: GraphQLResolveInfo) => {
+          const statsOnly = await assertPublicStatsRead(context, 'assets');
+          const finish = await publicStatsReadBoundary(context, 'assets', [], info);
+          return finish(await (statsOnly ? exploreStatsResolver(parent, args, context) : cachedExploreStatsResolver(parent, args, context)));
+        },
+        polkamarktSignals: async (parent: unknown, args: unknown, context: Context) => {
+          await assertPublicStatsRead(context, 'markets');
+          return cachedPolkamarktSignalsResolver(parent, args, context);
+        },
         networkAccountActivity: cachedNetworkAccountActivityResolver,
       },
+      AccountMeta: { recoveryPolicyHash: (parent: Record<string, unknown>) => parent.pointRecoveryPolicyHash ?? null },
+      NetworkSnapshot: { accounts: async (parent: Record<string, unknown>, _args: unknown, context: Context) =>
+        await statsRecoveryAdmission(context.repository) ? null : parent.accounts },
+      AccountPointSystem: { recoveryPolicyHash: (parent: Record<string, unknown>) => parent.pointRecoveryPolicyHash ?? null },
       HistoryElement: {
         calls: (parent: Record<string, unknown>) => ({
           nodes: Array.isArray(parent.calls) ? parent.calls : [],

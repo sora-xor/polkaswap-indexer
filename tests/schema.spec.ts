@@ -145,6 +145,7 @@ describe('Polkaswap indexer schema', () => {
 
     await expect(healthField?.resolve?.({}, {}, { repository: new MemoryRepository() }, {} as never)).resolves.toEqual({
       ok: false,
+      statsPipelineReady: false,
       checkpointCoherent: false,
       repositoryReady: true,
       service: 'polkaswap-indexer',
@@ -183,6 +184,7 @@ describe('Polkaswap indexer schema', () => {
 
     await expect(healthField?.resolve?.({}, {}, { repository }, {} as never)).resolves.toEqual({
       ok: false,
+      statsPipelineReady: false,
       checkpointCoherent: false,
       repositoryReady: false,
       service: 'polkaswap-indexer',
@@ -1748,6 +1750,64 @@ describe('Polkaswap indexer schema', () => {
     expect(positions.edges.map((edge) => edge.node.id)).toEqual(['7-alice']);
   });
 
+  it('preserves complete account predicates when querying account trades', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertMany([
+      {
+        collection: 'accountTransactions',
+        id: 'alice-trade',
+        timestamp: 20,
+        data: { id: 'alice-trade', accountId: 'alice', timestamp: 20, module: 'polkamarkt', marketId: 7 },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'bob-trade',
+        timestamp: 10,
+        data: { id: 'bob-trade', accountId: 'bob', timestamp: 10, module: 'polkamarkt', marketId: 7 },
+      },
+      {
+        collection: 'accountTransactions',
+        id: 'alice-transfer',
+        timestamp: 30,
+        data: { id: 'alice-transfer', accountId: 'alice', timestamp: 30, module: 'assets' },
+      },
+    ]);
+    const tradesField = createSchema().getQueryType()?.getFields().accountTrades;
+
+    const alternatives = (await tradesField?.resolve?.(
+      {},
+      {
+        first: 10,
+        orderBy: ['TIMESTAMP_DESC'],
+        filter: {
+          or: [
+            { account: { equalTo: 'alice' } },
+            { account: { equalTo: 'bob' } },
+          ],
+        },
+      },
+      { repository },
+      {} as never
+    )) as { edges: Array<{ node: Record<string, unknown> }>; totalCount: number };
+    const conflicting = (await tradesField?.resolve?.(
+      {},
+      {
+        first: 10,
+        where: { account_eq: 'alice' },
+        filter: { account: { equalTo: 'bob' } },
+      },
+      { repository },
+      {} as never
+    )) as { edges: Array<{ node: Record<string, unknown> }>; totalCount: number };
+
+    expect(alternatives.totalCount).toBe(2);
+    expect(alternatives.edges.map(({ node }) => [node.id, node.account])).toEqual([
+      ['alice-trade', 'alice'],
+      ['bob-trade', 'bob'],
+    ]);
+    expect(conflicting).toMatchObject({ totalCount: 0, edges: [] });
+  });
+
   it('serves SubQuery-compatible asset connections', async () => {
     const repository = new MemoryRepository();
     await repository.upsert({
@@ -2031,11 +2091,10 @@ describe('Polkaswap indexer schema', () => {
   });
 
   it('caches repeated non-checkpoint singleton resolver queries within the TTL window', async () => {
-    const get = vi.fn<IndexerRepository['get']>().mockResolvedValue({
-      collection: 'updatesStreams',
-      id: 'otherState',
-      data: { id: 'otherState', block: 123, data: '{"lastIndexedBlock":123}' },
-    });
+    const get = vi.fn<IndexerRepository['get']>().mockImplementation(async (collection, id) =>
+      collection === 'updatesStreams' && id === 'otherState' ? {
+        collection, id, data: { id, block: 123, data: '{"lastIndexedBlock":123}' },
+      } : null);
     const repository: IndexerRepository = {
       list: async () => [],
       query: async () => ({ items: [], totalCount: 0 }),
@@ -2057,7 +2116,7 @@ describe('Polkaswap indexer schema', () => {
       block: 123,
     });
 
-    expect(get).toHaveBeenCalledTimes(1);
+    expect(get.mock.calls.filter(([collection, id]) => collection === 'updatesStreams' && id === 'otherState')).toHaveLength(1);
   });
 
   it('falls back to list-based filtering, sorting, and forward keyset pagination when query is unavailable', async () => {
@@ -2957,7 +3016,7 @@ describe('Polkaswap indexer schema', () => {
       mutation_type: 'DELETE',
       _entity: { id: 'price' },
     });
-    expect(get).not.toHaveBeenCalled();
+    expect(get.mock.calls.filter(([collection, id]) => collection === 'updatesStreams' && id === 'price')).toEqual([]);
     await iterator.return(undefined);
   });
 });

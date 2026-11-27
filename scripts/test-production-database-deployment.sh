@@ -13,6 +13,7 @@ NETWORK="polkaswap-tls-evidence-$SUFFIX"
 POSTGRES_CONTAINER="polkaswap-tls-postgres-$SUFFIX"
 API_CONTAINER="polkaswap-tls-api-$SUFFIX"
 CERTIFICATE_VOLUME="polkaswap-tls-certs-$SUFFIX"
+CERTIFICATE_CONTAINER="polkaswap-tls-certificate-copy-$SUFFIX"
 CERTIFICATE_DIRECTORY="$(mktemp -d "$PWD/.polkaswap-certificate-test.XXXXXX")"
 CHECKPOINT="certificate-generation"
 POSTGRES_IMAGE='postgres@sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55'
@@ -25,7 +26,7 @@ PRIVILEGES_VERIFIED_LOG='Verified production PostgreSQL sessions and exact table
 
 cleanup() {
   local exit_code=$?
-  docker container rm --force "$API_CONTAINER" "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+  docker container rm --force "$API_CONTAINER" "$POSTGRES_CONTAINER" "$CERTIFICATE_CONTAINER" >/dev/null 2>&1 || true
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
   docker volume rm "$CERTIFICATE_VOLUME" >/dev/null 2>&1 || true
   find "$CERTIFICATE_DIRECTORY" -type f -delete >/dev/null 2>&1 || true
@@ -126,13 +127,20 @@ openssl x509 \
   -out "$CERTIFICATE_DIRECTORY/server.crt" >/dev/null 2>&1
 
 docker volume create "$CERTIFICATE_VOLUME" >/dev/null
-docker run --rm \
+docker create \
+  --name "$CERTIFICATE_CONTAINER" \
   --entrypoint bash \
   --volume "$CERTIFICATE_VOLUME:/dest" \
-  --volume "$CERTIFICATE_DIRECTORY:/src:ro" \
   "$POSTGRES_IMAGE" \
-  -c 'cp /src/ca.crt /src/server.crt /src/server.key /dest/; chown postgres:postgres /dest/server.crt /dest/server.key; chmod 600 /dest/server.key; chmod 644 /dest/ca.crt /dest/server.crt' \
+  -ec 'cp /tmp/ca.crt /tmp/server.crt /tmp/server.key /dest/; chown postgres:postgres /dest/server.crt /dest/server.key; chmod 600 /dest/server.key; chmod 644 /dest/ca.crt /dest/server.crt' \
   >/dev/null
+# Copy only the three runtime inputs through the Docker API. This works with a
+# remote engine and never exposes the test CA private key to a container.
+for certificate in ca.crt server.crt server.key; do
+  docker cp "$CERTIFICATE_DIRECTORY/$certificate" "$CERTIFICATE_CONTAINER:/tmp/$certificate"
+done
+docker start --attach "$CERTIFICATE_CONTAINER" >/dev/null
+docker container rm "$CERTIFICATE_CONTAINER" >/dev/null
 docker network create "$NETWORK" >/dev/null
 
 CHECKPOINT="TLS PostgreSQL startup"
@@ -149,7 +157,9 @@ docker run -d \
   -c ssl_cert_file=/certs/server.crt \
   -c ssl_key_file=/certs/server.key >/dev/null
 for attempt in {1..45}; do
-  if docker exec "$POSTGRES_CONTAINER" pg_isready -U postgres -d polkaswap >/dev/null 2>&1; then
+  # The official image's temporary initialization server accepts Unix sockets
+  # before it shuts down. TCP readiness selects the final running server.
+  if docker exec "$POSTGRES_CONTAINER" pg_isready -h 127.0.0.1 -U postgres -d polkaswap >/dev/null 2>&1; then
     break
   fi
   [[ "$attempt" -lt 45 ]]

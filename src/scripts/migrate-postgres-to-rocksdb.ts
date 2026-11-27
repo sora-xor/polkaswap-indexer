@@ -437,6 +437,9 @@ const replayChanges = async (
 
 export const runPostgresToRocksdbMigration = async (): Promise<void> => {
   const config = readConfig();
+  if (config.rocksdbDocumentCompression === 'brotli') {
+    throw new Error('PostgreSQL migration supports only format 2; ROCKSDB_DOCUMENT_COMPRESSION must be none');
+  }
   const batchSize = readBoundedPositiveInteger('ROCKSDB_MIGRATION_BATCH_SIZE', 5_000, MAX_MIGRATION_ROW_BATCH_SIZE);
   const changeBatchSize = readBoundedPositiveInteger(
     'ROCKSDB_CHANGE_REPLAY_BATCH_SIZE',
