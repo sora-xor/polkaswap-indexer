@@ -1,12 +1,14 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ATTACKER_ACCOUNT, RECOVERY_CHECKPOINT, type BurnRecoveryPolicy } from '../src/burn-recovery.js';
 import { SORA_MAINNET_GENESIS_HASH } from '../src/soraIdentity.js';
+import { readConfig } from '../src/config.js';
 import { MemoryRepository } from '../src/repository/memory.js';
-import type { IndexerDocument } from '../src/repository/types.js';
+import { RocksRepository } from '../src/repository/rocksdb.js';
+import { INDEXER_COLLECTIONS, type IndexerDocument } from '../src/repository/types.js';
 import { initializePointsRecovery, admitPointBlock, pointBlockDocuments, pointValuation, pointsDigest, pointJournalId,
   initialPointJournalCursor, validatePointJournalEntry, exportPointJournalRange, POINTS_RECOVERY_ID, POINTS_VALUATION_PREFIX,
   POINT_JOURNAL_MAX_BLOCKS, POINT_JOURNAL_MAX_LINE_BYTES, type PointJournalEntry } from '../src/points-recovery.js';
@@ -167,4 +169,71 @@ describe('bounded offline point journal transport', () => {
     const raw = JSON.stringify(policy); await writeFile(options.policy, raw);
     await expect(exportPointJournalFile({ ...options, policySha256: sha(raw), output: join(dir, 'live') })).rejects.toThrow('future live fields');
   });
+});
+
+describe('stopped-copy output boundary and command line', () => {
+  async function inputs() {
+    const dir = await folder(); const databaseCopy = join(dir, 'stopped-copy'); await mkdir(databaseCopy);
+    const policy = join(dir, 'allocation.json'); const raw = JSON.stringify(allocation); await writeFile(policy, raw);
+    return { dir, databaseCopy, policy, policySha256: sha(raw) };
+  }
+  /** Persist the synthetic journal rows into a real closed native copy, as an operator's stopped copy would be. */
+  async function nativeCopy() {
+    const paths = await inputs(); const { repo } = await fixture();
+    const native = new RocksRepository({ ...readConfig(), storageEngine: 'rocksdb', rocksdbPath: paths.databaseCopy,
+      rocksdbDocumentCompression: 'none', rocksdbBlockCacheMb: 16, rocksdbWriteBufferManagerMb: 16, rocksdbParallelism: 1,
+      rocksdbDocumentCacheMax: 0, rocksdbDocumentCacheMaxBytes: 0 });
+    try {
+      await native.prepare();
+      for (const collection of INDEXER_COLLECTIONS) { const rows = await repo.list(collection); if (rows.length) await native.upsertMany(rows); }
+    } finally { await native.close(); }
+    return paths;
+  }
+  /** Run the script entry point in-process with exact argv; stdout is captured and returned. */
+  async function cli(...args: string[]) {
+    const argv = process.argv; const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    process.argv = [process.execPath, resolve('src/scripts/points-journal.ts'), ...args];
+    vi.resetModules();
+    try { await import('../src/scripts/points-journal.js'); return write.mock.calls.map(([chunk]) => String(chunk)).join(''); }
+    finally { process.argv = argv; write.mockRestore(); }
+  }
+
+  it('refuses an output inside the stopped copy before creating it or opening the database', async () => {
+    const { databaseCopy, policy, policySha256 } = await inputs(); await writeFile(join(databaseCopy, 'CURRENT'), 'synthetic-stopped-copy');
+    const openRepository = vi.fn();
+    await expect(exportPointJournalFile({ databaseCopy, policy, policySha256, first: 1, last: 2, output: join(databaseCopy, 'export') },
+      { openRepository })).rejects.toThrow('output must be outside database copy');
+    expect(openRepository).not.toHaveBeenCalled();
+    expect(await readdir(databaseCopy)).toEqual(['CURRENT']);
+  });
+
+  it.each<[string[], string]>([
+    [[], 'use export or validate'],
+    [['import', '--output', 'x'], 'use export or validate'],
+    [['validate', '--wat', 'x'], 'unknown, duplicate or missing argument'],
+    [['validate', '--output'], 'unknown, duplicate or missing argument'],
+    [['validate', '--output', 'a', '--output', 'b'], 'unknown, duplicate or missing argument'],
+    [['validate', '--output', 'a'], 'all arguments required'],
+    [['export', '--database-copy', '/missing', '--policy', '/missing', '--policy-sha256', 'f'.repeat(64), '--first', '01', '--last', '2', '--output', '/missing/out'],
+      'canonical positive block numbers required'],
+  ])('rejects command line %j before reading any input', async (args, message) => {
+    await expect(cli(...args)).rejects.toThrow(message);
+  });
+
+  it('exports a real read-only native copy through the default opener and validates it from the command line', async () => {
+    const { dir, databaseCopy, policy, policySha256 } = await nativeCopy();
+    const before = (await readdir(databaseCopy)).sort();
+    const output = join(dir, 'export');
+    const exported = JSON.parse(await cli('export', '--database-copy', databaseCopy, '--policy', policy, '--policy-sha256', policySha256,
+      '--first', '1', '--last', '2', '--output', output));
+    expect(exported).toMatchObject({ receipt: join(output, 'EXPORT.json'), productionReady: false });
+    expect((await readdir(databaseCopy)).sort()).toEqual(before);
+    const receipt = JSON.parse(await readFile(exported.receipt, 'utf8'));
+    expect(receipt).toMatchObject({ blocks: 2, readOnlyRequested: true, databaseUnchanged: true, journal: { file: 'journal.jsonl' } });
+    const validated = JSON.parse(await cli('validate', '--manifest', exported.receipt, '--manifest-sha256', exported.sha256,
+      '--policy', policy, '--policy-sha256', policySha256, '--output', join(dir, 'VALIDATION.json')));
+    expect(validated).toMatchObject({ receipt: join(dir, 'VALIDATION.json'), productionReady: false });
+    expect(JSON.parse(await readFile(validated.receipt, 'utf8'))).toMatchObject({ blocks: 2, first: 1, last: 2,
+      commitmentChainVerified: true, storageProofsVerified: false, scoringReexecuted: false, historicalCoverageVerified: false });
+  }, 30_000);
 });

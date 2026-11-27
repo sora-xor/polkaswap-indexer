@@ -1,11 +1,11 @@
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { ApiPromise } from '@polkadot/api';
-import { TypeRegistry } from '@polkadot/types';
+import { Metadata, TypeRegistry } from '@polkadot/types';
 import type { Header } from '@polkadot/types/interfaces';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { blake2AsHex } from '@polkadot/util-crypto';
-import { RecoveryQueryContexts } from '../src/recovery-query-context.js';
+import { RecoveryQueryContexts, validateRecoveryStorageContext } from '../src/recovery-query-context.js';
 import { RecoveryMetadataCache } from '../src/recovery-metadata-cache.js';
 import { ATTACKER_ACCOUNT, RECOVERY_CHECKPOINT, type BurnRecoveryPolicy } from '../src/burn-recovery.js';
 import { SORA_MAINNET_GENESIS_HASH } from '../src/soraIdentity.js';
@@ -297,4 +297,315 @@ describe('exact-state recovery query contexts', () => {
     await manager.close(); await rejected; release(original); await Promise.resolve(); await Promise.resolve();
     expect(rpc.mock.calls).toHaveLength(count);
   });
+});
+
+const plainItem = { name: 'Number', modifier: 'Default', type: { Plain: 0 }, fallback: '0x00000000', docs: [] };
+const mapItem = { name: 'BlockHash', modifier: 'Default', type: { Map: { hashers: ['Twox64Concat'], key: 0, value: 0 } }, fallback: '0x00000000', docs: [] };
+/** Real V14 codec over a tiny synthetic System pallet; it makes no claim about SORA runtime declarations. */
+function synthetic(items: unknown[] | null) {
+  const registry = new TypeRegistry();
+  // u32 storage plus the primitives the API's well-known `:code`-style keys resolve against.
+  const types = [{ Primitive: 'U32' }, { Primitive: 'U8' }, { Sequence: { type: 1 } }, { Primitive: 'U64' },
+    { Array: { len: 32, type: 1 } }, { Primitive: 'U16' }].map((def, id) => ({ id, type: { path: [], params: [], def, docs: [] } }));
+  const raw = new Metadata(registry, { magicNumber: 0x6174656d, metadata: { v14: {
+    lookup: { types },
+    pallets: [{ name: 'System', storage: items && { prefix: 'System', items }, calls: null, events: null, constants: [], errors: null, index: 0 }],
+    extrinsic: { type: 0, version: 4, signedExtensions: [] }, type: 0 } } }).toHex();
+  const metadata = new Metadata(registry, raw);
+  registry.setMetadata(metadata);
+  return { registry, raw, metadata, runtime: registry.createType('RuntimeVersion', version(134)) };
+}
+const tiny = synthetic([plainItem, mapItem]);
+const tinyPolicy: BurnRecoveryPolicy = { ...policy,
+  metadata: [{ ...policy.metadata[0], lastBlock: Number.MAX_SAFE_INTEGER, metadataHash: blake2AsHex(tiny.raw, 256) }] };
+const storageValue = new TypeRegistry().createType('u32', 7).toHex(true);
+
+/** One offline canonical state whose next execution is pinned to the tiny metadata; isolated APIs initialize quickly. */
+function tinyFixture(options: { spec?: number; parentSpec?: number } = {}) {
+  const registry = new TypeRegistry();
+  const header = registry.createType<Header>('Header', { number: 28191818, parentHash: hex(400),
+    stateRoot: hex(401), extrinsicsRoot: hex(402), digest: { logs: [] } });
+  const state = { hash: header.hash.toHex(), parentHash: hex(400), height: 28191818, header: header.toJSON() };
+  const rpc = vi.fn(async (method: string, params: unknown[]): Promise<unknown> => {
+    if (method === 'chain_getBlockHash') return params[0] === 0 ? SORA_MAINNET_GENESIS_HASH : params[0] === state.height ? state.hash : null;
+    if (method === 'system_chain') return 'SORA Mainnet';
+    if (method === 'system_properties') return { ss58Format: 69, tokenDecimals: 18, tokenSymbol: 'XOR' };
+    if (method === 'chain_getHeader') return params[0] === state.hash ? state.header : null;
+    if (method === 'state_getMetadata') return tiny.raw;
+    if (method === 'state_getRuntimeVersion') return version(params[0] === state.parentHash ? options.parentSpec ?? 134 : options.spec ?? 134);
+    if (method === 'state_getStorage') return storageValue;
+    throw new Error(`Unexpected fixture RPC ${method}`);
+  });
+  const manager = new RecoveryQueryContexts({ policy: tinyPolicy, rpc: rpc as never, execute: (request) => request() });
+  managers.push(manager);
+  return { manager, rpc, state };
+}
+
+/** Hold isolated API construction open and expose the real pinned provider facade it was handed. */
+async function heldProvider(options: { spec?: number; parentSpec?: number } = {}) {
+  const fixture = tinyFixture(options), { state } = fixture;
+  let handed!: (provider: any) => void;
+  const facade = new Promise<any>((resolve) => { handed = resolve; });
+  vi.spyOn(ApiPromise, 'create').mockImplementationOnce(((init: { provider: unknown }) => {
+    handed(init.provider); return new Promise(() => undefined);
+  }) as never);
+  const pending = fixture.manager.at(state.hash);
+  pending.catch(() => undefined);
+  // Fail fast with the capture's own error if verification ends without requesting an isolated API.
+  const provider = await Promise.race([facade, pending.then(() => { throw new Error('capture finished without an isolated API request'); })]);
+  // The exact evidence the fixture served, rebuilt by the test: the facade accepts it only because it matches its own registry.
+  const registry = new TypeRegistry();
+  const proof = { hash: state.hash, height: state.height, parentHash: state.parentHash, header: state.header,
+    version: registry.createType('RuntimeVersion', version(options.spec ?? 134)),
+    parentVersion: registry.createType('RuntimeVersion', version(options.parentSpec ?? 134)),
+    metadata: tiny.raw, metadataHash: tinyPolicy.metadata[0].metadataHash, executionCodeHash: tinyPolicy.metadata[0].executionCodeHash };
+  return { ...fixture, provider, proof, pending };
+}
+
+describe('recovery query adapter fail-closed guards', () => {
+  it('validates every decorated storage declaration and refuses a mismatched, incomplete or storage-less registry', () => {
+    const { registry, raw, metadata, runtime } = tiny;
+    const [number, blockHash] = metadata.asLatest.pallets[0].storage.unwrap().items;
+    const entry = (meta: unknown, paged = false) => Object.assign(() => undefined, { creator: { meta } },
+      paged ? { entriesPaged: () => undefined } : {});
+    const api = { registry, runtimeMetadata: metadata, runtimeVersion: runtime } as never;
+    const at = (query: unknown, changes: Record<string, unknown> = {}) => ({ registry, runtimeVersion: runtime, query, ...changes }) as never;
+    const complete = { system: { number: entry(number), blockHash: entry(blockHash, true) } };
+    const evidence = validateRecoveryStorageContext(api, at(complete), raw);
+    expect(evidence.storageEntries).toBe(2);
+    expect(evidence.storageDeclarationsSha256).toMatch(/^[0-9a-f]{64}$/);
+    for (const query of [{ system: { number: entry(number), blockHash: entry(blockHash) } }, { system: { number: entry(number) } }]) {
+      expect(() => validateRecoveryStorageContext(api, at(query), raw)).toThrow('declaration differs: system.blockHash');
+    }
+    expect(() => validateRecoveryStorageContext(api, at({ system: { number: entry(blockHash), blockHash: entry(blockHash, true) } }), raw))
+      .toThrow('declaration differs: system.number');
+    for (const changes of [{ registry: new TypeRegistry() }, { runtimeVersion: registry.createType('RuntimeVersion', version(135)) }]) {
+      expect(() => validateRecoveryStorageContext(api, at(complete, changes), raw)).toThrow('registry differs from pinned state');
+    }
+    const empty = synthetic(null);
+    expect(() => validateRecoveryStorageContext({ registry: empty.registry, runtimeMetadata: empty.metadata, runtimeVersion: empty.runtime } as never,
+      { registry: empty.registry, runtimeVersion: empty.runtime, query: {} } as never, empty.raw)).toThrow('no storage declarations');
+  });
+
+  it('serves only immutable initialization facts until an exact-state lease exists and never forwards refused RPCs', async () => {
+    const { provider, proof, rpc, state } = await heldProvider();
+    expect(provider.isConnected).toBe(true);
+    await expect(provider.connect()).resolves.toBeUndefined();
+    const calls = rpc.mock.calls.length;
+    expect(await provider.send('chain_getBlockHash', [0])).toBe(SORA_MAINNET_GENESIS_HASH);
+    expect(await provider.send('chain_getBlockHash', ['0x00000000'])).toBe(SORA_MAINNET_GENESIS_HASH);
+    await expect(provider.send('chain_getBlockHash', [state.height])).rejects.toThrow('not allowed: chain_getBlockHash');
+    await expect(provider.send('chain_getHeader', [state.hash])).rejects.toThrow('not allowed: chain_getHeader');
+    await expect(provider.send('state_getRuntimeVersion', [state.parentHash])).rejects.toThrow('not allowed: state_getRuntimeVersion');
+    await expect(provider.send('author_submitExtrinsic', ['0x00'])).rejects.toThrow('not allowed: author_submitExtrinsic');
+    await expect(provider.send('state_getStorage', ['0x00', state.hash])).rejects.toThrow('lacks an active exact-state proof');
+    await provider.withProof(proof, async () => {
+      expect(await provider.send('chain_getHeader', [state.hash])).toEqual(state.header);
+      expect(await provider.send('state_getRuntimeVersion', [state.parentHash])).toEqual(proof.parentVersion.toJSON());
+    });
+    expect(rpc).toHaveBeenCalledTimes(calls);
+  }, 30_000);
+
+  it('never invents the executing parent version of a runtime-transition state', async () => {
+    const { provider, proof, state } = await heldProvider({ spec: 138, parentSpec: 134 });
+    // The facade's registry is the transition state's own version, not its parent's.
+    await expect(provider.withProof({ ...proof, version: proof.parentVersion }, async () => 'used')).rejects.toThrow('does not match isolated registry');
+    await provider.withProof(proof, async () => {
+      expect(await provider.send('chain_getHeader', [state.hash])).toEqual(state.header);
+      await expect(provider.send('state_getRuntimeVersion', [state.parentHash])).rejects.toThrow('not allowed: state_getRuntimeVersion');
+    });
+  }, 30_000);
+
+  it('bounds leased storage request shapes and validates returned key pages, change sets and storage hashes', async () => {
+    const { provider, proof, rpc } = await heldProvider();
+    const start = `0x${'ab'.repeat(32)}`, normal = rpc.getMockImplementation()!;
+    let page: unknown = [`${start}01`, `${start}02`], digest: unknown = hex(99);
+    rpc.mockImplementation(async (method, params) => method === 'state_getKeysPaged' ? page : method === 'state_getStorageHash' ? digest
+      : method === 'state_queryStorageAt' ? [{ block: params[1], changes: (params[0] as string[]).map((key) => [key, null]) }] : normal(method, params));
+    await provider.withProof(proof, async () => {
+      const calls = rpc.mock.calls.length;
+      for (const params of [[['0xzz'], proof.hash], ['0x00', proof.hash], [Array(1001).fill(start), proof.hash], [[start], 'extra', proof.hash]]) {
+        await expect(provider.send('state_queryStorageAt', params)).rejects.toThrow('multi-read exceeds bound');
+      }
+      for (const params of [['0xzz', proof.hash], [start, 'extra', proof.hash]]) {
+        await expect(provider.send('state_getStorage', params)).rejects.toThrow('Invalid recovery storage read');
+      }
+      expect(rpc).toHaveBeenCalledTimes(calls);
+      expect(await provider.send('state_queryStorageAt', [[start], proof.hash])).toEqual([{ block: proof.hash, changes: [[start, null]] }]);
+      expect(await provider.send('state_getKeysPaged', [start, 2, null, proof.hash])).toEqual(page);
+      for (const bad of [null, [`${start}02`, `${start}01`], [start], [`0x${'cd'.repeat(33)}`], [`${start}01`, `${start}02`, `${start}03`]]) {
+        page = bad;
+        await expect(provider.send('state_getKeysPaged', [start, 2, null, proof.hash])).rejects.toThrow('Invalid recovery storage keys page');
+      }
+      expect(await provider.send('state_getStorageHash', [start, proof.hash])).toBe(hex(99));
+      digest = null;
+      expect(await provider.send('state_getStorageHash', [start, proof.hash])).toBeNull();
+      for (const bad of ['0x1234', 42, hex(99).toUpperCase()]) {
+        digest = bad;
+        await expect(provider.send('state_getStorageHash', [start, proof.hash])).rejects.toThrow('Invalid recovery storage hash');
+      }
+    });
+  }, 30_000);
+
+  it('scopes exact-state leases to the isolated registry, reference-counts overlap and bounds active states', async () => {
+    const { provider, proof } = await heldProvider();
+    const key = `0x${'ab'.repeat(32)}`;
+    for (const foreign of [{ ...proof, metadataHash: hex(9) }, { ...proof, version: new TypeRegistry().createType('RuntimeVersion', version(135)) }]) {
+      await expect(provider.withProof(foreign, async () => 'used')).rejects.toThrow('does not match isolated registry');
+    }
+    let releaseFirst: ((value: string) => void) | undefined, releaseSecond: ((value: string) => void) | undefined;
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    const leases: Promise<unknown>[] = [];
+    try {
+      const first = provider.withProof(proof, () => new Promise<string>((resolve) => { releaseFirst = resolve; }));
+      const second = provider.withProof(proof, () => new Promise<string>((resolve) => { releaseSecond = resolve; }));
+      leases.push(first, second);
+      releaseFirst!('first');
+      await expect(first).resolves.toBe('first');
+      expect(await provider.send('state_getStorage', [key, proof.hash])).toBe(storageValue);
+      releaseSecond!('second');
+      await expect(second).resolves.toBe('second');
+      await expect(provider.send('state_getStorage', [key, proof.hash])).rejects.toThrow('lacks an active exact-state proof');
+      leases.push(...Array.from({ length: 128 }, (_, index) => provider.withProof({ ...proof, hash: hex(5000 + index) }, () => gate)));
+      await expect(provider.withProof({ ...proof, hash: hex(6000) }, async () => 'late')).rejects.toThrow('active-state bound exceeded');
+      await expect(provider.withProof({ ...proof, hash: hex(5000) }, async () => 'reentered')).resolves.toBe('reentered');
+      open();
+      await Promise.all(leases);
+      await expect(provider.withProof({ ...proof, hash: hex(6000) }, async () => 'admitted')).resolves.toBe('admitted');
+    } finally {
+      // Settle every lease even after a failed assertion, so none outlives the test or rejects unobserved at close.
+      releaseFirst?.('first'); releaseSecond?.('second'); open();
+      await Promise.allSettled(leases);
+    }
+  }, 30_000);
+
+  it('refuses reconnection and every later read once the facade is disconnected', async () => {
+    const { provider, proof, rpc } = await heldProvider();
+    await provider.disconnect();
+    expect(provider.isConnected).toBe(false);
+    const calls = rpc.mock.calls.length;
+    await expect(provider.connect()).rejects.toThrow('Recovery query provider is closed');
+    await expect(provider.send('system_chain', [])).rejects.toThrow('Recovery query provider is closed');
+    await expect(provider.withProof(proof, async () => 'used')).rejects.toThrow('Recovery query provider is closed');
+    expect(rpc).toHaveBeenCalledTimes(calls);
+  }, 30_000);
+
+  it('rejects out-of-range resource bounds, a void owner response and raw reads after close', async () => {
+    for (const bounds of [{ timeoutMs: 0 }, { timeoutMs: 120_001 }, { timeoutMs: 1.5 }, { maximumClients: 0 }, { maximumClients: 33 }]) {
+      expect(() => new RecoveryQueryContexts({ policy: tinyPolicy, rpc: vi.fn() as never, execute: (request) => request(), ...bounds }))
+        .toThrow('Invalid recovery query resource bounds');
+    }
+    const edge = new RecoveryQueryContexts({ policy: tinyPolicy, rpc: vi.fn() as never, execute: (request) => request(), timeoutMs: 120_000, maximumClients: 32 });
+    managers.push(edge);
+    const { manager, rpc } = tinyFixture();
+    rpc.mockResolvedValueOnce(undefined);
+    await expect(manager.raw('system_chain', [])).rejects.toThrow('Recovery query RPC response exceeds bound');
+    expect(await manager.raw('system_chain', [])).toBe('SORA Mainnet');
+    await manager.close();
+    const calls = rpc.mock.calls.length;
+    await expect(manager.raw('system_chain', [])).rejects.toThrow('Recovery queries cancelled');
+    expect(rpc).toHaveBeenCalledTimes(calls);
+  });
+
+  it('refuses a malformed state hash, a different genesis and invalid chain properties, rereading identity after each failure', async () => {
+    const { manager, rpc, state } = tinyFixture();
+    for (const bad of ['0x1234', hex(0), `0x${state.hash.slice(2).toUpperCase()}`]) {
+      await expect(manager.at(bad)).rejects.toThrow('Invalid recovery state hash');
+    }
+    expect(rpc).not.toHaveBeenCalled();
+    const normal = rpc.getMockImplementation()!;
+    const failures: Array<[string, unknown, string]> = [['chain_getBlockHash', hex(9), 'Recovery query genesis mismatch'],
+      ['system_chain', 'x'.repeat(129), 'Invalid recovery chain properties'], ['system_properties', null, 'Invalid recovery chain properties']];
+    for (const [failing, value, message] of failures) {
+      rpc.mockImplementation((method, params) => method === failing && (method !== 'chain_getBlockHash' || params[0] === 0)
+        ? Promise.resolve(value) : normal(method, params));
+      await expect(manager.at(state.hash)).rejects.toThrow(message);
+    }
+    rpc.mockImplementation(normal);
+    const context = await manager.at(state.hash);
+    expect(context.evidence).toMatchObject({ block: state.height, hash: state.hash, storageEntries: 2, specVersion: 134 });
+    expect(rpc.mock.calls.filter(([method, params]) => method === 'chain_getBlockHash' && params[0] === 0)).toHaveLength(4);
+    expect((await context.query.system.number()).toString()).toBe('7');
+  }, 30_000);
+
+  it('stops at the enclosing capture deadline before starting the next evidence read', async () => {
+    const { manager, rpc, state } = tinyFixture();
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const normal = rpc.getMockImplementation()!;
+    rpc.mockImplementation(async (method, params) => {
+      if (method === 'chain_getHeader') now += 30_001;
+      return normal(method, params);
+    });
+    await expect(manager.at(state.hash)).rejects.toThrow('Recovery state capture exceeded deadline');
+    expect(rpc.mock.calls.map(([method]) => method)).toEqual(['chain_getHeader']);
+  });
+
+  it('validates every runtime API entry before constructing a client and admits a well-formed one', async () => {
+    const { manager, rpc, state } = tinyFixture();
+    const normal = rpc.getMockImplementation()!;
+    let apis: unknown[] = [];
+    rpc.mockImplementation((method, params) => method === 'state_getRuntimeVersion'
+      ? Promise.resolve({ ...version(134), apis }) : normal(method, params));
+    const create = vi.spyOn(ApiPromise, 'create');
+    const core = '0xdf6acb689907609b';
+    for (const entry of [core, [core], [core.toUpperCase(), 4], ['0xdf6acb68', 4], [core, 1.5], [core, -1], [core, 2 ** 32]]) {
+      apis = [entry];
+      await expect(manager.at(state.hash)).rejects.toThrow('Invalid recovery state runtime version');
+    }
+    expect(create).not.toHaveBeenCalled();
+    apis = [[core, 4]];
+    const context = await manager.at(state.hash);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(context.runtimeVersion.apis.map(([id, apiVersion]) => [id.toHex(), apiVersion.toNumber()])).toEqual([[core, 4]]);
+  }, 30_000);
+
+  it('cancels an in-flight isolated client initialization and disconnects the late API', async () => {
+    const { manager, state } = tinyFixture();
+    let requested!: () => void, finish!: (api: unknown) => void, closedLate!: () => void;
+    const creationRequested = new Promise<void>((resolve) => { requested = resolve; });
+    const lateClosed = new Promise<void>((resolve) => { closedLate = resolve; });
+    const late = { disconnect: vi.fn(async () => { closedLate(); }) };
+    vi.spyOn(ApiPromise, 'create').mockImplementationOnce((() => {
+      requested(); return new Promise((resolve) => { finish = resolve; });
+    }) as never);
+    const pending = manager.at(state.hash), rejected = expect(pending).rejects.toThrow('Recovery queries cancelled');
+    await Promise.race([creationRequested, pending]);
+    await manager.close();
+    await rejected;
+    finish(late);
+    await lateClosed;
+    expect(late.disconnect).toHaveBeenCalledTimes(1);
+    await expect(manager.at(state.hash)).rejects.toThrow('Recovery queries cancelled');
+  }, 30_000);
+
+  it('refuses a client initialized with a different genesis and a cached client that resolves the wrong registry', async () => {
+    const { manager, state } = tinyFixture();
+    const real = ApiPromise.create.bind(ApiPromise);
+    let closedRejected!: () => void;
+    const rejectedClosed = new Promise<void>((resolve) => { closedRejected = resolve; });
+    const accepted: ApiPromise[] = [];
+    vi.spyOn(ApiPromise, 'create').mockImplementationOnce(async (options) => {
+      const api = await real(options);
+      Object.defineProperty(api, 'genesisHash', { value: api.registry.createType('Hash', hex(9)) });
+      const disconnect = api.disconnect.bind(api);
+      api.disconnect = async () => { closedRejected(); return disconnect(); };
+      return api;
+    }).mockImplementationOnce(async (options) => {
+      const api = await real(options);
+      accepted.push(api);
+      return api;
+    });
+    await expect(manager.at(state.hash)).rejects.toThrow('initialized with different chain/runtime properties');
+    await rejectedClosed;
+    const context = await manager.at(state.hash);
+    expect(context.evidence).toMatchObject({ block: state.height, storageEntries: 2, fixedTransitionContext: false });
+    expect(accepted).toHaveLength(1);
+    // Simulate an API regression handing the cached client's next state lookup to another registry.
+    vi.spyOn(accepted[0], 'at').mockResolvedValueOnce({ registry: new TypeRegistry(), runtimeVersion: accepted[0].runtimeVersion } as never);
+    await expect(manager.at(state.hash)).rejects.toThrow('Recovery query reused the wrong registry');
+    expect((await manager.at(state.hash)).registry).toBe(context.registry);
+    expect(accepted).toHaveLength(1);
+  }, 30_000);
 });
