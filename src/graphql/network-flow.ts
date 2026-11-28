@@ -231,11 +231,14 @@ export async function projectNetworkSnapshotFlows(
       }
     }
   };
-  const adjustInterval = async (start: number, end: number, through: number, totals: Totals, sign: bigint) => {
+  const adjustInterval = async (start: number, end: number, through: number, throughTimestamp: number, totals: Totals, sign: bigint) => {
     if (start >= end) return;
     if (start < oldest.timestamp) throw new RetiredCoverage();
-    const before = await endpoint('DESC', { timestamp: { lessThan: start } }, through);
-    const after = await endpoint('ASC', { timestamp: { greaterThanOrEqualTo: end } }, through);
+    // Bound the type/time index as well as the height filter so a historical
+    // anchor cannot scan newer blocks looking for a row at or below through.
+    const before = await endpoint('DESC', { timestamp: { lessThan: start, lessThanOrEqualTo: throughTimestamp } }, through);
+    const after = end > throughTimestamp ? null :
+      await endpoint('ASC', { timestamp: { greaterThanOrEqualTo: end, lessThanOrEqualTo: throughTimestamp } }, through);
     // Anchor both ends, including quiet intervals; one surviving row is not proof of completeness.
     const from = before ? blockPosition(before).height : oldest.height;
     const to = after ? blockPosition(after).height : through;
@@ -280,11 +283,11 @@ export async function projectNetworkSnapshotFlows(
             if (!source || blockPosition(source).timestamp !== sourceTimestamp || through > latest.height) throw unavailable('snapshot source block is missing');
           }
           // The stored rolling prefix belongs to the previous calendar bucket.
-          await adjustInterval(baseStart, start, through, totals, -1n);
+          await adjustInterval(baseStart, start, through, sourceTimestamp, totals, -1n);
           if (durable?.complete) {
-            await adjustInterval(end, bucketEnd, through, totals, -1n);
+            await adjustInterval(end, bucketEnd, through, sourceTimestamp, totals, -1n);
           } else {
-            await adjustInterval(end, sourceTimestamp + 1, through, totals, -1n);
+            await adjustInterval(end, sourceTimestamp + 1, through, sourceTimestamp, totals, -1n);
             // Height ownership also handles several blocks sharing the exact source timestamp.
             const last = await endpoint('DESC', { timestamp: { lessThan: end } }, latest.height);
             const lastHeight = last ? blockPosition(last).height : through;

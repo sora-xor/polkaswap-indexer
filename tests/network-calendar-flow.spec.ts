@@ -255,4 +255,41 @@ describe('calendar network API flow projection', () => {
       expect((second.data!.networkSnapshots as { nodes: unknown[] }).nodes).toEqual([{ transactions: 39, flowAggregation: 'CALENDAR' }]);
     } finally { await repository.close(); await rm(directory, { recursive: true, force: true }); }
   });
+
+  it('clips historical DAY flows within the native scan limit even with many newer BLOCK rows', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'network-calendar-historical-'));
+    const repository = new RocksRepository({ ...readConfig(), storageEngine: 'rocksdb', rocksdbPath: join(directory, 'db'),
+      rocksdbBlockCacheMb: 2, rocksdbWriteBufferManagerMb: 2, rocksdbParallelism: 1,
+      rocksdbDocumentCacheMax: 0, rocksdbQueryMaxScannedRows: 12 });
+    const day = 86400;
+    const start = day * 10;
+    const timestamps = [start - 1, start, start + 10, start + 10, start + 20, start + day - 1,
+      ...Array.from({ length: 32 }, (_, index) => start + day + index)];
+    const history: IndexerDocument[] = timestamps.map((timestamp, index) => ({
+      collection: 'networkSnapshots', id: `block-${100 + index}`, blockHeight: 100 + index, timestamp,
+      data: { id: `block-${100 + index}`, timestamp, type: 'BLOCK', ...flows(1) },
+    }));
+    const id = `network-all-DAY-${start}`;
+    const timestamp = start + day - 1;
+    const fullDay = { ...flows(5), volumeUSD: '5.00000005' };
+    const record: IndexerDocument = { collection: 'networkSnapshots', id, blockHeight: 105, timestamp,
+      data: { id, timestamp, type: 'DAY', ...fullDay, calendarFlows: { version: 1, complete: true,
+        bucketStart: start, bucketEnd: start + day, throughBlock: 105, throughTimestamp: timestamp, ...fullDay } } };
+    try {
+      await repository.prepare();
+      await repository.upsertMany([...history, record]);
+      const schema = createSchema();
+      const source = `query($to:Int!, $from:Int!){networkSnapshots(first:1,orderBy:TIMESTAMP_DESC,
+        filter:{type:{equalTo:DAY},timestamp:{greaterThanOrEqualTo:$to,lessThanOrEqualTo:$from}}){
+        nodes{transactions fees volumeUSD flowAggregation}}}`;
+      for (const [from, count] of [[start + 10, 3], [timestamp, 5]] as const) {
+        const response = await graphql({ schema, source, contextValue: { repository }, variableValues: { to: start - 1, from } });
+        expect(response.errors).toBeUndefined();
+        expect((response.data!.networkSnapshots as { nodes: unknown[] }).nodes).toEqual([{
+          transactions: count, fees: (feeUnit * BigInt(count)).toString(),
+          volumeUSD: `${count}.0000000${count}`, flowAggregation: 'CALENDAR',
+        }]);
+      }
+    } finally { await repository.close(); await rm(directory, { recursive: true, force: true }); }
+  });
 });

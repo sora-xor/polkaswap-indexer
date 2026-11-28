@@ -6,11 +6,11 @@ The API intentionally exposes SubQuery-compatible GraphQL field names so the
 static Polkaswap UI can use a single external endpoint without depending on
 SubQuery or Subsquid from the browser.
 
-Production recovery status (31 October 2026): the Pi API is in native read-only
-hold while a canonical replacement is prepared. MOF2's retained old archive
-passed historical availability checks; live indexing is not yet restored.
-See [post-fork recovery](docs/post-fork-recovery-20261031.md) for the archive,
-service paths, validation and cutover prerequisites.
+Since 8 November 2026 the public Pi API serves live canonical statistics and
+history at `https://pi.soramitsu.io/graphql`. Account entitlements remain
+unavailable. See the [production runbook](AGENTS.md#production-stats-api-deployment-target)
+for the live service and rollback target, and [post-fork recovery](docs/post-fork-recovery-20261031.md)
+for the retained archive and full-recovery prerequisites.
 
 ## Runtime
 
@@ -500,7 +500,9 @@ and worker processes. RocksDB is embedded local storage; the API and worker must
 share one process-local repository handle for fresh reads and safe writes. The
 standalone API and worker entry points reject `STORAGE_ENGINE=rocksdb` before
 opening the database so a split deployment cannot race accidentally.
-On the MacStadium host, install `ops/run-combined.sh` as
+The following MacStadium/launchd instructions are a historical deployment
+example. Pi now uses systemd on OVH. On the former host,
+install `ops/run-combined.sh` as
 `/Users/administrator/apps/polkaswap-indexer/run-combined.sh` and supervise it
 with `ops/org.polkaswap.indexer.plist` under `/Library/LaunchDaemons`.
 Install the bounded combined-log policy at the same time:
@@ -926,23 +928,39 @@ retain consistency checks but do not provide independent operator verification.
 Verify fresh progress and complete API qualification before public cutover.
 
 
-The current Pi deployment is on the MOF MacStadium host `207.254.29.218`.
-Its local SORA RPC node uses constrained `--pruning 256`; it is not an archive.
-The approved OVH MOF2 node (`51.161.218.175`, `wss://mof2.sora.org`) uses
-`--state-pruning archive-canonical --blocks-pruning archive-canonical`, retaining
-both canonical state and blocks. The durable MOF Pi worker uses this archive for
-both configured chain endpoints, including after catch-up. Recovery stays
-isolated from public routing until its data and API checks pass.
+Pi runs on the approved OVH host `141.94.30.127` (`mof-ovh`). Since
+8 November 2026 at 11:16:18 UTC, nginx routes the public API to
+`pi-canonical-stats-live.service` on `127.0.0.1:4039/graphql`. The service
+runs as `pi-indexer` under `/srv/services/pi-stats-recovery-20261107`, using
+`release-v3-calendar`, `data/candidate` and `worker-v3-cache2/live.env`. The switch
+receipt is `evidence/public-nginx-switch.json` under that directory.
+
+The live unit’s `90-calendar.conf` drop-in selects the corrected historical
+projection. Its additional preflight validates the runtime manifest. To roll back
+the binary, use the retained base unit and the same current database.
+
+The rollback unit is `/etc/systemd/system/pi-canonical-hold.service`, running as `pi-indexer` from
+`/srv/services/pi/release`. It launches
+`/srv/services/pi/release/dist/src/scripts/serve-recovery-hold.js` with
+`/srv/services/pi/admission/hold-manifest.json`, serving `127.0.0.1:4010/graphql`
+for rollback to the audited prefix through block 28,191,816. Its database is
+`/srv/services/pi/data/canonical`; the unit verifies its admitted file manifest
+before opening it read-only.
+
+Keep any future recovery candidate private until its data and API checks
+pass, and use the bounded canonical archive at `wss://mof2.sora.org/archive`
+under [the archive gateway procedure](docs/archive-gateway.md), never the
+retained abandoned-fork node's unbounded head.
 
 ### Pi host capacity safeguards
 
-The production host runs a five-minute capacity and explicit-retirement guard,
-maintenance free-space preflights, and supervised log rotation. See
-[host storage safeguards](docs/host-storage-safeguards.md) for thresholds,
-protected backups, alert delivery, validation, and release/rollback procedures.
+The former MacStadium deployment used a five-minute capacity and
+explicit-retirement guard, maintenance free-space preflights, and supervised
+log rotation. [Host storage safeguards](docs/host-storage-safeguards.md) retains
+that historical policy. The current OVH hold uses systemd journal logging,
+`MemoryHigh=5G`, `MemoryMax=6G`, and a read-only `/srv/services/pi` mount policy.
 
-An inactive, separately admitted canonical statistics/history recovery candidate
-is documented in [docs/canonical-stats-history.md](docs/canonical-stats-history.md).
-It preserves full-recovery admission requirements, exposes explicit partial
-capabilities, and never certifies point/burn entitlements. Its private clone must
-be independently qualified before the explicit initializer or worker is run.
+The [canonical statistics/history mode](docs/canonical-stats-history.md)
+preserves full-recovery admission requirements, exposes partial capabilities and
+never certifies point or burn entitlements. Independently qualify each new
+private clone before running its initializer or worker.

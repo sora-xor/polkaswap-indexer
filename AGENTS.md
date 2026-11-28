@@ -12,23 +12,92 @@ storage from a configured SORA2 node. Unless overridden, it connects to:
 SORA_WS_ENDPOINT=wss://mof2.sora.org
 ```
 
-The production topology uses embedded RocksDB. The API and worker run in one
-combined process and share one repository handle. PostgreSQL remains the
-migration source and a reference/development backend; its split API/worker
-topology is not the RocksDB production deployment. See `README.md` for migration,
-validation, backup, and supervised deployment procedures.
+Pi's production API and canonical worker run in one combined process and
+share the embedded Kasumi database. The read-only rollback listener uses
+RocksDB. PostgreSQL serves as a migration source and reference/development
+backend. See `README.md` for the supported deployment topologies and the
+production target below for the effective release and database identities.
 
 ### Production stats API deployment target
 
 The shipped Polkaswap configuration currently sets `POLKASWAP_INDEXER_ENDPOINT`
-to `https://pi.soramitsu.io/graphql`, served by the approved Pi host
-`207.254.29.218` (MOF). Check the live `env.json` before each API release and verify
-against the endpoint the browser actually uses. The separate MOF GraphQL
-service and `wss://ws.mof.sora.org` RPC node are distinct services; a successful
-MOF API rollout does not update Pi's GraphQL service.
+to `https://pi.soramitsu.io/graphql`, served by the approved OVH host
+`141.94.30.127` (`mof-ovh`) since 6 November 2026. On 8 November nginx
+switched to `pi-canonical-stats-live.service` on `127.0.0.1:4039` at indexed
+block 28,288,670. At that cutover the enabled unit ran as `pi-indexer` under
+`/srv/services/pi-stats-recovery-20261107` with `release-v3-calendar`, database
+`data/candidate`, and `worker-v3-cache2/live-admission.json`. Its admission
+covers canonical statistics and history. Entitlements and full recovery remain
+uncertified. The `mof_web_egress` nftables table permits nginx (UID 33) to reach
+`127.0.0.1:4039` and the rollback listener on port 4010. Keep the active
+`/etc/nftables.d/mof-web-egress.nft` and the matching nginx generation file
+in sync. Verify a public POST and CORS preflight from the Polkaswap origin
+when changing the upstream. A root-only loopback check bypasses this allowlist.
+
+On 9 November 2026 the production Stats writer on port 4039 switched to
+Kasumi master `e450e47e`. The original Kasumi release and current database are under
+`/srv/services/pi-stats-recovery-20261107/kasumi-20261109/` at `release` and
+`data/live`. The root-owned `rollout/transfer.json` binds this database to the
+original Stats admission. The RocksDB writer directory `data/candidate` is
+retained for rollback. Inspect the effective unit including `95-kasumi.conf`
+and verify the active database handles before changing the service. The root-owned
+`kasumi-20261109/rollout/cutover.py rollback` restores the original writer on
+port 4039.
+
+Later November 9 overrides extend coverage on the same Kasumi database. Inspect
+all effective drop-ins in lexical order, including the `zz-` overrides. The
+public Burn coverage now starts at block 28,194,044. Active-account period
+totals require full coverage. The closed-vault wallet history is bound to the
+finalized issued counter and complete open-ID inventory. The receipt documents
+the live checkout, scope, canonical evidence and rollback steps.
+See [production data verification](../polkaswap-exchange-web/docs/reports/data-integrity-2026-11-09.md).
+
+The 104 API release adds `publicTonswapCampaignActivity` for a sealed historical
+interval beginning at block 27,720,478. Its separate `publicBurnActivity` field
+still reports the advancing recent interval beginning at 28,194,044. Preserve
+the independent ranges and the entitlement guards. Inspect
+`zz-104-historical-tonswap.conf` and the checked effective executable before
+changing the writer. See [sealed campaign release](../polkaswap-exchange-web/docs/reports/tonswap-campaign-2026-11-09.md) for evidence
+and the extension procedure.
+
+### Public Burn activity on Pi
+
+The November 9 Burn runtime adds the nullable `publicBurnActivity` field to the
+canonical Stats writer. Show the inclusive `startBlock` and `throughBlock`
+with the emitted XOR burn totals and their TONSWAP-marked subset. A complete
+interval can have zero burns. Missing or stale coverage returns null. Account
+points, burn claims and TS estimates require separately certified history.
+
+Under `/srv/services/pi-stats-recovery-20261107/burn-activity-20261109`,
+`backfill/verified/report.json` records two matching scans of blocks
+28,281,700–28,296,140. The handoff extends this prefix to the stopped cursor,
+checks its height, hash, timestamp and admission, and seals `ops/prefix.json`
+with the SHA-256 in `ops/prefix.env`. The Burn drop-in is
+`96-public-burn.conf`. Check the effective service and compare the public
+field to the advancing Stats cursor before declaring availability.
+
+For a Burn-only rollback, verify the SHA-256 of that drop-in against the
+rollout receipt, stop `pi-canonical-stats-live.service`, remove the verified
+drop-in, reload systemd and start the service. Preserve `95-kasumi.conf`, the
+Kasumi `data/live` database, its transfer admission and the Burn prefix.
+Verify Stats and history on the public endpoint after the previous runtime
+resumes. Operational evidence and the field contract are documented in the
+Burn release worktree at `docs/canonical-stats-history.md`.
+
+### Canonical read-only rollback and API verification
+
+The rollback service `pi-canonical-hold.service` runs as `pi-indexer` on
+`127.0.0.1:4010`, using
+`/srv/services/pi/release/dist/src/scripts/serve-recovery-hold.js`, admission
+`/srv/services/pi/admission/hold-manifest.json`, and the native read-only database
+`/srv/services/pi/data/canonical`. Keep the hold database read-only. Check the
+live `env.json` before each
+API release and verify against the endpoint the browser actually uses. The
+separate MOF GraphQL service and `wss://ws.mof.sora.org` RPC node are distinct
+services; a successful MOF API rollout does not update Pi's GraphQL service.
 
 For an API-only correction, inspect Pi's actual launcher, process owner, release
-path, and RocksDB lock before stopping or replacing that service. Preserve
+path, and active database lock before stopping or replacing that service. Preserve
 Pi's deployed functionality and persistent database. Confirm the public Pi
 schema, health, canonical BLOCK totals, and the browser's exact stats queries
 after restart. No frontend/IPFS publication is needed for an API-only change.
@@ -36,7 +105,7 @@ For the one-shot trading-volume repair, follow
 `docs/network-volume-repair.md` and complete the offline
 repair before starting a calendar-enabled worker.
 
-As of 1 November 2026, Pi serves the exhaustively audited canonical prefix
+On 1 November 2026, Pi began serving the exhaustively audited canonical prefix
 through block 28,191,816 in native read-only recovery hold. That canonical
 service is the rollback target; the older abandoned-fork database remains
 retained for incident evidence and must never resume its writer or have its
@@ -44,9 +113,9 @@ checkpoint rewound. MOF2 retains a 657 GiB old archive, separate from its public
 recovery database. Preserve that archive and bound its historical use to the
 shared prefix through block 28,191,817. See
 `docs/post-fork-recovery-20261031.md` for exact service paths, evidence and
-canonical rebuild prerequisites. The hold is not a successful live-indexing
-recovery. A separate statistics/history candidate is private and cannot certify
-entitlements; no candidate preparation receipt authorizes public promotion.
+canonical rebuild prerequisites. For future releases, keep the candidate private
+until its data and API checks pass. A preparation receipt alone does not
+authorize public promotion or certify entitlements.
 
 The restored canonical historical endpoint is `wss://mof2.sora.org/archive`
 (`https://mof2.sora.org/archive` for HTTP). It combines the retained shared prefix
