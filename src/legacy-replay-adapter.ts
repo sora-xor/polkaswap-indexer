@@ -309,6 +309,13 @@ export function createLegacyReplayServer(adapter: LegacyReplayAdapter): {
   });
   wss.on('connection', (client: WebSocket) => {
     let pending = 0;
+    /** Ends only this connection; every other client and the HTTP listener keep serving. */
+    const closeAfterFailure = () => { if (client.readyState === WebSocket.OPEN) client.close(1011, 'Internal error'); };
+    // A frame error (oversized, invalid UTF-8, protocol violation) is scoped to its
+    // connection. ws has already begun the close handshake with the matching status
+    // (1009, 1007, 1002) and bounds it with its close timeout. Without this listener the
+    // emitted 'error' event would be thrown and end the whole replay process.
+    client.on('error', closeAfterFailure);
     const send = (message: unknown) => {
       if (client.readyState !== WebSocket.OPEN) return;
       if (client.bufferedAmount > MAX_RESPONSE) { client.terminate(); return; }
@@ -336,7 +343,9 @@ export function createLegacyReplayServer(adapter: LegacyReplayAdapter): {
           return;
         }
         send(await answer(request));
-      })().finally(() => { pending--; });
+      // A reply that cannot be encoded or written must not become an unhandled
+      // rejection, which would also end the process. It closes only this connection.
+      })().catch(closeAfterFailure).finally(() => { pending--; });
     });
   });
   const closeClients = () => { for (const client of wss.clients) client.terminate(); };
