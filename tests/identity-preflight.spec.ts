@@ -21,6 +21,11 @@ vi.mock('@polkadot/api', () => ({
 }));
 
 const { preflightSoraMainnetIdentity } = await import('../src/worker/identityPreflight.js');
+const { isDiscardedTimestampState, isUnavailableHistoricalState } = await import('../src/worker/historicalTimestamp.js');
+
+/** What wss://mof2.sora.org and wss://ws.mof.sora.org answered for the anchor timestamp on 2026-11-27. */
+const MISSING_ROOT =
+  '4003: Client error: Execution failed: Trie lookup error: Invalid state root: 0x768128cb5a171843f2715e178a061d5664001e68930d3e127df21c21e3c0804d';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const hash = (byte: string): string => `0x${byte.repeat(64)}`;
@@ -182,6 +187,118 @@ describe('database-free SORA identity preflight', () => {
     })).rejects.toThrow('State already discarded');
     expect(polkadotMocks.createProvider).toHaveBeenCalledOnce();
     expectClosed(provider);
+  });
+
+  describe('documented primary without the anchor state', () => {
+    it.each([
+      ['a missing state root', MISSING_ROOT],
+      ['a missing state root in uppercase hex', MISSING_ROOT.replace(/0x[0-9a-f]+$/, (root) => `0x${root.slice(2).toUpperCase()}`)],
+      ['explicitly discarded state', '4003: Client error: State already discarded for BlockId::Hash(0x01)'],
+    ])('recovers from %s through the verified archive, which proves genesis, anchor hash and timestamp itself', async (_label, message) => {
+      const primary = useProvider(providerWithIdentity(SORA_MAINNET_GENESIS_HASH, SORA_LEGACY_IDENTITY_ANCHOR.hash, new Error(message)));
+      const archive = useProvider();
+      await expect(preflightSoraMainnetIdentity('wss://mof2.sora.org', {
+        requireAnchorTimestamp: true, historicalEndpoint: 'wss://mof2.sora.org/archive',
+      })).resolves.toBeUndefined();
+      expect(polkadotMocks.createProvider.mock.calls.map(([endpoint]) => endpoint))
+        .toEqual(['wss://mof2.sora.org', 'wss://mof2.sora.org/archive']);
+      const proof = [
+        ['chain_getBlockHash', [0], false],
+        ['chain_getBlockHash', [SORA_LEGACY_IDENTITY_ANCHOR.block], false],
+        ['state_getStorage', [TIMESTAMP_KEY, SORA_LEGACY_IDENTITY_ANCHOR.hash], false],
+      ];
+      expect(primary.send.mock.calls).toEqual(proof);
+      expect(archive.send.mock.calls).toEqual(proof);
+      expectClosed(primary, archive);
+    });
+
+    it.each([
+      ['wrong genesis', { genesis: hash('1') }, 'does not match the reviewed SORA mainnet genesis hash'],
+      ['zero genesis', { genesis: hash('0') }, 'missing, zero, or malformed genesis hash'],
+      ['wrong anchor hash', { anchor: hash('2') }, 'does not contain the reviewed SORA mainnet history anchor'],
+      ['wrong timestamp', { timestamp: scaleTimestamp(BigInt(SORA_LEGACY_IDENTITY_ANCHOR.timestamp) * 1000n - 1n) },
+        'does not contain the reviewed SORA mainnet history anchor timestamp'],
+      ['missing timestamp', { timestamp: null }, 'does not contain the reviewed SORA mainnet history anchor timestamp'],
+      ['its own missing state root', { timestamp: new Error(MISSING_ROOT) }, 'the archive does not hold that state either'],
+      ['its own discarded state', { timestamp: new Error('State already discarded') }, 'the archive does not hold that state either'],
+      ['a failed timestamp query', { timestamp: new Error('archive overloaded') }, 'archive overloaded'],
+    ])('fails hard when the archive has %s, without a further fallback', async (_label, archiveIdentity, expected) => {
+      const primary = useProvider(providerWithIdentity(SORA_MAINNET_GENESIS_HASH, SORA_LEGACY_IDENTITY_ANCHOR.hash, new Error(MISSING_ROOT)));
+      const archive = useProvider(providerWithIdentity(
+        'genesis' in archiveIdentity ? archiveIdentity.genesis : SORA_MAINNET_GENESIS_HASH,
+        'anchor' in archiveIdentity ? archiveIdentity.anchor : SORA_LEGACY_IDENTITY_ANCHOR.hash,
+        'timestamp' in archiveIdentity ? archiveIdentity.timestamp : TIMESTAMP,
+      ));
+      await expect(preflightSoraMainnetIdentity('wss://mof2.sora.org', {
+        requireAnchorTimestamp: true, historicalEndpoint: 'wss://mof2.sora.org/archive',
+      })).rejects.toThrow(expected);
+      expect(polkadotMocks.createProvider).toHaveBeenCalledTimes(2);
+      expectClosed(primary, archive);
+    });
+
+    it('fails hard when the archive handshake fails', async () => {
+      const primary = useProvider(providerWithIdentity(SORA_MAINNET_GENESIS_HASH, SORA_LEGACY_IDENTITY_ANCHOR.hash, new Error(MISSING_ROOT)));
+      const archive = useProvider();
+      archive.connect.mockRejectedValue(new Error('archive handshake failed'));
+      await expect(preflightSoraMainnetIdentity('wss://mof2.sora.org', {
+        requireAnchorTimestamp: true, historicalEndpoint: 'wss://mof2.sora.org/archive',
+      })).rejects.toThrow('archive handshake failed');
+      expect(archive.send).not.toHaveBeenCalled();
+      expectClosed(primary, archive);
+    });
+
+    it.each([
+      ['an incomplete database', 'Trie lookup error: Incomplete database: 0x768128cb5a171843f2715e178a061d5664001e68930d3e127df21c21e3c0804d'],
+      ['a root-less invalid state root', '4003: Client error: Execution failed: Trie lookup error: Invalid state root'],
+      ['a truncated state root', 'Trie lookup error: Invalid state root: 0x768128cb'],
+      ['an overlong state root', `${MISSING_ROOT}00`],
+      ['an invalid state root outside a trie lookup', 'Invalid state root: 0x768128cb5a171843f2715e178a061d5664001e68930d3e127df21c21e3c0804d'],
+      ['a dropped connection', 'SORA identity preflight websocket disconnected'],
+      ['an unknown block', 'Unknown block'],
+    ])('fails hard on %s from the primary without consulting the archive', async (_label, message) => {
+      const provider = useProvider(providerWithIdentity(SORA_MAINNET_GENESIS_HASH, SORA_LEGACY_IDENTITY_ANCHOR.hash, new Error(message)));
+      await expect(preflightSoraMainnetIdentity('wss://mof2.sora.org', {
+        requireAnchorTimestamp: true, historicalEndpoint: 'wss://mof2.sora.org/archive',
+      })).rejects.toThrow(message);
+      expect(polkadotMocks.createProvider).toHaveBeenCalledOnce();
+      expectClosed(provider);
+    });
+
+    it('fails hard on a non-Error rejection that only quotes unavailable state', async () => {
+      const provider = useProvider();
+      provider.send.mockImplementation(async (method, params) => {
+        if (method === 'state_getStorage') throw MISSING_ROOT;
+        return params[0] === 0 ? SORA_MAINNET_GENESIS_HASH : SORA_LEGACY_IDENTITY_ANCHOR.hash;
+      });
+      await expect(preflightSoraMainnetIdentity('wss://mof2.sora.org', {
+        requireAnchorTimestamp: true, historicalEndpoint: 'wss://mof2.sora.org/archive',
+      })).rejects.toBe(MISSING_ROOT);
+      expect(polkadotMocks.createProvider).toHaveBeenCalledOnce();
+      expectClosed(provider);
+    });
+
+    it.each([undefined, 'wss://mof2.sora.org'])(
+      'explains that a separate archive is needed when the fallback is %s, keeping the node error as its cause', async (historicalEndpoint) => {
+        const cause = new Error(MISSING_ROOT);
+        const provider = useProvider(providerWithIdentity(SORA_MAINNET_GENESIS_HASH, SORA_LEGACY_IDENTITY_ANCHOR.hash, cause));
+        const failure = await preflightSoraMainnetIdentity('wss://mof2.sora.org', { requireAnchorTimestamp: true, historicalEndpoint })
+          .then(() => undefined, (error: unknown) => error);
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toBe('SORA identity preflight cannot read Timestamp.Now at the history anchor: ' +
+          `this endpoint no longer holds that state and SORA_ARCHIVE_WS_ENDPOINT names no separate archive (${MISSING_ROOT})`);
+        expect((failure as Error).cause).toBe(cause);
+        expect(polkadotMocks.createProvider).toHaveBeenCalledOnce();
+        expectClosed(provider);
+      },
+    );
+
+    it('leaves the indexing-time timestamp fallback limited to explicitly discarded state', () => {
+      expect(isUnavailableHistoricalState(new Error(MISSING_ROOT))).toBe(true);
+      expect(isDiscardedTimestampState(new Error(MISSING_ROOT))).toBe(false);
+      expect(isDiscardedTimestampState(new Error('State already discarded'))).toBe(true);
+      expect(isUnavailableHistoricalState(MISSING_ROOT)).toBe(false);
+      expect(isUnavailableHistoricalState(undefined)).toBe(false);
+    });
   });
 
   it.each([

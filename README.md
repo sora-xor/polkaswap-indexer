@@ -915,6 +915,22 @@ the audited anchor or stored checkpoint. Connection failures, unknown hashes,
 malformed timestamps, and conflicting identity never trigger this fallback.
 All archive connection and query operations retain their existing time bounds.
 
+The startup identity preflight also treats Substrate's
+`Trie lookup error: Invalid state root: 0x…` at the history anchor as
+unavailable state. The default primary `wss://mof2.sora.org` and
+`wss://ws.mof.sora.org` answer this way because they no longer hold pre-fork
+state at block 26,872,383, so a worker on the default primary needs
+`SORA_ARCHIVE_WS_ENDPOINT=wss://mof2.sora.org/archive` to pass the preflight.
+Without a separate archive, startup stops with an error that names the
+missing setting. The archive gets no further fallback, and other trie errors
+such as `Incomplete database` stay fatal. Checkpoint timestamp checks during
+indexing still fall back only on `State already discarded`. Passing the
+preflight does not make those nodes a backfill source: indexing still reads
+each block's runtime version from the primary, which they refuse for
+pre-fork blocks (`:code hash not found`). Backfill from an earlier
+`CHAIN_START_BLOCK` needs a primary that holds that state, such as the
+archive itself.
+
 This timestamp fallback does not permit replay through a pruned primary:
 `fetchBlockByHash` still requires primary/archive agreement on the complete
 block, events, and timestamp. A restored checkpoint older than the primary's

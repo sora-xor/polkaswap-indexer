@@ -593,4 +593,50 @@ describe('bounded pre-fork replay WebSocket server', () => {
     expect((await done)[0]).toBe(1006);
     expect(replies).toEqual([]);
   });
+
+  it.each([
+    ['an oversized frame', 1009, (ws: WebSocket) => ws.send('a'.repeat(256 * 1024 + 1))],
+    ['invalid UTF-8 text', 1007, (ws: WebSocket) => ws.send(Buffer.from([0xc3, 0x28]), { binary: false })],
+  ])('confines %s to its connection: it closes, its slot is freed and every other client keeps being served', async (
+    _label, code, misbehave,
+  ) => {
+    const { adapter } = fixture();
+    await adapter.verify();
+    const s = await serve(adapter);
+    const peers = await Promise.all(Array.from({ length: 15 }, () => open(s.ws)));
+    const { ws, replies } = await open(s.ws);
+    const emits = vi.spyOn(WebSocket.prototype, 'emit');
+    const done = closed(ws);
+    misbehave(ws);
+    expect((await done)[0]).toBe(code);
+    expect(replies).toEqual([]);
+    // The server-side socket's 'error' reached a listener; an unheard one is thrown and ends the process.
+    const serverErrors = emits.mock.calls.flatMap(([event], index) =>
+      event === 'error' && emits.mock.contexts[index] !== ws ? [emits.mock.results[index]] : []);
+    expect(serverErrors).toEqual([{ type: 'return', value: true }]);
+    // All 16 slots were taken, so a new client is admitted only once the failed connection is released.
+    const fresh = await vi.waitFor(() => open(s.ws), WAIT);
+    const clients = [...peers, fresh];
+    clients.forEach((client, id) => client.ws.send(JSON.stringify(request(id, 'chain_getFinalizedHead', []))));
+    await vi.waitFor(() => { for (const client of clients) expect(client.replies).toHaveLength(1); }, WAIT);
+    expect(clients.map((client) => client.replies[0]))
+      .toEqual(Array.from({ length: 16 }, (_, id) => ({ jsonrpc: '2.0', id, result: CAP.hash })));
+    expect(await (await s.post(request(16, 'chain_getHead', []))).json()).toEqual({ jsonrpc: '2.0', id: 16, result: CAP.hash });
+  }, SLOW);
+
+  it('closes with 1011 only the connection whose reply cannot be encoded, without an unhandled rejection', async () => {
+    const { adapter, archive } = fixture();
+    await adapter.verify();
+    const s = await serve(adapter);
+    const peer = await open(s.ws);
+    const { ws, replies } = await open(s.ws);
+    const done = closed(ws);
+    archive.mockResolvedValueOnce(1n);
+    ws.send(JSON.stringify(request(1)));
+    expect(await done).toEqual([1011, 'Internal error']);
+    expect(replies).toEqual([]);
+    peer.ws.send(JSON.stringify(request(2)));
+    await vi.waitFor(() => expect(peer.replies)
+      .toEqual([{ jsonrpc: '2.0', id: 2, result: { upstream: 'archive', method: 'system_health', params: [2] } }]), WAIT);
+  });
 });
