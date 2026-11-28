@@ -18,6 +18,7 @@ type GraphQlResponse = {
   data?: {
     _health?: HealthInfo;
     mobileConfig?: MobileCapabilityInfo;
+    indexerCapabilities?: IndexerCapabilityInfo;
     chainIdentity?: UpdateStreamProbe | null;
     chainState?: UpdateStreamProbe | null;
     networkSnapshots?: {
@@ -68,12 +69,31 @@ type MobileCapabilityInfo = {
   tairaDefaultVisible?: unknown;
 };
 
+type IndexerCapabilityInfo = {
+  schemaVersion?: unknown;
+  genesisHash?: unknown;
+  policyHash?: unknown;
+  mode?: unknown;
+  statsReady?: unknown;
+  historyReady?: unknown;
+  currentViewsReady?: unknown;
+  coreViewsReady?: unknown;
+  entitlementsReady?: unknown;
+  indexedBlock?: unknown;
+  indexedBlockHash?: unknown;
+  reason?: unknown;
+};
+
 type FetchLike = (input: URL, init?: RequestInit) => Promise<Response>;
+
+/** `full` requires complete service health; the partial mode is an explicit operator opt-in. */
+export type ProductionSmokeExpectedMode = 'full' | 'canonical-stats-history';
 
 export type ProductionSmokeOptions = {
   timeoutMs?: number;
   maxResponseBytes?: number;
   maxIndexerAgeSec?: number;
+  expectedMode?: ProductionSmokeExpectedMode | string;
 };
 
 const DEFAULT_GRAPHQL_URL = 'https://pi.soramitsu.io/graphql';
@@ -94,6 +114,43 @@ const PI_HEALTH_DEPLOYMENT_HINT =
   `Deploy the current polkaswap-indexer worker and API so _health proves genesisHash=${SORA_MAINNET_GENESIS_HASH} and an exact, fresh SORA mainnet chainState checkpoint.`;
 const PI_MOBILE_CAPABILITY_DEPLOYMENT_HINT =
   'Deploy the current polkaswap-indexer API so mobileConfig exposes the complete fail-closed SORA mobile capability contract.';
+const PI_INDEXER_CAPABILITY_DEPLOYMENT_HINT =
+  'Deploy the current polkaswap-indexer API so indexerCapabilities reports the service mode and its observed readiness.';
+const EXPECTED_MODE_VARIABLE = 'POLKASWAP_INDEXER_SMOKE_EXPECTED_MODE';
+const FULL_SERVICE_MODE = 'full';
+const STATS_HISTORY_MODE = 'canonical-stats-history';
+const EXPECTED_MODES: readonly ProductionSmokeExpectedMode[] = [FULL_SERVICE_MODE, STATS_HISTORY_MODE];
+const FULL_SERVICE_CAPABILITY_MODES = ['legacy', 'full-recovery'];
+/**
+ * Recovery policy commitment shipped in the recovery chain spec (BLAKE2-256 of
+ * `recovery.policyScale`) and reported by the live runtime; recorded in
+ * docs/post-fork-recovery-20261031.md. The partial mode is admitted only under it.
+ */
+const SORA_RECOVERY_POLICY_COMMITMENT = '0x1f4e11427a9c0a61a4868af40c9e0bdf263bb44a9ee59886a537c52164f3cdbb';
+const CANONICAL_HASH = /^0x[0-9a-f]{64}$/;
+const ZERO_HASH = `0x${'0'.repeat(64)}`;
+/**
+ * `indexerCapabilities` reads chainState after the shared checkpoint view, so a
+ * block landing mid-request moves it ahead of `chainState`; the server also asks
+ * callers to retry the complete query when a checkpoint or core view moves. Such
+ * movement is retried with a fresh request, at most this many requests in total.
+ */
+const MAX_SMOKE_REQUESTS = 3;
+const RETRYABLE_GRAPHQL_MESSAGES = ['retry the complete query', 'core view changed during the read'];
+const INDEXER_CAPABILITY_FIELDS = [
+  'schemaVersion',
+  'genesisHash',
+  'policyHash',
+  'mode',
+  'statsReady',
+  'historyReady',
+  'currentViewsReady',
+  'coreViewsReady',
+  'entitlementsReady',
+  'indexedBlock',
+  'indexedBlockHash',
+  'reason',
+] as const;
 
 const PRODUCTION_SMOKE_QUERY = /* GraphQL */ `
   query PolkaswapProductionSmoke {
@@ -130,6 +187,20 @@ const PRODUCTION_SMOKE_QUERY = /* GraphQL */ `
       polkamarktVisible
       polkamarktMutationsAvailable
       tairaDefaultVisible
+    }
+    indexerCapabilities {
+      schemaVersion
+      genesisHash
+      policyHash
+      mode
+      statsReady
+      historyReady
+      currentViewsReady
+      coreViewsReady
+      entitlementsReady
+      indexedBlock
+      indexedBlockHash
+      reason
     }
     chainIdentity: updatesStream(id: "chainIdentity") {
       id
@@ -196,7 +267,7 @@ function redactSecrets(value: string): string {
   return value
     .replace(/("(?:access[_-]?token|refresh[_-]?token|token|password|passwd|api[-_]?key|secret|authorization|cookie|set-cookie)"\s*:\s*)(?:"(?:\\.|[^"\\])*"|[^,}\]\s]+)/gi, '$1"<redacted>"')
     .replace(/(\b(?:bearer|basic)\s+)[A-Za-z0-9+/=_~.-]+/gi, '$1<redacted>')
-    .replace(/(https?:\/\/)[^/\s@]+@/gi, '$1<redacted>@')
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^/\s@?#]+@/gi, '$1<redacted>@')
     .replace(/([?&](?:access[_-]?token|refresh[_-]?token|token|password|passwd|api[-_]?key|secret|authorization|key)=)[^&#\s]*/gi, '$1<redacted>')
     .replace(/(\b(?:access[_-]?token|refresh[_-]?token|token|password|passwd|api[-_]?key|secret|authorization)\b\s*[:=]\s*)(?:["'][^"'\r\n]*["']|[^\s,;&]+)/gi, '$1<redacted>');
 }
@@ -394,6 +465,25 @@ function missingMobileCapabilityFields(errors: unknown): string[] {
   );
 }
 
+function missingIndexerCapabilityFields(errors: unknown): string[] {
+  const messages = graphqlErrorMessages(errors);
+  if (messages.some((message) => message.includes('Cannot query field "indexerCapabilities" on type "Query"'))) {
+    return ['indexerCapabilities'];
+  }
+  return INDEXER_CAPABILITY_FIELDS.filter((field) =>
+    messages.some((message) => message.includes(`Cannot query field "${field}" on type "IndexerCapabilities"`))
+  );
+}
+
+function resolveExpectedMode(value: unknown): ProductionSmokeExpectedMode {
+  if (value === undefined) return FULL_SERVICE_MODE;
+  const mode = EXPECTED_MODES.find((candidate) => candidate === value);
+  if (!mode) {
+    throw new Error(`${EXPECTED_MODE_VARIABLE} must be one of ${EXPECTED_MODES.join(', ')}`);
+  }
+  return mode;
+}
+
 async function fetchGraphQl(
   fetchImpl: FetchLike,
   graphqlUrl: URL,
@@ -446,6 +536,12 @@ async function fetchGraphQl(
             `PI production GraphQL schema is missing mobile capability fields (${missingCapabilityFields.join(', ')}). ${PI_MOBILE_CAPABILITY_DEPLOYMENT_HINT}`
           );
         }
+        const missingModeFields = missingIndexerCapabilityFields(errorPayload?.errors);
+        if (missingModeFields.length > 0) {
+          throw new Error(
+            `PI production GraphQL schema is missing indexer capability fields (${missingModeFields.join(', ')}). ${PI_INDEXER_CAPABILITY_DEPLOYMENT_HINT}`
+          );
+        }
       } catch (error) {
         if (error instanceof Error && error.message.startsWith('PI production GraphQL schema is missing')) {
           throw error;
@@ -476,7 +572,32 @@ async function fetchGraphQl(
   return parsed as GraphQlResponse;
 }
 
-function assertHealthContract(health: HealthInfo): void {
+/** Explains an unready service from what it reports itself; every value is bounded and redacted. */
+function notReadyDiagnosis(health: HealthInfo, capabilities: IndexerCapabilityInfo | undefined): string {
+  // workerLastError is free-form text that can carry endpoint credentials; only its presence is reported.
+  const lastError = health.workerLastError === null ? 'none'
+    : health.workerLastError === undefined ? '<missing>' : 'present (not printed)';
+  const worker =
+    `workerReady=${formatValue(health.workerReady)}, workerReadinessReason=${formatValue(health.workerReadinessReason)}, ` +
+    `workerLifecycle=${formatValue(health.workerLifecycle)}, workerLag=${formatValue(health.workerLag)}, ` +
+    `workerLatestIndexedBlock=${formatValue(health.workerLatestIndexedBlock)}, workerLastError=${lastError}`;
+  if (capabilities?.mode === STATS_HISTORY_MODE) {
+    return (
+      `The service reports the ${STATS_HISTORY_MODE} partial mode, in which _health.ok stays false by design and ` +
+      `recovery entitlements and current account views are never served (statsReady=${formatValue(capabilities.statsReady)}, ` +
+      `historyReady=${formatValue(capabilities.historyReady)}, coreViewsReady=${formatValue(capabilities.coreViewsReady)}; ` +
+      `reason: ${formatValue(capabilities.reason)}). Reported state: ${worker}. ` +
+      `This is not a full-service recovery. To verify the partial-mode contract instead, set ${EXPECTED_MODE_VARIABLE}=${STATS_HISTORY_MODE}.`
+    );
+  }
+  return `Reported state: repositoryReady=${formatValue(health.repositoryReady)}, ${worker}. ${PI_HEALTH_DEPLOYMENT_HINT}`;
+}
+
+function assertHealthContract(
+  health: HealthInfo,
+  expectedMode: ProductionSmokeExpectedMode = FULL_SERVICE_MODE,
+  capabilities?: IndexerCapabilityInfo,
+): void {
   if ('lastMasterSeqno' in health || health.serviceId === 'ti.soramitsu.io' || health.ecosystem === 'ton') {
     throw new Error(
       'PI production routing points at a TON indexer contract. Route pi.soramitsu.io to the polkaswap-indexer deployment.'
@@ -487,9 +608,19 @@ function assertHealthContract(health: HealthInfo): void {
       'PI production routing points at a Solswap indexer contract. Route pi.soramitsu.io to the polkaswap-indexer deployment.'
     );
   }
-  if (health.ok !== true) {
+  if (expectedMode === STATS_HISTORY_MODE) {
+    // The partial mode never reports complete health. A service that does is
+    // either fully recovered or another deployment; the operator must drop the
+    // override instead of this smoke silently accepting either reading.
+    if (health.ok === true) {
+      throw new Error(
+        `PI production reports full-service health (ok=true), but ${EXPECTED_MODE_VARIABLE}=${STATS_HISTORY_MODE} expects the partial mode. Remove the override to run the full-service smoke.`
+      );
+    }
+    assertHealthField(health.ok, false, `health ok must be false in the ${STATS_HISTORY_MODE} partial mode`);
+  } else if (health.ok !== true) {
     throw new Error(
-      `PI production health is not ready: expected ok=true, received keys ${objectKeys(health)}. ${PI_HEALTH_DEPLOYMENT_HINT}`
+      `PI production health is not ready: expected ok=true, received keys ${objectKeys(health)}. ${notReadyDiagnosis(health, capabilities)}`
     );
   }
   assertHealthField(health.repositoryReady, true, 'health repositoryReady must be true');
@@ -571,6 +702,104 @@ function assertMobileCapabilityContract(capabilities: MobileCapabilityInfo): voi
   }
 }
 
+function failCapability(message: string): never {
+  throw new Error(`PI production indexer capability ${message}. ${PI_INDEXER_CAPABILITY_DEPLOYMENT_HINT}`);
+}
+
+/** Every capability field except the checkpoint identity; also applied to a response that is retried. */
+function assertIndexerCapabilityFields(
+  capabilities: IndexerCapabilityInfo,
+  expectedMode: ProductionSmokeExpectedMode,
+): void {
+  const fail: (message: string) => never = failCapability;
+  if (capabilities.schemaVersion !== 1) fail(`schemaVersion must be 1; received ${formatValue(capabilities.schemaVersion)}`);
+  if (capabilities.genesisHash !== SORA_MAINNET_GENESIS_HASH) {
+    fail(`genesisHash must be the reviewed SORA mainnet genesis; received ${formatValue(capabilities.genesisHash)}`);
+  }
+  for (const field of ['statsReady', 'historyReady', 'currentViewsReady', 'coreViewsReady', 'entitlementsReady'] as const) {
+    if (typeof capabilities[field] !== 'boolean') fail(`${field} must be boolean; received ${formatValue(capabilities[field])}`);
+  }
+  if (capabilities.reason !== null && (typeof capabilities.reason !== 'string' || capabilities.reason.length > 1_000)) {
+    fail('reason must be null or a bounded string');
+  }
+  if (capabilities.policyHash !== null &&
+      (typeof capabilities.policyHash !== 'string' || !CANONICAL_HASH.test(capabilities.policyHash) ||
+       capabilities.policyHash === ZERO_HASH)) {
+    fail('policyHash must be null or a canonical nonzero hash');
+  }
+  // Schema v1 has no certification path: every implemented mode reports false.
+  if (capabilities.entitlementsReady !== false) {
+    fail(`entitlementsReady must be false in schema v1; received ${formatValue(capabilities.entitlementsReady)}`);
+  }
+
+  if (expectedMode === STATS_HISTORY_MODE) {
+    if (capabilities.mode !== STATS_HISTORY_MODE) {
+      fail(`mode must be ${STATS_HISTORY_MODE} when ${EXPECTED_MODE_VARIABLE} selects it; received ${formatValue(capabilities.mode)}`);
+    }
+    if (capabilities.policyHash !== SORA_RECOVERY_POLICY_COMMITMENT) {
+      fail(`policyHash must be the shipped recovery policy commitment ${SORA_RECOVERY_POLICY_COMMITMENT} in the ${STATS_HISTORY_MODE} mode; received ${formatValue(capabilities.policyHash)}`);
+    }
+    // Statistics and history are the whole purpose of the partial mode.
+    for (const field of ['statsReady', 'historyReady'] as const) {
+      if (capabilities[field] !== true) fail(`${field} must be true in the ${STATS_HISTORY_MODE} mode`);
+    }
+    // Current account views never exist in this mode; true here means the
+    // deployment is not the admitted partial mode.
+    if (capabilities.currentViewsReady !== false) fail(`currentViewsReady must be false in the ${STATS_HISTORY_MODE} mode`);
+  } else {
+    if (typeof capabilities.mode !== 'string' || !FULL_SERVICE_CAPABILITY_MODES.includes(capabilities.mode)) {
+      fail(`mode must be one of ${FULL_SERVICE_CAPABILITY_MODES.join(', ')} for a fully healthy service; received ${formatValue(capabilities.mode)}`);
+    }
+    if (capabilities.mode === 'legacy' && capabilities.policyHash !== null) {
+      fail(`policyHash must be null in the legacy mode; received ${formatValue(capabilities.policyHash)}`);
+    }
+    if (capabilities.mode === 'full-recovery' && capabilities.policyHash === null) {
+      fail('policyHash must pin the admitted recovery policy in the full-recovery mode');
+    }
+    for (const field of ['statsReady', 'historyReady', 'currentViewsReady', 'coreViewsReady'] as const) {
+      if (capabilities[field] !== true) fail(`${field} must be true for a fully healthy service`);
+    }
+  }
+
+  if (typeof capabilities.indexedBlock !== 'number' || !Number.isSafeInteger(capabilities.indexedBlock) ||
+      typeof capabilities.indexedBlockHash !== 'string' || !CANONICAL_HASH.test(capabilities.indexedBlockHash)) {
+    fail('indexedBlock and indexedBlockHash must identify an indexed block');
+  }
+}
+
+function assertIndexerCapabilityContract(
+  capabilities: IndexerCapabilityInfo,
+  expectedMode: ProductionSmokeExpectedMode,
+  state: { lastIndexedBlock: number; blockHash: string },
+  highestObservedBlock: number,
+): void {
+  assertIndexerCapabilityFields(capabilities, expectedMode);
+  if (capabilities.indexedBlock !== state.lastIndexedBlock || capabilities.indexedBlockHash !== state.blockHash) {
+    failCapability(`indexedBlock ${formatValue(capabilities.indexedBlock)} and its hash must identify the chainState checkpoint ${formatValue(state.lastIndexedBlock)} (still different after ${MAX_SMOKE_REQUESTS} requests or the smoke deadline if it kept moving)`);
+  }
+  // Finalized history only moves forward: an earlier request of this run that
+  // already saw a higher checkpoint makes a lower final one a regression.
+  if (state.lastIndexedBlock < highestObservedBlock) {
+    failCapability(`chainState checkpoint ${formatValue(state.lastIndexedBlock)} is lower than block ${formatValue(highestObservedBlock)} observed earlier in this smoke run`);
+  }
+}
+
+/** True only for observed checkpoint movement during one request, which a fresh request may resolve. */
+function checkpointMovedDuringRequest(payload: GraphQlResponse): boolean {
+  if (Array.isArray(payload.errors) && payload.errors.length > 0) {
+    return payload.errors.every((error) => {
+      if (!error || typeof error !== 'object') return false;
+      const { message, extensions } = error as { message?: unknown; extensions?: { code?: unknown } };
+      return extensions?.code === 'CHECKPOINT_VIEW_UNAVAILABLE' ||
+        (typeof message === 'string' && RETRYABLE_GRAPHQL_MESSAGES.some((text) => message.includes(text)));
+    });
+  }
+  const capabilityBlock = payload.data?.indexerCapabilities?.indexedBlock;
+  const stateBlock = payload.data?.chainState?.block;
+  return Number.isSafeInteger(capabilityBlock) && Number.isSafeInteger(stateBlock) &&
+    Number(capabilityBlock) > Number(stateBlock);
+}
+
 function parseProbeJson(probe: UpdateStreamProbe, label: string): unknown {
   if (typeof probe.data !== 'string') {
     throw new Error(`PI production ${label} data must be JSON text. ${PI_HEALTH_DEPLOYMENT_HINT}`);
@@ -608,7 +837,25 @@ export async function runProductionSmoke(
     DEFAULT_MAX_INDEXER_AGE_SEC,
     MAX_INDEXER_AGE_SEC,
   );
-  const payload = await fetchGraphQl(fetchImpl, graphqlUrl, requestOptions);
+  const expectedMode = resolveExpectedMode(options.expectedMode ?? process.env[EXPECTED_MODE_VARIABLE]);
+  // One total deadline covers every request of this run, retries included.
+  const deadline = Date.now() + requestOptions.timeoutMs;
+  let payload = await fetchGraphQl(fetchImpl, graphqlUrl, requestOptions);
+  let highestObservedBlock = 0;
+  for (let request = 2; request <= MAX_SMOKE_REQUESTS && checkpointMovedDuringRequest(payload); request += 1) {
+    const moved = payload.data;
+    if (moved?._health && typeof moved._health === 'object' && moved.indexerCapabilities &&
+        typeof moved.indexerCapabilities === 'object') {
+      // A moved response is still a complete answer: its other contract fields
+      // must hold before it is discarded, so a retry never hides a failure.
+      assertHealthContract(moved._health, expectedMode, moved.indexerCapabilities);
+      assertIndexerCapabilityFields(moved.indexerCapabilities, expectedMode);
+      highestObservedBlock = Math.max(highestObservedBlock, Number(moved.indexerCapabilities.indexedBlock));
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    payload = await fetchGraphQl(fetchImpl, graphqlUrl, { ...requestOptions, timeoutMs: remainingMs });
+  }
 
   if (payload.errors !== undefined) {
     const missingIdentityFields = missingHealthIdentityFields(payload.errors);
@@ -623,6 +870,12 @@ export async function runProductionSmoke(
         `PI production GraphQL schema is missing mobile capability fields (${missingCapabilityFields.join(', ')}). ${PI_MOBILE_CAPABILITY_DEPLOYMENT_HINT}`
       );
     }
+    const missingModeFields = missingIndexerCapabilityFields(payload.errors);
+    if (missingModeFields.length > 0) {
+      throw new Error(
+        `PI production GraphQL schema is missing indexer capability fields (${missingModeFields.join(', ')}). ${PI_INDEXER_CAPABILITY_DEPLOYMENT_HINT}`
+      );
+    }
     throw new Error(`Polkaswap GraphQL endpoint returned errors: ${bodyPreview(JSON.stringify(payload.errors))}. ${PI_GRAPHQL_DEPLOYMENT_HINT}`);
   }
   if (!payload.data?._health || typeof payload.data._health !== 'object') {
@@ -631,7 +884,10 @@ export async function runProductionSmoke(
     );
   }
 
-  assertHealthContract(payload.data._health);
+  const capabilities = payload.data.indexerCapabilities && typeof payload.data.indexerCapabilities === 'object'
+    ? payload.data.indexerCapabilities
+    : undefined;
+  assertHealthContract(payload.data._health, expectedMode, capabilities);
   if (!payload.data.mobileConfig || typeof payload.data.mobileConfig !== 'object') {
     throw new Error(
       `Polkaswap GraphQL endpoint did not return data.mobileConfig. ${PI_MOBILE_CAPABILITY_DEPLOYMENT_HINT}`
@@ -698,6 +954,27 @@ export async function runProductionSmoke(
     throw new Error(
       `PI production worker checkpoint must be within ${maxIndexerAgeSec} seconds of the smoke clock; received timestamp ${formatValue(state.blockTimestamp)}. ${PI_HEALTH_DEPLOYMENT_HINT}`,
     );
+  }
+  // The worker's own commit heartbeat must be fresh too, not only positive.
+  const heartbeat = Number(payload.data._health.workerLastSuccessfulIndexTimestamp);
+  const heartbeatAgeSec = now - heartbeat;
+  if (heartbeatAgeSec < -FUTURE_TIMESTAMP_TOLERANCE_SEC || heartbeatAgeSec > maxIndexerAgeSec) {
+    throw new Error(
+      `PI production workerLastSuccessfulIndexTimestamp must be within ${maxIndexerAgeSec} seconds of the smoke clock; received ${formatValue(heartbeat)}. ${PI_HEALTH_DEPLOYMENT_HINT}`,
+    );
+  }
+  if (!capabilities) {
+    throw new Error(
+      `Polkaswap GraphQL endpoint did not return data.indexerCapabilities. ${PI_INDEXER_CAPABILITY_DEPLOYMENT_HINT}`
+    );
+  }
+  assertIndexerCapabilityContract(capabilities, expectedMode, state, highestObservedBlock);
+  if (expectedMode === STATS_HISTORY_MODE) {
+    process.stdout.write(
+      `polkaswap production smoke ok in the ${STATS_HISTORY_MODE} partial mode ` +
+      `(statistics and history only; _health.ok stays false; coreViewsReady=${String(capabilities.coreViewsReady)}): ${graphqlUrl.toString()}\n`
+    );
+    return;
   }
   process.stdout.write(`polkaswap production smoke ok: ${graphqlUrl.toString()}\n`);
 }

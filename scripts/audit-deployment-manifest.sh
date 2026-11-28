@@ -204,6 +204,7 @@ done
 require_healthcheck_literal "spawn(process.execPath,['dist/src/scripts/production-smoke.js',endpoint]" "runtime healthcheck must reuse the complete PI identity smoke contract"
 require_healthcheck_literal "stdio:'ignore'" "runtime healthcheck must isolate smoke output from container health status"
 require_healthcheck_literal "POLKASWAP_INDEXER_SMOKE_TIMEOUT_MS:'4000'" "runtime healthcheck must use a deadline shorter than its container timeout"
+require_healthcheck_literal "POLKASWAP_INDEXER_SMOKE_EXPECTED_MODE:'full'}" "runtime healthcheck must keep the full-service smoke contract regardless of the container environment"
 require_healthcheck_literal "process.env.PORT??'4350'" "runtime healthcheck must derive its port from the runtime environment"
 require_healthcheck_literal "process.env.GRAPHQL_PATH??'/graphql'" "runtime healthcheck must derive its GraphQL path from the runtime environment"
 require_healthcheck_literal "const endpoint='http://127.0.0.1:'+port+path" "runtime healthcheck must probe the loopback GraphQL endpoint"
