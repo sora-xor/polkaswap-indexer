@@ -1,5 +1,5 @@
 import { WsProvider } from '@polkadot/api';
-import { isDiscardedTimestampState } from './historicalTimestamp.js';
+import { isUnavailableHistoricalState } from './historicalTimestamp.js';
 
 import {
   isNonzeroCanonicalSubstrateHash,
@@ -30,6 +30,11 @@ const withTimeout = async <T>(promise: Promise<T>, label: string, timeoutMs = PR
   }
 };
 
+const unavailableAnchorState = (error: Error, reason: string): Error => new Error(
+  `SORA identity preflight cannot read Timestamp.Now at the history anchor: ${reason} (${error.message})`,
+  { cause: error },
+);
+
 const disconnect = async (endpoint: unknown): Promise<void> => {
   const close = (endpoint as { disconnect?: () => unknown } | null)?.disconnect;
   if (typeof close === 'function') {
@@ -50,13 +55,26 @@ const disconnect = async (endpoint: unknown): Promise<void> => {
  * node-response trust boundary without downloading unrelated runtime metadata.
  * This is a fixed-anchor identity check, not a decoder for arbitrary runtimes
  * or a cryptographic storage proof; normal indexing still uses runtime metadata.
+ *
+ * A primary that no longer holds the anchor's state (explicitly discarded, or a
+ * missing state root, as the documented primary reports) may defer only the
+ * timestamp to `historicalEndpoint`. That endpoint must prove genesis, the same
+ * anchor hash and the exact timestamp itself; it gets no further fallback.
  */
-export async function preflightSoraMainnetIdentity(
+export function preflightSoraMainnetIdentity(
+  endpoint: string,
+  options: { requireAnchorTimestamp?: boolean; historicalEndpoint?: string } = {},
+): Promise<void> {
+  return proveSoraMainnetIdentity(endpoint, options, false);
+}
+
+async function proveSoraMainnetIdentity(
   endpoint: string,
   { requireAnchorTimestamp = false, historicalEndpoint }: {
     requireAnchorTimestamp?: boolean;
     historicalEndpoint?: string;
-  } = {},
+  },
+  isHistoricalFallback: boolean,
 ): Promise<void> {
   const provider = new WsProvider(endpoint, false, {}, PREFLIGHT_TIMEOUT_MS);
   let acceptingConnection = true;
@@ -104,10 +122,15 @@ export async function preflightSoraMainnetIdentity(
           'SORA identity preflight state_getStorage(Timestamp.Now at anchor)',
         );
       } catch (error) {
-        if (!isDiscardedTimestampState(error) || !historicalEndpoint || historicalEndpoint === endpoint) throw error;
+        if (!isUnavailableHistoricalState(error)) throw error;
+        if (isHistoricalFallback) throw unavailableAnchorState(error, 'the archive does not hold that state either');
+        if (!historicalEndpoint || historicalEndpoint === endpoint) {
+          throw unavailableAnchorState(error,
+            'this endpoint no longer holds that state and SORA_ARCHIVE_WS_ENDPOINT names no separate archive');
+        }
         // The primary already proved the canonical hash. Independently prove
         // the archive's genesis, same anchor hash, and exact audited timestamp.
-        await preflightSoraMainnetIdentity(historicalEndpoint, { requireAnchorTimestamp: true });
+        await proveSoraMainnetIdentity(historicalEndpoint, { requireAnchorTimestamp: true }, true);
         return;
       }
       if (typeof timestampStorage !== 'string' || !/^0x[0-9a-fA-F]{16}$/.test(timestampStorage) ||
